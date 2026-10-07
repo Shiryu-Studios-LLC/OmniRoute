@@ -42,6 +42,7 @@ import { isGeoBlockedError } from "@omniroute/open-sse/services/errorClassifier.
 const OAUTH_TEST_TIMEOUT_MS = 30_000;
 
 import { CLI_RUNTIME_PROVIDER_MAP } from "./cliRuntimeProviderMap";
+import { getComfyUIBaseUrl } from "@/lib/providers/comfyuiCatalog";
 
 /** POST body is optional; when present, only known fields are validated. */
 const providerConnectionTestBodySchema = z.object({
@@ -926,6 +927,45 @@ export async function testOAuthConnection(
 /**
  * Test API key connection
  */
+/**
+ * ComfyUI is a local, credentialless provider. Its native /system_stats
+ * endpoint is the health contract; the generic validator cannot test it.
+ */
+async function testComfyUIConnection(connection: any, proxyInfo: any) {
+  const url = `${getComfyUIBaseUrl(connection)}/system_stats`;
+  try {
+    const response = await safeOutboundFetch(url, {
+      ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
+      guard: getProviderValidationGuard(),
+      proxyConfig: proxyInfo?.proxy || null,
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      const error = `ComfyUI health check returned HTTP ${response.status}`;
+      return {
+        valid: false,
+        error,
+        statusCode: response.status,
+        diagnosis: classifyFailure({ error, statusCode: response.status, provider: "comfyui" }),
+      };
+    }
+    return {
+      valid: true,
+      error: null,
+      statusCode: response.status,
+      diagnosis: makeDiagnosis("ok", "upstream", null, null),
+    };
+  } catch (error: unknown) {
+    const message = toSafeMessage(error, "ComfyUI health check failed");
+    return {
+      valid: false,
+      error: message,
+      diagnosis: classifyFailure({ error: message, provider: "comfyui" }),
+    };
+  }
+}
+
 async function testApiKeyConnection(connection: any) {
   const requiresApiKey = !providerAllowsOptionalApiKey(connection.provider);
   if (requiresApiKey && !connection.apiKey) {
@@ -1030,6 +1070,8 @@ export async function testSingleConnection(connectionId: string, validationModel
     result = await runWithProxyContext(proxyInfo?.proxy || null, () =>
       Promise.resolve(appServerResult)
     );
+  } else if (provider === "comfyui") {
+    result = await testComfyUIConnection(connection, proxyInfo);
   } else if (shouldUseApiKeyConnectionTest(connection.authType, provider)) {
     const enrichedConnection = validationModelId
       ? {

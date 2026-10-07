@@ -14,6 +14,7 @@ import { mergeModelsWithCustomPrecedence } from "@/lib/providers/modelMetadataPr
 import {
   getCachedProviderConnectionById,
   getModelIsHidden,
+  resolveProxyForConnection,
   resolveProxyForProvider,
 } from "@/lib/localDb";
 import {
@@ -128,6 +129,7 @@ import {
 } from "./discovery/codex";
 import { maybeHandleConolModelDiscovery } from "./conolDiscovery";
 import { buildNoAuthModelsResponse, filterModelsForRoute } from "./modelRouteProjection";
+import { getComfyUIBaseUrl, parseComfyUIObjectInfo } from "@/lib/providers/comfyuiCatalog";
 
 /**
  * GET /api/providers/[id]/models - Get models list from provider
@@ -194,6 +196,42 @@ export async function GET(
       return NextResponse.json({ error: "Invalid connection provider" }, { status: 400 });
     }
     const usesCuratedModelsOnly = providerUsesCuratedModelsOnly(provider);
+
+    // ComfyUI has no OpenAI-style /models endpoint. Its authoritative catalog
+    // is /object_info, which reflects the models actually exposed by the live
+    // ComfyUI runtime, including extra model paths.
+    if (provider === "comfyui") {
+      const comfyUrl = `${getComfyUIBaseUrl(connection)}/object_info`;
+      try {
+        const response = await safeOutboundFetch(comfyUrl, {
+          ...SAFE_OUTBOUND_FETCH_PRESETS.modelsDiscovery,
+          guard: getProviderOutboundGuard(),
+          proxyConfig: await resolveProxyForConnection(id),
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          return NextResponse.json(
+            { error: `ComfyUI model discovery returned HTTP ${response.status}` },
+            { status: 502 }
+          );
+        }
+        const objectInfo = await response.json();
+        const models = parseComfyUIObjectInfo(objectInfo);
+        return buildResponse({
+          provider,
+          connectionId: typeof connection.id === "string" ? connection.id : id,
+          models,
+          source: "upstream",
+          authoritative: true,
+        });
+      } catch (error) {
+        return NextResponse.json(
+          { error: `ComfyUI model discovery failed: ${sanitizeErrorMessage(error)}` },
+          { status: 502 }
+        );
+      }
+    }
 
     // Resolve proxy for this provider (provider-level → global → direct)
     const proxy = await resolveProxyForProvider(provider);
