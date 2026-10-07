@@ -126,9 +126,9 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
   ],
   civitai: () => [
     // Civitai (civitai.red) is a model/image-generation catalog, not an LLM
-    // inference API — it has no /v1/models endpoint. Expose the supported
-    // capability types as a static catalog so the model-import UI shows a
-    // usable list instead of the 400 "does not support models listing" error.
+    // inference API. These capability rows are only a safe fallback when the
+    // live catalog is unavailable; the normal discovery path uses the real
+    // paginated civitai.red /api/v1/models endpoint.
     { id: "Checkpoint", name: "Checkpoint (Stable Diffusion base model)" },
     { id: "LORA", name: "LoRA (Low-Rank Adaptation)" },
     { id: "LoCon", name: "LyCORIS / LoCon" },

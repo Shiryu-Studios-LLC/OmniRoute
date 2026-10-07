@@ -205,42 +205,6 @@ export async function GET(
     }
     const usesCuratedModelsOnly = providerUsesCuratedModelsOnly(provider);
 
-    // ComfyUI has no OpenAI-style /models endpoint. Its authoritative catalog
-    // is /object_info, which reflects the models actually exposed by the live
-    // ComfyUI runtime, including extra model paths.
-    if (provider === "comfyui") {
-      const comfyUrl = `${getComfyUIBaseUrl(connection)}/object_info`;
-      try {
-        const response = await safeOutboundFetch(comfyUrl, {
-          ...SAFE_OUTBOUND_FETCH_PRESETS.modelsDiscovery,
-          guard: getProviderOutboundGuard(),
-          proxyConfig: await resolveProxyForConnection(id),
-          method: "GET",
-          headers: { Accept: "application/json" },
-        });
-        if (!response.ok) {
-          return NextResponse.json(
-            { error: `ComfyUI model discovery returned HTTP ${response.status}` },
-            { status: 502 }
-          );
-        }
-        const objectInfo = await response.json();
-        const models = parseComfyUIObjectInfo(objectInfo);
-        return buildResponse({
-          provider,
-          connectionId: typeof connection.id === "string" ? connection.id : id,
-          models,
-          source: "upstream",
-          authoritative: true,
-        });
-      } catch (error) {
-        return NextResponse.json(
-          { error: `ComfyUI model discovery failed: ${sanitizeErrorMessage(error)}` },
-          { status: 502 }
-        );
-      }
-    }
-
     // Resolve proxy for this provider (provider-level → global → direct)
     const proxy = await resolveProxyForProvider(provider);
 
@@ -279,7 +243,7 @@ export async function GET(
     const buildResponse = (payload: any, statusConfig?: ResponseInit) => {
       if (payload.models && Array.isArray(payload.models)) {
         payload.models = mergeCustomModels(payload.models);
-        payload.models = filterModelsForRoute(provider, payload.models, chatOnly);
+        // Civitai is a model catalog, not a chat provider. The dashboard import\n        // surface requests chatOnly=true globally, but that projection would\n        // incorrectly hide every Civitai image-model row. Keep its catalog\n        // visible while retaining the normal chat-only projection elsewhere.\n        payload.models = filterModelsForRoute(provider, payload.models, provider === "civitai" ? false : chatOnly);
       }
       if (excludeHidden && payload.models && Array.isArray(payload.models)) {
         payload.models = payload.models.filter((m: any) => !getModelIsHidden(provider, m.id));
@@ -288,6 +252,46 @@ export async function GET(
     };
 
     const connectionId = typeof connection.id === "string" ? connection.id : id;
+
+    // ComfyUI has no OpenAI-style /models endpoint. Its authoritative catalog
+    // is /object_info, which reflects the models actually exposed by the live
+    // ComfyUI runtime, including extra model paths.
+    //
+    // Keep this after buildResponse: calling the const closure before its
+    // initialization becomes a production-only TDZ ReferenceError after
+    // bundling/minification ("Cannot access ef before initialization").
+    if (provider === "comfyui") {
+      const comfyUrl = `${getComfyUIBaseUrl(connection)}/object_info`;
+      try {
+        const response = await safeOutboundFetch(comfyUrl, {
+          ...SAFE_OUTBOUND_FETCH_PRESETS.modelsDiscovery,
+          guard: getProviderOutboundGuard(),
+          proxyConfig: await resolveProxyForConnection(id),
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          return NextResponse.json(
+            { error: `ComfyUI model discovery returned HTTP ${response.status}` },
+            { status: 502 }
+          );
+        }
+        const objectInfo = await response.json();
+        const models = parseComfyUIObjectInfo(objectInfo);
+        return buildResponse({
+          provider,
+          connectionId,
+          models,
+          source: "upstream",
+          authoritative: true,
+        });
+      } catch (error) {
+        return NextResponse.json(
+          { error: `ComfyUI model discovery failed: ${sanitizeErrorMessage(error)}` },
+          { status: 502 }
+        );
+      }
+    }
     const apiKey = typeof connection.apiKey === "string" ? connection.apiKey : "";
     const accessToken = typeof connection.accessToken === "string" ? connection.accessToken : "";
     const autoFetchModels = isAutoFetchModelsEnabled(connection.providerSpecificData);
@@ -512,6 +516,213 @@ export async function GET(
         source: "api",
       });
     };
+
+    // Civitai is a public model catalog, not an inference endpoint. Its
+    // /api/v1/models endpoint is authoritative for the dashboard model picker,
+    // but it must be handled before the generic auto-fetch gate because the
+    // provider is intentionally optional-key and does not participate in the
+    // normal LLM discovery policy. Keep the configured civitai.red URL as the
+    // default so we never silently fall back to civitai.com.
+    if (provider === "civitai") {
+      const civitaiModelId = searchParams.get("modelId")?.trim() || "";
+      const civitaiQuery = searchParams.get("query")?.trim() || "";
+      const civitaiCursor = searchParams.get("cursor")?.trim() || "";
+      const parsedLimit = Number.parseInt(searchParams.get("limit") || "100", 10);
+      const civitaiLimit = Number.isFinite(parsedLimit)
+        ? Math.min(100, Math.max(1, parsedLimit))
+        : 100;
+      const isOnDemandLookup = Boolean(civitaiModelId || civitaiQuery || civitaiCursor);
+
+      // The normal dashboard import remains the first page, but Civitai is cursor
+      // paginated. Callers can now search or request an exact model without being
+      // constrained to the first 100 rows. Search/cursor/lookup requests are
+      // intentionally not persisted as the authoritative connection catalog — they
+      // are on-demand views and must never replace the normal synced page.
+      const cachedResponse = !isOnDemandLookup ? maybeReturnCachedDiscovery() : null;
+      if (cachedResponse) return cachedResponse;
+
+      const registryModelsUrl = getRegistryEntry("civitai")?.modelsUrl;
+      if (typeof registryModelsUrl !== "string" || registryModelsUrl.length === 0) {
+        const fallback = buildDiscoveryFallbackResponse({
+          cacheWarning: "Civitai models URL unavailable — using cached catalog",
+          localWarning: "Civitai models URL unavailable — using local catalog",
+        });
+        if (fallback) return fallback;
+        return NextResponse.json(
+          { error: "Civitai model catalog URL is not configured" },
+          { status: 500 }
+        );
+      }
+
+      const modelsUrl = civitaiModelId
+        ? new URL(
+            `${new URL(registryModelsUrl).origin}/api/v1/models/${encodeURIComponent(civitaiModelId)}`
+          )
+        : new URL(registryModelsUrl);
+      if (!civitaiModelId) {
+        modelsUrl.searchParams.set("limit", String(civitaiLimit));
+        if (civitaiQuery) modelsUrl.searchParams.set("query", civitaiQuery);
+        if (civitaiCursor) modelsUrl.searchParams.set("cursor", civitaiCursor);
+      }
+      const token = apiKey || accessToken;
+
+      const normalizeCivitaiModel = (item: unknown) => {
+        if (!item || typeof item !== "object") return null;
+        const record = item as Record<string, unknown>;
+        const id =
+          typeof record.id === "number"
+            ? String(record.id)
+            : typeof record.id === "string"
+              ? record.id.trim()
+              : "";
+        if (!id) return null;
+        const name =
+          typeof record.name === "string" && record.name.trim().length > 0
+            ? record.name.trim()
+            : id;
+        const modelType =
+          typeof record.type === "string" && record.type.trim().length > 0
+            ? record.type.trim()
+            : "image";
+        return {
+          id,
+          name,
+          owned_by: "civitai",
+          modelType,
+          supportedEndpoints: ["images"],
+        };
+      };
+
+      try {
+        const response = await safeOutboundFetch(modelsUrl.toString(), {
+          ...SAFE_OUTBOUND_FETCH_PRESETS.modelsDiscovery,
+          guard: getProviderOutboundGuard(),
+          proxyConfig: proxy,
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+        });
+
+        if (!response.ok) {
+          if (isOnDemandLookup) {
+            return NextResponse.json(
+              {
+                error: `Civitai ${civitaiModelId ? "model lookup" : "search"} returned HTTP ${response.status}`,
+              },
+              { status: response.status }
+            );
+          }
+          const fallback = buildDiscoveryFallbackResponse({
+            cacheWarning: `Civitai catalog returned ${response.status} — using cached catalog`,
+            localWarning: `Civitai catalog returned ${response.status} — using local catalog`,
+          });
+          if (fallback) return fallback;
+          return NextResponse.json(
+            { error: `Civitai model catalog returned HTTP ${response.status}` },
+            { status: response.status }
+          );
+        }
+
+        const data = (await response.json()) as {
+          id?: unknown;
+          name?: unknown;
+          type?: unknown;
+          items?: unknown;
+          data?: unknown;
+          models?: unknown;
+          metadata?: {
+            nextCursor?: unknown;
+            nextPage?: unknown;
+          };
+        };
+        const rawModels = civitaiModelId
+          ? [data]
+          : Array.isArray(data.items)
+            ? data.items
+            : Array.isArray(data.data)
+              ? data.data
+              : Array.isArray(data.models)
+                ? data.models
+                : [];
+        const models = rawModels.flatMap((item) => {
+          const normalized = normalizeCivitaiModel(item);
+          return normalized ? [normalized] : [];
+        });
+
+        if (models.length > 0) {
+          const extraPayload: Record<string, unknown> = {
+            catalogMode: civitaiModelId ? "civitai_model_lookup" : "civitai_models",
+            catalogScope: isOnDemandLookup ? "on_demand" : "public",
+          };
+          if (!civitaiModelId && data.metadata && typeof data.metadata === "object") {
+            const nextCursor =
+              typeof data.metadata.nextCursor === "string" ||
+              typeof data.metadata.nextCursor === "number"
+                ? String(data.metadata.nextCursor)
+                : "";
+            const nextPage =
+              typeof data.metadata.nextPage === "string" ? data.metadata.nextPage : "";
+            if (nextCursor) extraPayload.nextCursor = nextCursor;
+            if (nextPage) extraPayload.nextPage = nextPage;
+          }
+
+          // Only the default first page updates the synced catalog. On-demand
+          // searches and exact lookups must not replace the user's imported list.
+          if (!isOnDemandLookup) {
+            return buildApiDiscoveryResponse(models, undefined, extraPayload);
+          }
+          return buildResponse({
+            provider,
+            connectionId,
+            models,
+            source: "api",
+            ...extraPayload,
+          });
+        }
+
+        if (isOnDemandLookup) {
+          return buildResponse({
+            provider,
+            connectionId,
+            models: [],
+            source: "api",
+            catalogMode: civitaiModelId ? "civitai_model_lookup" : "civitai_models",
+            catalogScope: "on_demand",
+            warning: "Civitai returned no matching models",
+          });
+        }
+
+        const fallback = buildDiscoveryFallbackResponse({
+          cacheWarning: "Civitai returned no models — using cached catalog",
+          localWarning: "Civitai returned no models — using local catalog",
+        });
+        if (fallback) return fallback;
+        return buildResponse({
+          provider,
+          connectionId,
+          models: [],
+          source: "api",
+          warning: "Civitai returned an empty model catalog",
+        });
+      } catch (error) {
+        if (isOnDemandLookup) {
+          return NextResponse.json(
+            {
+              error: `Civitai ${civitaiModelId ? "model lookup" : "search"} failed: ${sanitizeErrorMessage(error)}`,
+            },
+            { status: 502 }
+          );
+        }
+        const fallback = buildDiscoveryErrorFallbackResponse(error, {
+          cacheWarning: "Civitai catalog unavailable — using cached catalog",
+          localWarning: "Civitai catalog unavailable — using local catalog",
+        });
+        if (fallback) return fallback;
+        throw error;
+      }
+    }
 
     if (provider === "reka") {
       // reka has no remote model-discovery endpoint — the local catalog is the

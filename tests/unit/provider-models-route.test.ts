@@ -182,6 +182,48 @@ test("provider models route allows private/LAN OpenAI-compatible base URLs under
   assert.equal(called, true);
 });
 
+test("provider models route discovers ComfyUI models without a production TDZ failure", async () => {
+  delete process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
+  delete process.env.OMNIROUTE_ALLOW_LOCAL_PROVIDER_URLS;
+
+  const connection = await seedConnection("comfyui", {
+    providerSpecificData: {
+      autoFetchModels: true,
+      baseUrl: "http://127.0.0.1:8188",
+    },
+  });
+
+  let calledUrl = "";
+  globalThis.fetch = async (url) => {
+    calledUrl = String(url);
+    return Response.json({
+      CheckpointLoaderSimple: {
+        input: {
+          required: {
+            ckpt_name: [["RealVisXL_V5.0_fp16.safetensors"]],
+          },
+        },
+      },
+    });
+  };
+
+  const response = await callRoute(connection.id);
+  const body = (await response.json()) as {
+    source: string;
+    authoritative: boolean;
+    models: Array<{ id: string }>;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "upstream");
+  assert.equal(body.authoritative, true);
+  assert.equal(calledUrl, "http://127.0.0.1:8188/object_info");
+  assert.ok(
+    body.models.some((model) => model.id === "RealVisXL_V5.0_fp16.safetensors"),
+    "ComfyUI checkpoint should be discovered from /object_info"
+  );
+});
+
 test("provider models route returns auth failures from OpenAI-compatible upstreams", async () => {
   const connection = await seedConnection("openai-compatible-auth", {
     apiKey: "sk-openai-compatible",

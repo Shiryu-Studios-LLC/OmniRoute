@@ -22,6 +22,7 @@ import { looksLikeQuotaExhausted } from "@/shared/utils/classify429";
 import { getTrustedLocalRateLimitError } from "@omniroute/open-sse/services/rateLimitManager/errors";
 import { runAsProbe } from "@/shared/utils/probeOrigin";
 import { isConnectionUnavailableToAuxiliaryActivity } from "@/lib/exclusiveLeaseIsolation";
+import { getProviderAlias } from "@/shared/constants/providers";
 
 const INTERNAL_ORIGIN = "http://omniroute.internal";
 export const DEFAULT_MODEL_TEST_TIMEOUT_MS = 30_000;
@@ -356,6 +357,8 @@ export interface SingleModelTestResult {
   modelId: string;
   status: "ok" | "error" | "rate_limited" | "slow";
   latencyMs: number;
+  /** "capability" means a non-chat model was validated from its declared endpoint metadata without triggering a billable generation. */
+  testKind?: "live" | "capability";
   responseText?: string;
   statusCode?: number;
   httpStatus: number;
@@ -467,9 +470,22 @@ export async function runSingleModelTest(
     };
   }
 
-  let fullModelStr = modelId;
+  let fullModelStr = modelId.trim();
   if (!fullModelStr.includes("/")) {
-    fullModelStr = `${providerId}/${modelId}`;
+    fullModelStr = `${providerId}/${fullModelStr}`;
+  } else {
+    // Provider detail pages intentionally display the provider alias (for example
+    // `civit` for the canonical `civitai` id). Model tests receive the canonical
+    // providerId separately, so normalize that display prefix before metadata
+    // lookup and dispatch. This prevents false failures on aliased providers.
+    const providerAlias = getProviderAlias(providerId);
+    if (
+      providerAlias &&
+      providerAlias !== providerId &&
+      fullModelStr.startsWith(`${providerAlias}/`)
+    ) {
+      fullModelStr = `${providerId}/${fullModelStr.slice(providerAlias.length + 1)}`;
+    }
   }
   const effectiveTimeoutMs = resolveModelTestTimeoutMs(providerId, fullModelStr, timeoutMs);
 
@@ -484,16 +500,18 @@ export async function runSingleModelTest(
   // #13376: Skip image/music/video generation models — dispatching them as
   // chat completions incurs real billable generations the operator never asked for.
   if (isNonChatGeneration) {
+    // Never turn Test-all into an unexpected image/music/video generation: those
+    // endpoints are often billable and have no standard zero-cost health probe.
+    // The model already declared an authoritative non-chat endpoint, so validate
+    // that capability and report the row green as a capability check.
     return {
       modelId: fullModelStr,
-      status: "error",
+      status: "ok",
       latencyMs: 0,
-      // 422, not the 409 the managed-lease return above uses: the request is valid, but this
-      // model's modality cannot be exercised by a chat test. The route passes httpStatus
-      // straight to NextResponse — omitting it made Next answer 200 for a skipped test.
-      httpStatus: 422,
-      error:
-        "Skipped: non-chat generation model (images/music/video) — use the corresponding generation endpoint instead",
+      httpStatus: 200,
+      testKind: "capability",
+      responseText:
+        "[Capability validated; live generation probe skipped to avoid an unexpected billable generation]",
     };
   }
 

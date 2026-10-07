@@ -441,16 +441,33 @@ test("runSingleModelTest preserves trusted local limiter HTTP statuses", async (
 });
 
 // ---------------------------------------------------------------------------
-// #13376 skip path — a non-chat generation model (image/music/video) must be
-// rejected with a real HTTP status and never dispatched as a chat completion.
-//
-// The route hands `result.httpStatus` straight to NextResponse
-// (src/app/api/models/test/route.ts). When the early return omitted it, the
-// status was `undefined`, Next fell back to 200, and a skipped test reached the
-// client as an HTTP success carrying `status: "error"` in the body.
+// #13376 capability path — a non-chat generation model (image/music/video) must
+// never be dispatched as a chat completion. Test-all reports a green capability
+// check instead of triggering an unexpected billable generation.
 // ---------------------------------------------------------------------------
 
-test("#13376 a generation-only model is skipped with a 4xx and is never dispatched", async () => {
+test("model tests normalize the provider display alias to the canonical provider id", async () => {
+  const { addCustomModel } = await import("@/lib/db/models");
+  await addCustomModel(
+    "civitai",
+    "257749",
+    "Pony Diffusion V6 XL",
+    "manual",
+    "images-generations",
+    ["images"]
+  );
+
+  const result = await runSingleModelTest({
+    providerId: "civitai",
+    modelId: "civit/257749",
+  });
+
+  assert.equal(result.modelId, "civitai/257749");
+  assert.equal(result.status, "ok");
+  assert.equal(result.testKind, "capability");
+});
+
+test("#13376 a generation-only model is capability-validated and never dispatched", async () => {
   const { addCustomModel } = await import("@/lib/db/models");
   await addCustomModel("openai", "image-only-13376", "Image only", "manual", "images-generations", [
     "images",
@@ -471,9 +488,10 @@ test("#13376 a generation-only model is skipped with a 4xx and is never dispatch
     });
 
     assert.equal(dispatched, false, "no billable generation may be triggered");
-    assert.equal(result.status, "error");
-    assert.equal(typeof result.httpStatus, "number", "the route needs a real status code");
-    assert.equal(result.httpStatus, 422);
+    assert.equal(result.status, "ok");
+    assert.equal(result.testKind, "capability");
+    assert.equal(result.httpStatus, 200);
+    assert.match(result.responseText || "", /capability validated/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

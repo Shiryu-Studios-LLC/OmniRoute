@@ -154,6 +154,8 @@ export default function CustomModelsSection({
   const [editingSupportsVision, setEditingSupportsVision] = useState(false);
   const [newIsFree, setNewIsFree] = useState(false);
   const [editingIsFree, setEditingIsFree] = useState(false);
+  const [civitaiLookupId, setCivitaiLookupId] = useState("");
+  const [civitaiLookingUp, setCivitaiLookingUp] = useState(false);
 
   const customMap = useMemo(() => buildCompatMap(customModels), [customModels]);
   const overrideMap = useMemo(() => buildCompatMap(modelCompatOverrides), [modelCompatOverrides]);
@@ -182,6 +184,35 @@ export default function CustomModelsSection({
     };
     void run();
   }, [providerId]);
+
+  const handleCivitaiLookup = async () => {
+    const modelId = civitaiLookupId.trim();
+    if (!modelId || civitaiLookingUp) return;
+    setCivitaiLookingUp(true);
+    try {
+      const response = await fetch(
+        "/api/providers/" +
+          encodeURIComponent(providerId) +
+          "/models?modelId=" +
+          encodeURIComponent(modelId)
+      );
+      const payload = await response.json();
+      const model = Array.isArray(payload?.models) ? payload.models[0] : null;
+      if (!response.ok || !model?.id) {
+        notify.error(payload?.error || "Civitai model lookup failed");
+        return;
+      }
+      setNewModelId(String(model.id));
+      setNewModelName(typeof model.name === "string" ? model.name : String(model.id));
+      setNewApiFormat("images-generations");
+      setNewEndpoints(["images"]);
+      notify.success("Found Civitai model " + (model.name || model.id));
+    } catch {
+      notify.error("Civitai model lookup failed");
+    } finally {
+      setCivitaiLookingUp(false);
+    }
+  };
 
   const handleAdd = async () => {
     if (!newModelId.trim() || adding) return;
@@ -428,6 +459,34 @@ export default function CustomModelsSection({
         {t("customModels")}
       </h3>
       <p className="text-xs text-text-muted mb-3">{t("customModelsHint")}</p>
+
+      {/* Civitai supports exact on-demand lookup so models outside the first catalog page can be added without replacing the synced catalog. */}
+      {providerId === "civitai" && (
+        <div className="flex items-end gap-2 mb-3 p-3 rounded-lg border border-border bg-background/60">
+          <div className="flex-1">
+            <label htmlFor="civitai-lookup-id" className="text-xs text-text-muted mb-1 block">
+              Civitai model ID
+            </label>
+            <input
+              id="civitai-lookup-id"
+              type="text"
+              value={civitaiLookupId}
+              onChange={(e) => setCivitaiLookupId(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleCivitaiLookup()}
+              placeholder="e.g. 257749"
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            />
+          </div>
+          <Button
+            size="sm"
+            icon="search"
+            onClick={handleCivitaiLookup}
+            disabled={!civitaiLookupId.trim() || civitaiLookingUp}
+          >
+            {civitaiLookingUp ? "Looking up…" : "Lookup"}
+          </Button>
+        </div>
+      )}
 
       {/* Add form */}
       <div className="flex flex-col gap-3 mb-3">

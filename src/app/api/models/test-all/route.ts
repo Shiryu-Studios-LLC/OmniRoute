@@ -42,6 +42,7 @@ const testAllSchema = z.object({
 export interface BatchTestResultEntry {
   status: "ok" | "error" | "slow";
   latencyMs: number;
+  testKind?: "live" | "capability";
   responseText?: string;
   error?: string;
   statusCode?: number;
@@ -58,6 +59,7 @@ function toBatchEntry(
   const entry: BatchTestResultEntry = {
     status: result.status === "ok" ? "ok" : result.status === "slow" ? "slow" : "error",
     latencyMs: result.latencyMs,
+    ...(result.testKind ? { testKind: result.testKind } : {}),
   };
   if (result.responseText !== undefined) entry.responseText = result.responseText;
   if (result.error !== undefined) entry.error = result.error;

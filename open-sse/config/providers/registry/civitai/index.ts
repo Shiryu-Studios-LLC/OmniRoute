@@ -9,7 +9,10 @@ export const civitaiProvider: RegistryEntry = {
   format: "custom",
   executor: "default",
   baseUrl: "https://civitai.red/api/v1",
-  modelsUrl: "https://civitai.red/api/v1/models?limit=100",
+  // Civitai is cursor-paginated; the discovery route supplies the page size
+  // and supports query/cursor/exact-id on demand instead of baking a 100-row cap
+  // into the registry configuration.
+  modelsUrl: "https://civitai.red/api/v1/models",
   authType: "apikey",
   authHeader: "Authorization",
   authPrefix: "Bearer",

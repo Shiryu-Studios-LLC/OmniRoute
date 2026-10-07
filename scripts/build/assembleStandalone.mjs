@@ -114,6 +114,15 @@ export const NATIVE_ASSET_ENTRIES = [
 /** @type {{label:string, src:string[], dest:string[]}[]} */
 const EXTRA_MODULE_ENTRIES = [
   {
+    // Next's standalone file trace misses this dynamically required server hook,
+    // but next/dist/server/next.js loads it unconditionally at runtime.
+    // Without it the packaged server dies before listening with
+    // MODULE_NOT_FOUND: ./require-hook.
+    label: "Next.js server require hook",
+    src: ["node_modules", "next", "dist", "server", "require-hook.js"],
+    dest: ["node_modules", "next", "dist", "server", "require-hook.js"],
+  },
+  {
     // tlsClient.ts intentionally resolves wreq-js through a runtime-dynamic
     // require so Turbopack cannot rewrite the package name to a hashed external.
     // That also makes the package invisible to static tracing, so copy the whole

@@ -177,6 +177,37 @@ test("pruneStandaloneArtifacts removes traced _tasks from standalone output", as
   });
 });
 
+test("syncStandaloneExtraModules copies Next.js require-hook missed by standalone tracing", async () => {
+  await withTempDir(async (tempDir) => {
+    const sourceHook = path.join(
+      tempDir,
+      "node_modules",
+      "next",
+      "dist",
+      "server",
+      "require-hook.js"
+    );
+    const destinationHook = path.join(
+      tempDir,
+      ".build",
+      "next",
+      "standalone",
+      "node_modules",
+      "next",
+      "dist",
+      "server",
+      "require-hook.js"
+    );
+
+    await fs.mkdir(path.dirname(sourceHook), { recursive: true });
+    await fs.writeFile(sourceHook, "module.exports = { patched: true };");
+
+    const changed = await syncStandaloneExtraModules(tempDir, fs);
+    assert.equal(changed, true);
+    assert.equal(await fs.readFile(destinationHook, "utf8"), "module.exports = { patched: true };");
+  });
+});
+
 test("syncStandaloneExtraModules copies the complete wreq-js runtime", async () => {
   await withTempDir(async (tempDir) => {
     const sourcePackage = path.join(tempDir, "node_modules", "wreq-js");
