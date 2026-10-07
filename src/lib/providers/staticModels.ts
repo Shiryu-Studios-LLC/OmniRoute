@@ -124,6 +124,26 @@ const STATIC_MODEL_PROVIDERS: Record<string, () => Array<{ id: string; name: str
     { id: "qwen3-4b", name: "Qwen3 4B" },
     { id: "deepseek-r1-671b", name: "DeepSeek R1 671B" },
   ],
+  civitai: () => [
+    // Civitai (civitai.red) is a model/image-generation catalog, not an LLM
+    // inference API — it has no /v1/models endpoint. Expose the supported
+    // capability types as a static catalog so the model-import UI shows a
+    // usable list instead of the 400 "does not support models listing" error.
+    { id: "Checkpoint", name: "Checkpoint (Stable Diffusion base model)" },
+    { id: "LORA", name: "LoRA (Low-Rank Adaptation)" },
+    { id: "LoCon", name: "LyCORIS / LoCon" },
+    { id: "TextualInversion", name: "Textual Inversion / Embedding" },
+    { id: "Hypernetwork", name: "Hypernetwork" },
+    { id: "AestheticGradient", name: "Aesthetic Gradient" },
+    { id: "ControlNet", name: "ControlNet" },
+    { id: "Poses", name: "Poses" },
+    { id: "Wildcards", name: "Wildcards" },
+    { id: "Workflows", name: "Workflows" },
+    { id: "VAE", name: "VAE (Variational Autoencoder)" },
+    { id: "Upscaler", name: "Upscaler" },
+    { id: "MotionModule", name: "Motion Module (AnimateDiff)" },
+    { id: "Other", name: "Other" },
+  ],
 };
 
 const SEARCH_TYPE_LABELS: Record<string, string> = {
