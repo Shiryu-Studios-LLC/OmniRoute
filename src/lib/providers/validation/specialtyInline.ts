@@ -11,6 +11,53 @@ import { buildBearerHeaders, directHttpsRequest } from "./headers";
 import { toValidationErrorResult, validationRead, validationWrite } from "./transport";
 import { validateKiroApiKeyRuntimeProbe } from "./kiro";
 
+export async function validateComfyUiProvider({ providerSpecificData = {} }: any) {
+  try {
+    const configuredBaseUrl =
+      typeof providerSpecificData?.baseUrl === "string" && providerSpecificData.baseUrl.trim()
+        ? providerSpecificData.baseUrl.trim()
+        : "http://127.0.0.1:8188";
+    const baseUrl = normalizeBaseUrl(configuredBaseUrl);
+    const response = await validationRead(
+      baseUrl + "/system_stats",
+      {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      },
+      true
+    );
+    if (response.ok) return { valid: true, error: null, method: "comfyui_system_stats" };
+    if (response.status === 401 || response.status === 403) {
+      return { valid: false, error: "ComfyUI rejected the local probe" };
+    }
+    return { valid: false, error: "ComfyUI system_stats returned " + response.status };
+  } catch (error: any) {
+    return toValidationErrorResult(error);
+  }
+}
+
+export async function validateCivitaiProvider({ apiKey, providerSpecificData = {} }: any) {
+  try {
+    const configuredBaseUrl =
+      typeof providerSpecificData?.baseUrl === "string" && providerSpecificData.baseUrl.trim()
+        ? providerSpecificData.baseUrl.trim()
+        : "https://civitai.red/api/v1";
+    const baseUrl = normalizeBaseUrl(configuredBaseUrl);
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (typeof apiKey === "string" && apiKey.trim()) {
+      headers.Authorization = "Bearer " + apiKey.trim();
+    }
+    const response = await validationRead(baseUrl + "/models?limit=1", { method: "GET", headers });
+    if (response.ok) return { valid: true, error: null, method: "civitai_models_catalog" };
+    if (response.status === 401 || response.status === 403) {
+      return { valid: false, error: "Civitai API key rejected" };
+    }
+    return { valid: false, error: "Civitai catalog probe returned " + response.status };
+  } catch (error: any) {
+    return toValidationErrorResult(error);
+  }
+}
+
 export async function validateV0VercelProvider({ apiKey, providerSpecificData, isLocal }: any) {
   try {
     const configuredBaseUrl =

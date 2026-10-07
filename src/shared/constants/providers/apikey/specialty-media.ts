@@ -177,6 +177,22 @@ export const APIKEY_PROVIDERS_SPECIALTY = {
     hasFree: true,
     freeNote: "10M free tokens on signup (non-commercial), no credit card required",
   },
+  civitai: {
+    id: "civitai",
+    serviceKinds: [],
+    alias: "civit",
+    name: "Civitai Model Hub",
+    icon: "hub",
+    color: "#6D28D9",
+    textIcon: "CI",
+    website: "https://civitai.com",
+    authHint:
+      "Public model/image catalog access works without a key. An optional Civitai API key enables authenticated catalog/download access. This provider is a model hub, not an LLM inference endpoint; use its models with ComfyUI.",
+    apiHint:
+      "OmniRoute probes the Civitai-compatible /api/v1/models catalog. The provider is intentionally kept out of chat/LLM routing.",
+    hasFree: true,
+    freeNote: "Public model and image catalog endpoints are available without a key.",
+  },
   "fal-ai": {
     id: "fal-ai",
     serviceKinds: [],

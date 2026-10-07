@@ -219,6 +219,11 @@ export function implicitPinAllowlist(
   if (Array.isArray(allowedConnectionIds) && allowedConnectionIds.length > 0) {
     return allowedConnectionIds;
   }
+  // Virtual no-auth combo targets use the synthetic "noauth" connection id.
+  // Treating that sentinel like a persisted connection invents an allowlist of
+  // ["noauth"], which makes credential selection reject the synthetic path.
+  // Real API-key allowedConnections are intersected separately by the caller.
+  if (pin === "noauth") return Array.isArray(allowedConnectionIds) ? [] : null;
   if (pin.length > 0) return [pin];
   return Array.isArray(allowedConnectionIds) ? [] : null;
 }

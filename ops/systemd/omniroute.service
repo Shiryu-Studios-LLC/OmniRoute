@@ -1,0 +1,26 @@
+[Unit]
+Description=OmniRoute AI proxy router (Shiryu Studios fork)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=180
+TimeoutStartSec=300
+WorkingDirectory=/mnt/Development/OmniRoute/.build/next/standalone
+ExecStart=/usr/bin/node /mnt/Development/OmniRoute/.build/next/standalone/server-ws.mjs
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=20128
+Environment=DASHBOARD_PORT=20128
+Environment=API_PORT=20128
+Environment=OMNIROUTE_PORT=20128
+Environment=HOSTNAME=127.0.0.1
+Environment=OMNIROUTE_SERVER_HOST=127.0.0.1
+Environment=APP_LOG_TO_FILE=true
+EnvironmentFile=-/home/okashi/.omniroute/.env
+
+[Install]
+WantedBy=default.target

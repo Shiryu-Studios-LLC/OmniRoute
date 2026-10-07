@@ -1,8 +1,8 @@
 /**
  * Auto-combo no-auth allowlist — the `auto`/`auto-*` candidate pool must only
  * pull in no-auth (keyless) providers verified to work without any credential on
- * our reference egress. As of this change that allowlist is narrowed to
- * `opencode`: on the reference VPS (.15) it answers 200 with zero configuration.
+ * our deployed egress. The allowlist includes `opencode` plus
+ * `cloudflare-playground` where the required Playwright Chromium runtime is installed.
  * The other no-auth providers
  * (duckduckgo-web, chipotle, aihorde) stay OUT of every auto/* pool
  * until re-verified — they remain usable via direct `<alias>/<model>` calls, they
@@ -46,7 +46,7 @@ test.after(async () => {
   }
 });
 
-const ALLOWED_NOAUTH_PROVIDERS = ["opencode"];
+const ALLOWED_NOAUTH_PROVIDERS = ["opencode", "cloudflare-playground"];
 const EXCLUDED_NOAUTH_PROVIDERS = ["duckduckgo-web", "chipotle", "aihorde"];
 
 test("fresh install: the allowlisted no-auth providers are present in the auto-combo pool", async () => {

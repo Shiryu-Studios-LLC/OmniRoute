@@ -10,9 +10,8 @@ import assert from "node:assert/strict";
 
 const { resolveComboTargets } = await import("../../open-sse/services/combo/comboStructure.ts");
 const { handleComboChat } = await import("../../open-sse/services/combo.ts");
-const { expandTargetsByFingerprints } = await import(
-  "../../open-sse/services/combo/fingerprintExpansion.ts"
-);
+const { expandTargetsByFingerprints } =
+  await import("../../open-sse/services/combo/fingerprintExpansion.ts");
 const { comboModelStepInputSchema } = await import("../../src/shared/validation/schemas/combo.ts");
 
 function createLog() {
@@ -118,9 +117,7 @@ test("handleComboChat passes the implicit pin allowlist into handleSingleModel",
       modelStr: string,
       target: { allowedConnectionIds?: unknown }
     ) => {
-      captured = Array.isArray(target?.allowedConnectionIds)
-        ? target.allowedConnectionIds
-        : null;
+      captured = Array.isArray(target?.allowedConnectionIds) ? target.allowedConnectionIds : null;
       return okResponse(modelStr);
     },
     log: createLog(),
@@ -206,6 +203,18 @@ test("implicitPinAllowlist treats omitted allowlist as [connectionId]", async ()
   assert.equal(implicitPinAllowlist(null, undefined), null);
 });
 
+test("synthetic noauth combo pin does not become a persisted-connection allowlist", async () => {
+  const { comboPinAllowlist, implicitPinAllowlist } = await import("../../src/lib/combos/steps.ts");
+
+  assert.equal(implicitPinAllowlist("noauth", undefined), null);
+  assert.equal(comboPinAllowlist(true, "noauth", undefined), null);
+  assert.deepEqual(
+    comboPinAllowlist(true, "noauth", ["real-connection"]),
+    ["real-connection"],
+    "an explicit connection allowlist must still win over the synthetic pin"
+  );
+});
+
 test("comboPinAllowlist does not invent an allowlist for header-forced pins", async () => {
   const { comboPinAllowlist } = await import("../../src/lib/combos/steps.ts");
   assert.equal(comboPinAllowlist(false, "header-pin", undefined), null);
@@ -231,5 +240,8 @@ test("checkModelAvailable applies comboPinAllowlist before credential preflight"
   );
   const pinAt = body.search(/comboPinAllowlist\s*\(/);
   const credsAt = body.search(/getProviderCredentialsWithQuotaPreflight\s*\(/);
-  assert.ok(pinAt >= 0 && credsAt > pinAt, "pin allowlist must be computed before preflight lookup");
+  assert.ok(
+    pinAt >= 0 && credsAt > pinAt,
+    "pin allowlist must be computed before preflight lookup"
+  );
 });

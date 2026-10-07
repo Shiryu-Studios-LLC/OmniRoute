@@ -808,6 +808,80 @@ async function handleTortoiseSpeech(providerConfig, body) {
 }
 
 /**
+ * Handle Shiryu shared Qwen3-TTS. This is the natural-voice path used by
+ * Shiryu apps. It intentionally lives outside any one client application.
+ * If the GPU-backed Qwen3 worker is unavailable or out of VRAM, fall back to
+ * Kokoro, then ultimately gTTS, so speech never hard-fails.
+ */
+async function handleQwen3LocalSpeech(providerConfig, body) {
+  const voice =
+    typeof body.voice === "string" && body.voice.trim().length > 0 ? body.voice.trim() : "Aiden";
+
+  try {
+    const res = await fetch(providerConfig.baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: body.input, voice }),
+    });
+    if (res.ok) {
+      const contentType = res.headers.get("content-type") || "audio/wav";
+      return new Response(res.body, {
+        status: 200,
+        headers: {
+          ...CORS_HEADERS,
+          "Content-Type": contentType,
+          "X-Shiryu-TTS-Backend": "qwen3-local",
+          ...(res.headers.get("x-shiryu-tts-voice")
+            ? { "X-Shiryu-TTS-Voice": res.headers.get("x-shiryu-tts-voice") }
+            : {}),
+        },
+      });
+    }
+  } catch {
+    // Fall through to the lightweight local backend below.
+  }
+
+  const kokoro = getSpeechProvider("kokoro-local");
+  if (kokoro) return handleKokoroLocalSpeech(kokoro, body);
+  return handleGttsSpeech({ ...body, voice: "en" });
+}
+
+/**
+ * Handle Shiryu shared Kokoro TTS. The local service is intentionally outside
+ * any one client app so every Shiryu Studios app can use the same voice pool.
+ * If the local worker is unavailable, fall back to free English gTTS instead
+ * of making speech playback fail completely.
+ */
+async function handleKokoroLocalSpeech(providerConfig, body) {
+  const voice =
+    typeof body.voice === "string" && body.voice.trim().length > 0
+      ? body.voice.trim()
+      : "am_michael";
+  const rate = typeof body.speed === "number" ? body.speed : 1.0;
+  const fallbackVoice = voice.startsWith("b") ? "en-gb" : "en";
+
+  try {
+    const res = await fetch(providerConfig.baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: body.input, voice, rate }),
+    });
+    if (res.ok) {
+      const contentType = res.headers.get("content-type") || "audio/wav";
+      return new Response(res.body, {
+        status: 200,
+        headers: { ...CORS_HEADERS, "Content-Type": contentType },
+      });
+    }
+  } catch {
+    // The shared worker may still be starting or downloading its model. Fall
+    // through to gTTS so callers retain a usable free speech path.
+  }
+
+  return handleGttsSpeech({ ...body, voice: fallbackVoice });
+}
+
+/**
  * Handle gTTS TTS (local no-auth, Google Translate batchexecute RPC).
  * `voice` doubles as the language code since gTTS has no voice concept —
  * defaults to English when omitted or unrecognized.
@@ -864,7 +938,7 @@ export async function handleAudioSpeech({
   if (!providerConfig) {
     return errorResponse(
       400,
-      `No speech provider found for model "${body.model}". Use format provider/model. Available: openai, hyperbolic, deepgram, nvidia, elevenlabs, huggingface, inworld, cartesia, fishaudio, playht, kie, aws-polly, xiaomi-mimo, gtts, coqui, tortoise, qwen`
+      `No speech provider found for model "${body.model}". Use format provider/model. Available: openai, hyperbolic, deepgram, nvidia, elevenlabs, huggingface, inworld, cartesia, fishaudio, playht, kie, aws-polly, xiaomi-mimo, qwen3-local, kokoro-local, gtts, coqui, tortoise, qwen`
     );
   }
 
@@ -960,6 +1034,14 @@ export async function handleAudioSpeech({
 
     if (providerConfig.format === "aws-polly") {
       return handleAwsPollySpeech(providerConfig, body, modelId, token, credentials);
+    }
+
+    if (providerConfig.format === "qwen3-local") {
+      return handleQwen3LocalSpeech(providerConfig, body);
+    }
+
+    if (providerConfig.format === "kokoro-local") {
+      return handleKokoroLocalSpeech(providerConfig, body);
     }
 
     if (providerConfig.format === "gtts") {

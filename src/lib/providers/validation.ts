@@ -112,6 +112,8 @@ import { validateZyloApiProvider } from "./validation/zylo";
 import { validateAdobeFireflyProvider } from "./validation/adobeFirefly";
 import {
   validateV0VercelProvider,
+  validateComfyUiProvider,
+  validateCivitaiProvider,
   validateAuggieProvider,
   validateCursorApiProvider,
   validateQoderProvider,
@@ -235,6 +237,8 @@ export async function validateProviderApiKey({ provider, apiKey, providerSpecifi
     freebuff: validateFreebuffProvider,
     "command-code": validateCommandCodeProvider,
     huggingface: validateHuggingFaceProvider,
+    civitai: validateCivitaiProvider,
+    comfyui: validateComfyUiProvider,
     // #11002: Dify serves no OpenAI-compatible route — only POST /v1/chat-messages.
     // The generic OpenAI-like probe 404s on /v1/models and /v1/chat/completions,
     // so every real app key was misreported as "endpoint not supported".

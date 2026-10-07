@@ -336,13 +336,12 @@ function hasUsableConnectionCredential(conn: VirtualFactoryConn): boolean {
 const SYNTHETIC_NOAUTH_CONNECTION_ID = RESILIENCE_NOAUTH_CONNECTION_ID;
 
 // Allowlist of no-auth (keyless) providers permitted to enter the `auto`/`auto-*`
-// candidate pool. Narrowed to the backends verified to answer without any
-// configuration on our reference egress (VPS .15): `opencode` returns 200
-// there, while duckduckgo-web (429/VQD rate limit),
-// chipotle (502), aihorde (401, anon key rejected)
-// and the others are unreliable. The excluded providers stay fully usable via
-// direct `<alias>/<model>` calls — they are just kept OUT of auto-routing until
-// re-verified. Re-add an id here to bring it back into every auto/* pool.
+// candidate pool. Keep this restricted to backends verified to answer without
+// credentials in the deployed environment. `opencode` remains available, and
+// `cloudflare-playground` is enabled here because its Playwright Chromium runtime
+// is installed and was verified live on this host. DuckDuckGo (anti-abuse/rate
+// limits), Chipotle, AI Horde, and the other unverified providers stay available
+// for direct `<alias>/<model>` calls but are kept out of automatic routing.
 //
 // Scope (operator decision 2026-07-24, refs #8183/#6453/#7032): this allowlist
 // targets public-HTTP-egress reliability for the category/tier and flat-variant
@@ -352,7 +351,7 @@ const SYNTHETIC_NOAUTH_CONNECTION_ID = RESILIENCE_NOAUTH_CONNECTION_ID;
 // pool, so it admits any no-auth backend that genuinely serves the family (e.g.
 // auggie, a local CLI subprocess with zero HTTP egress, belongs in auto/glm
 // regardless of this list). See the `bypassAllowlist` param below.
-const AUTO_COMBO_NOAUTH_ALLOWLIST = new Set<string>(["opencode"]);
+const AUTO_COMBO_NOAUTH_ALLOWLIST = new Set<string>(["opencode", "cloudflare-playground"]);
 
 function isChatAutoComboNoAuthProvider(
   providerDef: NoAuthProviderDefinition,

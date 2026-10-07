@@ -247,6 +247,8 @@ const EXPLICIT_OPTIONAL_APIKEY_PROVIDER_IDS = new Set([
   "g4f-pollinations",
   "g4f-ollama",
   "g4f-nvidia",
+  "civitai",
+  "comfyui",
   "huggingchat",
   "gitlawb",
   "gitlawb-gmi",

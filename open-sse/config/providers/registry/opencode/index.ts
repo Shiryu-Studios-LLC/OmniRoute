@@ -42,14 +42,6 @@ export const opencodeProvider: RegistryEntry = {
       contextLength: 1048576,
       maxOutputTokens: 131072,
     },
-    {
-      id: "muse-spark-1.2-contributor-free",
-      name: "Muse Spark 1.2 Contributor Free",
-      supportsReasoning: true,
-      targetFormat: "openai-responses",
-      contextLength: 1048576,
-      maxOutputTokens: 131072,
-    },
     // Muse Spark 1.3 is served only on the Responses API, same as 1.2 above.
     // Its window matches the published OpenCode catalog instead of the
     // 200000 provider default.
@@ -69,16 +61,33 @@ export const opencodeProvider: RegistryEntry = {
       contextLength: 1048576,
       maxOutputTokens: 131072,
     },
-    { id: "deepseek-v4-flash-free", name: "DeepSeek V4 Flash Free", supportsReasoning: true },
-    // #6998: 2026-07-14 refresh — the upstream free tier rotated its lineup;
-    // minimax-m3-free, minimax-m2.5-free, ling-2.6-1t-free,
-    // trinity-large-preview-free, nemotron-3-super-free and qwen3.6-plus-free
-    // were delisted (401 "Model X is not supported") and replaced by the 4
-    // entries below, confirmed live against
-    // https://opencode.ai/zen/v1/chat/completions.
+    // OpenCode's current Zen catalog (updated 2026-10-06) lists these as free.
+    // Keep the no-auth registry aligned with the live /zen/v1/models catalog so the
+    // dashboard exposes the current free pool instead of the July 2026 rotation.
+    { id: "jev-1.13-free", name: "Jev 1.13 Free", contextLength: 200000 },
+    { id: "exo-free", name: "Exo Free", contextLength: 200000 },
+    {
+      id: "muse-spark-1.2-contributor-free",
+      name: "Muse Spark 1.2 Contributor Free",
+      contextLength: 1048576,
+      maxOutputTokens: 131072,
+      targetFormat: "openai-responses",
+      supportsReasoning: true,
+    },
+    { id: "space-bunny-free", name: "Space Bunny Free", contextLength: 200000 },
+    { id: "longcat-2.5-preview-free", name: "LongCat 2.5 Preview Free", contextLength: 200000 },
+    { id: "fledge-alpha-free", name: "Fledge Alpha Free", contextLength: 200000 },
+    { id: "mimo-v2.6-flash-free", name: "MiMo V2.6 Flash Free", contextLength: 200000 },
     { id: "mimo-v2.5-free", name: "MiMo V2.5 Free", contextLength: 131000 },
     { id: "hy3-free", name: "HY3 Free", contextLength: 131000 },
-    { id: "nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free", contextLength: 1000000 },
     { id: "north-mini-code-free", name: "North Mini Code Free", contextLength: 131000 },
+    { id: "ling-3.1-flash-free", name: "Ling 3.1 Flash Free", contextLength: 200000 },
+    { id: "ling-3.0-flash-fin-free", name: "Ling 3.0 Flash Fin Free", contextLength: 200000 },
+    { id: "nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free", contextLength: 1000000 },
+    {
+      id: "nemotron-3.5-lightning-free",
+      name: "Nemotron 3.5 Lightning Free",
+      contextLength: 200000,
+    },
   ],
 };

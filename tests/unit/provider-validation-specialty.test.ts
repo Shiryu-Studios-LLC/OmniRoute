@@ -2909,3 +2909,54 @@ test("huggingface validator does NOT mark a fine-grained token invalid on a non-
   assert.notEqual(result.error, "Invalid API key");
   assert.match(result.error || "", /HuggingFace token check returned 503/);
 });
+
+test("civitai validator accepts a valid catalog response", async () => {
+  const calls: { url: string; headers: Record<string, string> }[] = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), headers: toPlainHeaders(init.headers) });
+    return new Response(JSON.stringify({ items: [] }), { status: 200 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "civitai",
+    apiKey: "civit_test_key",
+    providerSpecificData: { baseUrl: "https://civitai.red/api/v1" },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(result.method, "civitai_models_catalog");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://civitai.red/api/v1/models?limit=1");
+  assert.equal(calls[0].headers.Authorization, "Bearer civit_test_key");
+});
+
+test("civitai validator rejects 401/403 with API key rejected", async () => {
+  globalThis.fetch = async () => new Response("Unauthorized", { status: 401 });
+  const result = await validateProviderApiKey({
+    provider: "civitai",
+    apiKey: "bad_key",
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.error, "Civitai API key rejected");
+});
+
+test("comfyui validator checks /system_stats on configured base URL", async () => {
+  const calls: { url: string }[] = [];
+  globalThis.fetch = async (url) => {
+    calls.push({ url: String(url) });
+    return new Response(JSON.stringify({ system: { os: "linux" } }), { status: 200 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "comfyui",
+    apiKey: "",
+    providerSpecificData: { baseUrl: "http://127.0.0.1:8188" },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(result.method, "comfyui_system_stats");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:8188/system_stats");
+});

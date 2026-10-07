@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   BaseExecutor,
   type ExecuteInput,
@@ -16,7 +15,11 @@ import {
   runWithDirectFetchContext,
   runWithProxyContext,
 } from "../utils/proxyFetch.ts";
-import { forwardOpencodeClientHeaders } from "../utils/opencodeHeaders.ts";
+import {
+  clientSuppliedOpencodeSession,
+  forwardOpencodeClientHeaders,
+  resolveOpencodeCliDefaults,
+} from "../utils/opencodeHeaders.ts";
 import {
   type AccountProxyConfig,
   type RotatableAccount,
@@ -29,6 +32,17 @@ import {
   extractChatcmplId,
 } from "./accountRotation.ts";
 import { isOpencodeGeoBlocked, proxyKeyOf, isOpencodeUserBlocked } from "./opencodeGeoBlock.ts";
+import {
+  isGatedFreeTierRequest,
+  isPremiumOpencodeModel,
+  noteFreeTierOutcome,
+  prepareFreeTierRequest,
+  rebuildJsonFromForcedStream,
+  surfaceFromBaseUrl,
+  type FreeTierContractAttempt,
+} from "./opencodeFreeTierContract.ts";
+
+export { isPremiumOpencodeModel };
 import {
   guardResponsesStall,
   isResponsesFirstByteTimeout,
@@ -95,15 +109,6 @@ const EFFORT_LEVELS = ["none", "low", "high", "max"] as const;
  *
  * For `opencode-go`, there is no free tier — ALL models require an API key.
  */
-const OPENCODE_FREE_MODELS = new Set([
-  "big-pickle",
-  "deepseek-v4-flash-free",
-  "mimo-v2.5-free",
-  "hy3-free",
-  "nemotron-3-ultra-free",
-  "north-mini-code-free",
-]);
-
 /**
  * Models on opencode-go that support effort-tier aliases. Each entry maps the
  * canonical base id to the set of effort suffixes the upstream supports.
@@ -163,17 +168,6 @@ export function parseEffortLevel(model: string): { baseModel: string; effort: st
  *   free models OR ending in `-free`).
  * - Unknown models are assumed premium (fail-safe).
  */
-export function isPremiumOpencodeModel(model: string, provider: string): boolean {
-  // opencode-go has no free tier — every model requires a key.
-  if (provider === "opencode-go") return true;
-
-  // Models ending in `-free` are always free on the noauth/zen tier.
-  if (model.endsWith("-free")) return false;
-
-  // Check the known free model catalog.
-  return !OPENCODE_FREE_MODELS.has(model);
-}
-
 /**
  * Resolves the registry `targetFormat` for a model, aliasing `provider` first.
  *
@@ -305,6 +299,9 @@ export class OpencodeExecutor extends BaseExecutor {
   }
 
   _requestFormat: string | null = null;
+  private _contractAttempt: FreeTierContractAttempt | null = null;
+  private _clientSession: string | undefined;
+  private _surface = () => surfaceFromBaseUrl(this.config?.baseUrl);
 
   /**
    * Per-account rotation state, rebuilt from credentials on each request. The
@@ -392,6 +389,22 @@ export class OpencodeExecutor extends BaseExecutor {
    * non-streaming success responses. Non-muse-spark models pass through
    * untouched.
    */
+  private finalizeForcedStream(
+    input: ExecuteInput,
+    result: ExecutorExecuteResult
+  ): ExecutorExecuteResult {
+    noteFreeTierOutcome(this._contractAttempt, "response" in result && !!result.response?.ok);
+    if (input.stream) return result;
+    if (!("response" in result) || !result.response) return result;
+    if (!this._contractAttempt) return result;
+    const response = rebuildJsonFromForcedStream(
+      result.response,
+      this._requestFormat,
+      this._contractAttempt.model
+    );
+    return response === result.response ? result : { ...result, response };
+  }
+
   private normalizeMuseSparkResponse(
     input: ExecuteInput,
     result: ExecutorExecuteResult
@@ -585,9 +598,9 @@ export class OpencodeExecutor extends BaseExecutor {
                 "OPENCODE",
                 `${cid}upstream empty rejection on direct account (${chatcmplId}), retrying once…`
               );
-              return this.normalizeMuseSparkResponse(
+              return this.finalizeForcedStream(
                 input,
-                await guardStall(await super.execute(input))
+                this.normalizeMuseSparkResponse(input, await guardStall(await super.execute(input)))
               );
             }
             log?.debug?.(
@@ -596,7 +609,7 @@ export class OpencodeExecutor extends BaseExecutor {
             );
           }
         }
-        return this.normalizeMuseSparkResponse(input, single);
+        return this.finalizeForcedStream(input, this.normalizeMuseSparkResponse(input, single));
       }
 
       // This loop only ever dispatches through super.execute() (the HTTP request
@@ -909,7 +922,7 @@ export class OpencodeExecutor extends BaseExecutor {
         }
 
         this.markSuccess(account);
-        return this.normalizeMuseSparkResponse(input, result);
+        return this.finalizeForcedStream(input, this.normalizeMuseSparkResponse(input, result));
       }
 
       // The loop exhausted without a result. If it's because every remaining
@@ -923,9 +936,12 @@ export class OpencodeExecutor extends BaseExecutor {
       }
 
       // All accounts returned 429 (or errored) — surface the last response.
-      return this.normalizeMuseSparkResponse(
+      return this.finalizeForcedStream(
         input,
-        lastResult ?? (await guardStall(await super.execute(input)))
+        this.normalizeMuseSparkResponse(
+          input,
+          lastResult ?? (await guardStall(await super.execute(input)))
+        )
       );
     } finally {
       this._requestFormat = null;
@@ -995,7 +1011,9 @@ export class OpencodeExecutor extends BaseExecutor {
       headers["anthropic-version"] = "2023-06-01";
     }
 
-    if (stream) {
+    const gatedScope =
+      Boolean(model) && isGatedFreeTierRequest(this._surface(), this.provider, model);
+    if (stream || gatedScope) {
       headers["Accept"] = "text/event-stream";
     }
 
@@ -1004,24 +1022,12 @@ export class OpencodeExecutor extends BaseExecutor {
     // OPENCODE_SYNTHESIZE_CLI_HEADERS=false. Client-supplied headers always win;
     // User-Agent is replaced with the CLI UA unless the client already sends one that
     // looks like the OpenCode CLI. Default values match 9router's proven defaults.
-    const synthesizeCli = !/^(0|false|no|off)$/i.test(
-      process.env.OPENCODE_SYNTHESIZE_CLI_HEADERS?.trim() ?? ""
+    const cliDefaults = resolveOpencodeCliDefaults(
+      this.config?.id || this.provider || "opencode",
+      gatedScope
     );
-    const cliDefaults = synthesizeCli
-      ? (() => {
-          const providerId = this.config?.id || this.provider || "opencode";
-          const envUAKey = `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_USER_AGENT`;
-          return {
-            userAgent:
-              process.env[envUAKey]?.trim() ||
-              process.env.OPENCODE_USER_AGENT?.trim() ||
-              "opencode",
-            client: process.env.OPENCODE_CLIENT?.trim() || "desktop",
-            project: process.env.OPENCODE_PROJECT?.trim() || "global",
-          };
-        })()
-      : undefined;
 
+    this._clientSession = clientSuppliedOpencodeSession(clientHeaders);
     if (clientHeaders || cliDefaults) {
       const b = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
       forwardOpencodeClientHeaders(headers, clientHeaders ?? {}, {
@@ -1034,24 +1040,15 @@ export class OpencodeExecutor extends BaseExecutor {
               messages: Array.isArray(b.messages)
                 ? (b.messages as Array<{ role?: string; content?: unknown }>)
                 : undefined,
+              input: Array.isArray(b.input)
+                ? (b.input as Array<{ role?: string; content?: unknown }>)
+                : undefined,
               tools: Array.isArray(b.tools)
                 ? (b.tools as Array<{ name?: string; function?: { name?: string } }>)
                 : undefined,
             }
           : undefined,
       });
-    }
-
-    // Muse's Responses endpoint rejects the short conversation fingerprint used
-    // by the Chat endpoint in practice. Keep the workaround scoped to Muse.
-    if (
-      this._requestFormat === "openai-responses" &&
-      model.startsWith("muse-spark") &&
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        headers["x-opencode-session"] || ""
-      )
-    ) {
-      headers["x-opencode-session"] = randomUUID();
     }
 
     void model;
@@ -1138,6 +1135,16 @@ export class OpencodeExecutor extends BaseExecutor {
   ): any {
     let modifiedBody = super.transformRequest(model, body, stream, credentials);
     modifiedBody = this.applyDeepSeekJsonSchemaFallback(model, modifiedBody);
+    const prepared = prepareFreeTierRequest(
+      modifiedBody,
+      this._requestFormat ?? resolveOpencodeTargetFormat(this.provider, model),
+      this._surface(),
+      this.provider,
+      model,
+      this._clientSession
+    );
+    modifiedBody = prepared.body;
+    this._contractAttempt = prepared.attempt;
     // 9router#1442: OpenCode upstreams (e.g. kimi-k2.6 via opencode-go) return
     // 400 "Extra inputs are not permitted, field: 'client_metadata'" — an
     // OpenAI-Codex/Claude-CLI passthrough field with no equivalent here. The

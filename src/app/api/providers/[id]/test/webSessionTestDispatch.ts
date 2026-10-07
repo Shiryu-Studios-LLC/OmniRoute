@@ -1,4 +1,5 @@
 import { getWebSessionCredentialRequirement } from "@/shared/providers/webSessionCredentials";
+import { isLocalProvider } from "@/shared/constants/providers";
 
 /**
  * Token-kind web-session providers (`getWebSessionCredentialRequirement(...).kind ===
@@ -27,6 +28,11 @@ const TOKEN_AWARE_VALIDATED_WEB_SESSION_PROVIDERS = new Set([
 
 export function shouldUseApiKeyConnectionTest(authType: unknown, providerId: unknown): boolean {
   if (authType === "apikey") return true;
+  // Local providers such as Ollama are intentionally keyless, but they still
+  // expose an OpenAI-compatible /models probe. Route their connection tests
+  // through the API-key validator with an empty optional key instead of the
+  // OAuth path, which previously reported "No local probe available".
+  if (authType === "none" && (isLocalProvider(providerId) || providerId === "comfyui")) return true;
   if (authType !== "cookie") return false;
   if (getWebSessionCredentialRequirement(providerId)?.kind !== "token") return false;
   return (

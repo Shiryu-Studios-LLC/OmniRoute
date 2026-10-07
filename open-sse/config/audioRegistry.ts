@@ -544,6 +544,26 @@ export const AUDIO_SPEECH_PROVIDERS: Record<string, AudioProvider> = {
     ],
   },
 
+  "qwen3-local": {
+    id: "qwen3-local",
+    baseUrl: "http://127.0.0.1:37832/synthesize",
+    authType: "none",
+    authHeader: "none",
+    format: "qwen3-local",
+    supportedFormats: ["wav"],
+    models: [{ id: "qwen3-tts", name: "Shiryu Qwen3-TTS Natural Voice (Local)" }],
+  },
+
+  "kokoro-local": {
+    id: "kokoro-local",
+    baseUrl: "http://127.0.0.1:37831/synthesize",
+    authType: "none",
+    authHeader: "none",
+    format: "kokoro-local",
+    supportedFormats: ["wav"],
+    models: [{ id: "kokoro", name: "Shiryu Shared Kokoro (Local)" }],
+  },
+
   gtts: {
     id: "gtts",
     // Google Translate TTS — reverse-engineered, no API key required.
