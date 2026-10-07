@@ -18,6 +18,7 @@ import {
   isClaudeCodeCompatibleProvider,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
+  providerAllowsOptionalApiKey,
   resolveProviderId,
 } from "@/shared/constants/providers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
@@ -279,7 +280,10 @@ export async function POST(request: Request) {
 
     const newConnection = await createProviderConnection({
       provider,
-      authType: "apikey",
+      // Preserve credentialless local providers such as ComfyUI. The generic
+      // provider creation path historically forced `apikey`, which routed a
+      // no-key provider into the wrong health-test path.
+      authType: persistedApiKey || !providerAllowsOptionalApiKey(provider) ? "apikey" : "none",
       name,
       apiKey: persistedApiKey,
       priority: priority || 1,
