@@ -54,6 +54,14 @@ import {
   setCloudInferenceMonthlyBudget,
   type CloudInferenceEntitlement,
 } from "./inferencePolicy";
+import {
+  addCloudTenantOidcIdentity,
+  deleteCloudTenantOidcConfig,
+  deleteCloudTenantOidcIdentity,
+  getCloudTenantOidcConfig,
+  listCloudTenantOidcIdentities,
+  setCloudTenantOidcConfig,
+} from "./tenantOidc";
 
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
@@ -472,7 +480,18 @@ export async function handleCloudApiRequest(
         segments[1] === "memberships" &&
         segments[3] === "api-keys" &&
         request.method === "POST") ||
-      (segments.length === 3 && segments[1] === "api-keys" && request.method === "DELETE");
+      (segments.length === 3 && segments[1] === "api-keys" && request.method === "DELETE") ||
+      (segments.length === 2 &&
+        segments[1] === "oidc" &&
+        ["GET", "PUT", "DELETE"].includes(request.method)) ||
+      (segments.length === 3 &&
+        segments[1] === "oidc" &&
+        segments[2] === "identities" &&
+        ["GET", "POST"].includes(request.method)) ||
+      (segments.length === 4 &&
+        segments[1] === "oidc" &&
+        segments[2] === "identities" &&
+        request.method === "DELETE");
     if (isCustomerIdentityPath) {
       const [tenantId, collection, resourceId] = segments;
       if (!validId(tenantId) || (resourceId !== undefined && !validId(resourceId))) {
@@ -490,6 +509,156 @@ export async function handleCloudApiRequest(
         nowMs: now().getTime(),
       });
       if (!rateLimit.allowed) return json({ error: "Cloud API rate limit exceeded" }, 429);
+
+      if (collection === "oidc") {
+        const target = await getCloudTenantById(db, tenantId);
+        if (!target || target.kind !== "customer") return json({ error: "Tenant not found" }, 404);
+        const timestamp = now().toISOString();
+        const requestId = request.headers.get("cf-ray") ?? request.headers.get("x-request-id");
+        const recordAudit = async (
+          action: string,
+          auditTarget: string,
+          status: "attempted" | "success",
+          metadata: Record<string, unknown> = {}
+        ) =>
+          appendCloudComplianceAudit(db, {
+            id: crypto.randomUUID(),
+            tenantId: CLOUD_PLATFORM_TENANT_ID,
+            timestamp: now().toISOString(),
+            action,
+            actor: auditActor,
+            target: auditTarget,
+            resourceType: "customer-oidc",
+            status,
+            requestId,
+            metadata: { tenantId, ...metadata },
+          });
+
+        if (segments.length === 2) {
+          if (request.method === "GET") {
+            return json(await getCloudTenantOidcConfig(db, tenantId));
+          }
+          if (request.method === "PUT") {
+            const body = validateFields(
+              await readBody(request),
+              ["issuer", "clientId", "clientSecret", "scopes", "isEnabled"],
+              ["issuer", "clientId"]
+            );
+            if (typeof body.issuer !== "string" || typeof body.clientId !== "string") {
+              throw new ApiError(400, "Invalid OIDC issuer or clientId");
+            }
+            if (body.clientSecret !== undefined && typeof body.clientSecret !== "string") {
+              throw new ApiError(400, "clientSecret must be a string");
+            }
+            if (
+              body.scopes !== undefined &&
+              (!Array.isArray(body.scopes) ||
+                body.scopes.some((scope) => typeof scope !== "string"))
+            ) {
+              throw new ApiError(400, "scopes must be an array of strings");
+            }
+            if (body.isEnabled !== undefined && typeof body.isEnabled !== "boolean") {
+              throw new ApiError(400, "isEnabled must be a boolean");
+            }
+            const current = await getCloudTenantOidcConfig(db, tenantId);
+            const configAction = current
+              ? "customer.oidc.config.update"
+              : "customer.oidc.config.create";
+            await recordAudit(configAction, tenantId, "attempted", {
+              issuer: body.issuer,
+            });
+            let config;
+            try {
+              config = await setCloudTenantOidcConfig(db, options.credentialEncryptionKey, {
+                tenantId,
+                issuer: body.issuer,
+                clientId: body.clientId,
+                clientSecret: body.clientSecret as string | undefined,
+                scopes: (body.scopes as string[] | undefined) ?? current?.scopes,
+                isEnabled: body.isEnabled as boolean | undefined,
+                now: timestamp,
+              });
+            } catch (error) {
+              if (error instanceof TypeError || error instanceof RangeError) {
+                throw new ApiError(400, error.message);
+              }
+              if (error instanceof CloudCredentialEncryptionError) {
+                throw new ApiError(503, "OIDC credential encryption is unavailable");
+              }
+              throw error;
+            }
+            await recordAudit(configAction, tenantId, "success", {
+              issuer: config.issuer,
+              isEnabled: config.isEnabled,
+            });
+            return json(config, current ? 200 : 201);
+          }
+          if (request.method === "DELETE") {
+            await recordAudit("customer.oidc.config.delete", tenantId, "attempted");
+            if (!(await deleteCloudTenantOidcConfig(db, tenantId))) {
+              return json({ error: "OIDC configuration not found" }, 404);
+            }
+            await recordAudit("customer.oidc.config.delete", tenantId, "success");
+            return json({ deleted: true });
+          }
+        }
+
+        if (segments.length === 3 && resourceId === "identities") {
+          if (request.method === "GET") {
+            return json(await listCloudTenantOidcIdentities(db, tenantId));
+          }
+          if (request.method === "POST") {
+            const body = validateFields(
+              await readBody(request),
+              ["issuer", "subject", "membershipId"],
+              ["issuer", "subject", "membershipId"]
+            );
+            if (
+              typeof body.issuer !== "string" ||
+              typeof body.subject !== "string" ||
+              typeof body.membershipId !== "string"
+            ) {
+              throw new ApiError(400, "Invalid OIDC identity link");
+            }
+            await recordAudit("customer.oidc.identity.link", body.membershipId, "attempted", {
+              issuer: body.issuer,
+            });
+            let identity;
+            try {
+              identity = await addCloudTenantOidcIdentity(db, {
+                tenantId,
+                issuer: body.issuer,
+                subject: body.subject,
+                membershipId: body.membershipId,
+                now: timestamp,
+              });
+            } catch (error) {
+              if (error instanceof TypeError || error instanceof RangeError) {
+                const status = error.message.includes("not found") ? 404 : 400;
+                throw new ApiError(status, error.message);
+              }
+              throw error;
+            }
+            await recordAudit("customer.oidc.identity.link", identity.id, "success", {
+              membershipId: identity.membershipId,
+              issuer: identity.issuer,
+            });
+            return json(identity, 201);
+          }
+        }
+
+        if (segments.length === 4 && resourceId === "identities" && request.method === "DELETE") {
+          const identityId = segments[3];
+          if (!validId(identityId)) return json({ error: "Not found" }, 404);
+          await recordAudit("customer.oidc.identity.unlink", identityId, "attempted");
+          if (!(await deleteCloudTenantOidcIdentity(db, tenantId, identityId))) {
+            return json({ error: "OIDC identity link not found" }, 404);
+          }
+          await recordAudit("customer.oidc.identity.unlink", identityId, "success");
+          return json({ deleted: true });
+        }
+        return json({ error: "Method not allowed" }, 405);
+      }
 
       if (collection === "memberships" && resourceId === undefined) {
         const target = await getCloudTenantById(db, tenantId);

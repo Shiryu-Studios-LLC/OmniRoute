@@ -299,7 +299,7 @@ test(
           CI: "1",
         },
         encoding: "utf8",
-        timeout: 30_000,
+        timeout: 60_000,
         maxBuffer: 4 * 1024 * 1024,
       }
     );

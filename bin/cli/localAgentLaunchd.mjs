@@ -1,12 +1,21 @@
 import {
-  chmodSync,
-  existsSync,
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { homedir, userInfo } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -82,11 +91,123 @@ function isManagedPlist(contents) {
   return contents.startsWith(`<?xml version="1.0" encoding="UTF-8"?>\n${PLIST_MARKER}\n`);
 }
 
-function writeAtomic(filePath, content) {
-  const temporaryPath = `${filePath}.tmp-${process.pid}`;
-  writeFileSync(temporaryPath, content, { mode: 0o600 });
-  chmodSync(temporaryPath, 0o600);
-  renameSync(temporaryPath, filePath);
+function ensurePrivateDirectories(home) {
+  const ownerUid = typeof process.getuid === "function" ? process.getuid() : userInfo().uid;
+  const canonicalHome = realpathSync(home);
+  const homeStats = lstatSync(canonicalHome);
+  if (!homeStats.isDirectory() || homeStats.uid !== ownerUid || (homeStats.mode & 0o022) !== 0) {
+    throw new Error("Local Agent home must be current-user-owned and not group/world writable");
+  }
+  let currentPath = home;
+  for (const component of ["Library", "LaunchAgents"]) {
+    currentPath = join(currentPath, component);
+    try {
+      mkdirSync(currentPath, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stats = lstatSync(currentPath);
+    if (
+      !stats.isDirectory() ||
+      stats.isSymbolicLink() ||
+      stats.uid !== ownerUid ||
+      (stats.mode & 0o022) !== 0
+    ) {
+      throw new Error(
+        "Local Agent LaunchAgents path must use current-user-owned, non-writable directories"
+      );
+    }
+  }
+}
+
+function readExistingPlist(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error("Could not safely open the Local Agent launchd plist");
+  }
+  try {
+    const stats = fstatSync(fd);
+    const ownerUid = typeof process.getuid === "function" ? process.getuid() : userInfo().uid;
+    if (
+      !stats.isFile() ||
+      stats.nlink !== 1 ||
+      stats.uid !== ownerUid ||
+      (stats.mode & 0o077) !== 0
+    ) {
+      throw new Error(
+        "Refusing to read a Local Agent plist with unsafe file type, owner, links, or permissions"
+      );
+    }
+    return { contents: readFileSync(fd, "utf8"), identity: { dev: stats.dev, ino: stats.ino } };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function stillMatchesIdentity(filePath, identity) {
+  let fd;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stats = fstatSync(fd);
+    const ownerUid = typeof process.getuid === "function" ? process.getuid() : userInfo().uid;
+    return (
+      stats.isFile() &&
+      stats.nlink === 1 &&
+      stats.uid === ownerUid &&
+      (stats.mode & 0o077) === 0 &&
+      stats.dev === identity.dev &&
+      stats.ino === identity.ino
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function writeAtomic(filePath, content, { replaceExisting = false, expectedIdentity } = {}) {
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  let fd;
+  let linkedTarget = false;
+  try {
+    fd = openSync(
+      temporaryPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600
+    );
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, content, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    if (replaceExisting) {
+      if (expectedIdentity) {
+        const current = lstatSync(filePath);
+        if (
+          !current.isFile() ||
+          current.isSymbolicLink() ||
+          current.dev !== expectedIdentity.dev ||
+          current.ino !== expectedIdentity.ino
+        ) {
+          throw new Error("Local Agent launchd plist changed during update");
+        }
+      }
+      renameSync(temporaryPath, filePath);
+    } else {
+      linkSync(temporaryPath, filePath);
+      linkedTarget = true;
+      unlinkSync(temporaryPath);
+    }
+  } catch (error) {
+    if (linkedTarget) rmSync(filePath, { force: true });
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temporaryPath, { force: true });
+  }
 }
 
 function runLaunchctl(args, exec = execFileSync) {
@@ -122,7 +243,14 @@ function isLoaded(domain, exec) {
     exec("launchctl", ["print", `${domain}/${LABEL}`], { stdio: "ignore" });
     return true;
   } catch (error) {
-    if (error?.status === 113) return false;
+    if (error?.status === 113) {
+      try {
+        exec("launchctl", ["print", domain], { stdio: "ignore" });
+        return false;
+      } catch {
+        throw new Error("Could not verify whether the Local Agent launchd domain is available");
+      }
+    }
     throw new Error("Could not verify whether the Local Agent launchd service is loaded");
   }
 }
@@ -144,32 +272,49 @@ export function installLocalAgentLaunchd(
     throw new Error("Local Agent launchd program paths must be absolute");
   }
   const domain = launchDomain(uid);
-  const files = paths(home);
-  mkdirSync(files.launchAgentsDir, { recursive: true, mode: 0o700 });
-  const priorPlist = existsSync(files.plistFile) ? readFileSync(files.plistFile, "utf8") : null;
+  const canonicalHome = realpathSync(home);
+  ensurePrivateDirectories(canonicalHome);
+  const files = paths(canonicalHome);
+  const priorFile = readExistingPlist(files.plistFile);
+  const priorPlist = priorFile?.contents ?? null;
   if (priorPlist && !isManagedPlist(priorPlist)) {
     throw new Error("Refusing to replace an unmanaged Local Agent launchd plist");
   }
 
-  const loaded = priorPlist ? isLoaded(domain, exec) : false;
+  const loaded = isLoaded(domain, exec);
+  if (!priorPlist && loaded) {
+    throw new Error(
+      "Refusing to replace a loaded Local Agent launchd service without its managed plist"
+    );
+  }
   if (loaded) runLaunchctl(["bootout", `${domain}/${LABEL}`], exec);
   let wrotePlist = false;
   try {
     writeAtomic(
       files.plistFile,
-      plistContents({ nodePath, cliPath, values: valuesFromConfig(config) })
+      plistContents({ nodePath, cliPath, values: valuesFromConfig(config) }),
+      { replaceExisting: priorFile !== null, expectedIdentity: priorFile?.identity }
     );
     wrotePlist = true;
     runLaunchctl(["bootstrap", domain, files.plistFile], exec);
   } catch (error) {
     try {
-      if (isLoaded(domain, exec)) runLaunchctl(["bootout", `${domain}/${LABEL}`], exec);
+      if (priorPlist !== null && isLoaded(domain, exec)) {
+        runLaunchctl(["bootout", `${domain}/${LABEL}`], exec);
+      }
     } catch {
       // Preserve the original bootstrap failure.
     }
-    if (priorPlist === null) rmSync(files.plistFile, { force: true });
-    else if (wrotePlist) writeAtomic(files.plistFile, priorPlist);
-    if (loaded) {
+    let priorIsSafeToLoad = false;
+    if (priorPlist === null) {
+      if (wrotePlist) rmSync(files.plistFile, { force: true });
+    } else if (wrotePlist) {
+      writeAtomic(files.plistFile, priorPlist, { replaceExisting: true });
+      priorIsSafeToLoad = true;
+    } else {
+      priorIsSafeToLoad = stillMatchesIdentity(files.plistFile, priorFile.identity);
+    }
+    if (loaded && priorIsSafeToLoad) {
       try {
         runLaunchctl(["bootstrap", domain, files.plistFile], exec);
       } catch {
@@ -189,9 +334,12 @@ export function uninstallLocalAgentLaunchd({
   exec = execFileSync,
 } = {}) {
   if (platform !== "darwin") throw new Error("Local Agent launchd uninstall is supported on macOS");
-  const files = paths(home);
-  if (!existsSync(files.plistFile)) return false;
-  const plist = readFileSync(files.plistFile, "utf8");
+  const canonicalHome = realpathSync(home);
+  ensurePrivateDirectories(canonicalHome);
+  const files = paths(canonicalHome);
+  const existing = readExistingPlist(files.plistFile);
+  if (!existing) return false;
+  const plist = existing.contents;
   if (!isManagedPlist(plist)) {
     throw new Error("Refusing to remove an unmanaged Local Agent launchd plist");
   }

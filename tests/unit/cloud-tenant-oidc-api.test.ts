@@ -1,0 +1,372 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import test from "node:test";
+import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
+import {
+  decryptCloudCredential,
+  isCloudCredentialEnvelope,
+} from "../../src/cloud/credentialEncryption";
+import { createCloudCustomerMembership } from "../../src/cloud/customerIdentity";
+import { createCloudCustomerTenant } from "../../src/cloud/tenants";
+import { handleCloudApiRequest } from "../../src/cloud/httpApi";
+
+const ADMIN_TOKEN = "test-cloud-oidc-admin-token";
+const ENCRYPTION_KEY = btoa(String.fromCharCode(...new Uint8Array(32).fill(41)));
+const NOW = "2026-10-08T12:00:00.000Z";
+
+class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
+  private values: unknown[] = [];
+
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly sql: string
+  ) {}
+
+  bind(...values: unknown[]): CloudDbStatement<T> {
+    this.values = values;
+    return this;
+  }
+
+  async first<U = T>(): Promise<U | null> {
+    return (
+      (this.db
+        .prepare(this.sql)
+        .get(...(this.values as (null | number | bigint | string | Uint8Array)[])) as
+        U | undefined) ?? null
+    );
+  }
+
+  async all<U = T>(): Promise<{ results: U[]; success: boolean }> {
+    return {
+      results: this.db
+        .prepare(this.sql)
+        .all(...(this.values as (null | number | bigint | string | Uint8Array)[])) as U[],
+      success: true,
+    };
+  }
+
+  async run(): Promise<{ success: boolean; meta: Record<string, unknown> }> {
+    const result = this.db
+      .prepare(this.sql)
+      .run(...(this.values as (null | number | bigint | string | Uint8Array)[]));
+    return { success: true, meta: { changes: Number(result.changes) } };
+  }
+}
+
+class SqliteCloudDb implements CloudDb {
+  readonly db = new DatabaseSync(":memory:");
+
+  constructor() {
+    this.db.exec("PRAGMA foreign_keys = ON");
+  }
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    return new SqliteStatement<T>(this.db, sql);
+  }
+
+  async batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const results: unknown[] = [];
+      for (const statement of statements) results.push(await statement.run());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async exec(sql: string): Promise<unknown> {
+    return this.db.exec(sql);
+  }
+}
+
+async function makeDb() {
+  const db = new SqliteCloudDb();
+  for (const name of [
+    "0001_cloud_runtime.sql",
+    "0002_cloud_usage_audit_rate_limits.sql",
+    "0003_cloud_platform_tenant.sql",
+    "0005_cloud_customer_identity.sql",
+    "0015_cloud_tenant_oidc.sql",
+  ]) {
+    await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
+  }
+  await createCloudCustomerTenant(db, {
+    id: "customer-a",
+    name: "Customer A",
+    slug: "customer-a",
+    now: NOW,
+  });
+  await createCloudCustomerTenant(db, {
+    id: "customer-b",
+    name: "Customer B",
+    slug: "customer-b",
+    now: NOW,
+  });
+  const ownerA = await createCloudCustomerMembership(db, {
+    tenantId: "customer-a",
+    principalId: "principal-a-owner",
+    role: "owner",
+    now: NOW,
+  });
+  const memberA = await createCloudCustomerMembership(db, {
+    tenantId: "customer-a",
+    principalId: "principal-a-member",
+    role: "member",
+    now: NOW,
+  });
+  const ownerB = await createCloudCustomerMembership(db, {
+    tenantId: "customer-b",
+    principalId: "principal-b-owner",
+    role: "owner",
+    now: NOW,
+  });
+  return { db, ownerA, memberA, ownerB };
+}
+
+async function call(
+  db: CloudDb,
+  path: string,
+  method = "GET",
+  body?: unknown,
+  token = ADMIN_TOKEN
+): Promise<Response> {
+  return handleCloudApiRequest(
+    new Request(`https://worker.example/__cloud/v1/tenants/${path}`, {
+      method,
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }),
+    {
+      db,
+      adminToken: ADMIN_TOKEN,
+      credentialEncryptionKey: ENCRYPTION_KEY,
+      now: () => new Date(NOW),
+    }
+  );
+}
+
+async function json(response: Response): Promise<unknown> {
+  return response.json();
+}
+
+test("Cloud OIDC admin API encrypts secrets and binds exact identities to tenant memberships", async () => {
+  const { db, ownerA, ownerB } = await makeDb();
+  assert.equal((await call(db, "customer-a/oidc", "GET", undefined, "")).status, 401);
+  const maintenanceAccess = await handleCloudApiRequest(
+    new Request("https://worker.example/__cloud/v1/tenants/customer-a/oidc", {
+      headers: { Authorization: "Bearer maintenance-token" },
+    }),
+    {
+      db,
+      adminToken: ADMIN_TOKEN,
+      maintenanceToken: "maintenance-token",
+      credentialEncryptionKey: ENCRYPTION_KEY,
+      now: () => new Date(NOW),
+    }
+  );
+  assert.equal(
+    maintenanceAccess.status,
+    401,
+    "only the platform-admin token may manage OIDC links"
+  );
+  const tenantMemberAccess = await handleCloudApiRequest(
+    new Request("https://worker.example/__cloud/v1/tenants/customer-a/oidc", {
+      headers: { Authorization: "Bearer orc_live_customer_key" },
+    }),
+    {
+      db,
+      adminToken: ADMIN_TOKEN,
+      credentialEncryptionKey: ENCRYPTION_KEY,
+      now: () => new Date(NOW),
+    }
+  );
+  assert.equal(tenantMemberAccess.status, 401, "customer membership keys cannot manage OIDC links");
+  assert.equal((await call(db, "customer-a/oidc", "GET")).status, 200);
+  assert.deepEqual(await json(await call(db, "customer-a/oidc", "GET")), null);
+
+  const missingSecret = await call(db, "customer-a/oidc", "PUT", {
+    issuer: "https://id.example.com/tenant-a",
+    clientId: "client-a",
+  });
+  assert.equal(missingSecret.status, 400);
+
+  const created = await call(db, "customer-a/oidc", "PUT", {
+    issuer: "https://id.example.com/tenant-a",
+    clientId: "client-a",
+    clientSecret: "private-client-secret",
+    scopes: ["openid", "profile"],
+    isEnabled: true,
+  });
+  assert.equal(created.status, 201);
+  const config = (await json(created)) as Record<string, unknown>;
+  assert.equal(config.tenantId, "customer-a");
+  assert.equal(config.issuer, "https://id.example.com/tenant-a");
+  assert.equal(config.isEnabled, true);
+  assert.equal(config.hasClientSecret, true);
+  assert.equal("clientSecret" in config, false);
+  assert.equal(JSON.stringify(config).includes("private-client-secret"), false);
+  const stored = db.db
+    .prepare("SELECT client_secret_encrypted FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+    .get("customer-a") as { client_secret_encrypted: string };
+  assert.equal(isCloudCredentialEnvelope(stored.client_secret_encrypted), true);
+  assert.equal(
+    await decryptCloudCredential(stored.client_secret_encrypted, ENCRYPTION_KEY, {
+      tenantId: "customer-a",
+      connectionId: "tenant-oidc",
+      field: "clientSecret",
+    }),
+    "private-client-secret"
+  );
+
+  const linked = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "subject:Exact-Case-123",
+    membershipId: ownerA.id,
+  });
+  assert.equal(linked.status, 201);
+  const link = (await json(linked)) as Record<string, unknown>;
+  assert.equal(link.tenantId, "customer-a");
+  assert.equal(link.issuer, "https://id.example.com/tenant-a");
+  assert.equal(link.subject, "subject:Exact-Case-123");
+  assert.equal(link.membershipId, ownerA.id);
+  assert.equal(link.principalId, ownerA.principalId);
+  assert.equal(link.role, "owner");
+  const auditRows = db.db
+    .prepare(
+      "SELECT details_json, metadata_json FROM cloud_compliance_audit WHERE action LIKE 'customer.oidc.%'"
+    )
+    .all() as Array<{ details_json: string | null; metadata_json: string | null }>;
+  const auditText = JSON.stringify(auditRows);
+  assert.equal(auditText.includes("private-client-secret"), false);
+  assert.equal(auditText.includes("subject:Exact-Case-123"), false);
+
+  const duplicateSubject = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "subject:Exact-Case-123",
+    membershipId: ownerA.id,
+  });
+  assert.equal(duplicateSubject.status, 409, "issuer and subject are unique within the tenant");
+  const secondIdentityForMembership = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "another-subject",
+    membershipId: ownerA.id,
+  });
+  assert.equal(secondIdentityForMembership.status, 409, "a membership cannot have ambiguous links");
+
+  const links = (await json(await call(db, "customer-a/oidc/identities"))) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(links.length, 1);
+  assert.equal(links[0].subject, "subject:Exact-Case-123");
+
+  const crossTenantMembership = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "foreign-subject",
+    membershipId: ownerB.id,
+  });
+  assert.equal(crossTenantMembership.status, 404);
+
+  const mismatchedIssuer = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/other-tenant",
+    subject: "new-subject",
+    membershipId: ownerA.id,
+  });
+  assert.equal(mismatchedIssuer.status, 400);
+
+  const emailAutoJoinRejected = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "new-subject",
+    membershipId: ownerA.id,
+    email: "owner@example.com",
+  });
+  assert.equal(emailAutoJoinRejected.status, 400);
+
+  const deleteLink = await call(db, `customer-a/oidc/identities/${link.id}`, "DELETE");
+  assert.equal(deleteLink.status, 200);
+  assert.deepEqual(await json(deleteLink), { deleted: true });
+
+  const memberLink = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "member-subject",
+    membershipId: "not-a-real-membership",
+  });
+  assert.equal(memberLink.status, 404);
+  assert.equal(ownerB.tenantId, "customer-b");
+});
+
+test("Cloud OIDC config changes clear old issuer links and deletion clears the tenant config", async () => {
+  const { db, memberA } = await makeDb();
+  const created = await call(db, "customer-a/oidc", "PUT", {
+    issuer: "https://id.example.com/tenant-a",
+    clientId: "client-a",
+    clientSecret: "private-client-secret",
+    isEnabled: true,
+  });
+  assert.equal(created.status, 201);
+  const link = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a",
+    subject: "member-subject",
+    membershipId: memberA.id,
+  });
+  assert.equal(link.status, 201);
+
+  const update = await call(db, "customer-a/oidc", "PUT", {
+    issuer: "https://id.example.com/tenant-a-v2",
+    clientId: "client-a-v2",
+  });
+  assert.equal(update.status, 200);
+  const updatedConfig = (await json(update)) as Record<string, unknown>;
+  assert.equal(updatedConfig.isEnabled, true, "updates preserve the enabled flag unless provided");
+  assert.equal(updatedConfig.hasClientSecret, true, "updates preserve the encrypted secret");
+  assert.equal(
+    ((await json(await call(db, "customer-a/oidc/identities"))) as unknown[]).length,
+    0,
+    "changing issuer clears exact links tied to the previous issuer"
+  );
+
+  const relinked = await call(db, "customer-a/oidc/identities", "POST", {
+    issuer: "https://id.example.com/tenant-a-v2",
+    subject: "member-subject-v2",
+    membershipId: memberA.id,
+  });
+  assert.equal(relinked.status, 201);
+
+  const deleted = await call(db, "customer-a/oidc", "DELETE");
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await json(deleted), { deleted: true });
+  assert.deepEqual(await json(await call(db, "customer-a/oidc", "GET")), null);
+  assert.deepEqual(await json(await call(db, "customer-a/oidc/identities")), []);
+});
+
+test("OIDC config stays disabled by default and fails closed without the encryption key", async () => {
+  const { db } = await makeDb();
+  const response = await handleCloudApiRequest(
+    new Request("https://worker.example/__cloud/v1/tenants/customer-a/oidc", {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        issuer: "https://id.example.com/tenant-a",
+        clientId: "client-a",
+        clientSecret: "private-client-secret",
+      }),
+    }),
+    { db, adminToken: ADMIN_TOKEN, now: () => new Date(NOW) }
+  );
+  assert.equal(response.status, 503);
+
+  const created = await call(db, "customer-a/oidc", "PUT", {
+    issuer: "https://id.example.com/tenant-a",
+    clientId: "client-a",
+    clientSecret: "private-client-secret",
+  });
+  assert.equal(created.status, 201);
+  assert.equal(((await json(created)) as Record<string, unknown>).isEnabled, false);
+});
