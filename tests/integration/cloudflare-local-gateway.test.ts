@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
+import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -63,6 +64,52 @@ async function requestJson(
   }
   assert.ok(body !== null && typeof body === "object" && !Array.isArray(body));
   return { response, body: body as Record<string, unknown> };
+}
+
+async function requestHostJson(
+  port: number,
+  host: string,
+  pathname: string,
+  body?: unknown
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const serializedBody = body === undefined ? "" : JSON.stringify(body);
+  return await new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: pathname,
+        method: body === undefined ? "GET" : "POST",
+        headers: {
+          host,
+          ...(body === undefined
+            ? {}
+            : {
+                "content-type": "application/json",
+                "content-length": Buffer.byteLength(serializedBody),
+              }),
+        },
+      },
+      (response) => {
+        let responseBody = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => (responseBody += chunk));
+        response.on("end", () => {
+          try {
+            const parsed: unknown = JSON.parse(responseBody);
+            assert.ok(parsed !== null && typeof parsed === "object" && !Array.isArray(parsed));
+            resolve({ status: response.statusCode ?? 0, body: parsed as Record<string, unknown> });
+          } catch (error) {
+            reject(error);
+          }
+        });
+      }
+    );
+    request.setTimeout(20_000, () => request.destroy(new Error("Front Desk request timed out")));
+    request.once("error", reject);
+    if (serializedBody) request.write(serializedBody);
+    request.end();
+  });
 }
 
 async function waitForWorker(
@@ -310,6 +357,163 @@ test(
     assert.notEqual(customerA.customerKey, customerB.customerKey);
     assert.notEqual(customerA.deviceId, customerB.deviceId);
     assert.notEqual(customerA.credential, customerB.credential);
+
+    await t.test(
+      "Front Desk routes a host-scoped chat through the local Worker gateway to tenant A's device",
+      {
+        skip:
+          !process.env.FRONT_DESK_REPO &&
+          "Set FRONT_DESK_REPO to the Front Desk checkout to run the cross-repository fixture.",
+      },
+      async (frontDeskTest) => {
+        const frontDeskRepo = path.resolve(process.env.FRONT_DESK_REPO!);
+        const frontDeskTempDir = await mkdtemp(path.join(tempDir, "front-desk-"));
+        const frontDeskHome = path.join(frontDeskTempDir, "home");
+        await mkdir(frontDeskHome, { recursive: true });
+        for (const filename of ["server.js", "omnirouteConfig.js", "leadStore.js"]) {
+          await copyFile(path.join(frontDeskRepo, filename), path.join(frontDeskTempDir, filename));
+        }
+        await writeFile(path.join(frontDeskTempDir, "leads.json"), "[]\n", { mode: 0o600 });
+
+        const frontDeskHost = "tenant-a.frontdesk.test";
+        const frontDeskPort = await getUnusedPort();
+        const frontDeskKeyEnv = "FRONT_DESK_LOCAL_GATEWAY_KEY";
+        const frontDeskDashboardEnv = "FRONT_DESK_LOCAL_GATEWAY_DASHBOARD";
+        const frontDeskTenants = [
+          {
+            host: frontDeskHost,
+            tenantId: customerA.tenantId,
+            dashboardTokenEnv: frontDeskDashboardEnv,
+            gateway: {
+              baseUrl,
+              customerApiKeyEnv: frontDeskKeyEnv,
+              deviceId: customerA.deviceId,
+              ollamaModel: "integration-test",
+            },
+            business: {
+              name: "Local Gateway Integration",
+              description: "Isolated test business",
+              hours: "Always",
+              services: [],
+              assistant: {
+                name: "Integration assistant",
+                tone: "helpful",
+                handoff: "Offer a follow-up.",
+              },
+            },
+          },
+        ];
+        const frontDeskChild = spawn(process.execPath, ["server.js"], {
+          cwd: frontDeskTempDir,
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: frontDeskHome,
+            NODE_ENV: "test",
+            NO_COLOR: "1",
+            PORT: String(frontDeskPort),
+            FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
+            [frontDeskKeyEnv]: customerA.customerKey,
+            [frontDeskDashboardEnv]: "local-frontdesk-dashboard-token",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let frontDeskOutput = "";
+        const appendFrontDeskOutput = (chunk: Buffer) => {
+          frontDeskOutput = `${frontDeskOutput}${chunk.toString("utf8")}`.slice(-10_000);
+        };
+        frontDeskChild.stdout?.on("data", appendFrontDeskOutput);
+        frontDeskChild.stderr?.on("data", appendFrontDeskOutput);
+        frontDeskTest.after(async () => {
+          await stopWorker(frontDeskChild);
+          await rm(frontDeskTempDir, { recursive: true, force: true });
+        });
+
+        let frontDeskReady = false;
+        const frontDeskDeadline = Date.now() + 10_000;
+        while (Date.now() < frontDeskDeadline) {
+          if (frontDeskChild.exitCode !== null) {
+            assert.fail(
+              `Front Desk exited before becoming ready (code ${frontDeskChild.exitCode}):\n${frontDeskOutput}`
+            );
+          }
+          try {
+            const response = await requestHostJson(frontDeskPort, frontDeskHost, "/api/health");
+            if (response.status === 200) {
+              frontDeskReady = true;
+              break;
+            }
+          } catch {
+            // The temporary Front Desk process may still be starting.
+          }
+          await delay(50);
+        }
+        assert.equal(frontDeskReady, true, `Front Desk did not become ready:\n${frontDeskOutput}`);
+
+        const chatRequest = requestHostJson(frontDeskPort, frontDeskHost, "/api/chat", {
+          model: "ignored-by-gateway-fixture",
+          messages: [{ role: "user", content: "Please handle the local gateway test." }],
+        });
+        let gatewayRequests: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
+        const gatewayPollDeadline = Date.now() + 10_000;
+        while (!gatewayRequests?.length && Date.now() < gatewayPollDeadline) {
+          gatewayRequests = await deviceTransport.poll(customerA.session!);
+          if (!gatewayRequests?.length) await delay(25);
+        }
+        assert.equal(
+          gatewayRequests?.length,
+          1,
+          `Front Desk chat should reach tenant A's real local gateway device. Front Desk logs:\n${frontDeskOutput}`
+        );
+        const gatewayRequest = gatewayRequests![0]!;
+        assert.equal(gatewayRequest.capability, capability);
+        assert.deepEqual(gatewayRequest.payload, {
+          messages: [{ role: "user", content: "Please handle the local gateway test." }],
+          options: { temperature: 0.2 },
+        });
+        assert.equal(
+          await deviceTransport.submitResult(customerA.session!, {
+            version: 1,
+            requestId: gatewayRequest.requestId,
+            outcome: {
+              ok: true,
+              value: {
+                message: { role: "assistant", content: "Completed through the local device." },
+                done_reason: "stop",
+                prompt_eval_count: 9,
+                eval_count: 6,
+              },
+            },
+          }),
+          true
+        );
+
+        const frontDeskResponse = await chatRequest;
+        assert.equal(
+          frontDeskResponse.status,
+          200,
+          `Front Desk should translate the Worker result into a chat completion: ${JSON.stringify(frontDeskResponse.body)}`
+        );
+        assert.equal(frontDeskResponse.body.object, "chat.completion");
+        assert.equal(frontDeskResponse.body.model, "integration-test");
+        assert.deepEqual(frontDeskResponse.body.choices, [
+          {
+            index: 0,
+            message: { role: "assistant", content: "Completed through the local device." },
+            finish_reason: "stop",
+          },
+        ]);
+        assert.deepEqual(frontDeskResponse.body.usage, {
+          prompt_tokens: 9,
+          completion_tokens: 6,
+          total_tokens: 15,
+        });
+        assert.equal(
+          JSON.stringify(frontDeskResponse.body).includes(customerA.customerKey),
+          false,
+          "Front Desk chat response must not expose the tenant API key"
+        );
+      }
+    );
 
     const invoke = (customerKey: string, deviceId: string, idempotencyKey: string) =>
       requestJson(`${baseUrl}/__gateway/v1/customer/invoke`, {
