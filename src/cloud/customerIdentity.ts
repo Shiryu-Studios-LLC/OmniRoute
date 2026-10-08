@@ -1,4 +1,8 @@
 import type { CloudDb } from "./db";
+import {
+  prepareCloudComplianceAuditInsert,
+  type CloudComplianceAuditInput,
+} from "./complianceAudit";
 
 export type CloudCustomerRole = "owner" | "admin" | "member" | "viewer";
 
@@ -34,6 +38,13 @@ export class CloudLastActiveOwnerError extends Error {
   constructor() {
     super("A customer tenant must keep at least one active owner");
     this.name = "CloudLastActiveOwnerError";
+  }
+}
+
+export class CloudMembershipConflictError extends Error {
+  constructor() {
+    super("Customer membership changed during update");
+    this.name = "CloudMembershipConflictError";
   }
 }
 
@@ -146,6 +157,9 @@ export async function updateCloudCustomerMembership(
     membershipId: string;
     role: CloudCustomerRole;
     isActive: boolean;
+    expectedUpdatedAt?: string;
+    actorMembershipId?: string;
+    audit?: CloudComplianceAuditInput;
     now?: string;
   }
 ): Promise<CloudCustomerMembership | null> {
@@ -153,11 +167,30 @@ export async function updateCloudCustomerMembership(
   requireId(input.membershipId, "membershipId");
   const role = requireRole(input.role);
   const now = input.now ?? new Date().toISOString();
+  if (
+    input.expectedUpdatedAt !== undefined &&
+    (!Number.isFinite(Date.parse(input.expectedUpdatedAt)) ||
+      new Date(input.expectedUpdatedAt).toISOString() !== input.expectedUpdatedAt)
+  ) {
+    throw new TypeError("Invalid expectedUpdatedAt");
+  }
+  if (input.actorMembershipId !== undefined) {
+    requireId(input.actorMembershipId, "actorMembershipId");
+  }
   const updateMembership = db
     .prepare(
       `UPDATE cloud_customer_memberships
           SET role = ?, is_active = ?, updated_at = ?
         WHERE tenant_id = ? AND id = ?
+          AND (? IS NULL OR updated_at = ?)
+          AND (
+            ? IS NULL OR EXISTS (
+              SELECT 1 FROM cloud_customer_memberships actor
+               WHERE actor.tenant_id = ? AND actor.id = ? AND actor.is_active = 1
+                 AND actor.role IN ('owner', 'admin')
+                 AND (actor.role = 'owner' OR cloud_customer_memberships.role <> 'owner')
+            )
+          )
           AND (
             role <> 'owner' OR is_active = 0 OR (? = 'owner' AND ? = 1)
             OR EXISTS (
@@ -173,18 +206,31 @@ export async function updateCloudCustomerMembership(
       now,
       input.tenantId,
       input.membershipId,
+      input.expectedUpdatedAt ?? null,
+      input.expectedUpdatedAt ?? null,
+      input.actorMembershipId ?? null,
+      input.tenantId,
+      input.actorMembershipId ?? null,
       role,
       input.isActive ? 1 : 0,
       input.tenantId,
       input.membershipId
     );
   const statements = [updateMembership];
+  if (input.audit) {
+    statements.push(
+      prepareCloudComplianceAuditInsert(db, input.audit, {
+        requirePreviousStatementChange: true,
+      }).statement
+    );
+  }
   if (!input.isActive) {
     statements.push(
       db
         .prepare(
           `UPDATE cloud_customer_api_keys SET revoked_at = ?
             WHERE tenant_id = ? AND membership_id = ? AND revoked_at IS NULL
+              AND changes() = 1
               AND EXISTS (
                 SELECT 1 FROM cloud_customer_memberships
                  WHERE tenant_id = ? AND id = ? AND is_active = 0 AND updated_at = ?
@@ -194,6 +240,41 @@ export async function updateCloudCustomerMembership(
     );
   }
   const results = await db.batch(statements);
+  const updateChanges =
+    typeof results[0] === "object" && results[0] !== null && "meta" in results[0]
+      ? Number((results[0] as { meta?: { changes?: unknown } }).meta?.changes)
+      : Number.NaN;
+  if (input.expectedUpdatedAt !== undefined && updateChanges !== 1) {
+    const unchangedOwner = await getCloudCustomerMembership(db, input.tenantId, input.membershipId);
+    const actor = input.actorMembershipId
+      ? await db
+          .prepare<{ role: CloudCustomerRole; is_active: number }>(
+            `SELECT role, is_active FROM cloud_customer_memberships
+              WHERE tenant_id = ? AND id = ? LIMIT 1`
+          )
+          .bind(input.tenantId, input.actorMembershipId)
+          .first()
+      : null;
+    const actorMayChangeOwner =
+      input.actorMembershipId === undefined || (actor?.role === "owner" && actor.is_active === 1);
+    if (
+      unchangedOwner?.updatedAt === input.expectedUpdatedAt &&
+      unchangedOwner.role === "owner" &&
+      unchangedOwner.isActive &&
+      actorMayChangeOwner &&
+      (role !== "owner" || !input.isActive)
+    ) {
+      const otherActiveOwner = await db
+        .prepare<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM cloud_customer_memberships
+            WHERE tenant_id = ? AND id <> ? AND role = 'owner' AND is_active = 1`
+        )
+        .bind(input.tenantId, input.membershipId)
+        .first();
+      if (Number(otherActiveOwner?.count ?? 0) === 0) throw new CloudLastActiveOwnerError();
+    }
+    throw new CloudMembershipConflictError();
+  }
   if (
     results.some(
       (result) =>

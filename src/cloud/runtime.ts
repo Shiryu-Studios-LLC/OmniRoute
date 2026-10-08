@@ -6,6 +6,7 @@ import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi"
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
+  CLOUD_TENANT_MEMBERS_PATH,
   CLOUD_TENANT_OIDC_CALLBACK_PATH,
   CLOUD_TENANT_OIDC_LOGIN_PATH,
   CLOUD_TENANT_OIDC_SESSION_PATH,
@@ -64,6 +65,8 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         url.pathname === CLOUD_TENANT_OIDC_LOGIN_PATH ||
         url.pathname === CLOUD_TENANT_OIDC_CALLBACK_PATH ||
         url.pathname === CLOUD_TENANT_OIDC_SESSION_PATH ||
+        url.pathname === CLOUD_TENANT_MEMBERS_PATH ||
+        url.pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`) ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH
       ) {

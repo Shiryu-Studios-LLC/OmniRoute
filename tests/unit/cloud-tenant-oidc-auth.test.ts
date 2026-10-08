@@ -6,7 +6,13 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
-import { createCloudCustomerMembership } from "../../src/cloud/customerIdentity";
+import {
+  CloudMembershipConflictError,
+  createCloudCustomerMembership,
+  getCloudCustomerMembership,
+  issueCloudCustomerApiKey,
+  updateCloudCustomerMembership,
+} from "../../src/cloud/customerIdentity";
 import { createCloudCustomerTenant } from "../../src/cloud/tenants";
 import { addCloudTenantOidcIdentity, setCloudTenantOidcConfig } from "../../src/cloud/tenantOidc";
 import {
@@ -16,6 +22,7 @@ import {
   CLOUD_TENANT_OIDC_SESSION_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
+  CLOUD_TENANT_MEMBERS_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
 } from "../../src/cloud/tenantOidcAuth";
 import { createCloudRuntime } from "../../src/cloud/runtime";
@@ -90,6 +97,53 @@ class SqliteCloudDb implements CloudDb {
 
   async exec(sql: string): Promise<unknown> {
     return this.raw.exec(sql);
+  }
+}
+
+class FailingAuditStatement<T = unknown> implements CloudDbStatement<T> {
+  private bound: CloudDbStatement<T>;
+
+  constructor(
+    private readonly sql: string,
+    statement: CloudDbStatement<T>
+  ) {
+    this.bound = statement;
+  }
+
+  bind(...values: unknown[]): CloudDbStatement<T> {
+    this.bound = this.bound.bind(...values);
+    return this;
+  }
+
+  first<U = T>(column?: string): Promise<U | null> {
+    return this.bound.first<U>(column);
+  }
+
+  all<U = T>(): Promise<{ results: U[]; success: boolean; meta?: Record<string, unknown> }> {
+    return this.bound.all<U>();
+  }
+
+  run(): Promise<{ success: boolean; meta?: Record<string, unknown> }> {
+    if (this.sql.includes("INSERT INTO cloud_compliance_audit")) {
+      throw new Error("simulated audit write failure");
+    }
+    return this.bound.run();
+  }
+}
+
+class FailingAuditCloudDb implements CloudDb {
+  constructor(private readonly inner: CloudDb) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    return new FailingAuditStatement(sql, this.inner.prepare<T>(sql));
+  }
+
+  batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    return this.inner.batch(statements);
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.inner.exec(sql);
   }
 }
 
@@ -199,6 +253,28 @@ async function makeProvider(
     throw new Error(`Unexpected outbound URL: ${url.href}`);
   };
   return fetcher;
+}
+
+async function createPortalSession(
+  db: CloudDb,
+  tenantSlug: string,
+  subject: string
+): Promise<{ app: ReturnType<typeof runtime>; cookie: string }> {
+  const state: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const app = runtime(db, await makeProvider(state, { subject }));
+  const login = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGIN_PATH}?tenant=${tenantSlug}`)
+  );
+  const authorization = new URL(login.headers.get("location")!);
+  state.nonce = authorization.searchParams.get("nonce") ?? undefined;
+  const callback = await app.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=session-code&state=${authorization.searchParams.get("state")}`,
+      { headers: { Cookie: `omni_oidc_state=${getCookieValue(login, "omni_oidc_state")}` } }
+    )
+  );
+  assert.equal(callback.status, 303);
+  return { app, cookie: getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE) };
 }
 
 test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an isolated revocable session", async () => {
@@ -637,6 +713,12 @@ test("membership invitation issue requires a same-origin owner/admin session and
     })
   );
   assert.equal(memberDenied.status, 403, "an authenticated member cannot invite others");
+  const memberListDenied = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}`, {
+      headers: { Origin: ORIGIN, Cookie: memberCookie },
+    })
+  );
+  assert.equal(memberListDenied.status, 403, "members cannot list tenant membership");
   const crossOrigin = await app.fetch(
     new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH}`, {
       method: "POST",
@@ -666,4 +748,286 @@ test("membership invitation issue requires a same-origin owner/admin session and
     0
   );
   assert.equal(membership.role, "member");
+});
+
+test("OIDC owner member API paginates only its tenant and CAS-updates with key revocation and safe audit", async () => {
+  const { db, tenant, membership: owner } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, owner.id)
+    .run();
+  const target = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "member-to-update",
+    role: "member",
+    now: new Date(NOW - 10_000).toISOString(),
+  });
+  const otherTenant = await createCloudCustomerTenant(db, {
+    id: "customer-other-oidc",
+    name: "Other OIDC Customer",
+    slug: "other-oidc-customer",
+  });
+  const foreign = await createCloudCustomerMembership(db, {
+    tenantId: otherTenant.id,
+    principalId: "foreign-member",
+    role: "member",
+  });
+  const { app, cookie } = await createPortalSession(db, tenant.slug, "external-user-17");
+  const cookieHeader = `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${cookie}`;
+
+  const firstPageResponse = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}?limit=1`, {
+      headers: { Origin: ORIGIN, Cookie: cookieHeader },
+    })
+  );
+  assert.equal(firstPageResponse.status, 200);
+  const firstPage = (await firstPageResponse.json()) as {
+    members: Array<Record<string, unknown>>;
+    nextCursor: string | null;
+  };
+  assert.equal(firstPage.members.length, 1);
+  assert.ok(firstPage.nextCursor);
+  assert.equal("principalId" in firstPage.members[0]!, false);
+  assert.equal("subject" in firstPage.members[0]!, false);
+  assert.equal("issuer" in firstPage.members[0]!, false);
+
+  const secondPageResponse = await app.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}?limit=1&cursor=${encodeURIComponent(firstPage.nextCursor!)}`,
+      { headers: { Origin: ORIGIN, Cookie: cookieHeader } }
+    )
+  );
+  const secondPage = (await secondPageResponse.json()) as {
+    members: Array<{ id: string }>;
+    nextCursor: string | null;
+  };
+  assert.equal(secondPageResponse.status, 200);
+  assert.equal(secondPage.members.length, 1);
+  assert.equal(secondPage.nextCursor, null);
+  assert.deepEqual(
+    new Set([firstPage.members[0]!.id, secondPage.members[0]!.id]),
+    new Set([owner.id, target.id])
+  );
+  assert.equal(
+    JSON.stringify([firstPage.members, secondPage.members]).includes(foreign.id),
+    false,
+    "member listing is tenant-scoped"
+  );
+
+  const key = await issueCloudCustomerApiKey(db, { tenantId: tenant.id, membershipId: target.id });
+  const targetBefore = await getCloudCustomerMembership(db, tenant.id, target.id);
+  assert.ok(targetBefore);
+  const update = async (membershipId: string, body: unknown) =>
+    app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}/${membershipId}`, {
+        method: "PATCH",
+        headers: {
+          Origin: ORIGIN,
+          "Content-Type": "application/json",
+          Cookie: cookieHeader,
+        },
+        body: JSON.stringify(body),
+      })
+    );
+  const unknownField = await update(target.id, {
+    role: "viewer",
+    expectedUpdatedAt: targetBefore.updatedAt,
+    oidcSubject: "must-be-rejected",
+  });
+  assert.equal(unknownField.status, 400);
+  const crossOrigin = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}/${target.id}`, {
+      method: "PATCH",
+      headers: {
+        Origin: "https://attacker.example",
+        "Content-Type": "application/json",
+        Cookie: cookieHeader,
+      },
+      body: JSON.stringify({ role: "viewer", expectedUpdatedAt: targetBefore.updatedAt }),
+    })
+  );
+  assert.equal(crossOrigin.status, 403);
+  const roleResponse = await update(target.id, {
+    role: "viewer",
+    expectedUpdatedAt: targetBefore.updatedAt,
+  });
+  assert.equal(roleResponse.status, 200);
+  const updated = (await roleResponse.json()) as {
+    id: string;
+    role: string;
+    isActive: boolean;
+    updatedAt: string;
+    principalId?: string;
+  };
+  assert.equal(updated.role, "viewer");
+  assert.equal(updated.isActive, true);
+  assert.equal("principalId" in updated, false);
+
+  const stale = await update(target.id, {
+    isActive: false,
+    expectedUpdatedAt: targetBefore.updatedAt,
+  });
+  assert.equal(stale.status, 409);
+  assert.equal((await getCloudCustomerMembership(db, tenant.id, target.id))?.isActive, true);
+
+  const deactivate = await update(target.id, {
+    isActive: false,
+    expectedUpdatedAt: updated.updatedAt,
+  });
+  assert.equal(deactivate.status, 200);
+  assert.equal(((await deactivate.json()) as { isActive: boolean }).isActive, false);
+  const storedKey = db.raw
+    .prepare("SELECT revoked_at FROM cloud_customer_api_keys WHERE id = ?")
+    .get(key.id) as { revoked_at: string | null };
+  assert.ok(storedKey.revoked_at, "deactivation permanently revokes issued API keys");
+
+  const foreignUpdate = await update(foreign.id, {
+    role: "viewer",
+    expectedUpdatedAt: new Date(NOW).toISOString(),
+  });
+  assert.equal(foreignUpdate.status, 404, "foreign tenant membership IDs are hidden");
+
+  const audits = db.raw
+    .prepare(
+      `SELECT action, target, metadata_json FROM cloud_compliance_audit
+        WHERE tenant_id = ? AND action = 'customer.membership.portal.update'
+        ORDER BY timestamp, id`
+    )
+    .all(tenant.id) as Array<{ action: string; target: string; metadata_json: string }>;
+  assert.equal(audits.length, 2);
+  assert.equal(audits[0]?.target, target.id);
+  assert.deepEqual(JSON.parse(audits[0]!.metadata_json), {
+    role: "viewer",
+    isActive: true,
+    changedFields: ["role"],
+  });
+  assert.equal(audits[1]?.target, target.id);
+  assert.deepEqual(JSON.parse(audits[1]!.metadata_json), {
+    role: "viewer",
+    isActive: false,
+    changedFields: ["isActive"],
+  });
+  assert.equal(JSON.stringify(audits).includes("external-user-17"), false);
+});
+
+test("OIDC member API restricts admins from owners and preserves the last active owner", async () => {
+  const { db, tenant, membership: owner } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, owner.id)
+    .run();
+  const admin = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "oidc-admin-membership",
+    role: "admin",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "external-admin",
+    membershipId: admin.id,
+  });
+  const ownerPortal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const adminPortal = await createPortalSession(db, tenant.slug, "external-admin");
+  const update = (
+    portal: { app: ReturnType<typeof runtime>; cookie: string },
+    id: string,
+    body: unknown
+  ) =>
+    portal.app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}/${id}`, {
+        method: "PATCH",
+        headers: {
+          Origin: ORIGIN,
+          "Content-Type": "application/json",
+          Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        },
+        body: JSON.stringify(body),
+      })
+    );
+  const ownerBefore = await getCloudCustomerMembership(db, tenant.id, owner.id);
+  assert.ok(ownerBefore);
+  const adminDenied = await update(adminPortal, owner.id, {
+    role: "admin",
+    expectedUpdatedAt: ownerBefore.updatedAt,
+  });
+  assert.equal(adminDenied.status, 403);
+  await assert.rejects(
+    updateCloudCustomerMembership(db, {
+      tenantId: tenant.id,
+      membershipId: owner.id,
+      role: "admin",
+      isActive: true,
+      expectedUpdatedAt: ownerBefore.updatedAt,
+      actorMembershipId: admin.id,
+      now: new Date(Math.max(NOW, Date.parse(ownerBefore.updatedAt) + 1)).toISOString(),
+    }),
+    CloudMembershipConflictError,
+    "the D1 update guard also denies admin-to-owner edits"
+  );
+
+  const lastOwner = await update(ownerPortal, owner.id, {
+    isActive: false,
+    expectedUpdatedAt: ownerBefore.updatedAt,
+  });
+  assert.equal(lastOwner.status, 409);
+  assert.match(await lastOwner.text(), /At least one active owner must remain/);
+  const unchanged = await getCloudCustomerMembership(db, tenant.id, owner.id);
+  assert.equal(unchanged?.role, "owner");
+  assert.equal(unchanged?.isActive, true);
+});
+
+test("membership audit failure rolls back the member update and API-key revocation", async () => {
+  const { db, tenant, membership: owner } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, owner.id)
+    .run();
+  const target = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "membership-audit-failure-target",
+    role: "member",
+  });
+  const key = await issueCloudCustomerApiKey(db, { tenantId: tenant.id, membershipId: target.id });
+  const targetBefore = await getCloudCustomerMembership(db, tenant.id, target.id);
+  assert.ok(targetBefore);
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const failingApp = createCloudRuntime({
+    env: {
+      DB: new FailingAuditCloudDb(db),
+      OMNIROUTE_ENV: "production",
+      OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ORIGIN,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
+    },
+    now: () => new Date(NOW),
+  });
+  const response = await failingApp.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}/${target.id}`, {
+      method: "PATCH",
+      headers: {
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+      },
+      body: JSON.stringify({
+        isActive: false,
+        expectedUpdatedAt: targetBefore.updatedAt,
+      }),
+    })
+  );
+  assert.equal(response.status, 503);
+  const unchanged = await getCloudCustomerMembership(db, tenant.id, target.id);
+  assert.equal(unchanged?.isActive, true, "membership change must roll back with audit failure");
+  const storedKey = db.raw
+    .prepare("SELECT revoked_at FROM cloud_customer_api_keys WHERE id = ?")
+    .get(key.id) as { revoked_at: string | null };
+  assert.equal(storedKey.revoked_at, null, "key revocation must roll back with audit failure");
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.membership.portal.update'"
+      )
+      .get(tenant.id)?.count,
+    0
+  );
 });

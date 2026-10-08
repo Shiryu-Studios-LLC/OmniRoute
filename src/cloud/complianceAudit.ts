@@ -1,4 +1,4 @@
-import type { CloudDb } from "./db";
+import type { CloudDb, CloudDbStatement } from "./db";
 
 export interface CloudComplianceAuditRecord {
   id: string;
@@ -191,6 +191,17 @@ export async function appendCloudComplianceAudit(
   db: CloudDb,
   input: CloudComplianceAuditInput
 ): Promise<CloudComplianceAuditRecord> {
+  const prepared = prepareCloudComplianceAuditInsert(db, input);
+  await prepared.statement.run();
+  return prepared.record;
+}
+
+/** Build the standard sanitized audit statement for inclusion in a larger D1 batch. */
+export function prepareCloudComplianceAuditInsert(
+  db: CloudDb,
+  input: CloudComplianceAuditInput,
+  options: { requirePreviousStatementChange?: boolean } = {}
+): { record: CloudComplianceAuditRecord; statement: CloudDbStatement } {
   requireId(input.id, "id");
   requireId(input.tenantId, "tenantId");
   if (
@@ -216,14 +227,16 @@ export async function appendCloudComplianceAudit(
   };
   const detailsJson = serializeAuditValue(record.details, "details");
   const metadataJson = serializeAuditValue(record.metadata, "metadata");
-
-  await db
-    .prepare(
-      `INSERT INTO cloud_compliance_audit (
+  const columns = `INSERT INTO cloud_compliance_audit (
         id, tenant_id, timestamp, action, actor, target, details_json,
         ip_address, resource_type, status, request_id, metadata_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
+      )`;
+  const sql = options.requirePreviousStatementChange
+    ? `${columns}
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1`
+    : `${columns} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const statement = db
+    .prepare(sql)
     .bind(
       record.id,
       record.tenantId,
@@ -237,9 +250,8 @@ export async function appendCloudComplianceAudit(
       record.status,
       record.requestId,
       metadataJson
-    )
-    .run();
-  return record;
+    );
+  return { record, statement };
 }
 
 export async function listCloudComplianceAudit(

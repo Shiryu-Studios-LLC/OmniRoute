@@ -38,6 +38,17 @@ Tenant OIDC configuration cannot set a callback or post-login redirect URI.
 - `GET /__cloud/auth/session` returns the tenant, membership, and issuer for a valid
   customer portal session cookie. It does not return provider credentials or the external
   subject identifier.
+- `GET /__cloud/auth/members?limit=<1–100>&cursor=<opaque>` lists tenant memberships for
+  active owner/admin sessions. Pages contain membership ID, role, active state, and
+  timestamps; they omit principal IDs and OIDC details.
+- `PATCH /__cloud/auth/members/<membership-id>` accepts an exact same-origin JSON body with
+  `expectedUpdatedAt` and at least one of `role` or `isActive`. The timestamp is a
+  compare-and-set guard; stale writes return `409`. `role` may be admin, member, or viewer,
+  and cannot promote a member to owner. Admins cannot modify owner rows. Owners retain the
+  existing last-active-owner guard. The membership update, its conditional success audit,
+  and deactivation's tenant API-key revocation execute in one D1 batch and roll back together
+  if the audit write fails. The audit records membership ID and changed role/active fields
+  without principal or OIDC subject data.
 - `POST /__cloud/auth/members/invitations` accepts `{ "role": "admin" | "member" | "viewer" }`
   from a same-origin owner/admin portal session and returns a random invitation code once.
   Owner role cannot be granted by invitation. The code expires after 15 minutes and only

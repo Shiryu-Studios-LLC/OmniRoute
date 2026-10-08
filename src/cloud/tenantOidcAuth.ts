@@ -1,6 +1,13 @@
 import { createLocalJWKSet, jwtVerify } from "jose";
 import type { CloudDb } from "./db";
 import { encryptCloudCredential, decryptCloudCredential } from "./credentialEncryption";
+import {
+  CloudMembershipConflictError,
+  CloudLastActiveOwnerError,
+  getCloudCustomerMembership,
+  updateCloudCustomerMembership,
+  type CloudCustomerRole,
+} from "./customerIdentity";
 import { CLOUD_PLATFORM_TENANT_ID, getCloudTenantById, getCloudTenantBySlug } from "./tenants";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { getActiveCloudTenantOidcIdentity, getCloudTenantOidcCredentials } from "./tenantOidc";
@@ -11,6 +18,7 @@ import {
   getPendingCloudTenantMembershipInvitation,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_TTL_MS,
 } from "./tenantMembershipInvitations";
+import { listCloudTenantPortalMembers } from "./tenantMembershipManagement";
 
 export const CLOUD_TENANT_OIDC_LOGIN_PATH = "/__cloud/auth/oidc/login";
 export const CLOUD_TENANT_OIDC_CALLBACK_PATH = "/__cloud/auth/oidc/callback";
@@ -18,6 +26,7 @@ export const CLOUD_TENANT_OIDC_SESSION_PATH = "/__cloud/auth/session";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH = "/__cloud/auth/members/invitations";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
   "/__cloud/auth/oidc/invitations/redeem";
+export const CLOUD_TENANT_MEMBERS_PATH = "/__cloud/auth/members";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -759,6 +768,180 @@ async function resolveSession(
     .first();
 }
 
+async function requireMembershipManager(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  nowMs: number
+): Promise<OidcSessionRow | null> {
+  const session = await resolveSession(request, options, nowMs);
+  if (!session || (session.role !== "owner" && session.role !== "admin")) return null;
+  return session;
+}
+
+async function checkMembershipPortalRateLimit(
+  db: CloudDb,
+  session: OidcSessionRow,
+  action: "list" | "update",
+  nowMs: number
+): Promise<boolean> {
+  const result = await consumeCloudRateLimit(db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-membership:${action}:${session.tenant_id}:${session.membership_id}`,
+    limit: action === "list" ? 120 : 30,
+    windowMs: 60_000,
+    nowMs,
+  });
+  return result.allowed;
+}
+
+async function listMemberships(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  nowMs: number
+): Promise<Response> {
+  if (!options.db) return json({ error: "Membership service unavailable" }, 503);
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (!(await checkMembershipPortalRateLimit(options.db, session, "list", nowMs))) {
+    return json({ error: "Membership read rate limit exceeded" }, 429);
+  }
+  const url = new URL(request.url);
+  for (const key of url.searchParams.keys()) {
+    if (key !== "limit" && key !== "cursor") return json({ error: "Invalid query parameter" }, 400);
+  }
+  const limitValues = url.searchParams.getAll("limit");
+  const cursorValues = url.searchParams.getAll("cursor");
+  if (limitValues.length > 1 || cursorValues.length > 1) {
+    return json({ error: "Invalid query parameter" }, 400);
+  }
+  let limit = 50;
+  if (limitValues.length === 1) {
+    const value = limitValues[0] ?? "";
+    if (!/^[1-9][0-9]{0,2}$/.test(value) || Number(value) > 100) {
+      return json({ error: "Invalid page limit" }, 400);
+    }
+    limit = Number(value);
+  }
+  const cursor = cursorValues[0];
+  try {
+    return json(await listCloudTenantPortalMembers(options.db, session.tenant_id, limit, cursor));
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof RangeError) {
+      return json({ error: "Invalid membership cursor" }, 400);
+    }
+    throw error;
+  }
+}
+
+async function updateMembership(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number,
+  membershipId: string
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "Membership service unavailable" }, 503);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (!(await checkMembershipPortalRateLimit(db, session, "update", nowMs))) {
+    return json({ error: "Membership update rate limit exceeded" }, 429);
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(membershipId))
+    return json({ error: "Membership not found" }, 404);
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBounded(new Response(request.body), 2048);
+  } catch {
+    return json({ error: "Invalid request body" }, 400);
+  }
+  if (
+    !isRecord(body) ||
+    Object.keys(body).some(
+      (key) => key !== "role" && key !== "isActive" && key !== "expectedUpdatedAt"
+    ) ||
+    (body.role === undefined && body.isActive === undefined) ||
+    typeof body.expectedUpdatedAt !== "string" ||
+    body.expectedUpdatedAt.length > 64 ||
+    !Number.isFinite(Date.parse(body.expectedUpdatedAt)) ||
+    new Date(body.expectedUpdatedAt).toISOString() !== body.expectedUpdatedAt
+  ) {
+    return json({ error: "Expected a valid expectedUpdatedAt and role and/or isActive" }, 400);
+  }
+  if (
+    body.role !== undefined &&
+    body.role !== "admin" &&
+    body.role !== "member" &&
+    body.role !== "viewer"
+  ) {
+    return json({ error: "Invalid customer role" }, 400);
+  }
+  if (body.isActive !== undefined && typeof body.isActive !== "boolean") {
+    return json({ error: "isActive must be a boolean" }, 400);
+  }
+  const current = await getCloudCustomerMembership(db, session.tenant_id, membershipId);
+  if (!current) return json({ error: "Membership not found" }, 404);
+  if (current.updatedAt !== body.expectedUpdatedAt) {
+    return json({ error: "Membership changed; reload and retry" }, 409);
+  }
+  if (session.role === "admin" && current.role === "owner") {
+    return json({ error: "Admins cannot modify owner memberships" }, 403);
+  }
+  const nextRole = (body.role as CloudCustomerRole | undefined) ?? current.role;
+  const nextActive = (body.isActive as boolean | undefined) ?? current.isActive;
+  const timestamp = new Date(Math.max(nowMs, Date.parse(current.updatedAt) + 1)).toISOString();
+  const requestId = request.headers.get("cf-ray") ?? request.headers.get("x-request-id");
+  const changedFields: string[] = [];
+  if (current.role !== nextRole) changedFields.push("role");
+  if (current.isActive !== nextActive) changedFields.push("isActive");
+  let updated;
+  try {
+    updated = await updateCloudCustomerMembership(db, {
+      tenantId: session.tenant_id,
+      membershipId,
+      role: nextRole,
+      isActive: nextActive,
+      expectedUpdatedAt: body.expectedUpdatedAt,
+      actorMembershipId: session.membership_id,
+      audit: {
+        id: crypto.randomUUID(),
+        tenantId: session.tenant_id,
+        timestamp,
+        action: "customer.membership.portal.update",
+        actor: session.membership_id,
+        target: membershipId,
+        resourceType: "customer-membership",
+        status: "success",
+        requestId: requestId && requestId.length <= 512 ? requestId : null,
+        metadata: { role: nextRole, isActive: nextActive, changedFields },
+      },
+      now: timestamp,
+    });
+  } catch (error) {
+    if (error instanceof CloudMembershipConflictError) {
+      return json({ error: "Membership changed; reload and retry" }, 409);
+    }
+    if (error instanceof CloudLastActiveOwnerError) {
+      return json({ error: "At least one active owner must remain" }, 409);
+    }
+    throw error;
+  }
+  if (!updated) return json({ error: "Membership not found" }, 404);
+  return json({
+    id: updated.id,
+    role: updated.role,
+    isActive: updated.isActive,
+    createdAt: updated.createdAt,
+    updatedAt: updated.updatedAt,
+  });
+}
+
 async function createMembershipInvitation(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -876,13 +1059,25 @@ export async function handleCloudTenantOidcAuthRequest(
   const isLogin = pathname === CLOUD_TENANT_OIDC_LOGIN_PATH;
   const isCallback = pathname === CLOUD_TENANT_OIDC_CALLBACK_PATH;
   const isSession = pathname === CLOUD_TENANT_OIDC_SESSION_PATH;
+  const isMembers = pathname === CLOUD_TENANT_MEMBERS_PATH;
+  const isMemberItem = pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`);
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
-  if (!isLogin && !isCallback && !isSession && !isCreateInvitation && !isRedeemInvitation)
+  if (
+    !isLogin &&
+    !isCallback &&
+    !isSession &&
+    !isMembers &&
+    !isMemberItem &&
+    !isCreateInvitation &&
+    !isRedeemInvitation
+  ) {
     return null;
-  const requiresPost = isCreateInvitation || isRedeemInvitation;
-  if (request.method !== (requiresPost ? "POST" : "GET")) {
-    return json({ error: "Method not allowed" }, 405, { Allow: requiresPost ? "POST" : "GET" });
+  }
+  const expectedMethod =
+    isCreateInvitation || isRedeemInvitation ? "POST" : isMemberItem ? "PATCH" : "GET";
+  if (request.method !== expectedMethod) {
+    return json({ error: "Method not allowed" }, 405, { Allow: expectedMethod });
   }
   const origin = expectedOrigin(request, options);
   if (!origin)
@@ -899,6 +1094,16 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isCallback) return callback(request, options, origin, nowMs);
   if (isCreateInvitation) return createMembershipInvitation(request, options, origin, nowMs);
   if (isRedeemInvitation) return redeemMembershipInvitation(request, options, origin, nowMs);
+  if (isMembers) return listMemberships(request, options, nowMs);
+  if (isMemberItem) {
+    return updateMembership(
+      request,
+      options,
+      origin,
+      nowMs,
+      pathname.slice(`${CLOUD_TENANT_MEMBERS_PATH}/`.length)
+    );
+  }
   return introspectSession(request, options, origin, nowMs);
 }
 
