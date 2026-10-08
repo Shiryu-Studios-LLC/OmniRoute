@@ -261,6 +261,17 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
   }
 
   return {
+    /** Validates a session without touching its lease or changing any device state. */
+    async authenticateSession(
+      deviceId: string,
+      sessionToken: string
+    ): Promise<{ tenantId: string; sessionId: string } | null> {
+      const authenticated = await authenticateDeviceSession(deviceId, sessionToken);
+      return authenticated
+        ? { tenantId: authenticated.device.tenantId, sessionId: authenticated.session.sessionId }
+        : null;
+    },
+
     /**
      * Establishes a new outbound device session. Tenant identity is read from
      * the registration directory; callers cannot choose or override it.

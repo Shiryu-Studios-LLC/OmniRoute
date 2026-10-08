@@ -53,6 +53,29 @@ test("configuration accepts HTTPS cloud URL and reads credential only from its n
   });
 });
 
+test("configuration accepts HTTP only for a loopback Local Agent gateway", () => {
+  for (const gatewayUrl of [
+    "http://127.0.0.1:8787",
+    "http://localhost:8787",
+    "http://[::1]:8787",
+  ]) {
+    const config = resolveLocalAgentConfig(
+      { gatewayUrl, deviceId: "local_device" },
+      { SHIRYU_LOCAL_AGENT_CREDENTIAL: credential }
+    );
+    assert.equal(config.gatewayUrl, `${gatewayUrl}/`);
+  }
+
+  assert.throws(
+    () =>
+      resolveLocalAgentConfig(
+        { gatewayUrl: "http://gateway.example.test", deviceId: "remote_device" },
+        { SHIRYU_LOCAL_AGENT_CREDENTIAL: credential }
+      ),
+    /HTTP is allowed only on loopback/
+  );
+});
+
 test("configuration supports the documented Local Agent environment variables", () => {
   const config = resolveLocalAgentConfig(
     {},

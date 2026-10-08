@@ -244,8 +244,9 @@ export async function runLocalAgentGatewayCycle(
 }
 
 /**
- * Keep an agent connected with capped exponential retries. This process only
- * makes outbound HTTPS heartbeat requests; it never opens a listener or port.
+ * Keep an agent connected with capped exponential retries. It makes outbound
+ * gateway requests; remote gateways require HTTPS, with loopback HTTP for
+ * local development. It never opens a listener or port.
  */
 export async function runLocalAgent(
   config: LocalAgentRunnerConfig,

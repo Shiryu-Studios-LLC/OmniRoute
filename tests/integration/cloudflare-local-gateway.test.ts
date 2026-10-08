@@ -145,7 +145,8 @@ async function discoverInstalledOllamaModel(): Promise<string> {
 async function runLocalOllamaChat(
   model: string,
   messages: unknown,
-  options: unknown
+  options: unknown,
+  limits: { keepAlive: number | string; maxTokens: number } = { keepAlive: 0, maxTokens: 64 }
 ): Promise<Record<string, unknown>> {
   const response = await fetch(`${localOllamaBaseUrl}/api/chat`, {
     method: "POST",
@@ -154,10 +155,10 @@ async function runLocalOllamaChat(
       model,
       messages,
       stream: false,
-      keep_alive: 0,
+      keep_alive: limits.keepAlive,
       options: {
         ...(options && typeof options === "object" ? options : {}),
-        num_predict: 64,
+        num_predict: limits.maxTokens,
       },
     }),
     signal: AbortSignal.timeout(12_000),
@@ -602,8 +603,14 @@ test(
       },
       async (ollamaTest) => {
         const model = await discoverInstalledOllamaModel();
+        await runLocalOllamaChat(
+          model,
+          [{ role: "user", content: "Reply with one short word." }],
+          { temperature: 0 },
+          { keepAlive: "5m", maxTokens: 1 }
+        );
         const modelCapability = `ollama:chat:${model}`;
-        const ollamaCustomer = await provisionCustomer("ollama", true, [modelCapability]);
+        const ollamaCustomer = await provisionCustomer("ollama", false, [modelCapability]);
         const frontDeskRepo = path.resolve(process.env.FRONT_DESK_REPO!);
         const frontDeskTempDir = await mkdtemp(path.join(tempDir, "front-desk-ollama-"));
         const frontDeskHome = path.join(frontDeskTempDir, "home");
@@ -687,6 +694,75 @@ test(
         }
         assert.equal(frontDeskReady, true, `Front Desk did not become ready:\n${frontDeskOutput}`);
 
+        const agentDataDir = path.join(frontDeskTempDir, "local-agent-data");
+        await mkdir(agentDataDir, { recursive: true });
+        const agentCredentialEnv = "LOCAL_OLLAMA_AGENT_CREDENTIAL";
+        const agentChild = spawn(
+          process.execPath,
+          [
+            path.join(repoRoot, "bin", "omniroute.mjs"),
+            "local-agent",
+            "run",
+            "--gateway-url",
+            baseUrl,
+            "--device-id",
+            ollamaCustomer.deviceId,
+            "--credential-env",
+            agentCredentialEnv,
+            "--ollama-url",
+            localOllamaBaseUrl,
+            "--heartbeat-interval-ms",
+            "250",
+          ],
+          {
+            cwd: tempDir,
+            env: {
+              PATH: process.env.PATH ?? "",
+              HOME: frontDeskHome,
+              DATA_DIR: agentDataDir,
+              NODE_ENV: "test",
+              NO_COLOR: "1",
+              CI: "1",
+              OMNIROUTE_CLI_SKIP_REPO_ENV: "1",
+              OMNIROUTE_NO_UPDATE_NOTIFIER: "1",
+              [agentCredentialEnv]: ollamaCustomer.credential,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          }
+        );
+        let agentOutput = "";
+        const appendAgentOutput = (chunk: Buffer) => {
+          agentOutput = `${agentOutput}${chunk.toString("utf8")}`.slice(-10_000);
+        };
+        agentChild.stdout?.on("data", appendAgentOutput);
+        agentChild.stderr?.on("data", appendAgentOutput);
+        ollamaTest.after(async () => stopWorker(agentChild));
+
+        let agentReady = false;
+        const agentDeadline = Date.now() + 15_000;
+        while (Date.now() < agentDeadline) {
+          if (agentChild.exitCode !== null) {
+            assert.fail(
+              `Local Agent exited before its first heartbeat (code ${agentChild.exitCode}):\n${agentOutput}`
+            );
+          }
+          const deviceStatus = await requestJson(
+            `${baseUrl}/__cloud/v1/tenants/${ollamaCustomer.tenantId}/gateway-devices/${ollamaCustomer.deviceId}`,
+            { token: adminToken }
+          );
+          const serviceHealth = deviceStatus.body.serviceHealth as { ollama?: unknown } | undefined;
+          if (serviceHealth?.ollama === true) {
+            agentReady = true;
+            break;
+          }
+          await delay(100);
+        }
+        assert.equal(
+          agentReady,
+          true,
+          `Local Agent did not report Ollama health through Worker/D1:\n${agentOutput}`
+        );
+
         const chatRequest = requestHostJson(frontDeskPort, frontDeskHost, "/api/chat", {
           messages: [
             {
@@ -695,39 +771,12 @@ test(
             },
           ],
         });
-        let gatewayRequests: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
-        const gatewayPollDeadline = Date.now() + 8_000;
-        while (!gatewayRequests?.length && Date.now() < gatewayPollDeadline) {
-          gatewayRequests = await deviceTransport.poll(ollamaCustomer.session!);
-          if (!gatewayRequests?.length) await delay(25);
-        }
-        assert.equal(
-          gatewayRequests?.length,
-          1,
-          `Front Desk chat should reach the Ollama device session. Front Desk logs:\n${frontDeskOutput}`
-        );
-        const gatewayRequest = gatewayRequests![0]!;
-        assert.equal(gatewayRequest.capability, modelCapability);
-        const localResult = await runLocalOllamaChat(
-          model,
-          (gatewayRequest.payload as { messages?: unknown }).messages,
-          (gatewayRequest.payload as { options?: unknown }).options
-        );
-        assert.equal(
-          await deviceTransport.submitResult(ollamaCustomer.session!, {
-            version: 1,
-            requestId: gatewayRequest.requestId,
-            outcome: { ok: true, value: localResult },
-          }),
-          true,
-          "the Worker should accept the real Ollama result from the device session"
-        );
-
         const frontDeskResponse = await chatRequest;
+        await stopWorker(agentChild);
         assert.equal(
           frontDeskResponse.status,
           200,
-          `Front Desk should return the local model completion: ${JSON.stringify(frontDeskResponse.body)}`
+          `Front Desk should return the local model completion: ${JSON.stringify(frontDeskResponse.body)}. Local Agent output: ${agentOutput}`
         );
         assert.equal(frontDeskResponse.body.object, "chat.completion");
         assert.equal(frontDeskResponse.body.model, model);
@@ -738,10 +787,8 @@ test(
           finish_reason?: unknown;
         };
         assert.equal(firstChoice.message?.role, "assistant");
-        assert.equal(
-          firstChoice.message?.content,
-          (localResult.message as { content: string }).content
-        );
+        assert.equal(typeof firstChoice.message?.content, "string");
+        assert.ok((firstChoice.message.content as string).trim().length > 0);
         assert.equal(
           JSON.stringify(frontDeskResponse.body).includes(ollamaCustomer.customerKey),
           false,

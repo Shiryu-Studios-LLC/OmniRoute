@@ -5,6 +5,16 @@ import type {
 } from "./connectorGatewayDurableObject";
 import { D1GatewayDeviceDirectory } from "./gatewayDevices";
 import type { CloudDb } from "./db";
+import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
+import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
+
+const DEFAULT_DEVICE_RATE_LIMITS = {
+  heartbeat: { limit: 90, windowMs: 60_000 },
+  poll: { limit: 180, windowMs: 60_000 },
+  result: { limit: 60, windowMs: 60_000 },
+} as const;
+const DEFAULT_CONNECT_RATE_LIMIT = { limit: 300, windowMs: 60_000 };
+const DEFAULT_CONNECT_FALLBACK_RATE_LIMIT = { limit: 1_200, windowMs: 60_000 };
 
 const PREFIX = "/__gateway/v1/device";
 const VERSION = 1;
@@ -19,6 +29,11 @@ export interface GatewayDeviceHttpApiOptions {
   sessions?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
   now?: () => number;
   leaseMs?: number;
+  connectRateLimit?: { limit: number; windowMs: number };
+  connectFallbackRateLimit?: { limit: number; windowMs: number };
+  rateLimits?: Partial<
+    Record<keyof typeof DEFAULT_DEVICE_RATE_LIMITS, { limit: number; windowMs: number }>
+  >;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -155,6 +170,21 @@ export async function handleGatewayDeviceRequest(
     leaseMs: options.leaseMs,
   });
 
+  async function checkSessionRateLimit(
+    identity: { tenantId: string; deviceId: string },
+    route: keyof typeof DEFAULT_DEVICE_RATE_LIMITS
+  ): Promise<Response | null> {
+    const rateLimit = await consumeCloudRateLimit(options.db!, {
+      // These values come from a read-only, successful session validation and
+      // the D1 device directory, never from a caller-supplied tenant field.
+      tenantId: identity.tenantId,
+      bucketKey: `gateway-device:${route}:${identity.deviceId}`,
+      ...(options.rateLimits?.[route] ?? DEFAULT_DEVICE_RATE_LIMITS[route]),
+      nowMs: options.now?.(),
+    });
+    return rateLimit.allowed ? null : json({ error: "Device request rate limit exceeded" }, 429);
+  }
+
   if (path === `${PREFIX}/connect`) {
     if (
       body.version !== VERSION ||
@@ -165,6 +195,21 @@ export async function handleGatewayDeviceRequest(
       !/^[A-Za-z0-9_-]{32,128}$/.test(body.credential)
     ) {
       return json({ error: "Invalid connect request" }, 400);
+    }
+    // On production Worker ingress, cf-connecting-ip is accepted only when
+    // edge-provided request.cf metadata is present. Local/test Requests fall
+    // back to one bounded bucket rather than persisting attacker-chosen IDs.
+    const clientIpBucket = cloudflareClientIpBucket(request);
+    const connectRateLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: clientIpBucket ?? "gateway-device:connect-attempts:fallback",
+      ...(clientIpBucket
+        ? (options.connectRateLimit ?? DEFAULT_CONNECT_RATE_LIMIT)
+        : (options.connectFallbackRateLimit ?? DEFAULT_CONNECT_FALLBACK_RATE_LIMIT)),
+      nowMs: options.now?.(),
+    });
+    if (!connectRateLimit.allowed) {
+      return json({ error: "Device authentication rate limit exceeded" }, 429);
     }
     const session = await gateway.connect(body.deviceId, body.credential);
     return session
@@ -213,6 +258,13 @@ export async function handleGatewayDeviceRequest(
         typeof (health as Record<string, unknown>).comfyui !== "boolean")
     )
       return json({ error: "Invalid heartbeat request" }, 400);
+    const authenticated = await gateway.authenticateSession(session.deviceId, session.sessionToken);
+    if (!authenticated) return json({ error: "Device session is unavailable" }, 401);
+    const limited = await checkSessionRateLimit(
+      { ...authenticated, deviceId: session.deviceId },
+      "heartbeat"
+    );
+    if (limited) return limited;
     const accepted = await gateway.heartbeat(
       session.deviceId,
       session.sessionToken,
@@ -228,6 +280,13 @@ export async function handleGatewayDeviceRequest(
     if (!exactKeys(body, ["version", "deviceId", "sessionToken"])) {
       return json({ error: "Invalid poll request" }, 400);
     }
+    const authenticated = await gateway.authenticateSession(session.deviceId, session.sessionToken);
+    if (!authenticated) return json({ error: "Device session is unavailable" }, 401);
+    const limited = await checkSessionRateLimit(
+      { ...authenticated, deviceId: session.deviceId },
+      "poll"
+    );
+    if (limited) return limited;
     const requests = await gateway.pollDeviceRequests({
       ...session,
       limit: 1,
@@ -252,6 +311,13 @@ export async function handleGatewayDeviceRequest(
       return json({ error: "Invalid result payload" }, 400);
     }
     if (resultBytes > 64 * 1024) return json({ error: "Result exceeds the size limit" }, 413);
+    const authenticated = await gateway.authenticateSession(session.deviceId, session.sessionToken);
+    if (!authenticated) return json({ error: "Device session is unavailable" }, 401);
+    const limited = await checkSessionRateLimit(
+      { ...authenticated, deviceId: session.deviceId },
+      "result"
+    );
+    if (limited) return limited;
     const accepted = await gateway.submitDeviceResult({
       ...session,
       requestId: body.requestId,

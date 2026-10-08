@@ -15,10 +15,12 @@ function parseGatewayUrl(rawUrl) {
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error("Local Agent gateway URL must be a valid HTTPS URL");
+    throw new Error("Local Agent gateway URL must be a valid HTTPS URL or loopback HTTP URL");
   }
+  const loopbackHost = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname.toLowerCase());
+  const secureTransport = url.protocol === "https:" || (url.protocol === "http:" && loopbackHost);
   if (
-    url.protocol !== "https:" ||
+    !secureTransport ||
     url.username ||
     url.password ||
     url.search ||
@@ -26,7 +28,7 @@ function parseGatewayUrl(rawUrl) {
     url.pathname !== "/"
   ) {
     throw new Error(
-      "Local Agent gateway URL must be an HTTPS origin without credentials or path data"
+      "Local Agent gateway URL must be an HTTPS origin (HTTP is allowed only on loopback) without credentials or path data"
     );
   }
   return url.toString();

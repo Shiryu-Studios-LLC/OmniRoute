@@ -8,8 +8,9 @@ import { coordinatorFromNamespace } from "./gatewayHttpApi";
 import type { CloudDb } from "./db";
 import { D1GatewayDeviceDirectory } from "./gatewayDevices";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
-import { consumeCloudRateLimit } from "./rateLimit";
+import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { appendCloudUsageRecord } from "./usage";
+import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
 import {
   claimGatewayIdempotency,
   completeGatewayIdempotency,
@@ -24,6 +25,8 @@ const DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CAPABILITY = /^[A-Za-z0-9_:.\/-]{1,128}$/;
 // Per tenant, allow at most 30 local capability starts in a rolling minute.
 const DEFAULT_INVOKE_RATE_LIMIT = { limit: 30, windowMs: 60_000 };
+const DEFAULT_FAILED_KEY_RATE_LIMIT = { limit: 600, windowMs: 60_000 };
+const DEFAULT_FAILED_KEY_FALLBACK_RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 
 export interface GatewayCustomerHttpApiOptions {
   db?: CloudDb;
@@ -31,6 +34,8 @@ export interface GatewayCustomerHttpApiOptions {
   now?: () => number;
   wait?: (milliseconds: number) => Promise<void>;
   rateLimit?: { limit: number; windowMs: number };
+  failedKeyRateLimit?: { limit: number; windowMs: number };
+  failedKeyFallbackRateLimit?: { limit: number; windowMs: number };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -125,12 +130,38 @@ export async function handleGatewayCustomerRequest(
   }
   const token = bearerToken(request);
   if (!token) return json({ error: "Unauthorized" }, 401);
+  const clientIpBucket = cloudflareClientIpBucket(request);
+  if (clientIpBucket) {
+    // Worker-ingress IP limiting happens before the D1 key lookup, so a
+    // stream of distinct invalid keys cannot bypass the same source bucket.
+    const rateLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: `customer-key-auth:${clientIpBucket}`,
+      ...(options.failedKeyRateLimit ?? DEFAULT_FAILED_KEY_RATE_LIMIT),
+      nowMs: options.now?.(),
+    });
+    if (!rateLimit.allowed) return json({ error: "Authentication rate limit exceeded" }, 429);
+  }
   const identity = await authenticateCloudCustomerApiKey(
     options.db,
     token,
     new Date(options.now?.() ?? Date.now()).toISOString()
   );
-  if (!identity) return json({ error: "Unauthorized" }, 401);
+  if (!identity) {
+    if (clientIpBucket) return json({ error: "Unauthorized" }, 401);
+    // Trust the Cloudflare-managed visitor IP only on Worker ingress carrying
+    // edge metadata. Non-Worker callers use the presented key as a bounded,
+    // stable fallback identity; both bucket labels are SHA-256 hashed in D1.
+    const rateLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: `customer-key-auth:${token}`,
+      ...(options.failedKeyFallbackRateLimit ?? DEFAULT_FAILED_KEY_FALLBACK_RATE_LIMIT),
+      nowMs: options.now?.(),
+    });
+    return rateLimit.allowed
+      ? json({ error: "Unauthorized" }, 401)
+      : json({ error: "Authentication rate limit exceeded" }, 429);
+  }
   const idempotencyKey = request.headers.get("idempotency-key") ?? "";
   if (!/^[A-Za-z0-9._~-]{16,128}$/.test(idempotencyKey)) {
     return json({ error: "A valid Idempotency-Key header is required" }, 400);

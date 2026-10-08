@@ -30,6 +30,15 @@ const MAX_LIMIT = 1_000_000;
 const MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BUCKET_KEY_LENGTH = 512;
 
+/** Read the visitor address only on Workers requests carrying edge `cf` metadata. */
+export function cloudflareClientIpBucket(request: Request): string | null {
+  const workerMetadata = (request as Request & { cf?: unknown }).cf;
+  if (!workerMetadata || typeof workerMetadata !== "object") return null;
+  const address = request.headers.get("cf-connecting-ip")?.trim();
+  if (!address || address.length > 45 || !/^[A-Fa-f0-9:.]+$/.test(address)) return null;
+  return `cloudflare-ip:${address.toLowerCase()}`;
+}
+
 function requireTenantId(value: string): string {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
     throw new TypeError("tenantId must be a 1–128 character identifier");

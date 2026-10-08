@@ -120,6 +120,15 @@ class TestDurableObjectNamespace implements GatewayDurableObjectNamespace<Gatewa
 function createRuntimeFixture(
   options: {
     customerInvokeRateLimit?: { limit: number; windowMs: number };
+    customerAuthFailureRateLimit?: { limit: number; windowMs: number };
+    customerAuthFailureFallbackRateLimit?: { limit: number; windowMs: number };
+    gatewayConnectRateLimit?: { limit: number; windowMs: number };
+    gatewayConnectFallbackRateLimit?: { limit: number; windowMs: number };
+    gatewayDeviceRateLimits?: {
+      heartbeat?: { limit: number; windowMs: number };
+      poll?: { limit: number; windowMs: number };
+      result?: { limit: number; windowMs: number };
+    };
     currentClock?: boolean;
   } = {}
 ) {
@@ -158,6 +167,11 @@ function createRuntimeFixture(
     },
     now: () => new Date(options.currentClock ? Date.now() : now),
     customerInvokeRateLimit: options.customerInvokeRateLimit,
+    customerAuthFailureRateLimit: options.customerAuthFailureRateLimit,
+    customerAuthFailureFallbackRateLimit: options.customerAuthFailureFallbackRateLimit,
+    gatewayConnectRateLimit: options.gatewayConnectRateLimit,
+    gatewayConnectFallbackRateLimit: options.gatewayConnectFallbackRateLimit,
+    gatewayDeviceRateLimits: options.gatewayDeviceRateLimits,
   });
   const fetch = (input: RequestInfo | URL, init?: RequestInit) =>
     runtime.fetch(input instanceof Request ? input : new Request(input, init));
@@ -763,7 +777,7 @@ test("customer invocation replays completed results only while its device remain
     };
     const rateBefore = fixture.d1.db
       .prepare(
-        "SELECT COALESCE(SUM(request_count), 0) AS request_count FROM cloud_rate_limits WHERE tenant_id = 'tenant-a'"
+        "SELECT COALESCE(SUM(request_count), 0) AS request_count FROM cloud_rate_limits WHERE tenant_id = 'tenant-a' AND limit_count = 30"
       )
       .get() as { request_count: number };
 
@@ -801,7 +815,7 @@ test("customer invocation replays completed results only while its device remain
 
     const rateLimit = fixture.d1.db
       .prepare(
-        "SELECT SUM(request_count) AS request_count FROM cloud_rate_limits WHERE tenant_id = 'tenant-a'"
+        "SELECT SUM(request_count) AS request_count FROM cloud_rate_limits WHERE tenant_id = 'tenant-a' AND limit_count = 30"
       )
       .get() as { request_count: number };
     assert.equal(
@@ -1170,6 +1184,241 @@ test("customer invocation rate limit is tenant-scoped and fails closed when D1 i
       "a pre-execution 503 must release its claim so a retry can continue through the gateway"
     );
     assert.deepEqual(await retriedResponse.json(), { error: "Device is unavailable" });
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("device poll rate limit is scoped to the registered tenant device and preserves independent devices", async () => {
+  const fixture = createRuntimeFixture({
+    gatewayDeviceRateLimits: { poll: { limit: 2, windowMs: 60_000 } },
+  });
+  try {
+    const first = await registerOnlineDevice(fixture, "tenant-a", "poll-limit-device-a");
+    const second = await registerOnlineDevice(fixture, "tenant-a", "poll-limit-device-b");
+
+    const invalidSession = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/poll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: first.session.deviceId,
+          sessionToken: "z".repeat(43),
+        }),
+      })
+    );
+    assert.equal(invalidSession.status, 401);
+    assert.equal((await first.transport.poll(first.session))?.length, 0);
+    assert.equal((await first.transport.poll(first.session))?.length, 0);
+    const throttled = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/poll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: first.session.deviceId,
+          sessionToken: first.session.sessionToken,
+        }),
+      })
+    );
+    assert.equal(throttled.status, 429);
+    assert.equal((await second.transport.poll(second.session))?.length, 0);
+
+    const row = fixture.d1.db
+      .prepare(
+        "SELECT tenant_id, bucket_hash, request_count, limit_count FROM cloud_rate_limits WHERE tenant_id = ? ORDER BY request_count DESC LIMIT 1"
+      )
+      .get("tenant-a") as
+      | { tenant_id: string; bucket_hash: string; request_count: number; limit_count: number }
+      | undefined;
+    assert.equal(row?.tenant_id, "tenant-a");
+    assert.equal(row?.request_count, 3);
+    assert.equal(row?.limit_count, 2);
+    assert.match(row?.bucket_hash ?? "", /^[a-f0-9]{64}$/);
+    assert.equal((row?.bucket_hash ?? "").includes(first.session.deviceId), false);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("device connect, heartbeat, and result routes apply independent limits", async () => {
+  const fixture = createRuntimeFixture({
+    gatewayConnectFallbackRateLimit: { limit: 1, windowMs: 60_000 },
+    gatewayDeviceRateLimits: {
+      heartbeat: { limit: 1, windowMs: 60_000 },
+      result: { limit: 1, windowMs: 60_000 },
+    },
+  });
+  try {
+    const deviceId = "route-limit-device";
+    const { session } = await registerOnlineDevice(fixture, "tenant-a", deviceId);
+    const credential = `agent-${deviceId}-credential`.padEnd(43, "x");
+    const post = (route: string, payload: unknown) =>
+      fixture.fetch(
+        new Request(`https://cloud.example.test/__gateway/v1/device/${route}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        })
+      );
+
+    assert.equal(
+      (await post("connect", { version: 1, deviceId, credential })).status,
+      429,
+      "connect retries use the bounded pre-auth bucket"
+    );
+    assert.equal(
+      (
+        await post("heartbeat", {
+          version: 1,
+          deviceId,
+          sessionToken: session.sessionToken,
+          capabilities: [],
+        })
+      ).status,
+      429,
+      "heartbeat has its own route bucket"
+    );
+    assert.equal(
+      (
+        await post("result", {
+          version: 1,
+          deviceId,
+          sessionToken: session.sessionToken,
+          requestId: "no-pending-request",
+          result: { ok: true },
+        })
+      ).status,
+      409,
+      "first result reaches normal device authorization"
+    );
+    assert.equal(
+      (
+        await post("result", {
+          version: 1,
+          deviceId,
+          sessionToken: session.sessionToken,
+          requestId: "no-pending-request",
+          result: { ok: true },
+        })
+      ).status,
+      429,
+      "result retries are limited independently"
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("unknown device IDs share the bounded local/test pre-auth fallback bucket", async () => {
+  const fixture = createRuntimeFixture({
+    gatewayConnectFallbackRateLimit: { limit: 2, windowMs: 60_000 },
+  });
+  try {
+    const connect = (deviceId: string) =>
+      fixture.fetch(
+        new Request("https://cloud.example.test/__gateway/v1/device/connect", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ version: 1, deviceId, credential: "x".repeat(43) }),
+        })
+      );
+    assert.equal((await connect("unknown-device-a")).status, 401);
+    assert.equal((await connect("unknown-device-b")).status, 401);
+    assert.equal((await connect("unknown-device-c")).status, 429);
+
+    const rows = fixture.d1.db
+      .prepare("SELECT tenant_id, bucket_hash, request_count, limit_count FROM cloud_rate_limits")
+      .all() as Array<{
+      tenant_id: string;
+      bucket_hash: string;
+      request_count: number;
+      limit_count: number;
+    }>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].tenant_id, "tenant_shiryu_admin");
+    assert.equal(rows[0].request_count, 3);
+    assert.equal(rows[0].limit_count, 2);
+    assert.match(rows[0].bucket_hash, /^[a-f0-9]{64}$/);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("repeated invalid customer API keys are rate limited without persisting the credential", async () => {
+  const fixture = createRuntimeFixture({
+    customerAuthFailureFallbackRateLimit: { limit: 2, windowMs: 60_000 },
+  });
+  try {
+    const token = `orc_live_${"a".repeat(40)}`;
+    const body = {
+      deviceId: "missing-device",
+      capability: "ollama:chat:qwen-local",
+      payload: { prompt: "hello" },
+    };
+    assert.equal((await fixture.fetch(invokeRequest(token, body))).status, 401);
+    assert.equal((await fixture.fetch(invokeRequest(token, body))).status, 401);
+    assert.equal((await fixture.fetch(invokeRequest(token, body))).status, 429);
+
+    const row = fixture.d1.db
+      .prepare(
+        "SELECT tenant_id, bucket_hash, request_count, limit_count FROM cloud_rate_limits WHERE tenant_id = ?"
+      )
+      .get("tenant_shiryu_admin") as
+      | { tenant_id: string; bucket_hash: string; request_count: number; limit_count: number }
+      | undefined;
+    assert.equal(row?.tenant_id, "tenant_shiryu_admin");
+    assert.equal(row?.request_count, 3);
+    assert.equal(row?.limit_count, 2);
+    assert.match(row?.bucket_hash ?? "", /^[a-f0-9]{64}$/);
+    assert.equal((row?.bucket_hash ?? "").includes(token), false);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("Worker auth attempts use edge IP metadata and ignore spoofed X-Forwarded-For", async () => {
+  const fixture = createRuntimeFixture({
+    customerAuthFailureRateLimit: { limit: 1, windowMs: 60_000 },
+  });
+  try {
+    const body = {
+      deviceId: "missing-device",
+      capability: "ollama:chat:qwen-local",
+      payload: { prompt: "hello" },
+    };
+    const workerRequest = (token: string, forwardedFor: string) => {
+      const source = invokeRequest(token, body);
+      const request = new Request(source, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "Idempotency-Key": `cf-ip-test-${forwardedFor.replaceAll(".", "-")}-0001`,
+          "CF-Connecting-IP": "198.51.100.24",
+          "X-Forwarded-For": forwardedFor,
+        },
+      });
+      Object.defineProperty(request, "cf", { value: { colo: "DFW" } });
+      return request;
+    };
+    assert.equal(
+      (await fixture.fetch(workerRequest(`orc_live_${"a".repeat(40)}`, "192.0.2.1"))).status,
+      401
+    );
+    assert.equal(
+      (await fixture.fetch(workerRequest(`orc_live_${"b".repeat(40)}`, "203.0.113.99"))).status,
+      429,
+      "changing X-Forwarded-For cannot bypass the edge-IP bucket"
+    );
+
+    const rows = fixture.d1.db
+      .prepare("SELECT tenant_id, bucket_hash, request_count FROM cloud_rate_limits")
+      .all() as Array<{ tenant_id: string; bucket_hash: string; request_count: number }>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].tenant_id, "tenant_shiryu_admin");
+    assert.equal(rows[0].request_count, 2);
+    assert.match(rows[0].bucket_hash, /^[a-f0-9]{64}$/);
   } finally {
     fixture.d1.db.close();
   }

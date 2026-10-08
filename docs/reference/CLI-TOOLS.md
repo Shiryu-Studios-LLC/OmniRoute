@@ -126,6 +126,9 @@ one-time credential and the required configuration variables, then run
 install updates the service configuration. Remove the service and stored credential
 with `omniroute local-agent service uninstall`.
 
+For local development, the gateway URL may use plain HTTP only when its host is
+`localhost`, `127.0.0.1`, or `[::1]`. Remote gateway URLs must use HTTPS.
+
 ## Source of Truth
 
 The unified catalog lives in `src/shared/constants/cliTools.ts` as `CLI_TOOLS: Record<string, CliCatalogEntry>`.

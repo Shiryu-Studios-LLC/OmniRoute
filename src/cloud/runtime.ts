@@ -20,6 +20,16 @@ export interface CloudRuntimeOptions {
   now?: () => Date;
   adminRateLimit?: { limit: number; windowMs: number };
   customerInvokeRateLimit?: { limit: number; windowMs: number };
+  customerAuthFailureRateLimit?: { limit: number; windowMs: number };
+  customerAuthFailureFallbackRateLimit?: { limit: number; windowMs: number };
+  gatewayConnectRateLimit?: { limit: number; windowMs: number };
+  gatewayConnectFallbackRateLimit?: { limit: number; windowMs: number };
+  gatewayDeviceRateLimits?: {
+    connect?: { limit: number; windowMs: number };
+    heartbeat?: { limit: number; windowMs: number };
+    poll?: { limit: number; windowMs: number };
+    result?: { limit: number; windowMs: number };
+  };
 }
 
 export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
@@ -125,6 +135,9 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             db: options.env?.DB,
             sessions: options.env?.GATEWAY_SESSIONS,
             now: () => now().getTime(),
+            connectRateLimit: options.gatewayConnectRateLimit,
+            connectFallbackRateLimit: options.gatewayConnectFallbackRateLimit,
+            rateLimits: options.gatewayDeviceRateLimits,
           });
         } catch {
           return Response.json(
@@ -141,6 +154,8 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             sessions: options.env?.GATEWAY_SESSIONS,
             now: () => now().getTime(),
             rateLimit: options.customerInvokeRateLimit,
+            failedKeyRateLimit: options.customerAuthFailureRateLimit,
+            failedKeyFallbackRateLimit: options.customerAuthFailureFallbackRateLimit,
           });
         } catch {
           return Response.json(
