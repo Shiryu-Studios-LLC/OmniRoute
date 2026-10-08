@@ -3,6 +3,7 @@ import { handleCloudApiRequest } from "./httpApi";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
+import { handleCloudTenantOidcAuthRequest } from "./tenantOidcAuth";
 import type {
   GatewayCoordinatorStub,
   GatewayDurableObjectNamespace,
@@ -16,6 +17,7 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
+  OMNIROUTE_CLOUD_PUBLIC_ORIGIN?: string;
   GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
 }
 
@@ -40,6 +42,8 @@ export interface CloudRuntimeOptions {
     poll?: { limit: number; windowMs: number };
     result?: { limit: number; windowMs: number };
   };
+  gatewayPairingExchangeRateLimit?: { limit: number; windowMs: number };
+  gatewayPairingIssueRateLimit?: { limit: number; windowMs: number };
 }
 
 export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
@@ -48,6 +52,30 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
   return {
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
+
+      if (
+        url.pathname === "/__cloud/auth/oidc/login" ||
+        url.pathname === "/__cloud/auth/oidc/callback" ||
+        url.pathname === "/__cloud/auth/session"
+      ) {
+        try {
+          const response = await handleCloudTenantOidcAuthRequest(request, {
+            db: options.env?.DB,
+            publicOrigin: options.env?.OMNIROUTE_CLOUD_PUBLIC_ORIGIN,
+            environment: options.env?.OMNIROUTE_ENV,
+            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            now: () => now().getTime(),
+            fetcher: options.fetcher,
+          });
+          if (response) return response;
+          return new Response("Not Found", { status: 404 });
+        } catch {
+          return Response.json(
+            { error: "Customer identity request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
 
       if (request.method === "GET" && url.pathname === "/__cloud/health") {
         return Response.json(
@@ -170,6 +198,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             connectRateLimit: options.gatewayConnectRateLimit,
             connectFallbackRateLimit: options.gatewayConnectFallbackRateLimit,
             rateLimits: options.gatewayDeviceRateLimits,
+            pairingExchangeRateLimit: options.gatewayPairingExchangeRateLimit,
           });
         } catch {
           return Response.json(
@@ -188,6 +217,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             rateLimit: options.customerInvokeRateLimit,
             failedKeyRateLimit: options.customerAuthFailureRateLimit,
             failedKeyFallbackRateLimit: options.customerAuthFailureFallbackRateLimit,
+            pairingIssueRateLimit: options.gatewayPairingIssueRateLimit,
           });
         } catch {
           return Response.json(

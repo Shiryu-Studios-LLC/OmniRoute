@@ -1,9 +1,262 @@
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { randomBytes } from "node:crypto";
+import { homedir, userInfo } from "node:os";
+import { join } from "node:path";
 import { installLocalAgentSystemd, uninstallLocalAgentSystemd } from "../localAgentSystemd.mjs";
 import { installLocalAgentLaunchd, uninstallLocalAgentLaunchd } from "../localAgentLaunchd.mjs";
 
 const DEFAULT_CREDENTIAL_ENV = "SHIRYU_LOCAL_AGENT_CREDENTIAL";
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const CREDENTIAL_ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const DEVICE_CREDENTIAL_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+function configPath(home = homedir()) {
+  return join(realpathSync(home), ".config", "omniroute", "local-agent.json");
+}
+
+function currentUid() {
+  return typeof process.getuid === "function" ? process.getuid() : userInfo().uid;
+}
+
+function readPairedConfig(home = homedir()) {
+  if (process.platform === "win32") return null;
+  const canonicalHome = realpathSync(home);
+  const ownerUid = currentUid();
+  let directory = canonicalHome;
+  for (const [index, component] of [".config", "omniroute"].entries()) {
+    directory = join(directory, component);
+    let directoryStats;
+    try {
+      directoryStats = lstatSync(directory);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw new Error("Could not safely inspect the Local Agent pairing directory");
+    }
+    if (
+      !directoryStats.isDirectory() ||
+      directoryStats.isSymbolicLink() ||
+      directoryStats.uid !== ownerUid ||
+      (directoryStats.mode & (index === 1 ? 0o077 : 0o022)) !== 0
+    ) {
+      throw new Error("Local Agent pairing directory has unsafe ownership or permissions");
+    }
+  }
+  const filePath = join(directory, "local-agent.json");
+  let fd;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error("Could not safely open the Local Agent pairing config");
+  }
+  try {
+    const stats = fstatSync(fd);
+    if (
+      !stats.isFile() ||
+      stats.nlink !== 1 ||
+      stats.uid !== currentUid() ||
+      (stats.mode & 0o077) !== 0
+    ) {
+      throw new Error("Local Agent pairing config must be current-user-owned with mode 0600");
+    }
+    const parsed = JSON.parse(readFileSync(fd, "utf8"));
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.gatewayUrl !== "string" ||
+      typeof parsed.deviceId !== "string" ||
+      typeof parsed.credential !== "string"
+    ) {
+      throw new Error("Local Agent pairing config is invalid");
+    }
+    return parsed;
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error("Local Agent pairing config is invalid");
+    throw error;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function ensurePrivatePairingDirectory(home) {
+  if (process.platform === "win32") {
+    throw new Error(
+      "Local Agent pairing is not supported on Windows; configure the credential manually"
+    );
+  }
+  const canonicalHome = realpathSync(home);
+  const ownerUid = currentUid();
+  const homeStats = lstatSync(canonicalHome);
+  if (!homeStats.isDirectory() || homeStats.isSymbolicLink() || homeStats.uid !== ownerUid) {
+    throw new Error("Local Agent home must be a current-user-owned directory");
+  }
+  let currentPath = canonicalHome;
+  for (const component of [".config", "omniroute"]) {
+    currentPath = join(currentPath, component);
+    try {
+      mkdirSync(currentPath, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stats = lstatSync(currentPath);
+    if (
+      !stats.isDirectory() ||
+      stats.isSymbolicLink() ||
+      stats.uid !== ownerUid ||
+      (stats.mode & 0o022) !== 0
+    ) {
+      throw new Error("Local Agent pairing directory must be private and current-user-owned");
+    }
+    chmodSync(currentPath, 0o700);
+  }
+  return canonicalHome;
+}
+
+function writePairedConfig(config, home = homedir()) {
+  const canonicalHome = ensurePrivatePairingDirectory(home);
+  const filePath = configPath(canonicalHome);
+  try {
+    const stats = lstatSync(filePath);
+    if (
+      !stats.isFile() ||
+      stats.isSymbolicLink() ||
+      stats.nlink !== 1 ||
+      stats.uid !== currentUid() ||
+      (stats.mode & 0o077) !== 0
+    ) {
+      throw new Error("Refusing to replace an unsafe Local Agent pairing config");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  let fd;
+  try {
+    fd = openSync(
+      temporaryPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600
+    );
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temporaryPath, filePath);
+    chmodSync(filePath, 0o600);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+async function readPairingCode(stdin, stdout) {
+  if (stdin.isTTY && typeof stdin.setRawMode === "function") {
+    stdout.write("Enter the one-time Local Agent pairing code: ");
+    return await new Promise((resolve, reject) => {
+      let value = "";
+      const wasPaused = stdin.isPaused?.() ?? false;
+      stdin.setRawMode(true);
+      stdin.resume();
+      const finish = (error, result) => {
+        stdin.off("data", onData);
+        stdin.setRawMode(false);
+        if (wasPaused) stdin.pause();
+        stdout.write("\n");
+        if (error) reject(error);
+        else resolve(result);
+      };
+      const onData = (chunk) => {
+        for (const character of Buffer.from(chunk).toString("utf8")) {
+          if (character === "\u0003") return finish(new Error("Pairing cancelled"));
+          if (character === "\r" || character === "\n") return finish(null, value);
+          if (character === "\u007f" || character === "\b") value = value.slice(0, -1);
+          else if (value.length < 64) value += character;
+        }
+      };
+      stdin.on("data", onData);
+    });
+  }
+  let value = "";
+  for await (const chunk of stdin) {
+    value += Buffer.from(chunk).toString("utf8");
+    if (value.length > 128) throw new Error("Invalid pairing code input");
+  }
+  return value.trim();
+}
+
+export async function pairLocalAgentCommand(
+  options = {},
+  {
+    env = process.env,
+    stdin = process.stdin,
+    stdout = process.stdout,
+    fetcher = globalThis.fetch,
+    home = env.HOME || homedir(),
+    readCode = readPairingCode,
+  } = {}
+) {
+  if (process.platform === "win32") {
+    throw new Error(
+      "Local Agent pairing is not supported on Windows; configure the credential manually"
+    );
+  }
+  const gatewayUrl = parseGatewayUrl(
+    requiredValue(options.gatewayUrl, env.SHIRYU_LOCAL_AGENT_GATEWAY_URL, "gateway URL")
+  );
+  const code = (await readCode(stdin, stdout)).trim();
+  if (!PAIRING_CODE_PATTERN.test(code)) throw new Error("Invalid Local Agent pairing code");
+  const response = await fetcher(new URL("/__gateway/v1/device/pair", gatewayUrl), {
+    method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ version: 1, pairingCode: code }),
+  });
+  const advertisedLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(advertisedLength) && advertisedLength > 4_096) {
+    throw new Error("Local Agent pairing response exceeds the size limit");
+  }
+  const responseText = await response.text();
+  if (Buffer.byteLength(responseText, "utf8") > 4_096) {
+    throw new Error("Local Agent pairing response exceeds the size limit");
+  }
+  let body;
+  try {
+    body = JSON.parse(responseText);
+  } catch {
+    body = null;
+  }
+  if (
+    !response.ok ||
+    !body ||
+    body.version !== 1 ||
+    typeof body.deviceId !== "string" ||
+    !DEVICE_ID_PATTERN.test(body.deviceId) ||
+    typeof body.credential !== "string" ||
+    !DEVICE_CREDENTIAL_PATTERN.test(body.credential)
+  ) {
+    throw new Error("Local Agent pairing could not be completed");
+  }
+  const filePath = configPath(home);
+  writePairedConfig({ gatewayUrl, deviceId: body.deviceId, credential: body.credential }, home);
+  stdout.write(`Local Agent paired as ${body.deviceId}. Credential saved to ${filePath}.\n`);
+  return { deviceId: body.deviceId, configPath: filePath };
+}
 
 function requiredValue(value, envValue, label) {
   const resolved = typeof value === "string" && value.trim() ? value.trim() : envValue?.trim();
@@ -113,17 +366,30 @@ function parseMcpServers(value) {
 
 /** Resolve process configuration without persisting or displaying the credential. */
 export function resolveLocalAgentConfig(options = {}, env = process.env) {
-  const gatewayUrl = parseGatewayUrl(
-    requiredValue(options.gatewayUrl, env.SHIRYU_LOCAL_AGENT_GATEWAY_URL, "gateway URL")
-  );
-  const deviceId = requiredValue(options.deviceId, env.SHIRYU_LOCAL_AGENT_DEVICE_ID, "device ID");
-  if (!DEVICE_ID_PATTERN.test(deviceId)) throw new Error("Invalid Local Agent device ID");
-
   const credentialEnv = options.credentialEnv || DEFAULT_CREDENTIAL_ENV;
   if (!CREDENTIAL_ENV_PATTERN.test(credentialEnv)) {
     throw new Error("Invalid Local Agent credential environment variable name");
   }
-  const credential = env[credentialEnv];
+  const needsStoredConfig =
+    !(options.gatewayUrl || env.SHIRYU_LOCAL_AGENT_GATEWAY_URL) ||
+    !(options.deviceId || env.SHIRYU_LOCAL_AGENT_DEVICE_ID) ||
+    !env[credentialEnv];
+  const pairedConfig = needsStoredConfig ? readPairedConfig(env.HOME || homedir()) : null;
+  const gatewayUrl = parseGatewayUrl(
+    requiredValue(
+      options.gatewayUrl,
+      env.SHIRYU_LOCAL_AGENT_GATEWAY_URL ?? pairedConfig?.gatewayUrl,
+      "gateway URL"
+    )
+  );
+  const deviceId = requiredValue(
+    options.deviceId,
+    env.SHIRYU_LOCAL_AGENT_DEVICE_ID ?? pairedConfig?.deviceId,
+    "device ID"
+  );
+  if (!DEVICE_ID_PATTERN.test(deviceId)) throw new Error("Invalid Local Agent device ID");
+
+  const credential = env[credentialEnv] ?? pairedConfig?.credential;
   if (typeof credential !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(credential)) {
     throw new Error(`Set a valid one-time device credential in ${credentialEnv}`);
   }
@@ -180,6 +446,19 @@ export function registerLocalAgent(program) {
   const localAgent = program
     .command("local-agent")
     .description("Manage a tenant-registered outbound Local Agent");
+
+  localAgent
+    .command("pair")
+    .description("Pair this Local Agent with a short-lived customer pairing code")
+    .option("--gateway-url <url>", "HTTPS gateway base URL (or SHIRYU_LOCAL_AGENT_GATEWAY_URL)")
+    .action(async (options) => {
+      try {
+        await pairLocalAgentCommand(options);
+      } catch {
+        process.stderr.write("Local Agent pairing failed; check the gateway and pairing code.\n");
+        process.exitCode = 1;
+      }
+    });
 
   localAgent
     .command("run")

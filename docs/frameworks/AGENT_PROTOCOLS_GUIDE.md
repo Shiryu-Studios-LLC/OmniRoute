@@ -162,6 +162,35 @@ DELETE /api/v1/agents/tasks/[id]
 
 See [CLOUD_AGENT.md](./CLOUD_AGENT.md) for the `CloudAgentBase` contract, per-agent specifics, schema details, and credential plumbing endpoints.
 
+## 4. Customer Local Agent
+
+The customer Local Agent is an outbound-only device connection for customer-managed
+Ollama, ComfyUI, and MCP capabilities. A tenant owner or admin API key creates a
+five-minute pairing code at `POST /__gateway/v1/customer/local-agent/pairings` with
+an empty JSON object. The CLI reads that one-time code from a hidden terminal prompt
+or stdin and exchanges it at `POST /__gateway/v1/device/pair`. The Worker consumes
+the code once, derives the tenant from the issuing membership, and returns a new
+device ID and credential with `Cache-Control: no-store`.
+
+Pair and start the agent with:
+
+```bash
+omniroute local-agent pair --gateway-url https://connect.example.test
+omniroute local-agent run
+```
+
+Pairing saves the device ID and credential in
+`~/.config/omniroute/local-agent.json` with POSIX mode `0600`. Linux/macOS service
+installation can then read that saved configuration. Existing explicit environment
+variables for `local-agent run` remain supported. Windows pairing is currently
+unsupported; configure the device ID and credential through the existing environment
+variables on that platform.
+
+Only owner/admin roles can issue codes; member/viewer roles are denied. Pairing codes
+are stored and audited only by SHA-256 digest, rate-limited, single-use, and removed
+after expiry. See `src/cloud/gatewayCustomerHttpApi.ts`, `src/cloud/gatewayHttpApi.ts`,
+and `bin/cli/commands/local-agent.mjs` for the current route and CLI behavior.
+
 ## Comparison: A2A vs Cloud Agents
 
 Both have "long-running tasks" but at different layers:

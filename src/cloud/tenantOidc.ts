@@ -1,5 +1,9 @@
 import type { CloudDb } from "./db";
-import { encryptCloudCredential, isCloudCredentialEnvelope } from "./credentialEncryption";
+import {
+  decryptCloudCredential,
+  encryptCloudCredential,
+  isCloudCredentialEnvelope,
+} from "./credentialEncryption";
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const DEFAULT_SCOPES = ["openid", "profile", "email"];
@@ -24,6 +28,10 @@ export interface CloudTenantOidcIdentity {
   principalId: string;
   role: "owner" | "admin" | "member" | "viewer";
   createdAt: string;
+}
+
+export interface CloudTenantOidcCredentials extends CloudTenantOidcConfig {
+  clientSecret: string;
 }
 
 interface ConfigRow {
@@ -154,6 +162,29 @@ export async function getCloudTenantOidcConfig(
     .bind(tenantId)
     .first();
   return row ? mapConfig(row) : null;
+}
+
+/** Read decrypted credentials only inside the Worker auth flow for an enabled config. */
+export async function getCloudTenantOidcCredentials(
+  db: CloudDb,
+  encryptionKey: string | undefined,
+  tenantId: string
+): Promise<CloudTenantOidcCredentials | null> {
+  requireId(tenantId, "tenantId");
+  const row = await db
+    .prepare<ConfigRow>("SELECT * FROM cloud_tenant_oidc_configs WHERE tenant_id = ? LIMIT 1")
+    .bind(tenantId)
+    .first();
+  if (!row || row.is_enabled !== 1) return null;
+  if (!isCloudCredentialEnvelope(row.client_secret_encrypted)) {
+    throw new Error("Tenant OIDC client secret is not encrypted");
+  }
+  const clientSecret = await decryptCloudCredential(row.client_secret_encrypted, encryptionKey, {
+    tenantId,
+    connectionId: "tenant-oidc",
+    field: "clientSecret",
+  });
+  return { ...mapConfig(row), clientSecret };
 }
 
 export async function setCloudTenantOidcConfig(
@@ -294,6 +325,47 @@ export async function listCloudTenantOidcIdentities(
     role: row.role,
     createdAt: row.created_at,
   }));
+}
+
+/** Resolve only an exact external subject mapped to a currently active member. */
+export async function getActiveCloudTenantOidcIdentity(
+  db: CloudDb,
+  input: { tenantId: string; issuer: string; subject: string }
+): Promise<CloudTenantOidcIdentity | null> {
+  const tenantId = requireId(input.tenantId, "tenantId");
+  const issuer = requireIssuer(input.issuer);
+  if (typeof input.subject !== "string" || input.subject.length < 1 || input.subject.length > 512) {
+    return null;
+  }
+  const row = await db
+    .prepare<IdentityRow>(
+      `SELECT identity.id, identity.tenant_id, identity.issuer, identity.subject,
+              identity.membership_id, membership.principal_id, membership.role, identity.created_at
+         FROM cloud_tenant_oidc_identities AS identity
+         JOIN cloud_tenant_oidc_configs AS config
+           ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
+          AND config.is_enabled = 1
+         JOIN cloud_customer_memberships AS membership
+           ON membership.tenant_id = identity.tenant_id AND membership.id = identity.membership_id
+          AND membership.is_active = 1
+         JOIN tenants AS tenant
+           ON tenant.id = identity.tenant_id AND tenant.kind = 'customer' AND tenant.is_active = 1
+        WHERE identity.tenant_id = ? AND identity.issuer = ? AND identity.subject = ?
+        LIMIT 1`
+    )
+    .bind(tenantId, issuer, input.subject)
+    .first();
+  if (!row) return null;
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    issuer: row.issuer,
+    subject: row.subject,
+    membershipId: row.membership_id,
+    principalId: row.principal_id,
+    role: row.role,
+    createdAt: row.created_at,
+  };
 }
 
 export async function addCloudTenantOidcIdentity(

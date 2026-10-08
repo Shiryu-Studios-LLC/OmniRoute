@@ -7,6 +7,8 @@ import { D1GatewayDeviceDirectory } from "./gatewayDevices";
 import type { CloudDb } from "./db";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
+import { consumeCloudGatewayPairing, hashGatewayPairingCode } from "./gatewayPairing";
+import { appendCloudComplianceAudit } from "./complianceAudit";
 
 const DEFAULT_DEVICE_RATE_LIMITS = {
   heartbeat: { limit: 90, windowMs: 60_000 },
@@ -34,6 +36,7 @@ export interface GatewayDeviceHttpApiOptions {
   rateLimits?: Partial<
     Record<keyof typeof DEFAULT_DEVICE_RATE_LIMITS, { limit: number; windowMs: number }>
   >;
+  pairingExchangeRateLimit?: { limit: number; windowMs: number };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -163,6 +166,61 @@ export async function handleGatewayDeviceRequest(
   }
   const body = await readJson(request);
   if (!body) return json({ error: "Invalid or oversized JSON body" }, 400);
+  if (path === `${PREFIX}/pair`) {
+    if (
+      body.version !== VERSION ||
+      !exactKeys(body, ["version", "pairingCode"]) ||
+      typeof body.pairingCode !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(body.pairingCode)
+    ) {
+      return json({ error: "Invalid device pairing request" }, 400);
+    }
+    const clientIpBucket = cloudflareClientIpBucket(request);
+    const rateLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: clientIpBucket
+        ? `gateway-device-pairing:exchange:${clientIpBucket}`
+        : "gateway-device-pairing:exchange:fallback",
+      ...(options.pairingExchangeRateLimit ??
+        (clientIpBucket ? { limit: 20, windowMs: 60_000 } : { limit: 100, windowMs: 60_000 })),
+      nowMs: options.now?.(),
+    });
+    if (!rateLimit.allowed) return json({ error: "Device pairing rate limit exceeded" }, 429);
+    const codeLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: `gateway-device-pairing:code:${await hashGatewayPairingCode(body.pairingCode)}`,
+      limit: 10,
+      windowMs: 60 * 60_000,
+      nowMs: options.now?.(),
+    });
+    if (!codeLimit.allowed) return json({ error: "Device pairing rate limit exceeded" }, 429);
+    const paired = await consumeCloudGatewayPairing(options.db, {
+      code: body.pairingCode,
+      now: new Date(options.now?.() ?? Date.now()).toISOString(),
+    });
+    if (!paired) {
+      try {
+        const pairingHash = await hashGatewayPairingCode(body.pairingCode);
+        await appendCloudComplianceAudit(options.db, {
+          id: crypto.randomUUID(),
+          tenantId: CLOUD_PLATFORM_TENANT_ID,
+          timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+          action: "gateway.device.pair.exchange",
+          target: pairingHash,
+          resourceType: "gateway-device-pairing",
+          status: "denied",
+          metadata: { pairingHash },
+        });
+      } catch {
+        return json({ error: "Device pairing audit is unavailable" }, 503);
+      }
+      return json({ error: "Device pairing code is invalid, expired, or already used" }, 401);
+    }
+    return json(
+      { version: VERSION, deviceId: paired.deviceId, credential: paired.credential },
+      201
+    );
+  }
   const gateway = createConnectorGateway({
     directory: new D1GatewayDeviceDirectory(options.db),
     coordinator: coordinatorFromNamespace(options.sessions),

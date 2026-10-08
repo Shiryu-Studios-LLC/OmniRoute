@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
 import type {
@@ -17,6 +19,8 @@ import {
   issueCloudCustomerApiKey,
 } from "../../src/cloud/customerIdentity";
 import { createHttpLocalAgentGatewayTransport } from "../../src/lib/localAgent/httpGatewayTransport";
+import { pairLocalAgentCommand } from "../../bin/cli/commands/local-agent.mjs";
+import { cleanupExpiredCloudGatewayPairings } from "../../src/cloud/gatewayPairing";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 
 class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
@@ -66,7 +70,16 @@ class SqliteD1 implements CloudDb {
   }
 
   async batch(statements: CloudDbStatement[]): Promise<unknown[]> {
-    return statements;
+    const results: unknown[] = [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const statement of statements) results.push(await statement.run());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async exec(sql: string): Promise<unknown> {
@@ -129,6 +142,8 @@ function createRuntimeFixture(
       poll?: { limit: number; windowMs: number };
       result?: { limit: number; windowMs: number };
     };
+    gatewayPairingIssueRateLimit?: { limit: number; windowMs: number };
+    gatewayPairingExchangeRateLimit?: { limit: number; windowMs: number };
     currentClock?: boolean;
   } = {}
 ) {
@@ -141,6 +156,7 @@ function createRuntimeFixture(
     "0005_cloud_customer_identity.sql",
     "0006_gateway_invocation_idempotency.sql",
     "0007_gateway_device_service_health.sql",
+    "0017_cloud_gateway_pairings.sql",
   ]) {
     d1.db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -172,6 +188,8 @@ function createRuntimeFixture(
     gatewayConnectRateLimit: options.gatewayConnectRateLimit,
     gatewayConnectFallbackRateLimit: options.gatewayConnectFallbackRateLimit,
     gatewayDeviceRateLimits: options.gatewayDeviceRateLimits,
+    gatewayPairingIssueRateLimit: options.gatewayPairingIssueRateLimit,
+    gatewayPairingExchangeRateLimit: options.gatewayPairingExchangeRateLimit,
   });
   const fetch = (input: RequestInfo | URL, init?: RequestInit) =>
     runtime.fetch(input instanceof Request ? input : new Request(input, init));
@@ -196,6 +214,204 @@ async function customerKey(
     now: fixture.now,
   });
 }
+
+function pairingIssueRequest(token: string): Request {
+  return new Request("https://cloud.example.test/__gateway/v1/customer/local-agent/pairings", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: "{}",
+  });
+}
+
+test("customer owner can pair a Local Agent once; code and device stay tenant-bound", async () => {
+  const fixture = createRuntimeFixture();
+  const home = mkdtempSync(join(tmpdir(), "omniroute-worker-agent-pair-"));
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const issue = await fixture.fetch(pairingIssueRequest(owner.token));
+    assert.equal(issue.status, 201);
+    assert.equal(issue.headers.get("cache-control"), "no-store");
+    const issued = (await issue.json()) as { pairingCode: string; expiresAt: string };
+    assert.match(issued.pairingCode, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(Date.parse(issued.expiresAt), Date.parse(fixture.now) + 5 * 60_000);
+    const storedPairing = fixture.d1.db
+      .prepare("SELECT code_hash, consumed_at FROM cloud_gateway_pairings WHERE tenant_id = ?")
+      .get("tenant-a") as { code_hash: string; consumed_at: string | null };
+    assert.equal(
+      storedPairing.code_hash,
+      createHash("sha256").update(issued.pairingCode).digest("hex")
+    );
+    assert.equal(storedPairing.consumed_at, null);
+    assert.notEqual(storedPairing.code_hash, issued.pairingCode);
+
+    fixture.d1.db.exec(`CREATE TRIGGER fail_pair_exchange_audit
+      BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action = 'gateway.device.pair.exchange'
+      BEGIN SELECT RAISE(ABORT, 'pair audit unavailable'); END`);
+    const failedAtomicExchange = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ version: 1, pairingCode: issued.pairingCode }),
+      })
+    );
+    assert.equal(failedAtomicExchange.status, 503);
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare("SELECT consumed_at FROM cloud_gateway_pairings WHERE code_hash = ?")
+          .get(storedPairing.code_hash) as { consumed_at: string | null }
+      ).consumed_at,
+      null,
+      "audit failure rolls back code consumption"
+    );
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM cloud_gateway_devices WHERE tenant_id = 'tenant-a'"
+          )
+          .get() as { count: number }
+      ).count,
+      0,
+      "audit failure rolls back device creation"
+    );
+    fixture.d1.db.exec("DROP TRIGGER fail_pair_exchange_audit");
+    let output = "";
+    let exchangeCacheControl: string | null = null;
+    const paired = await pairLocalAgentCommand(
+      { gatewayUrl: "https://cloud.example.test" },
+      {
+        env: { HOME: home },
+        home,
+        readCode: async () => issued.pairingCode,
+        stdout: { write: (value: string) => (output += value) },
+        fetcher: async (input, init) => {
+          const response = await fixture.fetch(input, init);
+          exchangeCacheControl = response.headers.get("cache-control");
+          return response;
+        },
+      }
+    );
+    assert.equal(exchangeCacheControl, "no-store");
+    const codeBucketHash = createHash("sha256")
+      .update(`gateway-device-pairing:code:${storedPairing.code_hash}`)
+      .digest("hex");
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare("SELECT COUNT(*) AS count FROM cloud_rate_limits WHERE bucket_hash = ?")
+          .get(codeBucketHash) as { count: number }
+      ).count,
+      1,
+      "rate-limit storage uses the pairing code digest, never its raw value"
+    );
+    const rawCodeBucketHash = createHash("sha256")
+      .update(`gateway-device-pairing:code:${issued.pairingCode}`)
+      .digest("hex");
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare("SELECT COUNT(*) AS count FROM cloud_rate_limits WHERE bucket_hash = ?")
+          .get(rawCodeBucketHash) as { count: number }
+      ).count,
+      0,
+      "raw pairing code is absent from rate-limit bucket derivation"
+    );
+    assert.equal(output.includes(issued.pairingCode), false);
+    const device = fixture.d1.db
+      .prepare("SELECT tenant_id, credential_hash FROM cloud_gateway_devices WHERE id = ?")
+      .get(paired.deviceId) as { tenant_id: string; credential_hash: string };
+    assert.equal(device.tenant_id, "tenant-a");
+    assert.equal(device.credential_hash.length, 64);
+    assert.equal(statSync(paired.configPath).mode & 0o777, 0o600);
+
+    const replay = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ version: 1, pairingCode: issued.pairingCode }),
+      })
+    );
+    assert.equal(replay.status, 401);
+    assert.equal(replay.headers.get("cache-control"), "no-store");
+    const foreignRead = await fixture.fetch(
+      adminRequest(`/__cloud/v1/tenants/tenant-b/gateway-devices/${paired.deviceId}`, "GET")
+    );
+    assert.equal(foreignRead.status, 404);
+
+    const audits = fixture.d1.db
+      .prepare(
+        `SELECT action, target, metadata_json FROM cloud_compliance_audit
+          WHERE tenant_id = 'tenant-a' AND action LIKE 'gateway.device.pair.%' ORDER BY action`
+      )
+      .all() as Array<{ action: string; target: string; metadata_json: string }>;
+    assert.deepEqual(
+      audits.map((row) => row.action),
+      ["gateway.device.pair.exchange", "gateway.device.pair.issue"]
+    );
+    assert.ok(audits.every((row) => row.target !== issued.pairingCode));
+    assert.ok(
+      audits.every((row) => JSON.parse(row.metadata_json).pairingHash === storedPairing.code_hash)
+    );
+    const deniedReplayAudit = fixture.d1.db
+      .prepare(
+        `SELECT target, metadata_json FROM cloud_compliance_audit
+          WHERE tenant_id = 'tenant_shiryu_admin'
+            AND action = 'gateway.device.pair.exchange' AND status = 'denied' LIMIT 1`
+      )
+      .get() as { target: string; metadata_json: string };
+    assert.equal(deniedReplayAudit.target, storedPairing.code_hash);
+    assert.equal(JSON.parse(deniedReplayAudit.metadata_json).pairingHash, storedPairing.code_hash);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Local Agent pairing denies member/viewer roles and rate-limits owners", async () => {
+  const fixture = createRuntimeFixture({
+    gatewayPairingIssueRateLimit: { limit: 1, windowMs: 60_000 },
+  });
+  const member = await customerKey(fixture, "tenant-a", "member");
+  const viewer = await customerKey(fixture, "tenant-b", "viewer");
+  const admin = await customerKey(fixture, "tenant-b", "admin");
+  assert.equal((await fixture.fetch(pairingIssueRequest(member.token))).status, 403);
+  assert.equal((await fixture.fetch(pairingIssueRequest(viewer.token))).status, 403);
+  assert.equal((await fixture.fetch(pairingIssueRequest(admin.token))).status, 201);
+  const owner = await customerKey(fixture, "tenant-a", "owner");
+  assert.equal((await fixture.fetch(pairingIssueRequest(owner.token))).status, 201);
+  assert.equal((await fixture.fetch(pairingIssueRequest(owner.token))).status, 429);
+});
+
+test("expired Local Agent pairing grants are deleted in a bounded cleanup", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const issue = await fixture.fetch(pairingIssueRequest(owner.token));
+    const pairing = (await issue.json()) as { pairingCode: string };
+    const codeHash = createHash("sha256").update(pairing.pairingCode).digest("hex");
+    fixture.d1.db
+      .prepare("UPDATE cloud_gateway_pairings SET expires_at = ? WHERE code_hash = ?")
+      .run("2026-10-08T11:59:00.000Z", codeHash);
+    assert.equal(
+      await cleanupExpiredCloudGatewayPairings(fixture.d1, {
+        now: "2026-10-08T12:00:00.000Z",
+        batchSize: 1,
+      }),
+      1
+    );
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare("SELECT COUNT(*) AS count FROM cloud_gateway_pairings WHERE code_hash = ?")
+          .get(codeHash) as { count: number }
+      ).count,
+      0
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
 
 function invokeRequest(
   token: string,
@@ -1006,7 +1222,7 @@ test("a result-audit failure retries from the completed device request without i
   }
 });
 
-test("device revocation makes an idempotent operation terminal and replayable", async () => {
+test("device revocation makes an idempotent operation terminal and clears its queued request", async () => {
   const fixture = createRuntimeFixture();
   try {
     const owner = await customerKey(fixture, "tenant-a", "owner");
@@ -1040,7 +1256,7 @@ test("device revocation makes an idempotent operation terminal and replayable", 
     const stored = fixture.sessions
       .get("device-revoke-invoke")
       .getRequest("device-revoke-invoke", requests![0].requestId, fixture.now);
-    assert.ok(await stored);
+    assert.equal(await stored, null);
   } finally {
     fixture.d1.db.close();
   }

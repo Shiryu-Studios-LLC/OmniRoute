@@ -34,7 +34,7 @@ export const CLOUD_INFERENCE_GENERATION_TIMEOUT_MS = 30_000;
 const DEFAULT_CUSTOMER_RATE_LIMIT = { limit: 20, windowMs: 60_000 };
 const DEFAULT_FAILED_KEY_RATE_LIMIT = { limit: 600, windowMs: 60_000 };
 const DEFAULT_FAILED_KEY_FALLBACK_RATE_LIMIT = { limit: 10, windowMs: 60_000 };
-const ALLOWED_BODY_FIELDS = new Set(["model", "messages", "max_completion_tokens"]);
+const ALLOWED_BODY_FIELDS = new Set(["model", "messages", "max_completion_tokens", "stream"]);
 const encoder = new TextEncoder();
 
 export interface CloudInferenceCustomerHttpApiOptions {
@@ -54,6 +54,7 @@ export interface CloudInferenceCustomerHttpApiOptions {
 interface CustomerRequest {
   model: string;
   message: string;
+  stream: boolean;
   maxOutputTokens?: number;
 }
 
@@ -84,12 +85,15 @@ function json(body: unknown, status = 200, requestId?: string): Response {
   return Response.json(body, { status, headers });
 }
 
-function storedResponse(body: string, status: number, requestId: string): Response {
+function storedResponse(body: string, status: number, requestId: string, stream = false): Response {
   return new Response(body, {
     status,
     headers: {
       "Cache-Control": "no-store",
-      "Content-Type": "application/json; charset=utf-8",
+      "Content-Type":
+        stream && body.startsWith("data:")
+          ? "text/event-stream; charset=utf-8"
+          : "application/json; charset=utf-8",
       "X-Request-ID": requestId,
     },
   });
@@ -195,9 +199,11 @@ function parseCustomerRequest(body: Record<string, unknown>): CustomerRequest | 
       return null;
     }
   }
+  if (body.stream !== undefined && typeof body.stream !== "boolean") return null;
   return {
     model: CLOUD_INFERENCE_MODEL,
     message: content,
+    stream: body.stream === true,
     ...(body.max_completion_tokens === undefined
       ? {}
       : { maxOutputTokens: body.max_completion_tokens as number }),
@@ -392,6 +398,389 @@ function requestHeaders(apiKey: string): HeadersInit {
   };
 }
 
+function sseData(value: unknown): string {
+  return `data: ${JSON.stringify(value)}\n\n`;
+}
+
+function chatChunk(
+  requestId: string,
+  created: number,
+  delta: Record<string, unknown>,
+  finishReason: string | null = null
+): string {
+  return sseData({
+    id: `chatcmpl_${requestId.replace(/-/g, "")}`,
+    object: "chat.completion.chunk",
+    created,
+    model: CLOUD_INFERENCE_MODEL,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  });
+}
+
+function parseSseFrame(frame: string): { event: string; data: string } | null {
+  let event = "message";
+  const data: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  return data.length ? { event, data: data.join("\n") } : null;
+}
+
+function streamErrorBody(message: string): string {
+  return sseData({ error: { message, type: "cloud_inference_error" } });
+}
+
+interface CloudStreamInput {
+  options: CloudInferenceCustomerHttpApiOptions;
+  claim: { tenantId: string; requestId: string } & Parameters<
+    typeof markCloudInferenceOutcomeUnavailable
+  >[1];
+  tenantId: string;
+  apiKeyId: string;
+  apiKey: string;
+  connectionId: string;
+  inputTokens: number;
+  maxOutputTokens: number;
+  fetcher: typeof fetch;
+  countPayload: ReturnType<typeof requestPayload>;
+  audit: (status: string, metadata?: Record<string, unknown>) => Promise<void>;
+  startedAt: number;
+}
+
+/** Stream only the pinned Responses endpoint; persist the bounded SSE transcript for exact replay. */
+async function streamCloudInference(input: CloudStreamInput): Promise<Response> {
+  const { options, claim } = input;
+  const db = options.db!;
+  const nowMs = () => options.now?.() ?? Date.now();
+  const failedResponse = (message: string, status: number) =>
+    errorResponse(message, status, claim.requestId);
+  const settleConservatively = async () => {
+    await settleCloudInferenceReservation(db, {
+      tenantId: input.tenantId,
+      reservationId: claim.requestId,
+      actualInputTokens: input.inputTokens,
+      actualOutputTokens: input.maxOutputTokens,
+      now: new Date(nowMs()),
+    });
+  };
+  const controller = new AbortController();
+  let response: Response;
+  let rejectTimeout: ((error: Error) => void) | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timer = setTimeout(() => {
+    controller.abort("upstream timeout");
+    rejectTimeout?.(new Error("upstream timeout"));
+  }, options.generationTimeoutMs ?? CLOUD_INFERENCE_GENERATION_TIMEOUT_MS);
+  try {
+    response = await Promise.race([
+      input.fetcher(CLOUD_INFERENCE_RESPONSE_URL, {
+        method: "POST",
+        headers: {
+          ...requestHeaders(input.apiKey),
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          ...input.countPayload,
+          max_output_tokens: input.maxOutputTokens,
+          store: false,
+          stream: true,
+        }),
+        signal: controller.signal,
+        redirect: "error",
+      }),
+      timeout,
+    ]);
+  } catch {
+    clearTimeout(timer);
+    controller.abort("upstream unavailable");
+    try {
+      await settleConservatively();
+    } catch {
+      // The idempotency tombstone below prevents uncertain redispatch.
+    }
+    await markCloudInferenceOutcomeUnavailable(db, claim, nowMs());
+    try {
+      await input.audit("generation_outcome_unavailable", {
+        inputTokens: input.inputTokens,
+        outputTokensReserved: input.maxOutputTokens,
+        connectionId: input.connectionId,
+      });
+    } catch {
+      // Keep the public failure generic.
+    }
+    return failedResponse("Inference outcome is unavailable and will not be retried", 504);
+  }
+  if (!response.ok || !response.body) {
+    clearTimeout(timer);
+    await response.body?.cancel().catch(() => undefined);
+    try {
+      await settleConservatively();
+    } catch {
+      // The idempotency tombstone below prevents uncertain redispatch.
+    }
+    await markCloudInferenceOutcomeUnavailable(db, claim, nowMs());
+    try {
+      await input.audit("generation_outcome_unavailable", {
+        inputTokens: input.inputTokens,
+        outputTokensReserved: input.maxOutputTokens,
+        connectionId: input.connectionId,
+      });
+    } catch {
+      // Keep the public failure generic.
+    }
+    return failedResponse("Inference result could not be safely confirmed", 502);
+  }
+
+  const reader = response.body.getReader();
+  let handleConsumerCancel: (() => Promise<void>) | undefined;
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      const outputEncoder = new TextEncoder();
+      let transcript = "";
+      let transcriptBytes = 0;
+      let rawBytes = 0;
+      let buffer = "";
+      let outputText = "";
+      let pendingDelta = "";
+      let providerResult: ProviderResponse | null = null;
+      let cancelled = false;
+      let finalized = false;
+      let failureTask: Promise<void> | null = null;
+      handleConsumerCancel = async () => {
+        cancelled = true;
+        await fail("Inference stream was cancelled", false);
+      };
+      const created = Math.floor(nowMs() / 1000);
+
+      const emit = (chunk: string): boolean => {
+        const bytes = outputEncoder.encode(chunk);
+        if (transcriptBytes + bytes.byteLength > CLOUD_INFERENCE_MAX_RESPONSE_BYTES) return false;
+        transcriptBytes += bytes.byteLength;
+        transcript += chunk;
+        if (!cancelled) streamController.enqueue(bytes);
+        return true;
+      };
+      const fail = (message: string, exposeError: boolean): Promise<void> => {
+        if (failureTask) return failureTask;
+        failureTask = (async () => {
+          if (finalized) return;
+          finalized = true;
+          clearTimeout(timer);
+          controller.abort("stream failed");
+          await reader.cancel().catch(() => undefined);
+          try {
+            await settleConservatively();
+          } catch {
+            // The tombstone below is the retry safety boundary.
+          }
+          try {
+            await markCloudInferenceOutcomeUnavailable(db, claim, nowMs());
+          } catch {
+            // The existing claim still prevents dispatch; expiry also fails closed if D1 recovers.
+          }
+          try {
+            await input.audit("generation_outcome_unavailable", {
+              inputTokens: input.inputTokens,
+              outputTokensReserved: input.maxOutputTokens,
+              connectionId: input.connectionId,
+            });
+          } catch {
+            // Keep provider details and accounting errors out of the stream.
+          }
+          if (exposeError && !cancelled) {
+            try {
+              streamController.enqueue(outputEncoder.encode(streamErrorBody(message)));
+              streamController.close();
+            } catch {
+              // Consumer may have disconnected while the error was being written.
+            }
+          }
+        })();
+        return failureTask;
+      };
+      const processFrame = (frame: string): boolean => {
+        const parsed = parseSseFrame(frame);
+        if (!parsed || parsed.data === "[DONE]") return true;
+        let payload: unknown;
+        try {
+          payload = JSON.parse(parsed.data) as unknown;
+        } catch {
+          return false;
+        }
+        const body = record(payload);
+        const event = body?.type ?? parsed.event;
+        if (event === "response.output_text.delta" || event === "response.refusal.delta") {
+          const delta = body?.delta;
+          if (typeof delta !== "string") return false;
+          outputText += delta;
+          pendingDelta += delta;
+          return true;
+        }
+        if (event === "response.completed" || event === "response.incomplete") {
+          providerResult = parseProviderResponse(body?.response);
+          return providerResult !== null;
+        }
+        if (event === "response.failed" || event === "error") return false;
+        return true;
+      };
+
+      void (async () => {
+        try {
+          if (!emit(chatChunk(claim.requestId, created, { role: "assistant" }))) {
+            await fail("Inference result exceeds the response limit", true);
+            return;
+          }
+          const decoder = new TextDecoder("utf-8", { fatal: true });
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            rawBytes += value.byteLength;
+            if (rawBytes > CLOUD_INFERENCE_MAX_RESPONSE_BYTES * 4) {
+              await fail("Inference result exceeds the response limit", true);
+              return;
+            }
+            buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
+            let boundary = buffer.indexOf("\n\n");
+            let emittedDelta = false;
+            while (boundary >= 0) {
+              const frame = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              if (!processFrame(frame)) {
+                await fail("Inference result could not be safely confirmed", true);
+                return;
+              }
+              if (providerResult) break;
+              if (pendingDelta) emittedDelta = true;
+              boundary = buffer.indexOf("\n\n");
+            }
+            if (pendingDelta && emittedDelta) {
+              if (!emit(chatChunk(claim.requestId, created, { content: pendingDelta }))) {
+                await fail("Inference result exceeds the response limit", true);
+                return;
+              }
+              pendingDelta = "";
+            }
+            if (providerResult) break;
+          }
+          if (!providerResult && buffer.trim()) {
+            if (!processFrame(buffer)) {
+              await fail("Inference result could not be safely confirmed", true);
+              return;
+            }
+          }
+          if (providerResult) await reader.cancel().catch(() => undefined);
+          if (
+            !providerResult ||
+            outputText.length === 0 ||
+            assistantText(providerResult.output) !== outputText ||
+            providerResult.usage.input_tokens > input.inputTokens ||
+            providerResult.usage.output_tokens > input.maxOutputTokens
+          ) {
+            await fail("Inference result could not be safely confirmed", true);
+            return;
+          }
+          if (
+            pendingDelta &&
+            !emit(chatChunk(claim.requestId, created, { content: pendingDelta }))
+          ) {
+            await fail("Inference result exceeds the response limit", true);
+            return;
+          }
+          const settled = await settleCloudInferenceReservation(db, {
+            tenantId: input.tenantId,
+            reservationId: claim.requestId,
+            actualInputTokens: providerResult.usage.input_tokens,
+            actualOutputTokens: providerResult.usage.output_tokens,
+            now: new Date(nowMs()),
+          });
+          if (settled.kind !== "updated" && settled.kind !== "replay") {
+            await fail("Token accounting could not be safely confirmed", true);
+            return;
+          }
+          try {
+            await appendCloudUsageRecord(db, {
+              id: claim.requestId,
+              tenantId: input.tenantId,
+              provider: CLOUD_INFERENCE_PROVIDER,
+              model: CLOUD_INFERENCE_MODEL,
+              connectionId: input.connectionId,
+              apiKeyId: input.apiKeyId,
+              tokensInput: providerResult.usage.input_tokens,
+              tokensOutput: providerResult.usage.output_tokens,
+              serviceTier: "customer-managed",
+              status: "success",
+              success: true,
+              latencyMs: Math.max(0, Math.round(performance.now() - input.startedAt)),
+              endpoint: CLOUD_INFERENCE_CHAT_PATH,
+              timestamp: new Date(nowMs()).toISOString(),
+            });
+            await input.audit("success", {
+              inputTokens: providerResult.usage.input_tokens,
+              outputTokens: providerResult.usage.output_tokens,
+              connectionId: input.connectionId,
+            });
+          } catch {
+            await fail("Inference accounting is unavailable", true);
+            return;
+          }
+          const finishReason =
+            providerResult.status === "incomplete" &&
+            providerResult.incomplete_details?.reason === "max_output_tokens"
+              ? "length"
+              : "stop";
+          const terminal =
+            chatChunk(claim.requestId, created, {}, finishReason) + "data: [DONE]\n\n";
+          const terminalBytes = outputEncoder.encode(terminal);
+          if (transcriptBytes + terminalBytes.byteLength > CLOUD_INFERENCE_MAX_RESPONSE_BYTES) {
+            await fail("Inference result exceeds the response limit", true);
+            return;
+          }
+          transcript += terminal;
+          try {
+            const stored = await completeCloudInferenceIdempotency(
+              db,
+              claim,
+              { status: 200, body: transcript },
+              nowMs()
+            );
+            if (stored.kind !== "completed") {
+              await fail("Inference result is unavailable", true);
+              return;
+            }
+          } catch {
+            await fail("Inference result is unavailable", true);
+            return;
+          }
+          finalized = true;
+          clearTimeout(timer);
+          if (!cancelled) {
+            streamController.enqueue(terminalBytes);
+            streamController.close();
+          }
+        } catch {
+          await fail("Inference result could not be safely confirmed", true);
+        }
+      })();
+    },
+    async cancel() {
+      await handleConsumerCancel?.();
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Request-ID": claim.requestId,
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
 function errorResponse(message: string, status: number, requestId?: string): Response {
   return json({ error: { message, type: "cloud_inference_error" } }, status, requestId);
 }
@@ -407,7 +796,7 @@ function safeJsonString(value: unknown): string | null {
   }
 }
 
-/** Customer-authenticated, fixed-endpoint, non-streaming OpenAI chat compatibility route. */
+/** Customer-authenticated, fixed-endpoint OpenAI chat compatibility route. */
 export async function handleCloudInferenceCustomerRequest(
   request: Request,
   options: CloudInferenceCustomerHttpApiOptions
@@ -503,6 +892,7 @@ export async function handleCloudInferenceCustomerRequest(
     model: customerRequest.model,
     messages: [{ role: "user", content: customerRequest.message }],
     max_completion_tokens: customerRequest.maxOutputTokens ?? null,
+    ...(customerRequest.stream ? { stream: true } : {}),
   };
   let claimResult;
   try {
@@ -541,7 +931,12 @@ export async function handleCloudInferenceCustomerRequest(
     );
   }
   if (claimResult.kind === "replay") {
-    return storedResponse(claimResult.body, claimResult.status, claimResult.requestId);
+    return storedResponse(
+      claimResult.body,
+      claimResult.status,
+      claimResult.requestId,
+      customerRequest.stream
+    );
   }
   const claim = claimResult.claim;
 
@@ -551,14 +946,17 @@ export async function handleCloudInferenceCustomerRequest(
       await markCloudInferenceOutcomeUnavailable(options.db!, claim, options.now?.() ?? Date.now());
       return errorResponse("Inference result is unavailable", 503, claim.requestId);
     }
+    const responseBody = serialized;
     try {
       const stored = await completeCloudInferenceIdempotency(
         options.db!,
         claim,
-        { status, body: serialized },
+        { status, body: responseBody },
         options.now?.() ?? Date.now()
       );
-      if (stored.kind === "completed") return storedResponse(serialized, status, claim.requestId);
+      if (stored.kind === "completed") {
+        return storedResponse(responseBody, status, claim.requestId, customerRequest.stream);
+      }
     } catch {
       // The claim is converted to an unavailable tombstone below.
     }
@@ -756,6 +1154,22 @@ export async function handleCloudInferenceCustomerRequest(
   let providerResult: ProviderResponse | null = null;
   let content: string | null = null;
   const startedAt = performance.now();
+  if (customerRequest.stream) {
+    return streamCloudInference({
+      options,
+      claim,
+      tenantId: identity.tenantId,
+      apiKeyId: identity.apiKeyId,
+      apiKey,
+      connectionId,
+      inputTokens,
+      maxOutputTokens,
+      fetcher,
+      countPayload,
+      audit,
+      startedAt,
+    });
+  }
   try {
     const result = await fetchTimedBody(
       fetcher,

@@ -1,7 +1,7 @@
 ---
 title: "OmniRoute Cloudflare Workers Production Plan"
 version: 3.8.50
-lastUpdated: 2026-10-07
+lastUpdated: 2026-10-08
 ---
 
 ## Objective
@@ -122,6 +122,23 @@ Complete the existing `multi-tenant` foundation:
 
 **Exit:** tenant A cannot discover, connect to, or invoke tenant B MCP resources.
 
+#### Egress decision (2026-10-08)
+
+Cloudflare Workers VPC now offers a possible public-egress path: a VPC Network
+binding to `cf1:network` can send Worker `fetch()` calls through Cloudflare
+Gateway, where existing Gateway policies and logs apply. Workers VPC is in open
+beta and documented as free during beta. The same `cf1:network` binding also
+reaches every Tunnel, Mesh route, and WAN destination in the account, so it is
+not a least-privilege MCP proxy by itself. Do not add this binding to the
+production Worker until an isolated staging account/network has a verified
+Gateway policy that blocks private destinations and restricts outbound
+destinations; the current staging environment is not configured.
+
+References: [Workers VPC overview](https://developers.cloudflare.com/workers-vpc/),
+[VPC Networks](https://developers.cloudflare.com/workers-vpc/configuration/vpc-networks/),
+[Workers VPC pricing](https://developers.cloudflare.com/workers-vpc/platform/pricing/),
+and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/post/2026-06-05-gateway-egress/).
+
 ### 6. Front Desk tenancy
 
 - Front Desk identifies its tenant without exposing OmniRoute internals.
@@ -238,7 +255,10 @@ Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`,
 `OMNIROUTE_CLOUD_ADMIN_TOKEN`, `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN`, and
 `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`, and
-`OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY`. Both cloud tokens must be distinct and
+`OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY`. Also set the non-secret GitHub
+Environment variable `OMNIROUTE_CLOUD_PUBLIC_ORIGIN` to the exact HTTPS origin
+for the isolated `omniroute-cloud-runtime-staging.<account>.workers.dev` host;
+the workflow validates and binds it for the customer OIDC callback. Both cloud tokens must be distinct and
 32–512 URL-safe characters. Both key secrets must be distinct base64-encoded
 32-byte values. All four secrets are required by the manual staging workflow. The
 admin token retains the full server-side cloud API scope. The maintenance token
@@ -267,15 +287,20 @@ access; the runtime check verifies the staging name and deployed commit SHA.
 
 The Cloud Worker exposes a deliberately narrow `POST /v1/chat/completions`
 subset in `src/cloud/inferenceCustomerHttpApi.ts`. It accepts one plain-text
-`user` message for the pinned `gpt-4o-mini-2024-07-18` model, is non-streaming,
-and rejects tools, other roles, extra fields, and customer-selected endpoints.
+`user` message for the pinned `gpt-4o-mini-2024-07-18` model. `stream:true`
+returns bounded Chat Completions SSE from the fixed Responses API stream and
+replays the exact bounded transcript for an idempotent retry. The Worker rejects
+tools, other roles, extra fields, and customer-selected endpoints.
 The Worker calls only OpenAI's fixed Responses input-token count endpoint and
 Responses generation endpoint. The count preflight sends the message to OpenAI
 and may be billable; it is required before reserving the tenant's exact input
-count plus the requested output cap. Input/output caps and the monthly budget
-are token accounting only; they do not cap monetary cost. The route replays
-completed responses for 24 hours and retains compact idempotency keys for 30
-days, after which keys may be reused.
+count plus the requested output cap. Stream output is checked against the
+terminal Responses text and usage before accounting is settled; the finish chunk
+and `[DONE]` are emitted only after the success audit and transcript are stored.
+Client cancellation aborts upstream and settles the reservation at its maximum.
+Input/output caps and the monthly budget are token accounting only; they do not
+cap monetary cost. The route replays completed responses for 24 hours and retains
+compact idempotency keys for 30 days, after which keys may be reused.
 
 The dedicated `OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY` must be distinct from the
 credential-encryption key and remain stable for replay continuity across the

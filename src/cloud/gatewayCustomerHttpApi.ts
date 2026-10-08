@@ -11,6 +11,7 @@ import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { appendCloudUsageRecord } from "./usage";
 import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
+import { deleteCloudGatewayPairing, issueCloudGatewayPairing } from "./gatewayPairing";
 import {
   claimGatewayIdempotency,
   completeGatewayIdempotency,
@@ -19,6 +20,7 @@ import {
 } from "./gatewayIdempotency";
 
 const PATH = "/__gateway/v1/customer/invoke";
+const PAIRING_PATH = "/__gateway/v1/customer/local-agent/pairings";
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
 const DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -36,6 +38,7 @@ export interface GatewayCustomerHttpApiOptions {
   rateLimit?: { limit: number; windowMs: number };
   failedKeyRateLimit?: { limit: number; windowMs: number };
   failedKeyFallbackRateLimit?: { limit: number; windowMs: number };
+  pairingIssueRateLimit?: { limit: number; windowMs: number };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -120,7 +123,8 @@ export async function handleGatewayCustomerRequest(
   options: GatewayCustomerHttpApiOptions
 ): Promise<Response> {
   const url = new URL(request.url);
-  if (url.pathname !== PATH) return json({ error: "Not found" }, 404);
+  if (url.pathname !== PATH && url.pathname !== PAIRING_PATH)
+    return json({ error: "Not found" }, 404);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   if (url.search || !options.db || !options.sessions) {
     return json(
@@ -162,6 +166,84 @@ export async function handleGatewayCustomerRequest(
       ? json({ error: "Unauthorized" }, 401)
       : json({ error: "Authentication rate limit exceeded" }, 429);
   }
+  if (url.pathname === PAIRING_PATH) {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (url.search) return json({ error: "Unsupported request metadata" }, 400);
+    const body = await readBody(request);
+    if (!body || Object.keys(body).length !== 0) {
+      return json({ error: "Pairing request must be an empty JSON object" }, 400);
+    }
+    const timestamp = new Date(options.now?.() ?? Date.now()).toISOString();
+    if (identity.role !== "owner" && identity.role !== "admin") {
+      try {
+        await appendCloudComplianceAudit(options.db, {
+          id: crypto.randomUUID(),
+          tenantId: identity.tenantId,
+          timestamp,
+          action: "gateway.device.pair.issue",
+          actor: identity.principalId,
+          target: null,
+          resourceType: "gateway-device-pairing",
+          status: "denied",
+          metadata: { apiKeyId: identity.apiKeyId, role: identity.role },
+        });
+      } catch {
+        return json({ error: "Pairing audit is unavailable" }, 503);
+      }
+      return json({ error: "Customer role is not permitted to pair devices" }, 403);
+    }
+    let rateLimit: Awaited<ReturnType<typeof consumeCloudRateLimit>>;
+    try {
+      rateLimit = await consumeCloudRateLimit(options.db, {
+        tenantId: identity.tenantId,
+        bucketKey: "gateway-device-pairing-issue",
+        ...(options.pairingIssueRateLimit ?? { limit: 10, windowMs: 60 * 60_000 }),
+        nowMs: options.now?.(),
+      });
+    } catch {
+      return json({ error: "Pairing rate limit is unavailable" }, 503);
+    }
+    if (!rateLimit.allowed) return json({ error: "Pairing rate limit exceeded" }, 429);
+    let pairing: Awaited<ReturnType<typeof issueCloudGatewayPairing>>;
+    try {
+      pairing = await issueCloudGatewayPairing(options.db, {
+        tenantId: identity.tenantId,
+        membershipId: identity.membershipId,
+        apiKeyId: identity.apiKeyId,
+        issuedBy: identity.principalId,
+        now: timestamp,
+      });
+    } catch (error) {
+      if (error instanceof TypeError) return json({ error: "Pairing is not permitted" }, 403);
+      return json({ error: "Pairing is unavailable" }, 503);
+    }
+    try {
+      await appendCloudComplianceAudit(options.db, {
+        id: crypto.randomUUID(),
+        tenantId: identity.tenantId,
+        timestamp,
+        action: "gateway.device.pair.issue",
+        actor: identity.principalId,
+        target: pairing.codeHash,
+        resourceType: "gateway-device-pairing",
+        status: "success",
+        metadata: {
+          apiKeyId: identity.apiKeyId,
+          pairingHash: pairing.codeHash,
+          expiresAt: pairing.expiresAt,
+        },
+      });
+    } catch {
+      try {
+        await deleteCloudGatewayPairing(options.db, pairing.id);
+      } catch {
+        // The undisclosed code remains short-lived if cleanup is unavailable.
+      }
+      return json({ error: "Pairing audit is unavailable" }, 503);
+    }
+    return json({ pairingCode: pairing.code, expiresAt: pairing.expiresAt }, 201);
+  }
+  if (url.pathname !== PATH) return json({ error: "Not found" }, 404);
   const idempotencyKey = request.headers.get("idempotency-key") ?? "";
   if (!/^[A-Za-z0-9._~-]{16,128}$/.test(idempotencyKey)) {
     return json({ error: "A valid Idempotency-Key header is required" }, 400);

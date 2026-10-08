@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { Command } from "commander";
 import {
   registerLocalAgent,
+  pairLocalAgentCommand,
   resolveLocalAgentConfig,
   runLocalAgentCommand,
 } from "../../../bin/cli/commands/local-agent.mjs";
@@ -29,6 +33,52 @@ test("local-agent run is registered with explicit non-secret options", () => {
       "--heartbeat-interval-ms",
     ]
   );
+});
+
+test("local-agent pair reads its code outside argv and saves the credential privately", async () => {
+  const home = mkdtempSync(join(tmpdir(), "omniroute-agent-pair-"));
+  const pairingCode = "p".repeat(43);
+  const pairedCredential = "c".repeat(43);
+  let requestUrl;
+  let requestBody;
+  let output = "";
+  try {
+    const result = await pairLocalAgentCommand(
+      { gatewayUrl: "https://connect.example.test" },
+      {
+        env: { HOME: home },
+        home,
+        readCode: async () => pairingCode,
+        stdout: { write: (value) => (output += value) },
+        fetcher: async (url, init) => {
+          requestUrl = String(url);
+          requestBody = JSON.parse(init.body);
+          return Response.json(
+            { version: 1, deviceId: "device_paired", credential: pairedCredential },
+            { status: 201 }
+          );
+        },
+      }
+    );
+    assert.equal(requestUrl, "https://connect.example.test/__gateway/v1/device/pair");
+    assert.deepEqual(requestBody, { version: 1, pairingCode });
+    assert.equal(result.deviceId, "device_paired");
+    assert.equal(output.includes(pairedCredential), false);
+    assert.equal(output.includes(pairingCode), false);
+    assert.equal(statSync(result.configPath).mode & 0o777, 0o600);
+    const stored = JSON.parse(readFileSync(result.configPath, "utf8"));
+    assert.equal(stored.credential, pairedCredential);
+    assert.deepEqual(resolveLocalAgentConfig({}, { HOME: home }), {
+      gatewayUrl: "https://connect.example.test/",
+      deviceId: "device_paired",
+      credential: pairedCredential,
+      ollamaUrl: undefined,
+      comfyUiUrl: undefined,
+      mcpServers: [],
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("configuration accepts HTTPS cloud URL and reads credential only from its named env var", () => {

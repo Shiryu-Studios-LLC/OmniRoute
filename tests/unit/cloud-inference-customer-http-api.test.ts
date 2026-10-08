@@ -170,7 +170,7 @@ async function fixture(
   };
 }
 
-function request(token: string, key = "idempotency-key-0001", content = "hello") {
+function request(token: string, key = "idempotency-key-0001", content = "hello", stream = false) {
   return new Request("https://cloud.test/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -181,6 +181,7 @@ function request(token: string, key = "idempotency-key-0001", content = "hello")
     body: JSON.stringify({
       model: "gpt-4o-mini-2024-07-18",
       messages: [{ role: "user", content }],
+      ...(stream ? { stream: true } : {}),
     }),
   });
 }
@@ -227,9 +228,11 @@ test("fixed Responses endpoints, decrypts tenant-bound credential, records usage
     assert.equal(first.status, 200);
     const firstText = await first.text();
     assert.equal(JSON.parse(firstText).object, "chat.completion");
+    assert.match(first.headers.get("content-type") ?? "", /^application\/json/);
     assert.equal(calls, 2);
     const replay = await app.fetch(request(f.issued.token));
     assert.equal(replay.status, 200);
+    assert.match(replay.headers.get("content-type") ?? "", /^application\/json/);
     assert.equal(await replay.text(), firstText);
     assert.equal(calls, 2);
     const usage = await f.db
@@ -258,6 +261,268 @@ test("fixed Responses endpoints, decrypts tenant-bound credential, records usage
       .first();
     assert.ok(storedKey?.api_key.startsWith("enc:v2:"));
     assert.notEqual(storedKey?.api_key, OPENAI_KEY);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("streaming inference settles terminal usage before done and replays the exact SSE transcript", async () => {
+  const f = await fixture();
+  try {
+    let calls = 0;
+    let upstreamStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const terminalEvent =
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-4o-mini-2024-07-18","status":"completed","created_at":10,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}\n\n';
+    const fetcher: typeof fetch = async (input, init) => {
+      calls += 1;
+      const url = String(input);
+      if (url.endsWith("input_tokens"))
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      const requestBody = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+      assert.equal(requestBody.stream, true);
+      assert.equal(new Headers((init as RequestInit).headers).get("accept"), "text/event-stream");
+      const firstDelta =
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"world"}\n\n';
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            upstreamStreamController = controller;
+            controller.enqueue(new TextEncoder().encode(firstDelta));
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      );
+    };
+    const app = f.runtime(fetcher);
+    const first = await app.fetch(
+      request(f.issued.token, "idempotency-stream-success", "hello", true)
+    );
+    assert.equal(first.status, 200);
+    assert.match(first.headers.get("content-type") ?? "", /^text\/event-stream/);
+    const streamReader = first.body!.getReader();
+    const decoder = new TextDecoder();
+    let transcript = "";
+    const roleChunk = await streamReader.read();
+    assert.equal(roleChunk.done, false);
+    transcript += decoder.decode(roleChunk.value);
+    const deltaChunk = await streamReader.read();
+    assert.equal(deltaChunk.done, false);
+    transcript += decoder.decode(deltaChunk.value);
+    assert.match(transcript, /"content":"world"/);
+    assert.ok(!transcript.includes("[DONE]"));
+    const pendingReservation = await f.db
+      .prepare<{ status: string }>(
+        "SELECT status FROM cloud_inference_reservations WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(pendingReservation?.status, "reserved");
+    assert.ok(upstreamStreamController);
+    upstreamStreamController!.enqueue(new TextEncoder().encode(terminalEvent));
+    upstreamStreamController!.close();
+    while (true) {
+      const next = await streamReader.read();
+      if (next.done) break;
+      transcript += decoder.decode(next.value);
+    }
+    transcript += decoder.decode();
+    assert.ok(transcript.endsWith("data: [DONE]\n\n"));
+    assert.equal(calls, 2);
+    const settled = await f.db
+      .prepare<{ actual_input_tokens: number; actual_output_tokens: number; status: string }>(
+        "SELECT actual_input_tokens,actual_output_tokens,status FROM cloud_inference_reservations WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(settled?.actual_input_tokens, 5);
+    assert.equal(settled?.actual_output_tokens, 2);
+    assert.equal(settled?.status, "settled");
+    const replay = await app.fetch(
+      request(f.issued.token, "idempotency-stream-success", "hello", true)
+    );
+    assert.match(replay.headers.get("content-type") ?? "", /^text\/event-stream/);
+    assert.equal(await replay.text(), transcript);
+    assert.equal(calls, 2, "a streaming replay does not call the provider again");
+    assert.equal(
+      (await app.fetch(request(f.issued.token, "idempotency-stream-success", "hello", false)))
+        .status,
+      409,
+      "stream and non-stream operations have different fingerprints"
+    );
+    assert.equal(calls, 2);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("client cancellation aborts streaming generation and settles the reserved maximum", async () => {
+  const f = await fixture();
+  try {
+    let upstreamAborted = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("input_tokens"))
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      (init as RequestInit).signal?.addEventListener("abort", () => {
+        upstreamAborted = true;
+      });
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+              )
+            );
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      );
+    };
+    const app = f.runtime(fetcher);
+    const key = "idempotency-stream-cancel";
+    const response = await app.fetch(request(f.issued.token, key, "hello", true));
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.cancel("test client disconnect");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(upstreamAborted, true);
+    const reservation = await f.db
+      .prepare<{ actual_input_tokens: number; actual_output_tokens: number; status: string }>(
+        "SELECT actual_input_tokens,actual_output_tokens,status FROM cloud_inference_reservations WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(reservation?.actual_input_tokens, 5);
+    assert.equal(reservation?.actual_output_tokens, 40);
+    assert.equal(reservation?.status, "settled");
+    const idempotency = await f.db
+      .prepare<{ state: string }>(
+        "SELECT state FROM cloud_inference_idempotency WHERE request_id=(SELECT reservation_id FROM cloud_inference_reservations WHERE tenant_id=?)"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(idempotency?.state, "outcome_unavailable");
+    assert.equal((await app.fetch(request(f.issued.token, key, "hello", true))).status, 503);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("a failed idempotency tombstone write still closes the SSE response without reopening dispatch", async () => {
+  const f = await fixture();
+  try {
+    let calls = 0;
+    let upstreamStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let failTombstoneWrites = false;
+    const originalPrepare = f.db.prepare.bind(f.db);
+    f.db.prepare = ((sql: string) => {
+      if (
+        failTombstoneWrites &&
+        sql.includes("UPDATE cloud_inference_idempotency") &&
+        sql.includes("state = 'outcome_unavailable'")
+      ) {
+        const statement: CloudDbStatement = {
+          bind() {
+            return this;
+          },
+          async first<U = unknown>(): Promise<U | null> {
+            return null;
+          },
+          async all<U = unknown>(): Promise<{ results: U[]; success: boolean }> {
+            return { results: [], success: false };
+          },
+          async run(): Promise<{ success: boolean }> {
+            throw new Error("simulated D1 tombstone write failure");
+          },
+        };
+        return statement;
+      }
+      return originalPrepare(sql);
+    }) as typeof f.db.prepare;
+    const fetcher: typeof fetch = async (input) => {
+      calls += 1;
+      if (String(input).endsWith("input_tokens"))
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            upstreamStreamController = controller;
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+              )
+            );
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      );
+    };
+    const app = f.runtime(fetcher);
+    const key = "idempotency-stream-tombstone-db-failure";
+    const response = await app.fetch(request(f.issued.token, key, "hello", true));
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.read();
+
+    failTombstoneWrites = true;
+    upstreamStreamController!.enqueue(new TextEncoder().encode("data: invalid-json\n\n"));
+    upstreamStreamController!.close();
+    let transcript = "";
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      transcript += new TextDecoder().decode(next.value);
+    }
+    assert.match(transcript, /Inference result could not be safely confirmed/);
+    assert.ok(!transcript.includes("[DONE]"));
+    const reservation = await f.db
+      .prepare<{ actual_output_tokens: number; status: string }>(
+        "SELECT actual_output_tokens,status FROM cloud_inference_reservations WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(reservation?.actual_output_tokens, 40);
+    assert.equal(reservation?.status, "settled");
+    assert.equal(
+      (await app.fetch(request(f.issued.token, key, "hello", true))).status,
+      409,
+      "the existing live claim blocks dispatch while tombstone writes are unavailable"
+    );
+    f.advance(2 * 60 * 1000 + 1);
+    assert.equal(
+      (await app.fetch(request(f.issued.token, key, "hello", true))).status,
+      503,
+      "an expired uncertain claim fails closed when D1 cannot tombstone it"
+    );
+    assert.equal(calls, 2, "an unavailable ledger prevents redispatch");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("cached stream-request policy errors replay as JSON without reserving tokens", async () => {
+  const f = await fixture({ entitlement: false });
+  try {
+    let calls = 0;
+    const app = f.runtime(async () => {
+      calls += 1;
+      throw new Error("disabled entitlement must not call upstream");
+    });
+    const key = "idempotency-stream-policy-denied";
+    const first = await app.fetch(request(f.issued.token, key, "hello", true));
+    assert.equal(first.status, 403);
+    assert.match(first.headers.get("content-type") ?? "", /^application\/json/);
+    const firstBody = await first.text();
+    const replay = await app.fetch(request(f.issued.token, key, "hello", true));
+    assert.equal(replay.status, 403);
+    assert.match(replay.headers.get("content-type") ?? "", /^application\/json/);
+    assert.equal(await replay.text(), firstBody);
+    assert.equal(calls, 0);
+    const reservation = await f.db
+      .prepare("SELECT reservation_id FROM cloud_inference_reservations WHERE tenant_id=?")
+      .bind(TENANT_A)
+      .first();
+    assert.equal(reservation, null);
   } finally {
     f.db.db.close();
   }
@@ -417,16 +682,16 @@ test("viewer membership and unsupported generation features are rejected before 
       throw new Error("unsupported request must not dispatch");
     });
     const unsupported = request(owner.issued.token, "idempotency-key-unsupported");
-    const requestWithStream = new Request(unsupported.url, {
+    const requestWithUnsupportedFeature = new Request(unsupported.url, {
       method: "POST",
       headers: unsupported.headers,
       body: JSON.stringify({
         model: "gpt-4o-mini-2024-07-18",
         messages: [{ role: "user", content: "hello" }],
-        stream: true,
+        stream_options: { include_usage: true },
       }),
     });
-    assert.equal((await ownerApp.fetch(requestWithStream)).status, 400);
+    assert.equal((await ownerApp.fetch(requestWithUnsupportedFeature)).status, 400);
     assert.equal(calls, 0);
   } finally {
     viewer.db.db.close();
@@ -535,9 +800,19 @@ test("default deny and monthly budget denial do not invoke generation", async ()
       403
     );
     assert.equal(calls, 0, "default deny does not call count endpoint");
+    const defaultDeniedReservation = await noPolicy.db
+      .prepare("SELECT reservation_id FROM cloud_inference_reservations WHERE tenant_id=?")
+      .bind(TENANT_A)
+      .first();
+    assert.equal(defaultDeniedReservation, null, "pre-dispatch policy denial reserves no tokens");
     const denied = await lowBudget.runtime(fetcher).fetch(request(lowBudget.issued.token));
     assert.equal(denied.status, 429);
     assert.equal(calls, 1, "only exact-token preflight runs before budget reservation");
+    const budgetDeniedReservation = await lowBudget.db
+      .prepare("SELECT reservation_id FROM cloud_inference_reservations WHERE tenant_id=?")
+      .bind(TENANT_A)
+      .first();
+    assert.equal(budgetDeniedReservation, null, "budget denial reserves no tokens");
   } finally {
     noPolicy.db.db.close();
     lowBudget.db.db.close();
