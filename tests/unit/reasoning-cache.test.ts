@@ -40,8 +40,9 @@ import { translateNonStreamingResponse } from "../../open-sse/handlers/responseT
 import { getDbInstance } from "../../src/lib/db/core.ts";
 import { getReasoningCache, setReasoningCache } from "../../src/lib/db/reasoningCache.ts";
 import { DELETE, GET } from "../../src/app/api/cache/reasoning/route.ts";
-import { createApiKey } from "../../src/lib/db/apiKeys.ts";
+import { createApiKey, getApiKeyMetadata } from "../../src/lib/db/apiKeys.ts";
 import { updateSettings } from "../../src/lib/db/settings";
+import { runWithTenantContext } from "../../src/lib/tenantContext";
 import {
   clearModelsDevCapabilities,
   saveModelsDevCapabilities,
@@ -1217,6 +1218,8 @@ describe("Reasoning Replay Cache — Translator Replay", () => {
 
 describe("Reasoning Replay Cache — API Route", () => {
   let managementApiKey: string;
+  let tenantAApiKey: string;
+  let tenantBApiKey: string;
 
   before(() => {
     clearReasoningCacheAll();
@@ -1227,6 +1230,18 @@ describe("Reasoning Replay Cache — API Route", () => {
       "manage",
     ]);
     managementApiKey = created.key;
+    tenantAApiKey = (
+      await runWithTenantContext(
+        { tenantId: "tenant_reasoning_a", principalId: "test-a", role: "owner" },
+        () => createApiKey("reasoning-cache-tenant-a", "machine-reasoning-a", ["manage"])
+      )
+    ).key;
+    tenantBApiKey = (
+      await runWithTenantContext(
+        { tenantId: "tenant_reasoning_b", principalId: "test-b", role: "owner" },
+        () => createApiKey("reasoning-cache-tenant-b", "machine-reasoning-b", ["manage"])
+      )
+    ).key;
   });
 
   after(() => {
@@ -1238,6 +1253,62 @@ describe("Reasoning Replay Cache — API Route", () => {
       headers: { authorization: `Bearer ${managementApiKey}` },
     });
   }
+
+  function tenantRequest(url: string, key: string): Request {
+    return new Request(url, { headers: { authorization: `Bearer ${key}` } });
+  }
+
+  it("isolates persistent and in-memory entries and deletes by authenticated tenant", async () => {
+    assert.equal((await getApiKeyMetadata(tenantAApiKey))?.tenantId, "tenant_reasoning_a");
+    assert.equal((await getApiKeyMetadata(tenantBApiKey))?.tenantId, "tenant_reasoning_b");
+    await runWithTenantContext(
+      { tenantId: "tenant_reasoning_a", principalId: "test-a", role: "owner" },
+      () => cacheReasoning("call_shared_tenant_id", "deepseek", "deepseek-reasoner", "A reasoning")
+    );
+    await runWithTenantContext(
+      { tenantId: "tenant_reasoning_b", principalId: "test-b", role: "owner" },
+      () => cacheReasoning("call_shared_tenant_id", "deepseek", "deepseek-reasoner", "B reasoning")
+    );
+    assert.equal(
+      await runWithTenantContext(
+        { tenantId: "tenant_reasoning_a", principalId: "test-a", role: "owner" },
+        () => getReasoningCache("call_shared_tenant_id")?.reasoning
+      ),
+      "A reasoning"
+    );
+
+    const url = "https://api.example.test/api/cache/reasoning?provider=deepseek";
+    const responseA = await GET(tenantRequest(url, tenantAApiKey) as never);
+    const responseB = await GET(tenantRequest(url, tenantBApiKey) as never);
+    const bodyA = await responseA.json();
+    const bodyB = await responseB.json();
+
+    assert.equal(responseA.status, 200);
+    assert.equal(responseB.status, 200);
+    assert.equal(bodyA.entries.length, 1, JSON.stringify({ bodyA, bodyB }));
+    assert.equal(bodyB.entries.length, 1);
+    assert.equal(bodyA.entries[0].reasoning, "A reasoning");
+    assert.equal(bodyB.entries[0].reasoning, "B reasoning");
+    assert.equal(bodyA.stats.dbEntries, 1);
+    assert.equal(bodyB.stats.dbEntries, 1);
+
+    const deleteB = await DELETE(
+      tenantRequest(
+        "https://api.example.test/api/cache/reasoning?toolCallId=call_shared_tenant_id",
+        tenantBApiKey
+      ) as never
+    );
+    assert.equal((await deleteB.json()).cleared, 1);
+
+    await runWithTenantContext(
+      { tenantId: "tenant_reasoning_a", principalId: "test-a", role: "owner" },
+      () => assert.equal(lookupReasoning("call_shared_tenant_id"), "A reasoning")
+    );
+    await runWithTenantContext(
+      { tenantId: "tenant_reasoning_b", principalId: "test-b", role: "owner" },
+      () => assert.equal(lookupReasoning("call_shared_tenant_id"), null)
+    );
+  });
 
   it("should return stats and entries from GET", async () => {
     clearReasoningCacheAll();

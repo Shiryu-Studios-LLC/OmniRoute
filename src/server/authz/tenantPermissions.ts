@@ -18,6 +18,7 @@ const TENANT_RESOURCE_PREFIXES = [
   "/api/usage/budget",
   "/api/local-agents",
   "/api/tenant-members",
+  "/api/cache/reasoning",
 ] as const;
 const MAINTENANCE_PATHS = [
   /^\/api\/usage\/combo-health-autopilot(?:\/|$)/,
@@ -43,6 +44,10 @@ export function getTenantManagementPermission(
 
   // Revealing a stored API key is secret access even though the route is GET.
   if (/^\/api\/keys\/[^/]+\/reveal(?:\/|$)/.test(path)) return "manage";
+  // Reasoning entries contain private model content, so only tenant owners/admins may access them.
+  if (path === "/api/cache/reasoning" || path.startsWith("/api/cache/reasoning/")) {
+    return "manage";
+  }
 
   const normalizedMethod = method.toUpperCase();
   return normalizedMethod === "GET" || normalizedMethod === "HEAD" ? "read" : "manage";

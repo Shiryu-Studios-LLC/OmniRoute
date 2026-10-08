@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+import { PLATFORM_TENANT_ID } from "@/lib/db/tenantScope";
+import { getTenantContext, runWithTenantContext } from "@/lib/tenantContext";
+import { extractApiKey } from "@/sse/services/auth";
+import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
 import {
   clearReasoningCacheAll,
   deleteReasoningCacheEntry,
@@ -13,6 +18,28 @@ function errorMessage(error: unknown): string {
   return sanitizeErrorMessage(error);
 }
 
+async function runInAuthenticatedTenant<T>(request: Request, action: () => T): Promise<T | null> {
+  const apiKey = extractApiKey(request, { allowUrl: false });
+  if (apiKey) {
+    const metadata = await getApiKeyMetadata(apiKey);
+    if (!metadata?.tenantId?.trim()) return null;
+    return runWithTenantContext({ tenantId: metadata.tenantId, principalId: metadata.id }, action);
+  }
+
+  const existingContext = getTenantContext();
+  if (existingContext) return runWithTenantContext(existingContext, action);
+
+  if (await isDashboardSessionAuthenticated(request)) {
+    return runWithTenantContext(
+      { tenantId: PLATFORM_TENANT_ID, principalId: "dashboard", role: "owner" },
+      action
+    );
+  }
+
+  // Other management credentials need an upstream authenticated tenant context.
+  return null;
+}
+
 /**
  * GET /api/cache/reasoning
  *
@@ -20,9 +47,8 @@ function errorMessage(error: unknown): string {
  * Query params: ?provider=deepseek&model=deepseek-reasoner&limit=50&offset=0
  */
 export async function GET(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requireManagementAuth(req, { alwaysRequireAuth: true });
+  if (authError) return authError;
 
   try {
     const { searchParams } = new URL(req.url);
@@ -31,15 +57,19 @@ export async function GET(req: NextRequest) {
     const limit = parseInt(searchParams.get("limit") || "50", 10);
     const offset = parseInt(searchParams.get("offset") || "0", 10);
 
-    const stats = getReasoningCacheServiceStats();
-    const entries = getReasoningCacheServiceEntries({
-      limit: Math.min(Math.max(limit, 1), 200),
-      offset: Math.max(offset, 0),
-      provider,
-      model,
-    });
+    const scopedResult = await runInAuthenticatedTenant(req, () => ({
+      stats: getReasoningCacheServiceStats(),
+      entries: getReasoningCacheServiceEntries({
+        limit: Math.min(Math.max(limit, 1), 200),
+        offset: Math.max(offset, 0),
+        provider,
+        model,
+      }),
+    }));
+    if (!scopedResult)
+      return NextResponse.json({ error: "Authenticated tenant required" }, { status: 403 });
 
-    return NextResponse.json({ stats, entries });
+    return NextResponse.json(scopedResult);
   } catch (error) {
     return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
   }
@@ -52,33 +82,30 @@ export async function GET(req: NextRequest) {
  * Query params: ?toolCallId=call_abc (single entry), ?provider=deepseek, or no params.
  */
 export async function DELETE(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requireManagementAuth(req, { alwaysRequireAuth: true });
+  if (authError) return authError;
 
   try {
     const { searchParams } = new URL(req.url);
     const toolCallId = searchParams.get("toolCallId") || undefined;
     const provider = searchParams.get("provider") || undefined;
 
-    if (toolCallId) {
-      const cleared = deleteReasoningCacheEntry(toolCallId);
-      return NextResponse.json({
+    const result = await runInAuthenticatedTenant(req, () => {
+      if (toolCallId) {
+        const cleared = deleteReasoningCacheEntry(toolCallId);
+        return { ok: true, cleared, scope: "toolCallId", toolCallId };
+      }
+      const cleared = clearReasoningCacheAll(provider);
+      return {
         ok: true,
         cleared,
-        scope: "toolCallId",
-        toolCallId,
-      });
-    }
-
-    const cleared = clearReasoningCacheAll(provider);
-
-    return NextResponse.json({
-      ok: true,
-      cleared,
-      scope: provider ? "provider" : "all",
-      ...(provider ? { provider } : {}),
+        scope: provider ? "provider" : "all",
+        ...(provider ? { provider } : {}),
+      };
     });
+    if (!result)
+      return NextResponse.json({ error: "Authenticated tenant required" }, { status: 403 });
+    return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
   }

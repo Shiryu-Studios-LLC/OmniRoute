@@ -96,6 +96,9 @@ test("tenant role permission matrix separates read, manage, and maintenance", ()
   assert.equal(getTenantManagementPermission("/api/local-agents", "GET"), "read");
   assert.equal(getTenantManagementPermission("/api/local-agents", "POST"), "manage");
   assert.equal(getTenantManagementPermission("/api/local-agents/device-1", "DELETE"), "manage");
+  assert.equal(isTenantManagementResource("/api/cache/reasoning"), true);
+  assert.equal(getTenantManagementPermission("/api/cache/reasoning", "GET"), "manage");
+  assert.equal(getTenantManagementPermission("/api/cache/reasoning", "DELETE"), "manage");
   assert.equal(isTenantManagementResource("/api/quota/groups"), true);
   assert.equal(getTenantManagementPermission("/api/quota/groups", "GET"), "read");
   assert.equal(getTenantManagementPermission("/api/quota/groups", "POST"), "manage");

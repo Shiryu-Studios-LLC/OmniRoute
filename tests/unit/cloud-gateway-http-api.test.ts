@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -118,7 +118,10 @@ class TestDurableObjectNamespace implements GatewayDurableObjectNamespace<Gatewa
 }
 
 function createRuntimeFixture(
-  options: { customerInvokeRateLimit?: { limit: number; windowMs: number } } = {}
+  options: {
+    customerInvokeRateLimit?: { limit: number; windowMs: number };
+    currentClock?: boolean;
+  } = {}
 ) {
   const d1 = new SqliteD1();
   for (const name of [
@@ -127,6 +130,7 @@ function createRuntimeFixture(
     "0003_cloud_platform_tenant.sql",
     "0004_cloud_gateway_devices.sql",
     "0005_cloud_customer_identity.sql",
+    "0006_gateway_invocation_idempotency.sql",
   ]) {
     d1.db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -151,7 +155,7 @@ function createRuntimeFixture(
       OMNIROUTE_CLOUD_ADMIN_TOKEN: "test-admin-token",
       GATEWAY_SESSIONS: sessions,
     },
-    now: () => new Date(now),
+    now: () => new Date(options.currentClock ? Date.now() : now),
     customerInvokeRateLimit: options.customerInvokeRateLimit,
   });
   const fetch = (input: RequestInfo | URL, init?: RequestInit) =>
@@ -178,12 +182,17 @@ async function customerKey(
   });
 }
 
-function invokeRequest(token: string, body: unknown): Request {
+function invokeRequest(
+  token: string,
+  body: unknown,
+  idempotencyKey: string = randomUUID()
+): Request {
   return new Request("https://cloud.example.test/__gateway/v1/customer/invoke", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "content-type": "application/json",
+      "Idempotency-Key": idempotencyKey,
     },
     body: JSON.stringify(body),
   });
@@ -673,6 +682,171 @@ test("customer invocation derives tenant from its API key, completes through the
   }
 });
 
+test("customer invocation atomically claims an Idempotency-Key and replays the completed response", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const device = await registerOnlineDevice(fixture, "tenant-a", "device-idempotent");
+    const key = "gateway-operation-0001";
+    const body = {
+      deviceId: "device-idempotent",
+      capability: "ollama:chat:qwen-local",
+      payload: { messages: [{ role: "user", content: "one execution" }] },
+      timeoutMs: 2_000,
+    };
+    const rateBefore = fixture.d1.db
+      .prepare(
+        "SELECT COALESCE(SUM(request_count), 0) AS request_count FROM cloud_rate_limits WHERE tenant_id = 'tenant-a'"
+      )
+      .get() as { request_count: number };
+
+    const first = fixture.fetch(invokeRequest(owner.token, body, key));
+    const concurrent = await fixture.fetch(invokeRequest(owner.token, body, key));
+    assert.equal(concurrent.status, 409);
+    assert.deepEqual(await concurrent.json(), {
+      error: "Invocation with this Idempotency-Key is in progress",
+    });
+
+    let requests: Awaited<ReturnType<typeof device.transport.poll>> = null;
+    for (let attempt = 0; attempt < 50 && !requests?.length; attempt += 1) {
+      requests = await device.transport.poll(device.session);
+      if (!requests?.length) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(requests?.length, 1);
+    assert.equal(
+      await device.transport.submitResult(device.session, {
+        version: 1,
+        requestId: requests![0].requestId,
+        outcome: { ok: true, value: { message: { role: "assistant", content: "once" } } },
+      }),
+      true
+    );
+
+    const completed = await first;
+    assert.equal(completed.status, 200);
+    const completedBody = await completed.json();
+    assert.equal((completedBody as { requestId: string }).requestId, requests![0].requestId);
+
+    const replay = await fixture.fetch(invokeRequest(owner.token, body, key));
+    assert.equal(replay.status, 200);
+    assert.deepEqual(await replay.json(), completedBody);
+    assert.equal((await device.transport.poll(device.session))?.length, 0);
+
+    const rateLimit = fixture.d1.db
+      .prepare(
+        "SELECT SUM(request_count) AS request_count FROM cloud_rate_limits WHERE tenant_id = 'tenant-a'"
+      )
+      .get() as { request_count: number };
+    assert.equal(
+      rateLimit.request_count,
+      rateBefore.request_count + 1,
+      "retries must not consume another invocation slot"
+    );
+    const stored = fixture.d1.db
+      .prepare("SELECT state, key_hash, request_id FROM cloud_gateway_idempotency")
+      .get() as { state: string; key_hash: string; request_id: string };
+    assert.equal(stored.state, "completed");
+    assert.equal(stored.request_id, requests![0].requestId);
+    assert.notEqual(stored.key_hash, key, "D1 stores only the Idempotency-Key hash");
+
+    for (const changed of [
+      { ...body, payload: { messages: [{ role: "user", content: "different" }] } },
+      { ...body, capability: "ollama:chat:other-model" },
+      { ...body, deviceId: "different-device" },
+    ]) {
+      assert.equal((await fixture.fetch(invokeRequest(owner.token, changed, key))).status, 409);
+    }
+    const ownerB = await customerKey(fixture, "tenant-b", "owner");
+    assert.equal(
+      (await fixture.fetch(invokeRequest(ownerB.token, body, key))).status,
+      404,
+      "the tenant-scoped key does not reveal or block tenant A's idempotency record"
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("an invocation retry after timeout resumes the same retained device request", async () => {
+  const fixture = createRuntimeFixture({ currentClock: true });
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const device = await registerOnlineDevice(fixture, "tenant-a", "device-timeout-retry");
+    const key = "gateway-timeout-0001";
+    const body = {
+      deviceId: "device-timeout-retry",
+      capability: "ollama:chat:qwen-local",
+      payload: { prompt: "complete after the first wait expires" },
+      timeoutMs: 100,
+    };
+    const timedOut = await fixture.fetch(invokeRequest(owner.token, body, key));
+    assert.equal(timedOut.status, 504);
+
+    const delivered = await device.transport.poll(device.session);
+    assert.equal(delivered?.length, 1);
+    const retry = fixture.fetch(invokeRequest(owner.token, { ...body, timeoutMs: 2_000 }, key));
+    assert.equal((await device.transport.poll(device.session))?.length, 0);
+    assert.equal(
+      await device.transport.submitResult(device.session, {
+        version: 1,
+        requestId: delivered![0].requestId,
+        outcome: { ok: true, value: { recovered: true } },
+      }),
+      true
+    );
+    const completed = await retry;
+    assert.equal(completed.status, 200);
+    assert.equal((completed as Response).headers.get("cache-control"), "no-store");
+    const stored = fixture.d1.db
+      .prepare("SELECT request_id, state FROM cloud_gateway_idempotency")
+      .get() as { request_id: string; state: string };
+    assert.equal(stored.request_id, delivered![0].requestId);
+    assert.equal(stored.state, "completed");
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("device revocation makes an idempotent operation terminal and replayable", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const device = await registerOnlineDevice(fixture, "tenant-a", "device-revoke-invoke");
+    const key = "gateway-revocation-0001";
+    const body = {
+      deviceId: "device-revoke-invoke",
+      capability: "ollama:chat:qwen-local",
+      payload: { prompt: "must not repeat after revocation" },
+      timeoutMs: 2_000,
+    };
+    const invocation = fixture.fetch(invokeRequest(owner.token, body, key));
+    let requests: Awaited<ReturnType<typeof device.transport.poll>> = null;
+    for (let attempt = 0; attempt < 50 && !requests?.length; attempt += 1) {
+      requests = await device.transport.poll(device.session);
+      if (!requests?.length) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(requests?.length, 1);
+
+    const revokeResponse = await fixture.fetch(
+      adminRequest("/__cloud/v1/tenants/tenant-a/gateway-devices/device-revoke-invoke", "DELETE")
+    );
+    assert.equal(revokeResponse.status, 200);
+    const first = await invocation;
+    assert.equal(first.status, 503);
+    assert.deepEqual(await first.json(), { error: "Device is unavailable" });
+
+    const replay = await fixture.fetch(invokeRequest(owner.token, body, key));
+    assert.equal(replay.status, 503);
+    assert.deepEqual(await replay.json(), { error: "Device is unavailable" });
+    const stored = fixture.sessions
+      .get("device-revoke-invoke")
+      .getRequest("device-revoke-invoke", requests![0].requestId, fixture.now);
+    assert.ok(await stored);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
 test("customer invocation rejects invalid, revoked, expired, suspended, viewer, and offline identities safely", async () => {
   const fixture = createRuntimeFixture();
   try {
@@ -692,6 +866,17 @@ test("customer invocation rejects invalid, revoked, expired, suspended, viewer, 
       capability: "ollama:chat:qwen-local",
       payload: { prompt: "do not log" },
     };
+    const missingIdempotencyKey = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/customer/invoke", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${owner.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      })
+    );
+    assert.equal(missingIdempotencyKey.status, 400);
     const unauthorized = await fixture.fetch(invokeRequest("not-a-customer-key", body));
     assert.equal(unauthorized.status, 401);
     assert.equal((await fixture.fetch(invokeRequest(expired.token, body))).status, 401);
@@ -754,9 +939,14 @@ test("customer invocation rate limit is tenant-scoped and fails closed when D1 i
       ]
     );
 
+    let rateLimitUnavailable = true;
+    let attemptedAuditUnavailable = false;
     const failingDb: CloudDb = {
       prepare<T = unknown>(sql: string): CloudDbStatement<T> {
-        if (sql.includes("INSERT INTO cloud_rate_limits")) {
+        if (rateLimitUnavailable && sql.includes("INSERT INTO cloud_rate_limits")) {
+          throw new Error("D1 unavailable");
+        }
+        if (attemptedAuditUnavailable && sql.includes("INSERT INTO cloud_compliance_audit")) {
           throw new Error("D1 unavailable");
         }
         return fixture.d1.prepare<T>(sql);
@@ -772,11 +962,29 @@ test("customer invocation rate limit is tenant-scoped and fails closed when D1 i
       env: { DB: failingDb, GATEWAY_SESSIONS: fixture.sessions },
       now: () => new Date(fixture.now),
     });
-    const failingResponse = await failingRuntime.fetch(invokeRequest(ownerB.token, body));
+    const retryKey = "gateway-rate-limit-retry-0001";
+    const failingResponse = await failingRuntime.fetch(invokeRequest(ownerB.token, body, retryKey));
     assert.equal(failingResponse.status, 503);
     assert.deepEqual(await failingResponse.json(), {
       error: "Invocation rate limit is unavailable",
     });
+    rateLimitUnavailable = false;
+    attemptedAuditUnavailable = true;
+    const auditFailureResponse = await failingRuntime.fetch(
+      invokeRequest(ownerB.token, body, retryKey)
+    );
+    assert.equal(auditFailureResponse.status, 503);
+    assert.deepEqual(await auditFailureResponse.json(), {
+      error: "Invocation audit is unavailable",
+    });
+    attemptedAuditUnavailable = false;
+    const retriedResponse = await failingRuntime.fetch(invokeRequest(ownerB.token, body, retryKey));
+    assert.equal(
+      retriedResponse.status,
+      503,
+      "a pre-execution 503 must release its claim so a retry can continue through the gateway"
+    );
+    assert.deepEqual(await retriedResponse.json(), { error: "Device is unavailable" });
   } finally {
     fixture.d1.db.close();
   }

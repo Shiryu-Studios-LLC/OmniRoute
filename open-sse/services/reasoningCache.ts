@@ -24,6 +24,7 @@ import {
   setReasoningCache,
 } from "../../src/lib/db/reasoningCache.ts";
 import { isInternalReasoningPlaceholder } from "../utils/reasoningPlaceholder.ts";
+import { currentDbTenantId } from "../../src/lib/db/tenantScope.ts";
 
 // ──────────────── Provider/Model Detection ────────────────
 
@@ -123,6 +124,7 @@ export function requiresReasoningReplay(params: {
 // ──────────────── In-Memory Cache ────────────────
 
 interface MemoryCacheEntry {
+  tenantId: string;
   reasoning: string;
   provider: string;
   model: string;
@@ -153,9 +155,22 @@ const TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 // ──────────────── Counters ────────────────
 
-let hits = 0;
-let misses = 0;
-let replays = 0;
+type TenantCounters = { hits: number; misses: number; replays: number };
+const countersByTenant = new Map<string, TenantCounters>();
+
+function tenantCacheKey(key: string): string {
+  return JSON.stringify([currentDbTenantId(), key]);
+}
+
+function tenantCounters(): TenantCounters {
+  const tenantId = currentDbTenantId();
+  let counters = countersByTenant.get(tenantId);
+  if (!counters) {
+    counters = { hits: 0, misses: 0, replays: 0 };
+    countersByTenant.set(tenantId, counters);
+  }
+  return counters;
+}
 
 // ──────────────── Core Operations ────────────────
 
@@ -220,7 +235,9 @@ export function cacheReasoningByKey(
   if (memoryCache.size >= MAX_MEMORY_ENTRIES) {
     evictOldest();
   }
-  memoryCache.set(key, {
+  const tenantId = currentDbTenantId();
+  memoryCache.set(tenantCacheKey(key), {
+    tenantId,
     reasoning,
     provider,
     model,
@@ -376,25 +393,26 @@ export function cacheReasoningFromAssistantMessage(
  */
 export function lookupReasoning(toolCallId: string): string | null {
   if (!toolCallId) {
-    misses++;
+    tenantCounters().misses++;
     return null;
   }
+  const cacheKey = tenantCacheKey(toolCallId);
 
   // 1. Check memory
-  const mem = memoryCache.get(toolCallId);
+  const mem = memoryCache.get(cacheKey);
   if (mem) {
     if (Date.now() < mem.expiresAt) {
       // ponytail: never replay the internal placeholder from memory.
       if (isInternalReasoningPlaceholder(mem.reasoning)) {
-        memoryCache.delete(toolCallId);
-        misses++;
+        memoryCache.delete(cacheKey);
+        tenantCounters().misses++;
         return null;
       }
-      hits++;
+      tenantCounters().hits++;
       return mem.reasoning;
     }
     // Expired in memory — remove
-    memoryCache.delete(toolCallId);
+    memoryCache.delete(cacheKey);
   }
 
   // 2. Fallback to DB
@@ -408,21 +426,22 @@ export function lookupReasoning(toolCallId: string): string | null {
   if (dbResult) {
     // ponytail: never promote/replay the internal placeholder from DB.
     if (isInternalReasoningPlaceholder(dbResult.reasoning)) {
-      misses++;
+      tenantCounters().misses++;
       return null;
     }
     const persistedExpiresAt = Date.parse(dbResult.expiresAt);
     if (!Number.isFinite(persistedExpiresAt) || persistedExpiresAt <= Date.now()) {
-      misses++;
+      tenantCounters().misses++;
       return null;
     }
-    hits++;
+    tenantCounters().hits++;
     let promotedReasoning = dbResult.reasoning;
     if (promotedReasoning.length > MAX_ENTRY_BYTES) {
       promotedReasoning = promotedReasoning.slice(0, MAX_ENTRY_BYTES);
     }
     // Promote back to memory for fast subsequent lookups
-    memoryCache.set(toolCallId, {
+    memoryCache.set(cacheKey, {
+      tenantId: currentDbTenantId(),
       reasoning: promotedReasoning,
       provider: dbResult.provider,
       model: dbResult.model,
@@ -433,7 +452,7 @@ export function lookupReasoning(toolCallId: string): string | null {
   }
 
   // 3. Miss
-  misses++;
+  tenantCounters().misses++;
   return null;
 }
 
@@ -441,7 +460,7 @@ export function lookupReasoning(toolCallId: string): string | null {
  * Record that a replay was performed (for dashboard metrics).
  */
 export function recordReplay(): void {
-  replays++;
+  tenantCounters().replays++;
 }
 
 // ──────────────── Stats & Dashboard ────────────────
@@ -465,6 +484,8 @@ export function getReasoningCacheServiceStats(): {
 } {
   // Purge expired memory entries before reporting
   purgeExpiredMemory();
+  const tenantId = currentDbTenantId();
+  const tenantMemory = [...memoryCache.values()].filter((entry) => entry.tenantId === tenantId);
 
   let dbStats = {
     totalEntries: 0,
@@ -480,17 +501,19 @@ export function getReasoningCacheServiceStats(): {
     // DB stats are unavailable; return memory counters with empty persisted stats.
   }
 
-  const totalLookups = hits + misses;
-  const replayRate = totalLookups > 0 ? ((replays / totalLookups) * 100).toFixed(1) : "0.0";
+  const counters = tenantCounters();
+  const totalLookups = counters.hits + counters.misses;
+  const replayRate =
+    totalLookups > 0 ? ((counters.replays / totalLookups) * 100).toFixed(1) : "0.0";
 
   return {
-    memoryEntries: memoryCache.size,
+    memoryEntries: tenantMemory.length,
     dbEntries: dbStats.totalEntries,
     totalEntries: dbStats.totalEntries,
     totalChars: dbStats.totalChars,
-    hits,
-    misses,
-    replays,
+    hits: counters.hits,
+    misses: counters.misses,
+    replays: counters.replays,
     replayRate: `${replayRate}%`,
     byProvider: dbStats.byProvider,
     byModel: dbStats.byModel,
@@ -525,16 +548,17 @@ export function clearReasoningCacheAll(provider?: string): number {
   // Clear memory
   if (provider) {
     for (const [key, entry] of memoryCache) {
-      if (entry.provider === provider) memoryCache.delete(key);
+      if (entry.tenantId === currentDbTenantId() && entry.provider === provider)
+        memoryCache.delete(key);
     }
   } else {
-    memoryCache.clear();
+    for (const [key, entry] of memoryCache) {
+      if (entry.tenantId === currentDbTenantId()) memoryCache.delete(key);
+    }
   }
 
   // Reset counters
-  hits = 0;
-  misses = 0;
-  replays = 0;
+  countersByTenant.set(currentDbTenantId(), { hits: 0, misses: 0, replays: 0 });
 
   try {
     return clearAllReasoningCache(provider);
@@ -548,7 +572,7 @@ export function clearReasoningCacheAll(provider?: string): number {
  */
 export function deleteReasoningCacheEntry(toolCallId: string): number {
   if (!toolCallId) return 0;
-  const existedInMemory = memoryCache.delete(toolCallId);
+  const existedInMemory = memoryCache.delete(tenantCacheKey(toolCallId));
   let deletedFromDb = 0;
   try {
     deletedFromDb = deleteReasoningCache(toolCallId);

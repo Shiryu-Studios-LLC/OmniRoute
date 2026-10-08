@@ -214,8 +214,9 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
       const rows = await this.readRequests(transaction);
       const now = Date.parse(request.createdAt);
       const active = rows.filter((row) => Date.parse(row.expiresAt) > now);
+      const pending = active.filter((row) => row.status !== "complete");
       if (
-        active.length >= MAX_PENDING_REQUESTS ||
+        pending.length >= MAX_PENDING_REQUESTS ||
         active.some((row) => row.requestId === request.requestId)
       ) {
         return false;

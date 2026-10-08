@@ -105,6 +105,11 @@ export interface GatewayRequestInput {
   capability: string;
   payload: unknown;
   timeoutMs?: number;
+  /** Stable server-generated request identity used by an authorized retry. */
+  requestId?: string;
+  requestCreatedAt?: string;
+  /** Retain a retryable request/result until this bounded idempotency expiry. */
+  requestExpiresAt?: string;
 }
 
 export interface GatewayDeviceRequestEnvelope {
@@ -410,21 +415,64 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         throw new Error("Gateway request timeout must be between 100 ms and 30 seconds");
       }
       const payload = serializeBounded(input.payload, "Gateway request");
+      const requestId = input.requestId ?? createRequestId();
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId)) {
+        throw new Error("Gateway request identity is invalid");
+      }
       const authorization = await this.authorizeCapability(input);
       if (!authorization.ok) return authorization;
       const target = authorization.target;
       const timestamp = now();
+      const createdAt = input.requestCreatedAt ?? new Date(timestamp).toISOString();
+      const expiresAt = input.requestExpiresAt ?? new Date(timestamp + timeoutMs).toISOString();
+      if (
+        !Number.isFinite(Date.parse(createdAt)) ||
+        Date.parse(createdAt) > timestamp ||
+        !Number.isFinite(Date.parse(expiresAt)) ||
+        Date.parse(expiresAt) <= timestamp ||
+        Date.parse(expiresAt) - timestamp > 15 * 60_000
+      ) {
+        throw new Error("Gateway request expiry must be within 15 minutes");
+      }
       const request: GatewayDeviceRequest = {
-        requestId: createRequestId(),
+        requestId,
         tenantId: input.tenantId,
         sessionId: target.sessionId,
         capability: target.capability,
         payload,
-        createdAt: new Date(timestamp).toISOString(),
-        expiresAt: new Date(timestamp + timeoutMs).toISOString(),
+        createdAt,
+        expiresAt,
         status: "pending",
       };
-      if (!(await options.coordinator.enqueueRequest(input.deviceId, request))) {
+      let storedRequest: GatewayDeviceRequest | null = null;
+      if (input.requestId) {
+        storedRequest = await options.coordinator.getRequest(
+          input.deviceId,
+          request.requestId,
+          new Date(timestamp).toISOString()
+        );
+        if (
+          storedRequest &&
+          (storedRequest.tenantId !== request.tenantId ||
+            storedRequest.sessionId !== request.sessionId ||
+            storedRequest.capability !== request.capability ||
+            storedRequest.payload !== request.payload)
+        ) {
+          return { ok: false, reason: "queue_full" };
+        }
+        if (storedRequest?.status === "complete" && storedRequest.result !== undefined) {
+          try {
+            return {
+              ok: true,
+              requestId: storedRequest.requestId,
+              result: JSON.parse(storedRequest.result) as unknown,
+            };
+          } catch {
+            return { ok: false, reason: "offline" };
+          }
+        }
+      }
+      if (!storedRequest && !(await options.coordinator.enqueueRequest(input.deviceId, request))) {
         return { ok: false, reason: "queue_full" };
       }
 
@@ -432,7 +480,9 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
       while (now() < deadline) {
         const active = await this.authorizeCapability(input);
         if (!active.ok || active.target.sessionId !== target.sessionId) {
-          await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+          if (!input.requestId) {
+            await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+          }
           return active.ok ? { ok: false, reason: "offline" } : active;
         }
         const stored = await options.coordinator.getRequest(
@@ -441,7 +491,9 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
           new Date(now()).toISOString()
         );
         if (stored?.status === "complete" && stored.result !== undefined) {
-          await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+          if (!input.requestId) {
+            await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+          }
           try {
             return {
               ok: true,
@@ -454,7 +506,9 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         }
         await wait(Math.min(REQUEST_RESULT_POLL_INTERVAL_MS, Math.max(1, deadline - now())));
       }
-      await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+      if (!input.requestId) {
+        await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+      }
       return { ok: false, reason: "timeout" };
     },
 

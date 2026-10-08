@@ -1,9 +1,13 @@
 import { NextResponse } from "next/server";
 import { getAllFallbackChains, registerFallback, removeFallback } from "@/domain/fallbackPolicy";
+import { requirePlatformAdminManagement } from "@/lib/api/platformAdminAuth";
 import { registerFallbackSchema, removeFallbackSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requirePlatformAdminManagement(request);
+  if (authError) return authError;
+
   try {
     const chains = getAllFallbackChains();
     return NextResponse.json(chains);
@@ -14,6 +18,9 @@ export async function GET() {
 }
 
 export async function POST(request) {
+  const authError = await requirePlatformAdminManagement(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -45,6 +52,9 @@ export async function POST(request) {
 }
 
 export async function DELETE(request) {
+  const authError = await requirePlatformAdminManagement(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();

@@ -19,6 +19,7 @@
  * Part of: Quota-aware provider scheduling (feat/quota-aware-scheduling).
  */
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import { createLogger } from "@/shared/utils/logger";
 
 const log = createLogger("quota:provider-state");
@@ -46,6 +47,7 @@ export interface ProviderQuotaSnapshot {
 }
 
 interface RowLike {
+  tenant_id?: string;
   connection_id?: string;
   model?: string;
   tokens_used?: number;
@@ -80,8 +82,10 @@ export function getProviderQuota(
   try {
     const db = getDbInstance();
     const row = db
-      .prepare("SELECT * FROM provider_quota_state WHERE connection_id = ? AND model = ?")
-      .get(connectionId, model) as RowLike | undefined;
+      .prepare(
+        "SELECT * FROM provider_quota_state WHERE connection_id = ? AND model = ? AND tenant_id = ?"
+      )
+      .get(connectionId, model, currentDbTenantId()) as RowLike | undefined;
     if (!row) return null;
 
     const normalized = normalizeRow(row);
@@ -135,9 +139,17 @@ export function recordProviderQuotaUsage(
   if (!connectionId || !model || !(tokensUsedDelta > 0)) return;
   try {
     const db = getDbInstance();
+    const tenantId = currentDbTenantId();
+    const ownsConnection = db
+      .prepare("SELECT 1 FROM provider_connections WHERE id = ? AND tenant_id = ?")
+      .get(connectionId, tenantId);
+    if (!ownsConnection) return;
+
     const existing = db
-      .prepare("SELECT * FROM provider_quota_state WHERE connection_id = ? AND model = ?")
-      .get(connectionId, model) as RowLike | undefined;
+      .prepare(
+        "SELECT * FROM provider_quota_state WHERE connection_id = ? AND model = ? AND tenant_id = ?"
+      )
+      .get(connectionId, model, tenantId) as RowLike | undefined;
 
     const now = Date.now();
     const windowMs = opts.windowMs ?? 60_000; // default: per-minute window
@@ -147,9 +159,10 @@ export function recordProviderQuotaUsage(
     if (!existing) {
       db.prepare(
         `INSERT OR REPLACE INTO provider_quota_state
-         (connection_id, model, tokens_used, token_limit, window_start, window_reset, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+         (tenant_id, connection_id, model, tokens_used, token_limit, window_start, window_reset, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
+        tenantId,
         connectionId,
         model,
         tokensUsedDelta,
@@ -170,7 +183,7 @@ export function recordProviderQuotaUsage(
     db.prepare(
       `UPDATE provider_quota_state
        SET tokens_used = ?, token_limit = ?, window_start = ?, window_reset = ?, updated_at = ?
-       WHERE connection_id = ? AND model = ?`
+       WHERE connection_id = ? AND model = ? AND tenant_id = ?`
     ).run(
       nextUsed,
       nextLimit,
@@ -178,7 +191,8 @@ export function recordProviderQuotaUsage(
       windowReset,
       new Date().toISOString(),
       connectionId,
-      model
+      model,
+      tenantId
     );
   } catch (err) {
     log.warn(
@@ -193,8 +207,8 @@ export function clearProviderQuota(connectionId: string): void {
   if (!connectionId) return;
   try {
     getDbInstance()
-      .prepare("DELETE FROM provider_quota_state WHERE connection_id = ?")
-      .run(connectionId);
+      .prepare("DELETE FROM provider_quota_state WHERE connection_id = ? AND tenant_id = ?")
+      .run(connectionId, currentDbTenantId());
   } catch {
     // best-effort
   }

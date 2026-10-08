@@ -8,6 +8,7 @@
  */
 
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import { createLogger } from "@/shared/utils/logger";
 
 const log = createLogger("quota:reset-timers");
@@ -27,7 +28,9 @@ export interface QuotaResetItem {
 export function getActiveQuotaResetItems(): QuotaResetItem[] {
   try {
     const db = getDbInstance();
-    const rows = db.prepare("SELECT * FROM provider_quota_state WHERE window_reset > 0").all() as Array<{
+    const rows = db
+      .prepare("SELECT * FROM provider_quota_state WHERE tenant_id = ? AND window_reset > 0")
+      .all(currentDbTenantId()) as Array<{
       connection_id: string;
       model: string;
       tokens_used: number;
@@ -59,8 +62,10 @@ export function resetExpiredQuotaWindows(): number {
     const db = getDbInstance();
     const now = Date.now();
     const result = db
-      .prepare("DELETE FROM provider_quota_state WHERE window_reset > 0 AND window_reset <= ?")
-      .run(now);
+      .prepare(
+        "DELETE FROM provider_quota_state WHERE tenant_id = ? AND window_reset > 0 AND window_reset <= ?"
+      )
+      .run(currentDbTenantId(), now);
     return result.changes ?? 0;
   } catch (error) {
     log.error("Failed to reset expired quota windows", error);

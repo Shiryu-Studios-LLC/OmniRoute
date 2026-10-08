@@ -10,6 +10,12 @@ import { D1GatewayDeviceDirectory } from "./gatewayDevices";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import { consumeCloudRateLimit } from "./rateLimit";
 import { appendCloudUsageRecord } from "./usage";
+import {
+  claimGatewayIdempotency,
+  completeGatewayIdempotency,
+  markGatewayIdempotencyPreflight,
+  releaseGatewayIdempotencyClaim,
+} from "./gatewayIdempotency";
 
 const PATH = "/__gateway/v1/customer/invoke";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -125,20 +131,10 @@ export async function handleGatewayCustomerRequest(
     new Date(options.now?.() ?? Date.now()).toISOString()
   );
   if (!identity) return json({ error: "Unauthorized" }, 401);
-
-  let rateLimit: Awaited<ReturnType<typeof consumeCloudRateLimit>>;
-  try {
-    rateLimit = await consumeCloudRateLimit(options.db, {
-      tenantId: identity.tenantId,
-      bucketKey: "gateway-customer-invoke",
-      limit: options.rateLimit?.limit ?? DEFAULT_INVOKE_RATE_LIMIT.limit,
-      windowMs: options.rateLimit?.windowMs ?? DEFAULT_INVOKE_RATE_LIMIT.windowMs,
-      nowMs: options.now?.() ?? Date.now(),
-    });
-  } catch {
-    return json({ error: "Invocation rate limit is unavailable" }, 503);
+  const idempotencyKey = request.headers.get("idempotency-key") ?? "";
+  if (!/^[A-Za-z0-9._~-]{16,128}$/.test(idempotencyKey)) {
+    return json({ error: "A valid Idempotency-Key header is required" }, 400);
   }
-  if (!rateLimit.allowed) return json({ error: "Customer invocation rate limit exceeded" }, 429);
 
   const body = await readBody(request);
   if (!body) return json({ error: "Invalid or oversized JSON body" }, 400);
@@ -189,7 +185,8 @@ export async function handleGatewayCustomerRequest(
   }
 
   const db = options.db;
-  const timestamp = new Date(options.now?.() ?? Date.now()).toISOString();
+  const nowMs = options.now?.() ?? Date.now();
+  const timestamp = new Date(nowMs).toISOString();
   const requestId = requestIdFrom(request);
   const auditBase = {
     tenantId: identity.tenantId,
@@ -199,15 +196,109 @@ export async function handleGatewayCustomerRequest(
     requestId,
     metadata: { apiKeyId: identity.apiKeyId, capability: body.capability },
   };
+
+  const proposedRequestId = crypto.randomUUID();
+  const claimToken = crypto.randomUUID();
+  let idempotency: Awaited<ReturnType<typeof claimGatewayIdempotency>>;
   try {
-    await appendCloudComplianceAudit(db, {
-      id: crypto.randomUUID(),
-      ...auditBase,
-      timestamp,
-      action: "gateway.customer.invoke",
-      status: "attempted",
+    idempotency = await claimGatewayIdempotency(db, {
+      key: idempotencyKey,
+      scope: {
+        tenantId: identity.tenantId,
+        principalId: identity.principalId,
+        apiKeyId: identity.apiKeyId,
+      },
+      operation: {
+        deviceId: body.deviceId,
+        capability: body.capability,
+        payload: body.payload,
+      },
+      requestId: proposedRequestId,
+      claimToken,
+      nowMs,
     });
   } catch {
+    return json({ error: "Invocation idempotency storage is unavailable" }, 503);
+  }
+  if (idempotency.kind === "conflict") {
+    return json({ error: "Idempotency-Key was already used for a different operation" }, 409);
+  }
+  if (idempotency.kind === "capacity") {
+    return json({ error: "Invocation idempotency storage is full or invalid" }, 503);
+  }
+  if (idempotency.kind === "replay") return json(idempotency.response, idempotency.status);
+  if (idempotency.kind === "in_progress") {
+    return json({ error: "Invocation with this Idempotency-Key is in progress" }, 409);
+  }
+  const claim = idempotency.claim;
+  const releaseClaim = async () => {
+    try {
+      await releaseGatewayIdempotencyClaim(db, claim, claimToken, options.now?.() ?? Date.now());
+    } catch {
+      // The claim lease expires automatically if D1 cannot release it now.
+    }
+  };
+  const cacheResponse = async (responseBody: unknown, status: number): Promise<Response> => {
+    try {
+      const completed = await completeGatewayIdempotency(
+        db,
+        claim,
+        claimToken,
+        responseBody,
+        status,
+        options.now?.() ?? Date.now()
+      );
+      if (completed.kind === "replay") return json(completed.response, completed.status);
+    } catch {
+      // Keep the operation pending. A later claimant can recover the same DO result by request ID.
+    }
+    return json({ error: "Invocation result is unavailable" }, 503);
+  };
+
+  if (!claim.rateLimitChecked) {
+    let rateLimit: Awaited<ReturnType<typeof consumeCloudRateLimit>>;
+    try {
+      rateLimit = await consumeCloudRateLimit(db, {
+        tenantId: identity.tenantId,
+        bucketKey: "gateway-customer-invoke",
+        limit: options.rateLimit?.limit ?? DEFAULT_INVOKE_RATE_LIMIT.limit,
+        windowMs: options.rateLimit?.windowMs ?? DEFAULT_INVOKE_RATE_LIMIT.windowMs,
+        nowMs,
+      });
+    } catch {
+      await releaseClaim();
+      return json({ error: "Invocation rate limit is unavailable" }, 503);
+    }
+    if (!rateLimit.allowed) {
+      return cacheResponse({ error: "Customer invocation rate limit exceeded" }, 429);
+    }
+    try {
+      if (!(await markGatewayIdempotencyPreflight(db, claim, claimToken, "rate_limit_checked"))) {
+        await releaseClaim();
+        return json({ error: "Invocation rate limit is unavailable" }, 503);
+      }
+    } catch {
+      await releaseClaim();
+      return json({ error: "Invocation rate limit is unavailable" }, 503);
+    }
+  }
+
+  try {
+    if (!claim.attemptAudited) {
+      await appendCloudComplianceAudit(db, {
+        id: crypto.randomUUID(),
+        ...auditBase,
+        timestamp,
+        action: "gateway.customer.invoke",
+        status: "attempted",
+      });
+      if (!(await markGatewayIdempotencyPreflight(db, claim, claimToken, "attempt_audited"))) {
+        await releaseClaim();
+        return json({ error: "Invocation audit is unavailable" }, 503);
+      }
+    }
+  } catch {
+    await releaseClaim();
     return json({ error: "Invocation audit is unavailable" }, 503);
   }
 
@@ -226,6 +317,9 @@ export async function handleGatewayCustomerRequest(
       capability: body.capability,
       payload: body.payload,
       timeoutMs,
+      requestId: claim.requestId,
+      requestCreatedAt: claim.createdAt,
+      requestExpiresAt: claim.expiresAt,
     });
   } catch {
     try {
@@ -239,6 +333,7 @@ export async function handleGatewayCustomerRequest(
     } catch {
       // The response remains generic; the attempted audit record is retained when D1 is available.
     }
+    await releaseClaim();
     return json({ error: "Gateway invocation is unavailable" }, 503);
   }
   const responseResult = result.ok ? result : undefined;
@@ -257,11 +352,12 @@ export async function handleGatewayCustomerRequest(
       status,
     });
   } catch {
+    await releaseClaim();
     return json({ error: "Invocation result is unavailable" }, 503);
   }
   if (result.ok) {
     if (responseBytes === null || responseBytes > MAX_RESULT_BYTES) {
-      return json({ error: "Invocation result exceeds the size limit" }, 502);
+      return cacheResponse({ error: "Invocation result exceeds the size limit" }, 502);
     }
     const chatModelPrefix = "ollama:chat:";
     if (body.capability.startsWith(chatModelPrefix)) {
@@ -270,40 +366,48 @@ export async function handleGatewayCustomerRequest(
       const localResult = outcome?.ok === true ? record(outcome.value) : null;
       if (localResult) {
         try {
-          await appendCloudUsageRecord(db, {
-            id: result.requestId,
-            tenantId: identity.tenantId,
-            provider: "ollama",
-            model: body.capability.slice(chatModelPrefix.length),
-            apiKeyId: identity.apiKeyId,
-            tokensInput: tokenCount(localResult.prompt_eval_count),
-            tokensOutput: tokenCount(localResult.eval_count),
-            serviceTier: "customer-managed",
-            status: "success",
-            success: true,
-            latencyMs: Math.max(0, Math.round(performance.now() - invocationStartedAt)),
-            endpoint: PATH,
-            timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
-          });
+          const existingUsage = await db
+            .prepare("SELECT id FROM cloud_usage_history WHERE tenant_id = ? AND id = ? LIMIT 1")
+            .bind(identity.tenantId, result.requestId)
+            .first<{ id: string }>();
+          if (!existingUsage) {
+            await appendCloudUsageRecord(db, {
+              id: result.requestId,
+              tenantId: identity.tenantId,
+              provider: "ollama",
+              model: body.capability.slice(chatModelPrefix.length),
+              apiKeyId: identity.apiKeyId,
+              tokensInput: tokenCount(localResult.prompt_eval_count),
+              tokensOutput: tokenCount(localResult.eval_count),
+              serviceTier: "customer-managed",
+              status: "success",
+              success: true,
+              latencyMs: Math.max(0, Math.round(performance.now() - invocationStartedAt)),
+              endpoint: PATH,
+              timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+            });
+          }
         } catch {
+          await releaseClaim();
           return json({ error: "Invocation usage accounting is unavailable" }, 503);
         }
       }
     }
-    return json({ requestId: result.requestId, result: result.result });
+    return cacheResponse({ requestId: result.requestId, result: result.result }, 200);
   }
 
   switch (result.reason) {
     case "tenant_mismatch":
-      return json({ error: "Device not found" }, 404);
+      return cacheResponse({ error: "Device not found" }, 404);
     case "revoked":
     case "offline":
-      return json({ error: "Device is unavailable" }, 503);
+      return cacheResponse({ error: "Device is unavailable" }, 503);
     case "capability_unavailable":
-      return json({ error: "Capability is unavailable" }, 409);
+      return cacheResponse({ error: "Capability is unavailable" }, 409);
     case "timeout":
+      await releaseClaim();
       return json({ error: "Invocation timed out" }, 504);
     case "queue_full":
-      return json({ error: "Device request queue is full" }, 429);
+      return cacheResponse({ error: "Device request queue is full" }, 429);
   }
 }

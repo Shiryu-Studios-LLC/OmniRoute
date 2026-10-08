@@ -227,3 +227,68 @@ test("Durable Object request queue binds delivery and results to the active tena
   };
   assert.equal(await coordinator.enqueueRequest("device_A", largeRequest), false);
 });
+
+test("completed idempotent results do not consume the pending queue capacity", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const createdAt = "2026-10-08T12:00:00.000Z";
+  const expiresAt = "2026-10-08T12:10:00.000Z";
+
+  for (let index = 0; index < 16; index += 1) {
+    assert.equal(
+      await coordinator.enqueueRequest("device_A", {
+        requestId: `retained_${index}`,
+        tenantId: "tenant_A",
+        sessionId: "session_A",
+        capability: "ollama.chat",
+        payload: "{}",
+        createdAt,
+        expiresAt,
+        status: "pending",
+      }),
+      true
+    );
+  }
+  assert.equal(
+    await coordinator.enqueueRequest("device_A", {
+      requestId: "pending_overflow",
+      tenantId: "tenant_A",
+      sessionId: "session_A",
+      capability: "ollama.chat",
+      payload: "{}",
+      createdAt,
+      expiresAt,
+      status: "pending",
+    }),
+    false
+  );
+
+  const delivered = await coordinator.takeRequests("device_A", "session_A", createdAt);
+  assert.equal(delivered.length, 16);
+  for (const request of delivered) {
+    assert.equal(
+      await coordinator.submitRequestResult(
+        "device_A",
+        "session_A",
+        request.requestId,
+        "{}",
+        createdAt
+      ),
+      true
+    );
+  }
+  assert.equal(
+    await coordinator.enqueueRequest("device_A", {
+      requestId: "after_completions",
+      tenantId: "tenant_A",
+      sessionId: "session_A",
+      capability: "ollama.chat",
+      payload: "{}",
+      createdAt,
+      expiresAt,
+      status: "pending",
+    }),
+    true
+  );
+});

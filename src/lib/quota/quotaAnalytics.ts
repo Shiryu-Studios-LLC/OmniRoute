@@ -8,6 +8,7 @@
  */
 
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import { createLogger } from "@/shared/utils/logger";
 
 const log = createLogger("quota:analytics");
@@ -37,7 +38,9 @@ export interface QuotaAnalyticsSummary {
 export function getQuotaAnalyticsSummary(): QuotaAnalyticsSummary {
   try {
     const db = getDbInstance();
-    const rows = db.prepare("SELECT * FROM provider_quota_state").all() as Array<{
+    const rows = db
+      .prepare("SELECT * FROM provider_quota_state WHERE tenant_id = ?")
+      .all(currentDbTenantId()) as Array<{
       connection_id: string;
       model: string;
       tokens_used: number;

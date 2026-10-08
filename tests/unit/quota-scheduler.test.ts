@@ -8,6 +8,7 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omni-quota-sched-")
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const coreDb = await import("../../src/lib/db/core.ts");
+const providersDb = await import("../../src/lib/db/providers.ts");
 const { canAffordRequest } = await import("../../src/lib/quota/quotaScheduler");
 const { clearProviderQuota, getProviderQuota, recordProviderQuotaUsage } =
   await import("../../src/lib/quota/providerQuotaState");
@@ -16,6 +17,14 @@ async function resetStorage() {
   coreDb.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+  coreDb.getDbInstance();
+  const connection = await providersDb.createProviderConnection({
+    provider: "openai",
+    authType: "apikey",
+    name: "quota-scheduler",
+    apiKey: "sk-quota-scheduler",
+  });
+  CONN = String((connection as { id?: string }).id);
 }
 
 test.beforeEach(async () => {
@@ -27,7 +36,7 @@ test.after(() => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
-const CONN = "test-conn-quota";
+let CONN = "";
 const MODEL = "test-model";
 
 test("canAffordRequest: fails open when no budget configured", () => {

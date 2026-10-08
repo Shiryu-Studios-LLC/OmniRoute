@@ -26,8 +26,12 @@ const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
 
 // Set DATA_DIR before importing anything that touches the DB.
 process.env.DATA_DIR = TEST_DATA_DIR;
+process.env.API_KEY_SECRET = "rule12-platform-test-secret-1234567890";
 
 const core = await import("../../src/lib/db/core.ts");
+const apiKeys = await import("../../src/lib/db/apiKeys.ts");
+const tenants = await import("../../src/lib/db/tenants.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 const compressionRoute = await import("../../src/app/api/settings/compression/route.ts");
 const cacheEntriesRoute = await import("../../src/app/api/cache/entries/route.ts");
 const dbHealthRoute = await import("../../src/app/api/db/health/route.ts");
@@ -123,9 +127,21 @@ test("GET /api/settings/compression → 500 body is sanitized (shape { error })"
 });
 
 test("GET /api/cache/entries → 500 body is sanitized (shape { error })", async () => {
+  const platformKey = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => apiKeys.createApiKey("rule12-platform", "rule12-platform", ["manage"])
+  );
   const restore = patchPrepareToThrow("semantic_cache");
   try {
-    const res = await cacheEntriesRoute.GET(makeRequest("http://localhost/api/cache/entries"));
+    const res = await runWithTenantContext(
+      { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+      () =>
+        cacheEntriesRoute.GET(
+          makeRequest("http://localhost/api/cache/entries", {
+            headers: { authorization: `Bearer ${platformKey.key}` },
+          })
+        )
+    );
     assert.equal(res.status, 500);
     const body = (await res.json()) as { error: string };
     assert.equal(typeof body.error, "string");

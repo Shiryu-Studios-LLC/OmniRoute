@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requirePlatformAdminManagement } from "@/lib/api/platformAdminAuth";
 import {
   listSemanticCacheEntries,
   deleteSemanticCacheBySignature,
@@ -9,9 +9,8 @@ import {
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 export async function GET(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(req);
+  if (authError) return authError;
 
   try {
     const { searchParams } = new URL(req.url);
@@ -22,7 +21,14 @@ export async function GET(req: NextRequest) {
     const sortBy = searchParams.get("sortBy") || "created_at";
     const sortOrder = searchParams.get("sortOrder") || "desc";
 
-    const { entries, total } = listSemanticCacheEntries({ page, limit, search, model, sortBy, sortOrder });
+    const { entries, total } = listSemanticCacheEntries({
+      page,
+      limit,
+      search,
+      model,
+      sortBy,
+      sortOrder,
+    });
 
     return NextResponse.json({
       entries,
@@ -39,9 +45,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(req);
+  if (authError) return authError;
 
   try {
     const { searchParams } = new URL(req.url);

@@ -8,16 +8,13 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omni-quota-phase2-"
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const coreDb = await import("../../src/lib/db/core.ts");
-const { parseProviderQuotaHeaders, applyQuotaHeadersToState } = await import(
-  "../../src/lib/quota/quotaAdapters"
-);
+const providersDb = await import("../../src/lib/db/providers.ts");
+const { parseProviderQuotaHeaders, applyQuotaHeadersToState } =
+  await import("../../src/lib/quota/quotaAdapters");
 const { getQuotaAnalyticsSummary } = await import("../../src/lib/quota/quotaAnalytics");
-const { getActiveQuotaResetItems, resetExpiredQuotaWindows } = await import(
-  "../../src/lib/quota/quotaResetTimers"
-);
-const { recordProviderQuotaUsage, getProviderQuota } = await import(
-  "../../src/lib/quota/providerQuotaState"
-);
+const { getActiveQuotaResetItems, resetExpiredQuotaWindows } =
+  await import("../../src/lib/quota/quotaResetTimers");
+const { getProviderQuota } = await import("../../src/lib/quota/providerQuotaState");
 const { getDbInstance } = coreDb;
 
 async function resetStorage() {
@@ -63,8 +60,14 @@ test("parseProviderQuotaHeaders: parses Anthropic rate limit headers", () => {
   assert.equal(parsed?.windowResetMs, 30000);
 });
 
-test("applyQuotaHeadersToState & getQuotaAnalyticsSummary: records and aggregates quota analytics", () => {
-  const connId = "test-conn-p2-01";
+test("applyQuotaHeadersToState & getQuotaAnalyticsSummary: records and aggregates quota analytics", async () => {
+  const connection = await providersDb.createProviderConnection({
+    provider: "openai",
+    authType: "apikey",
+    name: "quota-phase2",
+    apiKey: "sk-quota-phase2",
+  });
+  const connId = String((connection as { id?: string }).id);
   const model = "gpt-4o";
   const headers = {
     "x-ratelimit-limit-tokens": "100000",
@@ -84,8 +87,14 @@ test("applyQuotaHeadersToState & getQuotaAnalyticsSummary: records and aggregate
   assert.ok(analytics.connections.some((c) => c.connectionId === connId));
 });
 
-test("quotaResetTimers: tracks active reset items and purges expired windows", () => {
-  const connId = "test-conn-expired";
+test("quotaResetTimers: tracks active reset items and purges expired windows", async () => {
+  const connection = await providersDb.createProviderConnection({
+    provider: "openai",
+    authType: "apikey",
+    name: "quota-expired",
+    apiKey: "sk-quota-expired",
+  });
+  const connId = String((connection as { id?: string }).id);
   const model = "claude-sonnet-4-6";
   const now = Date.now();
 
@@ -94,8 +103,8 @@ test("quotaResetTimers: tracks active reset items and purges expired windows", (
   const db = getDbInstance();
   db.prepare(
     `INSERT OR REPLACE INTO provider_quota_state
-     (connection_id, model, tokens_used, token_limit, window_start, window_reset, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+     (connection_id, model, tokens_used, token_limit, window_start, window_reset, updated_at, tenant_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     connId,
     model,
@@ -103,9 +112,11 @@ test("quotaResetTimers: tracks active reset items and purges expired windows", (
     5000,
     now - 10_000,
     now - 1_000,
-    new Date().toISOString()
+    new Date().toISOString(),
+    "tenant_shiryu_admin"
   );
 
+  assert.ok(getActiveQuotaResetItems().some((item) => item.connectionId === connId));
   const expiredCount = resetExpiredQuotaWindows();
   assert.ok(expiredCount >= 1);
 });

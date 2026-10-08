@@ -10,6 +10,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 // ──────────────── Types ────────────────
 
@@ -87,14 +88,15 @@ export function setReasoningCache(
     reasoning = reasoning.slice(0, MAX_ENTRY_BYTES);
   }
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   const expiresAt = toUnixEpochSeconds(Date.now() + ttlMs);
   const charCount = reasoning.length;
 
   db.prepare(
     `INSERT OR REPLACE INTO reasoning_cache
-       (tool_call_id, provider, model, reasoning, char_count, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, datetime('now'), ?)`
-  ).run(toolCallId, provider, model, reasoning, charCount, expiresAt);
+       (tenant_id, tool_call_id, provider, model, reasoning, char_count, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)`
+  ).run(tenantId, toolCallId, provider, model, reasoning, charCount, expiresAt);
 }
 
 /**
@@ -105,12 +107,13 @@ export function getReasoningCache(
   toolCallId: string
 ): { reasoning: string; provider: string; model: string; expiresAt: string } | null {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   const row = db
     .prepare(
       `SELECT reasoning, provider, model, expires_at FROM reasoning_cache
-       WHERE tool_call_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')`
+       WHERE tenant_id = ? AND tool_call_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')`
     )
-    .get(toolCallId) as
+    .get(tenantId, toolCallId) as
     | {
         reasoning: string;
         provider: string;
@@ -136,7 +139,9 @@ export function getReasoningCache(
  */
 export function deleteReasoningCache(toolCallId: string): number {
   const db = getDbInstance();
-  const result = db.prepare(`DELETE FROM reasoning_cache WHERE tool_call_id = ?`).run(toolCallId);
+  const result = db
+    .prepare(`DELETE FROM reasoning_cache WHERE tenant_id = ? AND tool_call_id = ?`)
+    .run(currentDbTenantId(), toolCallId);
   return result.changes;
 }
 
@@ -157,11 +162,14 @@ export function cleanupExpiredReasoning(): number {
  */
 export function clearAllReasoningCache(provider?: string): number {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   if (provider) {
-    const result = db.prepare(`DELETE FROM reasoning_cache WHERE provider = ?`).run(provider);
+    const result = db
+      .prepare(`DELETE FROM reasoning_cache WHERE tenant_id = ? AND provider = ?`)
+      .run(tenantId, provider);
     return result.changes;
   }
-  const result = db.prepare(`DELETE FROM reasoning_cache`).run();
+  const result = db.prepare(`DELETE FROM reasoning_cache WHERE tenant_id = ?`).run(tenantId);
   return result.changes;
 }
 
@@ -172,23 +180,24 @@ export function clearAllReasoningCache(provider?: string): number {
  */
 export function getReasoningCacheStats(): ReasoningCacheStats {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
 
   // Total counts
   const totals = db
     .prepare(
       `SELECT COUNT(*) as total_entries, COALESCE(SUM(char_count), 0) as total_chars
-       FROM reasoning_cache WHERE ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')`
+       FROM reasoning_cache WHERE tenant_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')`
     )
-    .get() as { total_entries: number; total_chars: number };
+    .get(tenantId) as { total_entries: number; total_chars: number };
 
   // By provider
   const providerRows = db
     .prepare(
       `SELECT provider, COUNT(*) as entries, COALESCE(SUM(char_count), 0) as chars
-       FROM reasoning_cache WHERE ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')
+       FROM reasoning_cache WHERE tenant_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')
        GROUP BY provider ORDER BY entries DESC`
     )
-    .all() as { provider: string; entries: number; chars: number }[];
+    .all(tenantId) as { provider: string; entries: number; chars: number }[];
 
   const byProvider: Record<string, { entries: number; chars: number }> = {};
   for (const row of providerRows) {
@@ -199,10 +208,10 @@ export function getReasoningCacheStats(): ReasoningCacheStats {
   const modelRows = db
     .prepare(
       `SELECT model, COUNT(*) as entries, COALESCE(SUM(char_count), 0) as chars
-       FROM reasoning_cache WHERE ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')
+       FROM reasoning_cache WHERE tenant_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')
        GROUP BY model ORDER BY entries DESC`
     )
-    .all() as { model: string; entries: number; chars: number }[];
+    .all(tenantId) as { model: string; entries: number; chars: number }[];
 
   const byModel: Record<string, { entries: number; chars: number }> = {};
   for (const row of modelRows) {
@@ -213,16 +222,16 @@ export function getReasoningCacheStats(): ReasoningCacheStats {
   const oldest = db
     .prepare(
       `SELECT created_at FROM reasoning_cache
-       WHERE ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now') ORDER BY created_at ASC LIMIT 1`
+       WHERE tenant_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now') ORDER BY created_at ASC LIMIT 1`
     )
-    .get() as { created_at: string } | undefined;
+    .get(tenantId) as { created_at: string } | undefined;
 
   const newest = db
     .prepare(
       `SELECT created_at FROM reasoning_cache
-       WHERE ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now') ORDER BY created_at DESC LIMIT 1`
+       WHERE tenant_id = ? AND ${EXPIRES_AT_EPOCH_SQL} > unixepoch('now') ORDER BY created_at DESC LIMIT 1`
     )
-    .get() as { created_at: string } | undefined;
+    .get(tenantId) as { created_at: string } | undefined;
 
   return {
     totalEntries: totals.total_entries,
@@ -248,11 +257,12 @@ export function getReasoningCacheEntries(
   } = {}
 ): ReasoningCacheEntry[] {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   const limit = Math.min(opts.limit ?? 50, 200);
   const offset = opts.offset ?? 0;
 
-  const conditions: string[] = [`${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')`];
-  const params: unknown[] = [];
+  const conditions: string[] = ["tenant_id = ?", `${EXPIRES_AT_EPOCH_SQL} > unixepoch('now')`];
+  const params: unknown[] = [tenantId];
 
   if (opts.provider) {
     conditions.push("provider = ?");
