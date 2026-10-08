@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const entry = path.join(repoRoot, "cloudflare/worker.ts");
+const cloudSourceRoot = path.join(repoRoot, "src/cloud");
 const forbiddenBuiltins = new Set([
   "child_process",
   "cluster",
@@ -71,6 +72,13 @@ if (!fs.existsSync(entry)) {
 }
 
 inspect(entry);
+
+if (fs.existsSync(cloudSourceRoot)) {
+  for (const name of fs.readdirSync(cloudSourceRoot, { withFileTypes: true })) {
+    const file = path.join(cloudSourceRoot, name.name);
+    if (name.isFile() && /\.(ts|tsx|js|mjs)$/.test(name.name)) inspect(file);
+  }
+}
 
 if (violations.length) {
   console.error("Cloudflare runtime boundary contains forbidden Node-only imports:");
