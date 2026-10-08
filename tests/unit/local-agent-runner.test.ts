@@ -15,7 +15,11 @@ const config: LocalAgentRunnerConfig = {
 };
 
 const discover = async () => ({
-  heartbeat: { status: "online" as const, capabilities: ["ollama:chat:local"] },
+  heartbeat: {
+    status: "online" as const,
+    capabilities: ["ollama:chat:local"],
+    serviceHealth: { ollama: true, comfyui: false },
+  },
   services: [{ service: "ollama" as const, reachable: true, models: ["local"] }],
 });
 
@@ -40,12 +44,17 @@ test("sends signed heartbeat outbound to the existing endpoint with discovered c
   assert.ok(sentBody);
   assert.equal(sentBody.deviceId, config.deviceId);
   assert.equal(sentBody.credential, config.credential);
-  assert.deepEqual(sentBody.payload, { status: "online", capabilities: ["ollama:chat:local"] });
+  assert.deepEqual(sentBody.payload, {
+    status: "online",
+    capabilities: ["ollama:chat:local"],
+    serviceHealth: { ollama: true, comfyui: false },
+  });
   assert.equal(
     sentBody.signature,
     signLocalAgentHeartbeat(config.credential, 1_800_000_000_000, "runner-nonce-00000001", {
       status: "online",
       capabilities: ["ollama:chat:local"],
+      serviceHealth: { ollama: true, comfyui: false },
     })
   );
 });

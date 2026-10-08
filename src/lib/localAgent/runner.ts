@@ -162,7 +162,11 @@ export async function runLocalAgentGatewayCycle(
   let session = previousSession;
   if (
     session &&
-    !(await dependencies.gateway.heartbeat(session, discovery.heartbeat.capabilities))
+    !(await dependencies.gateway.heartbeat(
+      session,
+      discovery.heartbeat.capabilities,
+      discovery.heartbeat.serviceHealth
+    ))
   ) {
     session = undefined;
   }
@@ -170,7 +174,11 @@ export async function runLocalAgentGatewayCycle(
     session = (await dependencies.gateway.connect(config.deviceId, config.credential)) ?? undefined;
     if (
       session &&
-      !(await dependencies.gateway.heartbeat(session, discovery.heartbeat.capabilities))
+      !(await dependencies.gateway.heartbeat(
+        session,
+        discovery.heartbeat.capabilities,
+        discovery.heartbeat.serviceHealth
+      ))
     ) {
       session = undefined;
     }

@@ -131,6 +131,7 @@ function createRuntimeFixture(
     "0004_cloud_gateway_devices.sql",
     "0005_cloud_customer_identity.sql",
     "0006_gateway_invocation_idempotency.sql",
+    "0007_gateway_device_service_health.sql",
   ]) {
     d1.db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -249,6 +250,15 @@ test("D1 device registration and Worker v1 connect/heartbeat/poll/result stay de
     const registered = (await registration.json()) as Record<string, unknown>;
     assert.equal(registered.tenantId, "tenant-a");
     assert.equal("credentialHash" in registered, false);
+    const legacyDeviceRead = await fixture.fetch(
+      adminRequest("/__cloud/v1/tenants/tenant-a/gateway-devices/device-a", "GET")
+    );
+    assert.equal(legacyDeviceRead.status, 200);
+    assert.equal(
+      ((await legacyDeviceRead.json()) as Record<string, unknown>).serviceHealth,
+      null,
+      "legacy devices without a health heartbeat remain readable as unknown"
+    );
 
     const gatewayUrl = "https://cloud.example.test";
     const transport = createHttpLocalAgentGatewayTransport(gatewayUrl, { fetch: fixture.fetch });
@@ -256,18 +266,75 @@ test("D1 device registration and Worker v1 connect/heartbeat/poll/result stay de
     assert.ok(session);
     assert.equal(session.tenantId, "tenant-a");
 
-    assert.equal(await transport.heartbeat(session, ["ollama:chat:qwen-local"]), true);
+    const malformedHeartbeat = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/heartbeat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: session.deviceId,
+          sessionToken: session.sessionToken,
+          capabilities: [],
+          serviceHealth: { ollama: true, comfyui: false, endpoint: "http://127.0.0.1" },
+        }),
+      })
+    );
+    assert.equal(malformedHeartbeat.status, 400);
+
+    assert.equal(
+      await transport.heartbeat(session, ["ollama:chat:qwen-local"], {
+        ollama: true,
+        comfyui: false,
+      }),
+      true
+    );
     const stored = fixture.d1.db
       .prepare(
-        "SELECT tenant_id, status, capabilities_json, last_seen_at FROM cloud_gateway_devices WHERE id = ?"
+        "SELECT tenant_id, status, capabilities_json, service_health_json, last_seen_at FROM cloud_gateway_devices WHERE id = ?"
       )
       .get("device-a") as
-      | { tenant_id: string; status: string; capabilities_json: string; last_seen_at: string }
+      | {
+          tenant_id: string;
+          status: string;
+          capabilities_json: string;
+          service_health_json: string | null;
+          last_seen_at: string;
+        }
       | undefined;
     assert.equal(stored?.tenant_id, "tenant-a");
     assert.equal(stored?.status, "online");
     assert.deepEqual(JSON.parse(stored?.capabilities_json ?? "[]"), ["ollama:chat:qwen-local"]);
+    assert.deepEqual(JSON.parse(stored?.service_health_json ?? "null"), {
+      ollama: true,
+      comfyui: false,
+    });
     assert.equal(stored?.last_seen_at, fixture.now);
+
+    const deviceRead = await fixture.fetch(
+      adminRequest("/__cloud/v1/tenants/tenant-a/gateway-devices/device-a", "GET")
+    );
+    assert.equal(deviceRead.status, 200);
+    const deviceBody = (await deviceRead.json()) as Record<string, unknown>;
+    assert.deepEqual(deviceBody.serviceHealth, { ollama: true, comfyui: false });
+    assert.equal("credentialHash" in deviceBody, false);
+    assert.equal("credential_hash" in deviceBody, false);
+    assert.equal(
+      await transport.heartbeat(session, ["ollama:chat:qwen-local"]),
+      true,
+      "legacy heartbeats may omit the optional service health field"
+    );
+    const legacyHeartbeatRead = await fixture.fetch(
+      adminRequest("/__cloud/v1/tenants/tenant-a/gateway-devices/device-a", "GET")
+    );
+    assert.equal(
+      ((await legacyHeartbeatRead.json()) as Record<string, unknown>).serviceHealth,
+      null,
+      "omitting service health clears the prior observation instead of refreshing stale data"
+    );
+    const crossTenantRead = await fixture.fetch(
+      adminRequest("/__cloud/v1/tenants/tenant-b/gateway-devices/device-a", "GET")
+    );
+    assert.equal(crossTenantRead.status, 404);
 
     const coordinator = fixture.sessions.get("device-a");
     const requestId = "queued-request-1";

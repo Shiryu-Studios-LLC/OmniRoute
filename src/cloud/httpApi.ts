@@ -28,6 +28,7 @@ import { appendCloudUsageRecord, listCloudUsageRecords } from "./usage";
 import {
   getCloudGatewayDevice,
   listCloudGatewayDeviceIds,
+  listCloudGatewayDevices,
   registerCloudGatewayDevice,
   revokeCloudGatewayDeviceCredential,
   rotateCloudGatewayDeviceCredential,
@@ -885,6 +886,9 @@ export async function handleCloudApiRequest(
     }
 
     if (collection === "gateway-devices") {
+      if (!resourceId && request.method === "GET") {
+        return json(await listCloudGatewayDevices(db, tenantId));
+      }
       if (!resourceId && request.method === "POST") {
         const body = validateFields(
           await readBody(request),
@@ -935,6 +939,17 @@ export async function handleCloudApiRequest(
           if (error instanceof TypeError) throw new ApiError(400, error.message);
           throw error;
         }
+      }
+      if (resourceId && request.method === "GET") {
+        if (!validId(resourceId)) return json({ error: "Not found" }, 404);
+        const device = await getCloudGatewayDevice(db, resourceId);
+        if (!device || device.tenantId !== tenantId) return json({ error: "Not found" }, 404);
+        return json({
+          id: device.id,
+          capabilities: device.capabilities,
+          serviceHealth: device.serviceHealth,
+          revokedAt: device.revokedAt,
+        });
       }
       if (
         resourceId &&

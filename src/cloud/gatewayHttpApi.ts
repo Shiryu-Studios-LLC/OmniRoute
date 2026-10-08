@@ -174,7 +174,7 @@ export async function handleGatewayDeviceRequest(
 
   const additionalKeys =
     path === `${PREFIX}/heartbeat`
-      ? ["capabilities"]
+      ? ["capabilities", "serviceHealth"]
       : path === `${PREFIX}/result`
         ? ["requestId", "result"]
         : [];
@@ -183,7 +183,11 @@ export async function handleGatewayDeviceRequest(
 
   if (path === `${PREFIX}/heartbeat`) {
     if (
-      !exactKeys(body, ["version", "deviceId", "sessionToken", "capabilities"]) ||
+      !["version", "deviceId", "sessionToken", "capabilities"].every((key) => key in body) ||
+      Object.keys(body).some(
+        (key) =>
+          !["version", "deviceId", "sessionToken", "capabilities", "serviceHealth"].includes(key)
+      ) ||
       !Array.isArray(body.capabilities) ||
       body.capabilities.length > 64 ||
       body.capabilities.some(
@@ -197,10 +201,23 @@ export async function handleGatewayDeviceRequest(
     ) {
       return json({ error: "Invalid heartbeat request" }, 400);
     }
+    const health = body.serviceHealth;
+    if (
+      health !== undefined &&
+      (health === null ||
+        typeof health !== "object" ||
+        Array.isArray(health) ||
+        Object.keys(health).length !== 2 ||
+        Object.keys(health).some((key) => key !== "ollama" && key !== "comfyui") ||
+        typeof (health as Record<string, unknown>).ollama !== "boolean" ||
+        typeof (health as Record<string, unknown>).comfyui !== "boolean")
+    )
+      return json({ error: "Invalid heartbeat request" }, 400);
     const accepted = await gateway.heartbeat(
       session.deviceId,
       session.sessionToken,
-      body.capabilities as string[]
+      body.capabilities as string[],
+      health as { ollama: boolean; comfyui: boolean } | undefined
     );
     return accepted
       ? json({ version: VERSION, accepted: true })

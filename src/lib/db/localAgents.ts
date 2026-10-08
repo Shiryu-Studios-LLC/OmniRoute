@@ -19,6 +19,7 @@ const heartbeatSchema = z
   .object({
     status: z.enum(["online", "busy", "offline"]),
     capabilities: z.array(z.string().trim().min(1).max(80)).max(64),
+    serviceHealth: z.object({ ollama: z.boolean(), comfyui: z.boolean() }).strict().optional(),
   })
   .strict();
 

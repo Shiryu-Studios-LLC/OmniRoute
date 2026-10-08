@@ -13,6 +13,7 @@ export interface GatewayDeviceRecord {
   tenantId: string;
   credentialHash: string;
   capabilities: string[];
+  serviceHealth?: { ollama: boolean; comfyui: boolean } | null;
   revokedAt: string | null;
 }
 
@@ -47,7 +48,8 @@ export interface GatewayDeviceDirectory {
   updateCapabilities?(
     deviceId: string,
     capabilities: string[],
-    lastSeenAt?: string
+    lastSeenAt?: string,
+    serviceHealth?: { ollama: boolean; comfyui: boolean }
   ): Promise<boolean>;
 }
 
@@ -301,7 +303,8 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
     async heartbeat(
       deviceId: string,
       sessionToken: string,
-      capabilities?: string[]
+      capabilities?: string[],
+      serviceHealth?: { ollama: boolean; comfyui: boolean }
     ): Promise<boolean> {
       const device = await getActiveDevice(deviceId);
       if (!device || device.revokedAt || !sessionToken) return false;
@@ -320,6 +323,14 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
       ) {
         return false;
       }
+      if (
+        serviceHealth !== undefined &&
+        (!serviceHealth ||
+          typeof serviceHealth.ollama !== "boolean" ||
+          typeof serviceHealth.comfyui !== "boolean" ||
+          Object.keys(serviceHealth).some((key) => key !== "ollama" && key !== "comfyui"))
+      )
+        return false;
       const session = await options.coordinator.getSession(deviceId);
       if (!session || session.revokedAt || session.tenantId !== device.tenantId) return false;
       if (Date.parse(session.leaseExpiresAt) <= now()) return false;
@@ -337,7 +348,16 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         return options.directory.updateCapabilities(
           deviceId,
           [...new Set(capabilities)],
-          new Date(timestamp).toISOString()
+          new Date(timestamp).toISOString(),
+          serviceHealth
+        );
+      }
+      if (serviceHealth !== undefined && options.directory.updateCapabilities) {
+        return options.directory.updateCapabilities(
+          deviceId,
+          device.capabilities,
+          new Date(timestamp).toISOString(),
+          serviceHealth
         );
       }
       return true;

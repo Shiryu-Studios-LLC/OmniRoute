@@ -73,7 +73,11 @@ test("signed heartbeats update status and reject tampering, replay, and stale ti
   const registration = asTenant("agent_tenant_a", () =>
     agents.registerLocalAgent({ name: "comfyui-worker" })
   );
-  const payload = { status: "busy" as const, capabilities: ["comfyui", "ollama"] };
+  const payload = {
+    status: "busy" as const,
+    capabilities: ["comfyui", "ollama"],
+    serviceHealth: { ollama: true, comfyui: false },
+  };
   const nonce = "first-heartbeat-nonce-0001";
   const signature = signLocalAgentHeartbeat(registration.credential, nowMs, nonce, payload);
   const request = {
@@ -89,6 +93,13 @@ test("signed heartbeats update status and reject tampering, replay, and stale ti
   const updated = asTenant("agent_tenant_a", () => agents.acceptLocalAgentHeartbeat(request));
   assert.equal(updated.status, "busy");
   assert.deepEqual(updated.capabilities, ["comfyui", "ollama"]);
+  assert.notEqual(
+    signLocalAgentHeartbeat(registration.credential, nowMs, "signed-health-tamper-0001", payload),
+    signLocalAgentHeartbeat(registration.credential, nowMs, "signed-health-tamper-0001", {
+      ...payload,
+      serviceHealth: { ollama: false, comfyui: false },
+    })
+  );
   assert.equal(updated.lastSeenAt, new Date(nowMs).toISOString());
 
   assert.throws(

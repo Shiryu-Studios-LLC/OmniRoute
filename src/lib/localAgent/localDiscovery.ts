@@ -287,6 +287,10 @@ export async function discoverLocalCapabilities(
     heartbeat: {
       status: "online",
       capabilities: [...new Set(capabilities)].slice(0, 64),
+      serviceHealth: {
+        ollama: services.find((service) => service.service === "ollama")?.reachable ?? false,
+        comfyui: services.find((service) => service.service === "comfyui")?.reachable ?? false,
+      },
     },
     services,
   };

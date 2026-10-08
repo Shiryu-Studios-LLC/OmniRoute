@@ -5,9 +5,11 @@ import {
   type IssuedCloudCustomerApiKey,
 } from "./customerIdentity";
 import { getCloudTenantById, type CloudTenant } from "./tenants";
+import { getCloudTenantSettings, type CloudTenantSettings } from "./tenantSettings";
 
 export interface ProvisionedCloudCustomer {
   tenant: CloudTenant;
+  settings: CloudTenantSettings;
   ownerMembership: { id: string; tenantId: string; principalId: string; role: "owner" };
   ownerApiKey: IssuedCloudCustomerApiKey;
 }
@@ -33,8 +35,9 @@ export async function provisionCloudCustomer(
       throw new Error("Customer tenant could not be created");
     }
 
-    const [tenant, ownerMembership] = await Promise.all([
+    const [tenant, settings, ownerMembership] = await Promise.all([
       getCloudTenantById(db, input.id),
+      getCloudTenantSettings(db, input.id),
       createCloudCustomerMembership(db, {
         tenantId: input.id,
         principalId: input.ownerPrincipalId,
@@ -43,12 +46,13 @@ export async function provisionCloudCustomer(
       }),
     ]);
     if (!tenant) throw new Error("Provisioned customer tenant could not be read back");
+    if (!settings) throw new Error("Provisioned customer tenant settings could not be read back");
     const ownerApiKey = await issueCloudCustomerApiKey(db, {
       tenantId: input.id,
       membershipId: ownerMembership.id,
       now: input.now,
     });
-    return { tenant, ownerMembership, ownerApiKey };
+    return { tenant, settings, ownerMembership, ownerApiKey };
   } catch (error) {
     if (tenantInserted) {
       try {

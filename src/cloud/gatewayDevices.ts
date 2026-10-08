@@ -10,6 +10,7 @@ interface GatewayDeviceRow {
   tenant_id: string;
   credential_hash: string;
   capabilities_json: string;
+  service_health_json: string | null;
   revoked_at: string | null;
 }
 
@@ -41,8 +42,33 @@ function mapDevice(row: GatewayDeviceRow): GatewayDeviceRecord {
     tenantId: row.tenant_id,
     credentialHash: row.credential_hash,
     capabilities: parseCapabilities(row.capabilities_json),
+    serviceHealth: parseServiceHealth(row.service_health_json),
     revokedAt: row.revoked_at,
   };
+}
+
+function parseServiceHealth(value: string | null): { ollama: boolean; comfyui: boolean } | null {
+  if (value === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed).length === 2 &&
+      Object.keys(parsed).every((key) => key === "ollama" || key === "comfyui") &&
+      typeof (parsed as Record<string, unknown>).ollama === "boolean" &&
+      typeof (parsed as Record<string, unknown>).comfyui === "boolean"
+    ) {
+      return {
+        ollama: (parsed as { ollama: boolean }).ollama,
+        comfyui: (parsed as { comfyui: boolean }).comfyui,
+      };
+    }
+  } catch {
+    // Malformed persisted metadata fails closed.
+  }
+  return null;
 }
 
 function validateDeviceFields(input: {
@@ -109,7 +135,8 @@ export async function getCloudGatewayDevice(
   if (!DEVICE_ID_PATTERN.test(deviceId)) return null;
   const row = await db
     .prepare<GatewayDeviceRow>(
-      `SELECT d.id, d.tenant_id, d.credential_hash, d.capabilities_json, d.revoked_at
+      `SELECT d.id, d.tenant_id, d.credential_hash, d.capabilities_json,
+              d.service_health_json, d.revoked_at
          FROM cloud_gateway_devices d
          JOIN tenants t ON t.id = d.tenant_id
         WHERE d.id = ? AND t.is_active = 1
@@ -120,11 +147,44 @@ export async function getCloudGatewayDevice(
   return row ? mapDevice(row) : null;
 }
 
+/** Return tenant-owned device metadata without credential material. */
+export async function listCloudGatewayDevices(
+  db: CloudDb,
+  tenantId: string
+): Promise<
+  Array<{
+    id: string;
+    capabilities: string[];
+    serviceHealth: { ollama: boolean; comfyui: boolean } | null;
+    revokedAt: string | null;
+  }>
+> {
+  const rows = await db
+    .prepare<GatewayDeviceRow>(
+      `SELECT d.id, d.tenant_id, d.credential_hash, d.capabilities_json,
+              d.service_health_json, d.revoked_at
+         FROM cloud_gateway_devices d
+        WHERE d.tenant_id = ? ORDER BY d.id`
+    )
+    .bind(tenantId)
+    .all<GatewayDeviceRow>();
+  return rows.results.map((row) => {
+    const device = mapDevice(row);
+    return {
+      id: device.id,
+      capabilities: device.capabilities,
+      serviceHealth: device.serviceHealth,
+      revokedAt: device.revokedAt,
+    };
+  });
+}
+
 export async function updateCloudGatewayDeviceCapabilities(
   db: CloudDb,
   deviceId: string,
   capabilities: string[],
-  lastSeenAt = new Date().toISOString()
+  lastSeenAt = new Date().toISOString(),
+  serviceHealth?: { ollama: boolean; comfyui: boolean }
 ): Promise<boolean> {
   if (!DEVICE_ID_PATTERN.test(deviceId)) return false;
   if (
@@ -141,14 +201,29 @@ export async function updateCloudGatewayDeviceCapabilities(
   ) {
     throw new TypeError("Invalid device capabilities");
   }
+  if (
+    serviceHealth !== undefined &&
+    (!serviceHealth ||
+      typeof serviceHealth.ollama !== "boolean" ||
+      typeof serviceHealth.comfyui !== "boolean" ||
+      Object.keys(serviceHealth).length !== 2 ||
+      Object.keys(serviceHealth).some((key) => key !== "ollama" && key !== "comfyui"))
+  )
+    throw new TypeError("Invalid device service health");
   const result = await db
     .prepare(
       `UPDATE cloud_gateway_devices AS d
-          SET capabilities_json = ?, status = 'online', last_seen_at = ?
+          SET capabilities_json = ?, service_health_json = ?,
+              status = 'online', last_seen_at = ?
         WHERE d.id = ? AND d.revoked_at IS NULL
           AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = d.tenant_id AND t.is_active = 1)`
     )
-    .bind(JSON.stringify([...new Set(capabilities)]), lastSeenAt, deviceId)
+    .bind(
+      JSON.stringify([...new Set(capabilities)]),
+      serviceHealth === undefined ? null : JSON.stringify(serviceHealth),
+      lastSeenAt,
+      deviceId
+    )
     .run();
   return result.success && Number(result.meta?.changes ?? 0) === 1;
 }
@@ -242,8 +317,15 @@ export class D1GatewayDeviceDirectory implements GatewayDeviceDirectory {
   updateCapabilities(
     deviceId: string,
     capabilities: string[],
-    lastSeenAt?: string
+    lastSeenAt?: string,
+    serviceHealth?: { ollama: boolean; comfyui: boolean }
   ): Promise<boolean> {
-    return updateCloudGatewayDeviceCapabilities(this.db, deviceId, capabilities, lastSeenAt);
+    return updateCloudGatewayDeviceCapabilities(
+      this.db,
+      deviceId,
+      capabilities,
+      lastSeenAt,
+      serviceHealth
+    );
   }
 }

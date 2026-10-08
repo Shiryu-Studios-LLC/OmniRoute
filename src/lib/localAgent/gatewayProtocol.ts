@@ -28,7 +28,11 @@ export interface LocalAgentGatewaySession {
 
 export interface LocalAgentGatewayTransport {
   connect(deviceId: string, credential: string): Promise<LocalAgentGatewaySession | null>;
-  heartbeat(session: LocalAgentGatewaySession, capabilities?: string[]): Promise<boolean>;
+  heartbeat(
+    session: LocalAgentGatewaySession,
+    capabilities?: string[],
+    serviceHealth?: { ollama: boolean; comfyui: boolean }
+  ): Promise<boolean>;
   poll(
     session: LocalAgentGatewaySession
   ): Promise<Array<Omit<LocalAgentGatewayRequest, "version">> | null>;
@@ -41,7 +45,12 @@ export interface LocalAgentGatewayTransport {
 /** Structural contract implemented by createConnectorGateway(). */
 export interface ConnectorGatewayPort {
   connect(deviceId: string, credential: string): Promise<LocalAgentGatewaySession | null>;
-  heartbeat(deviceId: string, sessionToken: string, capabilities?: string[]): Promise<boolean>;
+  heartbeat(
+    deviceId: string,
+    sessionToken: string,
+    capabilities?: string[],
+    serviceHealth?: { ollama: boolean; comfyui: boolean }
+  ): Promise<boolean>;
   pollDeviceRequests(input: {
     deviceId: string;
     sessionToken: string;
@@ -61,8 +70,8 @@ export function createConnectorGatewayTransport(
 ): LocalAgentGatewayTransport {
   return {
     connect: (deviceId, credential) => gateway.connect(deviceId, credential),
-    heartbeat: (session, capabilities) =>
-      gateway.heartbeat(session.deviceId, session.sessionToken, capabilities),
+    heartbeat: (session, capabilities, serviceHealth) =>
+      gateway.heartbeat(session.deviceId, session.sessionToken, capabilities, serviceHealth),
     poll: (session) =>
       gateway.pollDeviceRequests({
         deviceId: session.deviceId,

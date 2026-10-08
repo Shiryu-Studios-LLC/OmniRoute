@@ -91,6 +91,9 @@ async function fixture() {
     "0003_cloud_platform_tenant.sql",
     "0004_cloud_gateway_devices.sql",
     "0005_cloud_customer_identity.sql",
+    "0006_gateway_invocation_idempotency.sql",
+    "0007_gateway_device_service_health.sql",
+    "0008_cloud_tenant_settings.sql",
   ]) {
     await d1.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
@@ -149,6 +152,13 @@ test("platform admin can provision a tenant, owner membership, and one-time key 
     assert.equal(response.status, 201);
     const provisioned = (await response.json()) as {
       tenant: { id: string; kind: string };
+      settings: {
+        tenantId: string;
+        localAiEnabled: boolean;
+        mcpEnabled: boolean;
+        createdAt: string;
+        updatedAt: string;
+      };
       ownerMembership: { tenantId: string; principalId: string; role: string };
       ownerApiKey: { id: string; token: string };
     };
@@ -176,6 +186,13 @@ test("platform admin can provision a tenant, owner membership, and one-time key 
       }
     );
     assert.match(provisioned.ownerApiKey.token, /^orc_live_[A-Za-z0-9_-]{43}$/);
+    assert.deepEqual(provisioned.settings, {
+      tenantId: "tenant-new-customer",
+      localAiEnabled: false,
+      mcpEnabled: false,
+      createdAt: now,
+      updatedAt: now,
+    });
     assert.equal(
       (await authenticateCloudCustomerApiKey(d1, provisioned.ownerApiKey.token, now))?.tenantId,
       "tenant-new-customer"

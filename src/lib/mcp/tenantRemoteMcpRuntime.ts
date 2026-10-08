@@ -147,6 +147,8 @@ function isPublicIpv6(value: string): boolean {
   // unique-local, link-local, multicast, transition, and documentation blocks.
   if (first < 0x2000 || first > 0x3fff) return false;
   if (first === 0x2001 && second <= 0x01ff) return false;
+  // RFC 3849 documentation addresses are not valid public egress targets.
+  if (first === 0x2001 && second === 0x0db8) return false;
   if (first === 0x2002 || first === 0x3fff) return false;
   return true;
 }

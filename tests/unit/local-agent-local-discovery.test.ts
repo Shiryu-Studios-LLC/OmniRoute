@@ -40,6 +40,7 @@ test("discovers installed Ollama IDs and only reports verified model capabilitie
       "ollama:chat:llama3.2:3b",
       "ollama:chat:llava:7b",
     ],
+    serviceHealth: { ollama: true, comfyui: false },
   });
   assert.equal(
     result.heartbeat.capabilities.some((capability) => /:(vision|embedding):/.test(capability)),
@@ -72,6 +73,7 @@ test("discovers ComfyUI checkpoint IDs and only executable image capability", as
   assert.deepEqual(result.heartbeat, {
     status: "online",
     capabilities: ["comfyui:image"],
+    serviceHealth: { ollama: false, comfyui: true },
   });
 });
 
@@ -111,6 +113,7 @@ test("probes only the default loopback endpoints when service URLs are omitted",
     "ollama:chat:qwen3",
     "comfyui:image",
   ]);
+  assert.deepEqual(result.heartbeat.serviceHealth, { ollama: true, comfyui: true });
 });
 
 test("reports omitted default loopback services as unavailable when probes fail", async () => {
@@ -134,6 +137,7 @@ test("reports omitted default loopback services as unavailable when probes fail"
     { service: "comfyui", reachable: false, models: [] },
   ]);
   assert.deepEqual(result.heartbeat.capabilities, []);
+  assert.deepEqual(result.heartbeat.serviceHealth, { ollama: false, comfyui: false });
 });
 
 test("does not make a request to arbitrary DNS hostnames, even if they resolve privately", async () => {

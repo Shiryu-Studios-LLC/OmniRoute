@@ -148,6 +148,7 @@ test("cloud discovery refuses stdio and unsafe endpoint URLs", async () => {
     "https://10.2.3.4/mcp",
     "https://169.254.169.254/latest/meta-data",
     "https://[::1]/mcp",
+    "https://[2001:db8::1]/mcp",
     "https://mcp.example.com:8443/mcp",
     "https://user:password@mcp.example.com/mcp",
   ]) {

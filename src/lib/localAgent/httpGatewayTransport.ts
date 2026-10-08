@@ -123,12 +123,13 @@ export function createHttpLocalAgentGatewayTransport(
         ? validSession(body.session)
         : null;
     },
-    async heartbeat(session, capabilities = []) {
+    async heartbeat(session, capabilities = [], serviceHealth) {
       const response = await post("heartbeat", {
         version: LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
         deviceId: session.deviceId,
         sessionToken: session.sessionToken,
         capabilities,
+        ...(serviceHealth === undefined ? {} : { serviceHealth }),
       });
       return (
         response.status === 200 &&
