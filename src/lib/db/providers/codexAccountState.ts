@@ -1,6 +1,7 @@
 import { backupDbFile } from "../backup";
 import { getDbInstance, rowToCamel } from "../core";
 import { invalidateDbCache } from "../readCache";
+import { currentDbTenantId } from "../tenantScope";
 import { toRecord } from "./columns";
 
 type JsonRecord = Record<string, unknown>;
@@ -32,12 +33,16 @@ export async function updateCodexScopedQuotaState(
   patch: CodexScopedQuotaPatch
 ): Promise<JsonRecord | null> {
   const db = getDbInstance() as unknown as DbLike;
-  const candidate = db.prepare("SELECT provider FROM provider_connections WHERE id = ?").get(id);
+  const candidate = db
+    .prepare("SELECT provider FROM provider_connections WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId());
   if (toRecord(candidate).provider !== "codex") return null;
 
   backupDbFile("pre-write");
   const persisted = db.transaction(() => {
-    const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
+    const existing = db
+      .prepare("SELECT * FROM provider_connections WHERE id = ? AND tenant_id = ?")
+      .get(id, currentDbTenantId());
     if (!existing) return null;
 
     const existingRecord = toRecord(rowToCamel(existing));
@@ -97,8 +102,13 @@ export async function updateCodexScopedQuotaState(
     db.prepare(
       `UPDATE provider_connections
        SET provider_specific_data = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(JSON.stringify(nextProviderSpecificData), new Date().toISOString(), id);
+       WHERE id = ? AND tenant_id = ?`
+    ).run(
+      JSON.stringify(nextProviderSpecificData),
+      new Date().toISOString(),
+      id,
+      currentDbTenantId()
+    );
     return nextProviderSpecificData;
   })();
 

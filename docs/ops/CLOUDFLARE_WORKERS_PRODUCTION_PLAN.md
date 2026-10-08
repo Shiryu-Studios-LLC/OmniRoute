@@ -161,6 +161,7 @@ Build the customer-side application:
 - ComfyUI detection/connection.
 - Local MCP discovery/forwarding.
 - Application-level capability reporting.
+- The CLI supports `omniroute local-agent run` and Linux `service install` / `service uninstall`. The user-level systemd service stores its credential in an owner-only environment file and opens no inbound listener.
 
 The agent may manage `cloudflared` underneath, but Shiryu owns tenant identity and authorization.
 
@@ -184,6 +185,7 @@ The agent may manage `cloudflared` underneath, but Shiryu owns tenant identity a
 - Provide health/test endpoints through the agent.
 - Support customer-managed compute first.
 - Preserve the provider abstraction for future Shiryu-hosted compute.
+- The Local Agent accepts only heartbeat-advertised capabilities and fixed local service URLs. Its ComfyUI image path polls a submitted prompt for at most 18 seconds and returns up to two validated image outputs within the gateway's bounded result envelope; larger outputs fail closed.
 
 **Exit:** Front Desk -> OmniRoute -> connector -> agent -> Ollama/ComfyUI works end-to-end.
 
@@ -226,6 +228,17 @@ Test:
 - Local-only process routes: never remotely reachable.
 
 ### 14. Cloudflare deployment
+
+The repository includes a manual-only GitHub Actions workflow at
+`.github/workflows/deploy-cloudflare-staging.yml`. It deploys only the isolated
+`omniroute-cloud-runtime-staging` Worker to its `workers.dev` address; it does not
+configure production routes or custom domains. Configure a protected GitHub
+Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`, and
+`OMNIROUTE_CLOUD_ADMIN_TOKEN`. The D1 ID must resolve through the Cloudflare API
+to a database named exactly `omniroute-cloud-runtime-staging`. The workflow binds
+the admin token through `wrangler secret put` using stdin. It applies pending D1
+migrations and checks `/__cloud/health` and `/__cloud/db` after deployment.
 
 After the repository is cloud-ready:
 

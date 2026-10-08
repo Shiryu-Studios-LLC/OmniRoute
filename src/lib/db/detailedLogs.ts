@@ -7,6 +7,7 @@
  */
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { getSettings } from "./settings";
 import { isNoLog } from "../compliance/noLog";
 import {
@@ -83,12 +84,13 @@ export function saveRequestDetailLog(entry: RequestDetailLog): void {
   db.prepare(
     `
     INSERT INTO request_detail_logs
-      (id, call_log_id, timestamp, client_request, translated_request,
+      (id, tenant_id, call_log_id, timestamp, client_request, translated_request,
        provider_response, client_response, provider, model, source_format, target_format, duration_ms)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `
   ).run(
     id,
+    currentDbTenantId(),
     entry.call_log_id ?? null,
     timestamp,
     serializePayloadForStorage(protectPayloadForLog(entry.client_request)),
@@ -111,11 +113,12 @@ export function getRequestDetailLogs(limit = 50, offset = 0): RequestDetailLog[]
     .prepare(
       `
       SELECT * FROM request_detail_logs
+      WHERE tenant_id = ?
       ORDER BY timestamp DESC
       LIMIT ? OFFSET ?
     `
     )
-    .all(limit, offset) as Array<Record<string, unknown>>;
+    .all(currentDbTenantId(), limit, offset) as Array<Record<string, unknown>>;
 
   return rows.map(mapDetailedLogRow);
 }
@@ -124,8 +127,9 @@ export function getRequestDetailLogs(limit = 50, offset = 0): RequestDetailLog[]
 export function getRequestDetailLogById(id: string): RequestDetailLog | null {
   if (!requestDetailLogsTableExists()) return null;
   const db = getDbInstance();
-  const row = db.prepare("SELECT * FROM request_detail_logs WHERE id = ?").get(id) as
-    Record<string, unknown> | undefined;
+  const row = db
+    .prepare("SELECT * FROM request_detail_logs WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId()) as Record<string, unknown> | undefined;
   return row ? mapDetailedLogRow(row) : null;
 }
 
@@ -137,12 +141,12 @@ export function getRequestDetailLogByCallLogId(callLogId: string): RequestDetail
     .prepare(
       `
       SELECT * FROM request_detail_logs
-      WHERE call_log_id = ?
+      WHERE call_log_id = ? AND tenant_id = ?
       ORDER BY timestamp DESC
       LIMIT 1
     `
     )
-    .get(callLogId) as Record<string, unknown> | undefined;
+    .get(callLogId, currentDbTenantId()) as Record<string, unknown> | undefined;
   return row ? mapDetailedLogRow(row) : null;
 }
 
@@ -150,9 +154,9 @@ export function getRequestDetailLogByCallLogId(callLogId: string): RequestDetail
 export function getRequestDetailLogCount(): number {
   if (!requestDetailLogsTableExists()) return 0;
   const db = getDbInstance();
-  const row = db.prepare("SELECT COUNT(*) as cnt FROM request_detail_logs").get() as {
-    cnt: number;
-  };
+  const row = db
+    .prepare("SELECT COUNT(*) as cnt FROM request_detail_logs WHERE tenant_id = ?")
+    .get(currentDbTenantId()) as { cnt: number };
   return row?.cnt ?? 0;
 }
 

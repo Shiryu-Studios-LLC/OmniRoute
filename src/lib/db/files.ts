@@ -1,9 +1,11 @@
-import { getDbInstance, rowToCamel, objToSnake } from "./core";
+import { getDbInstance, rowToCamel } from "./core";
 import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
+import { currentDbTenantId } from "./tenantScope";
 
 export interface FileRecord {
   id: string;
+  tenantId?: string;
   bytes: number;
   createdAt: number;
   filename: string;
@@ -16,7 +18,7 @@ export interface FileRecord {
 }
 
 const FILE_METADATA_COLUMNS =
-  "id, bytes, created_at, filename, purpose, mime_type, api_key_id, expires_at, deleted_at";
+  "id, tenant_id, bytes, created_at, filename, purpose, mime_type, api_key_id, expires_at, deleted_at";
 
 export function createFile(file: Omit<FileRecord, "id" | "createdAt">): FileRecord {
   const db = getDbInstance();
@@ -44,11 +46,12 @@ export function createFile(file: Omit<FileRecord, "id" | "createdAt">): FileReco
 
   db.prepare(
     `
-    INSERT INTO files (id, bytes, created_at, filename, purpose, content, mime_type, api_key_id, expires_at, deleted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO files (id, tenant_id, bytes, created_at, filename, purpose, content, mime_type, api_key_id, expires_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `
   ).run(
     record.id,
+    currentDbTenantId(),
     record.bytes,
     record.createdAt,
     record.filename,
@@ -66,16 +69,18 @@ export function createFile(file: Omit<FileRecord, "id" | "createdAt">): FileReco
 export function getFile(id: string): FileRecord | null {
   const db = getDbInstance();
   const row = db
-    .prepare(`SELECT ${FILE_METADATA_COLUMNS} FROM files WHERE id = ? AND deleted_at IS NULL`)
-    .get(id);
+    .prepare(
+      `SELECT ${FILE_METADATA_COLUMNS} FROM files WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`
+    )
+    .get(id, currentDbTenantId());
   return row ? (rowToCamel(row) as unknown as FileRecord) : null;
 }
 
 export function getFileContent(id: string): Buffer | null {
   const db = getDbInstance();
   const row = db
-    .prepare("SELECT content FROM files WHERE id = ? AND deleted_at IS NULL")
-    .get(id) as { content: Buffer | Uint8Array | string | null } | undefined;
+    .prepare("SELECT content FROM files WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL")
+    .get(id, currentDbTenantId()) as { content: Buffer | Uint8Array | string | null } | undefined;
   if (!row?.content) return null;
   return Buffer.isBuffer(row.content) ? row.content : Buffer.from(row.content);
 }
@@ -92,8 +97,8 @@ export function listFiles(
   const db = getDbInstance();
   const { apiKeyId, purpose, limit = 20, after, order = "desc" } = options;
 
-  let query = `SELECT ${FILE_METADATA_COLUMNS} FROM files WHERE deleted_at IS NULL`;
-  const params: any[] = [];
+  let query = `SELECT ${FILE_METADATA_COLUMNS} FROM files WHERE tenant_id = ? AND deleted_at IS NULL`;
+  const params: any[] = [currentDbTenantId()];
 
   if (apiKeyId) {
     query += " AND api_key_id = ?";
@@ -129,8 +134,8 @@ export function listFiles(
 export function countFiles(options: { apiKeyId?: string; purpose?: string } = {}): number {
   const db = getDbInstance();
   const { apiKeyId, purpose } = options;
-  let query = "SELECT COUNT(*) as c FROM files WHERE deleted_at IS NULL";
-  const params: any[] = [];
+  let query = "SELECT COUNT(*) as c FROM files WHERE tenant_id = ? AND deleted_at IS NULL";
+  const params: any[] = [currentDbTenantId()];
   if (apiKeyId) {
     query += " AND api_key_id = ?";
     params.push(apiKeyId);
@@ -164,7 +169,7 @@ export function formatFileResponse(file: FileRecord) {
 export function deleteFile(id: string): boolean {
   const db = getDbInstance();
   const result = db
-    .prepare("UPDATE files SET deleted_at = ?, content = NULL WHERE id = ?")
-    .run(Math.floor(Date.now() / 1000), id);
+    .prepare("UPDATE files SET deleted_at = ?, content = NULL WHERE id = ? AND tenant_id = ?")
+    .run(Math.floor(Date.now() / 1000), id, currentDbTenantId());
   return result.changes > 0;
 }

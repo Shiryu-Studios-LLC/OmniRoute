@@ -8,6 +8,7 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-quota-res
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../../src/lib/db/core.ts");
+const { runWithTenantContext } = await import("../../../src/lib/tenantContext.ts");
 const {
   recordProviderQuotaResetEventIfChanged,
   getProviderQuotaWindowStart,
@@ -49,6 +50,32 @@ test("getWindowStart returns null for a reset day with no recorded event", () =>
     getProviderQuotaWindowStartIso(CONN, "2026-02-01T00:00:00.000Z", Date.parse(OBSERVED) + 1000),
     null
   );
+});
+
+test("recorded quota reset events are isolated by tenant", () => {
+  const connectionId = "shared-connection-id";
+  runWithTenantContext({ tenantId: "tenant-a" }, () => {
+    recordProviderQuotaResetEventIfChanged({
+      provider: PROVIDER,
+      connectionId,
+      windowKey: "weekly",
+      currentResetAt: CUR_RESET,
+      currentRemainingPercentage: 100,
+      previousObservation: { resetAt: PREV_RESET, remainingPercentage: 5 },
+      observedAt: OBSERVED,
+    });
+  });
+
+  const row = core
+    .getDbInstance()
+    .prepare("SELECT tenant_id FROM provider_quota_reset_events WHERE connection_id = ?")
+    .get(connectionId) as { tenant_id: string };
+  assert.equal(row.tenant_id, "tenant-a");
+
+  const foreignTenantStart = runWithTenantContext({ tenantId: "tenant-b" }, () =>
+    getProviderQuotaWindowStartIso(connectionId, CUR_RESET, Date.parse(OBSERVED) + 1000)
+  );
+  assert.equal(foreignTenantStart, null);
 });
 
 test("observed same-resetAt quota drop overrides an older recorded weekly window", () => {

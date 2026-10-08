@@ -1,4 +1,5 @@
 import { getDbInstance } from "../core";
+import { currentDbTenantId } from "../tenantScope";
 
 export const PROXY_ALIVE_PREDICATE =
   "(p.status IS NULL OR LOWER(p.status) NOT IN ('inactive','error','disabled','dead','down'))";
@@ -29,8 +30,11 @@ export function hasBlockingProxyAssignment(connectionId: string, providerId?: st
     if (!isGlobalProxyEnabled(db)) return false;
 
     const conn = db
-      .prepare("SELECT provider, proxy_enabled FROM provider_connections WHERE id = ?")
-      .get(connectionId) as { provider?: string | null; proxy_enabled?: number } | undefined;
+      .prepare(
+        "SELECT provider, proxy_enabled FROM provider_connections WHERE id = ? AND tenant_id = ?"
+      )
+      .get(connectionId, currentDbTenantId()) as
+      { provider?: string | null; proxy_enabled?: number } | undefined;
     if (conn && conn.proxy_enabled === 0) return false;
     const provider = conn?.provider ?? providerId ?? null;
     const dead = db

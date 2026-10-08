@@ -595,11 +595,20 @@ export function loadCircuitBreakerState(name: string): CircuitBreakerStateRecord
  * Load all circuit breaker states.
  * @returns {Array<{name: string, state: string, failureCount: number, lastFailureTime: number|null}>}
  */
-export function loadAllCircuitBreakerStates() {
+export function loadAllCircuitBreakerStates(storagePrefix?: string) {
   const db = getDbInstance();
-  return db
-    .prepare("SELECT name, state, failure_count, last_failure_time FROM domain_circuit_breakers")
-    .all()
+  const rows = storagePrefix
+    ? db
+        .prepare(
+          "SELECT name, state, failure_count, last_failure_time FROM domain_circuit_breakers WHERE substr(name, 1, ?) = ?"
+        )
+        .all(storagePrefix.length, storagePrefix)
+    : db
+        .prepare(
+          "SELECT name, state, failure_count, last_failure_time FROM domain_circuit_breakers"
+        )
+        .all();
+  return rows
     .map((row) => {
       const record = asRecord(row);
       return {
@@ -624,7 +633,14 @@ export function deleteCircuitBreakerState(name: string) {
 /**
  * Delete all circuit breaker states.
  */
-export function deleteAllCircuitBreakerStates() {
+export function deleteAllCircuitBreakerStates(storagePrefix?: string) {
   const db = getDbInstance();
+  if (storagePrefix) {
+    db.prepare("DELETE FROM domain_circuit_breakers WHERE substr(name, 1, ?) = ?").run(
+      storagePrefix.length,
+      storagePrefix
+    );
+    return;
+  }
   db.prepare("DELETE FROM domain_circuit_breakers").run();
 }

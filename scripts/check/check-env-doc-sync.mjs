@@ -198,6 +198,9 @@ const IGNORE_FROM_CODE = new Set([
   // Listener-owned self-fetch transport signal. The HTTP/HTTPS launchers set
   // this before application imports; it is not user-configurable product env.
   "OMNIROUTE_INTERNAL_SCHEME",
+  // Cloudflare build wrapper's disposable profile directory; build-only and
+  // never read as a user runtime setting.
+  "OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR",
   // Source typo / placeholder.
   "OMNIROUT",
   // Static config alias path (the canonical var is OMNIROUTE_PAYLOAD_RULES_PATH).

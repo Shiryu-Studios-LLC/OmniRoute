@@ -88,13 +88,14 @@ export async function redeemInvite(
  */
 export async function listInvites(apiKeyId: string) {
   const db = (await import("../db/core")).getDbInstance();
+  const { currentDbTenantId } = await import("../db/tenantScope");
 
   const rows = db
     .prepare(
       `SELECT id, code, server_url, max_uses, use_count, expires_at, revoked_at, created_at
-       FROM invite_tokens WHERE created_by = ? ORDER BY created_at DESC`
+       FROM invite_tokens WHERE tenant_id = ? AND created_by = ? ORDER BY created_at DESC`
     )
-    .all(apiKeyId) as Array<{
+    .all(currentDbTenantId(), apiKeyId) as Array<{
     id: string;
     code: string;
     server_url: string | null;
@@ -122,6 +123,5 @@ export async function listInvites(apiKeyId: string) {
  */
 export async function revokeInvite(inviteId: string): Promise<boolean> {
   const { revokeInvite: dbRevoke } = await import("../db/gamification");
-  dbRevoke(inviteId);
-  return true;
+  return dbRevoke(inviteId);
 }

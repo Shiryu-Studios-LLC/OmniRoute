@@ -1,7 +1,6 @@
 import { getDbInstance, rowToCamel } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
-
-type JsonRecord = Record<string, unknown>;
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -13,7 +12,7 @@ interface DbLike {
   prepare: <TRow = unknown>(sql: string) => StatementLike<TRow>;
 }
 
-let lastCleanupAt = 0;
+const lastCleanupAtByTenant = new Map<string, number>();
 
 export function saveQuotaSnapshot(snapshot: Omit<QuotaSnapshotRow, "id" | "created_at">): void {
   const db = getDbInstance() as unknown as DbLike;
@@ -22,10 +21,11 @@ export function saveQuotaSnapshot(snapshot: Omit<QuotaSnapshotRow, "id" | "creat
   try {
     db.prepare(
       `INSERT INTO quota_snapshots
-       (provider, connection_id, window_key, remaining_percentage, is_exhausted,
+       (tenant_id, provider, connection_id, window_key, remaining_percentage, is_exhausted,
         next_reset_at, window_duration_ms, raw_data, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
+      currentDbTenantId(),
       snapshot.provider,
       snapshot.connection_id,
       snapshot.window_key,
@@ -54,8 +54,8 @@ export function getQuotaSnapshots(opts: {
   until?: string;
 }): QuotaSnapshotRow[] {
   const db = getDbInstance() as unknown as DbLike;
-  const conditions: string[] = ["created_at >= ?"];
-  const params: unknown[] = [opts.since];
+  const conditions: string[] = ["tenant_id = ?", "created_at >= ?"];
+  const params: unknown[] = [currentDbTenantId(), opts.since];
 
   if (opts.provider) {
     conditions.push("provider = ?");
@@ -108,11 +108,11 @@ export function getLatestQuotaSnapshotsForConnection(connectionId: string): Quot
              PARTITION BY window_key ORDER BY created_at DESC, id DESC
            ) AS rn
            FROM quota_snapshots
-           WHERE connection_id = ?
+           WHERE tenant_id = ? AND connection_id = ?
          )
          WHERE rn = 1`
       )
-      .all(connectionId);
+      .all(currentDbTenantId(), connectionId);
 
     return rows.map((row) => rowToCamel(row) as unknown as QuotaSnapshotRow);
   } catch (err: any) {
@@ -131,8 +131,8 @@ export function getAggregatedSnapshots(opts: {
   aggregateBy?: "provider" | "connection";
 }): ProviderUtilizationPoint[] {
   const db = getDbInstance() as unknown as DbLike;
-  const conditions: string[] = ["created_at >= ?"];
-  const params: unknown[] = [opts.since];
+  const conditions: string[] = ["tenant_id = ?", "created_at >= ?"];
+  const params: unknown[] = [currentDbTenantId(), opts.since];
 
   if (opts.provider) {
     conditions.push("provider = ?");
@@ -196,6 +196,8 @@ export function getAggregatedSnapshots(opts: {
 export function cleanupOldSnapshots(retentionDays = 90): number {
   const now = Date.now();
   const cleanupThresholdMs = 6 * 60 * 60 * 1000;
+  const tenantId = currentDbTenantId();
+  const lastCleanupAt = lastCleanupAtByTenant.get(tenantId) ?? 0;
 
   if (now - lastCleanupAt < cleanupThresholdMs) {
     return 0;
@@ -205,8 +207,10 @@ export function cleanupOldSnapshots(retentionDays = 90): number {
   const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
 
   try {
-    const result = db.prepare("DELETE FROM quota_snapshots WHERE created_at < ?").run(cutoffDate);
-    lastCleanupAt = now;
+    const result = db
+      .prepare("DELETE FROM quota_snapshots WHERE tenant_id = ? AND created_at < ?")
+      .run(tenantId, cutoffDate);
+    lastCleanupAtByTenant.set(tenantId, now);
     return result.changes;
   } catch (err: any) {
     if (err?.message?.includes("no such table")) {

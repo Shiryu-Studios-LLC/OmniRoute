@@ -3,6 +3,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { backupDbFile } from "./backup";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
 import { invalidateDbCache } from "./readCache";
@@ -499,10 +500,10 @@ export async function resolveProxyForConnection(
   providerId?: string
 ) {
   const cacheKey = providerId
-    ? `${connectionId}:${apiKeyId || ""}:${providerId}`
+    ? `${currentDbTenantId()}:${connectionId}:${apiKeyId || ""}:${providerId}`
     : apiKeyId
-      ? `${connectionId}:${apiKeyId}`
-      : connectionId;
+      ? `${currentDbTenantId()}:${connectionId}:${apiKeyId}`
+      : `${currentDbTenantId()}:${connectionId}`;
   const startGeneration = proxyConfigGeneration;
   const startRegistryGeneration = getProxyRegistryGeneration();
   const cached = proxyResolutionCache.get(cacheKey);
@@ -544,9 +545,9 @@ export async function resolveProxyForConnection(
 
   const row = db
     .prepare(
-      "SELECT provider, proxy_enabled, per_key_proxy_enabled FROM provider_connections WHERE id = ?"
+      "SELECT provider, proxy_enabled, per_key_proxy_enabled FROM provider_connections WHERE id = ? AND tenant_id = ?"
     )
-    .get(connectionId);
+    .get(connectionId, currentDbTenantId());
   if (row) {
     connectionRecord = toRecord(row);
     connectionProvider =
@@ -590,8 +591,9 @@ export async function resolveProxyForConnection(
 
     if (perKeyEnabled) {
       try {
-        const apiKeyRow = db.prepare("SELECT proxy_id FROM api_keys WHERE id = ?").get(apiKeyId) as
-          { proxy_id?: string | null } | undefined;
+        const apiKeyRow = db
+          .prepare("SELECT proxy_id FROM api_keys WHERE id = ? AND tenant_id = ?")
+          .get(apiKeyId, currentDbTenantId()) as { proxy_id?: string | null } | undefined;
         if (apiKeyRow?.proxy_id) {
           const proxyRow = db
             .prepare(
@@ -671,7 +673,9 @@ export async function resolveProxyForConnection(
     // proxy assignment completely inert). Fall back to the legacy in-memory
     // combos map for any pre-existing legacy data.
     if (connectionProvider && connectionProxyEnabled) {
-      const combos = db.prepare("SELECT id, data FROM combos").all();
+      const combos = db
+        .prepare("SELECT id, data FROM combos WHERE tenant_id = ?")
+        .all(currentDbTenantId());
       for (const comboRow of combos) {
         const comboRecord = toRecord(comboRow);
         const comboId = typeof comboRecord.id === "string" ? comboRecord.id : null;

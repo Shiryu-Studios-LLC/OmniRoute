@@ -16,6 +16,7 @@ const purgeRequestHistoryRoute =
 const settingsDb = await import("../../src/lib/db/settings.ts");
 const cleanup = await import("../../src/lib/db/cleanup.ts");
 const aggregateHistory = await import("../../src/lib/usage/aggregateHistory.ts");
+const { enterTenantContext, runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 type CountRow = {
   count: number;
@@ -30,6 +31,7 @@ type UsageSummaryRow = {
 
 function resetStorage() {
   core.resetDbInstance();
+  enterTenantContext({ tenantId: "tenant_shiryu_admin", role: "owner" });
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
@@ -51,6 +53,23 @@ function insertCallLog(id: string, artifactRelPath: string | null = null) {
     `
   ).run(
     id,
+    "2026-06-01T12:00:00.000Z",
+    "POST",
+    "/v1/chat/completions",
+    200,
+    artifactRelPath ? "ready" : "none",
+    artifactRelPath
+  );
+}
+
+function insertTenantCallLog(id: string, tenantId: string, artifactRelPath: string | null = null) {
+  const db = core.getDbInstance();
+  db.prepare(
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, detail_state, artifact_relpath)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    tenantId,
     "2026-06-01T12:00:00.000Z",
     "POST",
     "/v1/chat/completions",
@@ -221,30 +240,40 @@ test("database settings reader normalizes legacy negative cache size to the posi
   assert.equal(databaseSettings.getUserDatabaseSettings().optimization.cacheSize, 65536);
 });
 
-test("purgeDetailedLogs deletes request_detail_logs", async () => {
+test("purgeDetailedLogs deletes only the active tenant's request_detail_logs", async () => {
   const db = core.getDbInstance();
-  db.prepare("INSERT INTO request_detail_logs (id, timestamp, duration_ms) VALUES (?, ?, ?)").run(
-    "detail-1",
-    new Date().toISOString(),
-    10
+  const insert = db.prepare(
+    "INSERT INTO request_detail_logs (id, tenant_id, timestamp, duration_ms) VALUES (?, ?, ?, ?)"
   );
-  db.prepare("INSERT INTO request_detail_logs (id, timestamp, duration_ms) VALUES (?, ?, ?)").run(
-    "detail-2",
-    new Date().toISOString(),
-    20
-  );
+  insert.run("detail-a1", "tenant_A", new Date().toISOString(), 10);
+  insert.run("detail-a2", "tenant_A", new Date().toISOString(), 20);
+  insert.run("detail-b", "tenant_B", new Date().toISOString(), 30);
 
-  const result = await cleanup.purgeDetailedLogs();
+  const result = await runWithTenantContext({ tenantId: "tenant_A", role: "owner" }, () =>
+    cleanup.purgeDetailedLogs()
+  );
 
   assert.equal(result.errors, 0);
   assert.equal(result.deleted, 2);
   assert.equal(
-    (db.prepare("SELECT COUNT(*) AS count FROM request_detail_logs").get() as CountRow).count,
+    (
+      db
+        .prepare("SELECT COUNT(*) AS count FROM request_detail_logs WHERE tenant_id = 'tenant_A'")
+        .get() as CountRow
+    ).count,
     0
+  );
+  assert.equal(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS count FROM request_detail_logs WHERE tenant_id = 'tenant_B'")
+        .get() as CountRow
+    ).count,
+    1
   );
 });
 
-test("purgeCallLogs deletes summary rows and local request artifacts", async () => {
+test("purgeCallLogs deletes summary rows and linked local request artifacts", async () => {
   const db = core.getDbInstance();
   const artifactPath = writeCallLogArtifact("2026-06-01/request-1.json");
   const orphanPath = writeCallLogArtifact("2026-06-02/orphan.json");
@@ -254,11 +283,36 @@ test("purgeCallLogs deletes summary rows and local request artifacts", async () 
 
   assert.equal(result.errors, 0);
   assert.equal(result.deleted, 1);
-  assert.equal(result.deletedArtifacts, 2);
+  assert.equal(result.deletedArtifacts, 1);
   assert.equal((db.prepare("SELECT COUNT(*) AS count FROM call_logs").get() as CountRow).count, 0);
   assert.equal(fs.existsSync(artifactPath), false);
-  assert.equal(fs.existsSync(orphanPath), false);
-  assert.equal(fs.existsSync(path.join(TEST_DATA_DIR, "call_logs")), false);
+  assert.equal(fs.existsSync(orphanPath), true);
+  assert.equal(fs.existsSync(path.join(TEST_DATA_DIR, "call_logs")), true);
+});
+
+test("purgeCallLogs only deletes the active tenant's rows and artifacts", async () => {
+  const db = core.getDbInstance();
+  const artifactA = writeCallLogArtifact("tenant-a/request.json");
+  const artifactB = writeCallLogArtifact("tenant-b/request.json");
+  insertTenantCallLog("call-tenant-a", "tenant_A", "tenant-a/request.json");
+  insertTenantCallLog("call-tenant-b", "tenant_B", "tenant-b/request.json");
+
+  const result = await runWithTenantContext({ tenantId: "tenant_A", role: "owner" }, () =>
+    cleanup.purgeCallLogs()
+  );
+
+  assert.equal(result.errors, 0);
+  assert.equal(result.deleted, 1);
+  assert.equal(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS count FROM call_logs WHERE tenant_id = 'tenant_B'")
+        .get() as CountRow
+    ).count,
+    1
+  );
+  assert.equal(fs.existsSync(artifactA), false);
+  assert.equal(fs.existsSync(artifactB), true);
 });
 
 test("purge request history route clears call logs, artifacts, and legacy detail rows", async () => {
@@ -347,11 +401,11 @@ test("cleanupUsageHistory rolls up and deletes old rows using the same day bound
   });
 
   const insertUsage = db.prepare(
-    `INSERT INTO usage_history (provider, model, timestamp, tokens_input, tokens_output, success, latency_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO usage_history (tenant_id, provider, model, timestamp, tokens_input, tokens_output, success, latency_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  insertUsage.run("openai", "gpt-test", oldTimestamp, 100, 40, 1, 200);
-  insertUsage.run("openai", "gpt-test", recentTimestamp, 7, 3, 1, 100);
+  insertUsage.run("tenant_shiryu_admin", "openai", "gpt-test", oldTimestamp, 100, 40, 1, 200);
+  insertUsage.run("tenant_shiryu_admin", "openai", "gpt-test", recentTimestamp, 7, 3, 1, 100);
 
   const result = await cleanup.cleanupUsageHistory();
 

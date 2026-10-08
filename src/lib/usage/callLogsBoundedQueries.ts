@@ -1,4 +1,5 @@
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 
 // #5618 — node:sqlite's StatementSync.all() materializes the ENTIRE result set as
 // JS objects at once. On a large storage.sqlite (~170 MB+) an unbounded
@@ -9,17 +10,20 @@ import { getDbInstance } from "../db/core";
 const CALL_LOG_QUERY_PAGE = 5000;
 
 /**
- * Collect every non-null `artifact_relpath` referenced by call_logs, paging with
- * LIMIT/OFFSET so a huge table never loads into memory in one `.all()`.
+ * Collect every non-null `artifact_relpath` referenced by the active tenant's
+ * call_logs, paging with LIMIT/OFFSET so a huge table never loads into memory in one `.all()`.
  */
 export function collectReferencedArtifacts(): Set<string> {
   const db = getDbInstance();
   const referenced = new Set<string>();
+  const tenantId = currentDbTenantId();
   const stmt = db.prepare(
-    "SELECT artifact_relpath FROM call_logs WHERE artifact_relpath IS NOT NULL LIMIT ? OFFSET ?"
+    `SELECT artifact_relpath FROM call_logs
+     WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+       AND artifact_relpath IS NOT NULL LIMIT ? OFFSET ?`
   );
   for (let offset = 0; ; offset += CALL_LOG_QUERY_PAGE) {
-    const rows = stmt.all(CALL_LOG_QUERY_PAGE, offset) as Array<{
+    const rows = stmt.all(tenantId, tenantId, CALL_LOG_QUERY_PAGE, offset) as Array<{
       artifact_relpath: string | null;
     }>;
     for (const row of rows) {
@@ -37,29 +41,39 @@ export function collectReferencedArtifacts(): Set<string> {
  */
 export function selectCallLogIdsBefore(cutoff: string, limit = CALL_LOG_QUERY_PAGE): string[] {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   const rows = db
-    .prepare("SELECT id FROM call_logs WHERE timestamp < ? ORDER BY timestamp ASC LIMIT ?")
-    .all(cutoff, limit) as Array<{ id: string }>;
+    .prepare(
+      `SELECT id FROM call_logs
+       WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+         AND timestamp < ?
+       ORDER BY timestamp ASC LIMIT ?`
+    )
+    .all(tenantId, tenantId, cutoff, limit) as Array<{ id: string }>;
   return rows.map((row) => String(row.id));
 }
 
 export function selectOverflowArtifactPaths(maxEntries: number, limit: number): string[] {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   const rows = db
     .prepare(
       `SELECT artifact_relpath
        FROM call_logs
-       WHERE artifact_relpath IS NOT NULL
+       WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+         AND artifact_relpath IS NOT NULL
        ORDER BY timestamp DESC, id DESC
        LIMIT ? OFFSET ?`
     )
-    .all(limit, maxEntries) as Array<{ artifact_relpath: string }>;
+    .all(tenantId, tenantId, limit, maxEntries) as Array<{ artifact_relpath: string }>;
   return rows.map((row) => row.artifact_relpath);
 }
 
 export function findReferencedArtifacts(relativePaths: string[]): Set<string> {
   if (relativePaths.length === 0) return new Set();
 
+  // Artifact files share one on-disk directory, so deletion safety must consider
+  // references from every tenant even though the caller is tenant-scoped.
   const db = getDbInstance();
   const placeholders = relativePaths.map(() => "?").join(", ");
   const rows = db

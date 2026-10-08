@@ -758,10 +758,10 @@ test("cache metrics, trend and no-op update/reset methods read from usage_histor
 
   const insertUsage = db.prepare(`
     INSERT INTO usage_history (
-      provider, model, connection_id, api_key_id, api_key_name,
+      tenant_id, provider, model, connection_id, api_key_id, api_key_name,
       tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation,
       tokens_reasoning, status, success, latency_ms, ttft_ms, error_code, timestamp
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES ('tenant_shiryu_admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   insertUsage.run(
@@ -859,7 +859,11 @@ test("cache metrics and trend coerce null aggregate fields to zero", async () =>
       };
     }
 
-    if (text.match(/SELECT\s+COUNT\(\*\)\s+as\s+totalRequests\s+FROM\s+usage_history\s*$/)) {
+    if (
+      text.match(
+        /SELECT\s+COUNT\(\*\)\s+as\s+totalRequests\s+FROM\s+usage_history\s+WHERE\s+tenant_id\s*=\s*@tenantId\s*$/
+      )
+    ) {
       return {
         get: () => ({
           totalRequests: 5,

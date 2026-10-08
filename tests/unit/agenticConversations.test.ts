@@ -4,6 +4,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import Database from "better-sqlite3";
 
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
@@ -30,6 +32,11 @@ const {
   resolveCallLogIdsByCorrelationIds,
 } = await import("../../src/lib/db/agenticConversations.ts");
 const { getDbInstance } = await import("../../src/lib/db/core.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
+
+function asTenant<T>(tenantId: string, callback: () => T): T {
+  return runWithTenantContext({ tenantId, role: "owner" }, callback);
+}
 
 test("createAgenticConversation + findAgenticConversationsByFingerprint round-trip", () => {
   const row = createAgenticConversation({
@@ -206,8 +213,8 @@ test("getConversationTurnPage: afterSeq returns only turns newer than the cursor
 });
 
 test("touchOrCreateExternalConversation creates then increments turn_count on repeat calls", () => {
-  const id = "ext-conv-test-id";
-  touchOrCreateExternalConversation(id, { apiKeyId: "key-d" });
+  const id = touchOrCreateExternalConversation("ext-conv-test-id", { apiKeyId: "key-d" });
+  assert.match(id, /^ext_[0-9a-f]{64}$/);
 
   const db = getDbInstance();
   const afterCreate = db
@@ -215,11 +222,176 @@ test("touchOrCreateExternalConversation creates then increments turn_count on re
     .get(id) as { turn_count: number };
   assert.equal(afterCreate.turn_count, 1);
 
-  touchOrCreateExternalConversation(id, { apiKeyId: "key-d" });
+  touchOrCreateExternalConversation("ext-conv-test-id", { apiKeyId: "key-d" });
   const afterTouch = db
     .prepare("SELECT turn_count FROM agentic_conversations WHERE id = ?")
     .get(id) as { turn_count: number };
   assert.equal(afterTouch.turn_count, 2);
+});
+
+test("external session IDs are deterministically namespaced by tenant", () => {
+  const sameClientSessionId = "client-session-reused";
+  const tenantAId = asTenant("tenant_a", () =>
+    touchOrCreateExternalConversation(sameClientSessionId, { apiKeyId: "key-a" })
+  );
+  const tenantBId = asTenant("tenant_b", () =>
+    touchOrCreateExternalConversation(sameClientSessionId, { apiKeyId: "key-b" })
+  );
+  assert.notEqual(tenantAId, tenantBId);
+  assert.equal(
+    asTenant("tenant_a", () =>
+      touchOrCreateExternalConversation(sameClientSessionId, { apiKeyId: "key-a" })
+    ),
+    tenantAId
+  );
+
+  const db = getDbInstance();
+  assert.deepEqual(
+    db
+      .prepare("SELECT tenant_id, turn_count FROM agentic_conversations WHERE id = ?")
+      .get(tenantAId),
+    { tenant_id: "tenant_a", turn_count: 2 }
+  );
+  assert.deepEqual(
+    db
+      .prepare("SELECT tenant_id, turn_count FROM agentic_conversations WHERE id = ?")
+      .get(tenantBId),
+    { tenant_id: "tenant_b", turn_count: 1 }
+  );
+});
+
+test("tenant conversation migration backfills existing records to the Shiryu admin tenant", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE agentic_conversations (
+        id TEXT PRIMARY KEY,
+        api_key_id TEXT,
+        fingerprint_hash TEXT NOT NULL,
+        last_message_count INTEGER NOT NULL,
+        last_messages_hash TEXT NOT NULL,
+        turn_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+      INSERT INTO agentic_conversations VALUES
+        ('legacy-conversation', 'legacy-key', 'fingerprint', 0, '', 3, 'first', 'last');
+    `);
+    db.exec(fs.readFileSync("src/lib/db/migrations/172_tenant_agentic_conversations.sql", "utf8"));
+    assert.deepEqual(
+      db
+        .prepare("SELECT tenant_id FROM agentic_conversations WHERE id = ?")
+        .get("legacy-conversation"),
+      { tenant_id: "tenant_shiryu_admin" }
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT turn_count, api_key_id FROM agentic_conversations WHERE id = ?")
+        .get("legacy-conversation"),
+      { turn_count: 3, api_key_id: "legacy-key" }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("conversation list, detail, turn nodes, and call-log IDs remain tenant-scoped", () => {
+  const conversationA = asTenant("tenant_a", () => {
+    const row = createAgenticConversation({
+      apiKeyId: "key-a",
+      fingerprintHash: "shared-fingerprint",
+    });
+    insertConversationTurnNodes(row.id, "shared-correlation", [
+      { id: "tenant-a-node-1", parentId: null, role: "user", contentHash: "a1" },
+      { id: "tenant-a-node-2", parentId: "tenant-a-node-1", role: "assistant", contentHash: "a2" },
+    ]);
+    return row;
+  });
+  const conversationB = asTenant("tenant_b", () => {
+    const row = createAgenticConversation({
+      apiKeyId: "key-b",
+      fingerprintHash: "shared-fingerprint",
+    });
+    insertConversationTurnNodes(row.id, "shared-correlation", [
+      { id: "tenant-b-node-1", parentId: null, role: "user", contentHash: "b1" },
+      { id: "tenant-b-node-2", parentId: "tenant-b-node-1", role: "assistant", contentHash: "b2" },
+    ]);
+    return row;
+  });
+
+  const db = getDbInstance();
+  db.prepare(
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, correlation_id, session_tag)
+     VALUES (?, ?, ?, 'POST', '/v1/chat/completions', 200, ?, ?, ?)`
+  ).run(
+    "tenant-a-call",
+    "tenant_a",
+    "2026-05-01T00:00:00.000Z",
+    "model-a",
+    "shared-correlation",
+    conversationA.id
+  );
+  db.prepare(
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, correlation_id, session_tag)
+     VALUES (?, ?, ?, 'POST', '/v1/chat/completions', 200, ?, ?, ?)`
+  ).run(
+    "tenant-b-call",
+    "tenant_b",
+    "2026-05-01T00:01:00.000Z",
+    "model-b",
+    "shared-correlation",
+    conversationB.id
+  );
+
+  const listA = asTenant("tenant_a", () => listMultiTurnConversations());
+  const listB = asTenant("tenant_b", () => listMultiTurnConversations());
+  assert.deepEqual(
+    listA.rows.map((row) => row.id),
+    [conversationA.id]
+  );
+  assert.deepEqual(
+    listB.rows.map((row) => row.id),
+    [conversationB.id]
+  );
+  assert.equal(listA.rows[0].lastCallLogId, "tenant-a-call");
+  assert.equal(listB.rows[0].lastCallLogId, "tenant-b-call");
+  assert.equal(
+    asTenant("tenant_a", () => getConversationTurnPage(conversationB.id)).nodes.length,
+    0
+  );
+  assert.equal(
+    asTenant("tenant_b", () => getConversationTurnPage(conversationA.id)).nodes.length,
+    0
+  );
+  assert.equal(
+    asTenant("tenant_a", () => getConversationTurnIndex(conversationB.id)).nodeIds.size,
+    0
+  );
+  assert.equal(
+    asTenant("tenant_b", () => getConversationTurnIndex(conversationA.id)).nodeIds.size,
+    0
+  );
+  assert.equal(
+    asTenant("tenant_a", () => resolveCallLogIdsByCorrelationIds(["shared-correlation"])).get(
+      "shared-correlation"
+    ),
+    "tenant-a-call"
+  );
+  assert.equal(
+    asTenant("tenant_b", () => resolveCallLogIdsByCorrelationIds(["shared-correlation"])).get(
+      "shared-correlation"
+    ),
+    "tenant-b-call"
+  );
+  assert.throws(
+    () =>
+      asTenant("tenant_b", () =>
+        insertConversationTurnNodes(conversationA.id, null, [
+          { id: "cross-tenant-node", parentId: null, role: "user", contentHash: "nope" },
+        ])
+      ),
+    /conversation not found/i
+  );
 });
 
 test("listMultiTurnConversations only returns conversations with >= 2 actual turn nodes, joined to their latest call_logs row", () => {
@@ -255,12 +427,12 @@ test("listMultiTurnConversations only returns conversations with >= 2 actual tur
   ]);
 
   db.prepare(
-    `INSERT INTO call_logs (id, timestamp, method, path, status, model, provider, session_tag)
-     VALUES (?, ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', 'opencode-zen', ?)`
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, provider, session_tag)
+     VALUES (?, 'tenant_shiryu_admin', ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', 'opencode-zen', ?)`
   ).run("multi-turn-1", "2026-03-01T00:00:00.000Z", "conv-multi-turn");
   db.prepare(
-    `INSERT INTO call_logs (id, timestamp, method, path, status, model, provider, session_tag)
-     VALUES (?, ?, 'POST', '/v1/chat/completions', 200, 'gemma-4', 'gemini', ?)`
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, provider, session_tag)
+     VALUES (?, 'tenant_shiryu_admin', ?, 'POST', '/v1/chat/completions', 200, 'gemma-4', 'gemini', ?)`
   ).run("multi-turn-2", "2026-03-01T00:01:00.000Z", "conv-multi-turn");
 
   const { rows, total } = listMultiTurnConversations();
@@ -279,12 +451,12 @@ test("resolveCallLogIdsByCorrelationIds bulk-resolves correlation_id to call_log
   const db = getDbInstance();
 
   db.prepare(
-    `INSERT INTO call_logs (id, timestamp, method, path, status, model, correlation_id)
-     VALUES (?, ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', ?)`
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, correlation_id)
+     VALUES (?, 'tenant_shiryu_admin', ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', ?)`
   ).run("call-corr-1", "2026-04-01T00:00:00.000Z", "corr-a");
   db.prepare(
-    `INSERT INTO call_logs (id, timestamp, method, path, status, model, correlation_id)
-     VALUES (?, ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', ?)`
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, correlation_id)
+     VALUES (?, 'tenant_shiryu_admin', ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', ?)`
   ).run("call-corr-2", "2026-04-01T00:01:00.000Z", "corr-b");
 
   const resolved = resolveCallLogIdsByCorrelationIds(["corr-a", "corr-b", "corr-missing"]);

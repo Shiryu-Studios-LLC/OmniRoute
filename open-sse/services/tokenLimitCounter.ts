@@ -13,6 +13,7 @@
  */
 
 import { getDbInstance } from "../../src/lib/db/core.ts";
+import { currentDbTenantId } from "../../src/lib/db/tenantScope.ts";
 import {
   resetWindowIfElapsed,
   getWindowUsage,
@@ -46,6 +47,8 @@ export function seedWindowUsageFromHistory(limit: TokenLimit, now = Date.now()):
   const { periodStartAt } = resetWindowIfElapsed(limit, now);
   const lowerBound = new Date(periodStartAt).toISOString();
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
+  const tenantClause = "(tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))";
 
   // Canonical billable total = input + output + reasoning. tokens_cache_read and
   // tokens_cache_creation are a BREAKDOWN already inside tokens_input (see migration
@@ -61,23 +64,23 @@ export function seedWindowUsageFromHistory(limit: TokenLimit, now = Date.now()):
     row = db
       .prepare(
         `SELECT ${tokenSum} FROM usage_history
-         WHERE api_key_id = ? AND model = ? AND timestamp >= ?`
+         WHERE api_key_id = ? AND ${tenantClause} AND model = ? AND timestamp >= ?`
       )
-      .get(limit.apiKeyId, limit.scopeValue, lowerBound);
+      .get(limit.apiKeyId, tenantId, tenantId, limit.scopeValue, lowerBound);
   } else if (limit.scopeType === "provider") {
     row = db
       .prepare(
         `SELECT ${tokenSum} FROM usage_history
-         WHERE api_key_id = ? AND provider = ? AND timestamp >= ?`
+         WHERE api_key_id = ? AND ${tenantClause} AND provider = ? AND timestamp >= ?`
       )
-      .get(limit.apiKeyId, limit.scopeValue, lowerBound);
+      .get(limit.apiKeyId, tenantId, tenantId, limit.scopeValue, lowerBound);
   } else {
     row = db
       .prepare(
         `SELECT ${tokenSum} FROM usage_history
-         WHERE api_key_id = ? AND timestamp >= ?`
+         WHERE api_key_id = ? AND ${tenantClause} AND timestamp >= ?`
       )
-      .get(limit.apiKeyId, lowerBound);
+      .get(limit.apiKeyId, tenantId, tenantId, lowerBound);
   }
 
   const total = row && typeof row === "object" ? (row as { total?: unknown }).total : 0;
@@ -295,8 +298,7 @@ export function recordTokenUsage(
                  ORDER BY window_start DESC LIMIT 1`
               )
               .get(limit.id, windowStart) as
-              | { window_start?: string; tokens_used?: number }
-              | undefined;
+              { window_start?: string; tokens_used?: number } | undefined;
             const prevTokens =
               priorRow && typeof priorRow.tokens_used === "number" ? priorRow.tokens_used : 0;
             if (prevTokens > 0) {

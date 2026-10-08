@@ -101,6 +101,31 @@ by removing the guard.
 
 ---
 
+## Shiryu Local Agent
+
+The Local Agent makes outbound HTTPS requests to the connector gateway and discovers
+only the Ollama and ComfyUI services configured on the customer machine. It does not
+open an inbound port. A one-time device credential is read from an environment
+variable and is never accepted as a command-line argument:
+
+```bash
+omniroute local-agent run \
+  --gateway-url https://connect.shiryu.org \
+  --device-id DEVICE_ID \
+  --credential-env SHIRYU_LOCAL_AGENT_CREDENTIAL
+```
+
+The gateway URL and device ID can instead come from
+`SHIRYU_LOCAL_AGENT_GATEWAY_URL` and `SHIRYU_LOCAL_AGENT_DEVICE_ID`. Optional local
+service URLs use `SHIRYU_LOCAL_AGENT_OLLAMA_URL` and
+`SHIRYU_LOCAL_AGENT_COMFYUI_URL`. To install the Linux user service, export the
+one-time credential and the required configuration variables, then run
+`omniroute local-agent service install`. The installer stores the credential in
+`~/.config/omniroute/local-agent.env` with owner-only permissions and manages
+`omniroute-local-agent.service` under the current user's systemd session. Re-running
+install updates the service configuration. Remove the service and stored credential
+with `omniroute local-agent service uninstall`.
+
 ## Source of Truth
 
 The unified catalog lives in `src/shared/constants/cliTools.ts` as `CLI_TOOLS: Record<string, CliCatalogEntry>`.

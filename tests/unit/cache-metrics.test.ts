@@ -60,10 +60,10 @@ describe("Cache Metrics Database", () => {
 
       db.prepare(
         `
-        INSERT INTO usage_history (provider, model, connection_id, api_key_id, api_key_name,
+        INSERT INTO usage_history (tenant_id, provider, model, connection_id, api_key_id, api_key_name,
           tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, tokens_reasoning,
           status, success, latency_ms, ttft_ms, error_code, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ('tenant_shiryu_admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       ).run(
         "test-provider",
@@ -87,10 +87,10 @@ describe("Cache Metrics Database", () => {
       // Insert another row
       db.prepare(
         `
-        INSERT INTO usage_history (provider, model, connection_id, api_key_id, api_key_name,
+        INSERT INTO usage_history (tenant_id, provider, model, connection_id, api_key_id, api_key_name,
           tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, tokens_reasoning,
           status, success, latency_ms, ttft_ms, error_code, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ('tenant_shiryu_admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       ).run(
         "test-provider",

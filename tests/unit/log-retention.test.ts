@@ -13,9 +13,15 @@ process.env.PROXY_LOGS_TABLE_MAX_ROWS = "5";
 
 const core = await import("../../src/lib/db/core.ts");
 const compliance = await import("../../src/lib/compliance/index.ts");
+const { runWithTenantContext, enterTenantContext } = await import("../../src/lib/tenantContext.ts");
+
+function countRows(sql: string): number {
+  return (core.getDbInstance().prepare(sql).get() as { cnt: number }).cnt;
+}
 
 function resetStorage() {
   core.resetDbInstance();
+  enterTenantContext({ tenantId: "tenant_shiryu_admin", role: "owner" });
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
@@ -26,6 +32,47 @@ test.beforeEach(() => {
 
 test.after(() => {
   resetStorage();
+});
+
+test("cleanupExpiredLogs retains expired detail rows owned by another tenant", async () => {
+  const db = core.getDbInstance();
+  const expired = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare("INSERT INTO request_detail_logs (id, tenant_id, timestamp) VALUES (?, ?, ?)").run(
+    "expired-a",
+    "tenant_A",
+    expired
+  );
+  db.prepare("INSERT INTO request_detail_logs (id, tenant_id, timestamp) VALUES (?, ?, ?)").run(
+    "expired-b",
+    "tenant_B",
+    expired
+  );
+
+  const result = await runWithTenantContext({ tenantId: "tenant_A", role: "owner" }, () =>
+    compliance.cleanupExpiredLogs()
+  );
+
+  assert.equal(result.deletedRequestDetailLogs, 1);
+  assert.equal(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS cnt FROM request_detail_logs WHERE tenant_id = 'tenant_A'")
+        .get() as {
+        cnt: number;
+      }
+    ).cnt,
+    0
+  );
+  assert.equal(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS cnt FROM request_detail_logs WHERE tenant_id = 'tenant_B'")
+        .get() as {
+        cnt: number;
+      }
+    ).cnt,
+    1
+  );
 });
 
 test("cleanupExpiredLogs uses separate APP and CALL retention windows", async () => {
@@ -43,6 +90,9 @@ test("cleanupExpiredLogs uses separate APP and CALL retention windows", async ()
   db.prepare(
     "INSERT INTO usage_history (provider, model, tokens_input, tokens_output, success, latency_ms, ttft_ms, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
   ).run("openai", "fresh-usage", 1, 1, 1, 1, 1, freshCallTs);
+  db.prepare(
+    "INSERT INTO usage_history (tenant_id, provider, model, tokens_input, tokens_output, success, latency_ms, ttft_ms, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run("tenant_b", "openai", "foreign-old-usage", 1, 1, 1, 1, 1, oldCallTs);
 
   db.prepare(
     "INSERT INTO call_logs (id, timestamp, method, path, status, model, provider, account, duration, tokens_in, tokens_out, has_pipeline_details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -105,6 +155,12 @@ test("cleanupExpiredLogs uses separate APP and CALL retention windows", async ()
     "fresh-audit",
     "system"
   );
+  db.prepare("INSERT INTO audit_log (tenant_id, timestamp, action, actor) VALUES (?, ?, ?, ?)").run(
+    "tenant_b",
+    oldAppTs,
+    "foreign-old-audit",
+    "tenant-b-user"
+  );
 
   db.prepare("INSERT INTO mcp_tool_audit (tool_name, success, created_at) VALUES (?, ?, ?)").run(
     "old-tool",
@@ -127,12 +183,17 @@ test("cleanupExpiredLogs uses separate APP and CALL retention windows", async ()
   assert.equal(result.deletedMcpAuditLogs, 1);
   assert.deepEqual(compliance.getRetentionDays(), { app: 2, call: 1 });
 
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM usage_history").get() as any).cnt, 1);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as any).cnt, 1);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM proxy_logs").get() as any).cnt, 1);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM request_detail_logs").get() as any).cnt, 1);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM audit_log").get() as any).cnt, 2);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM mcp_tool_audit").get() as any).cnt, 1);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM usage_history"), 2);
+  assert.equal(
+    countRows("SELECT COUNT(*) AS cnt FROM usage_history WHERE tenant_id = 'tenant_b'"),
+    1
+  );
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM call_logs"), 1);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM proxy_logs"), 1);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM request_detail_logs"), 1);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM audit_log"), 3);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM audit_log WHERE tenant_id = 'tenant_b'"), 1);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM mcp_tool_audit"), 1);
 });
 
 test("cleanupExpiredLogs honors the dashboard usageHistory retention when env is unset (#4354)", async () => {
@@ -147,7 +208,9 @@ test("cleanupExpiredLogs honors the dashboard usageHistory retention when env is
     const db = core.getDbInstance();
 
     const { updateDatabaseSettings } = await import("../../src/lib/db/databaseSettings.ts");
-    updateDatabaseSettings({ retention: { usageHistory: 90, callLogs: 90 } } as any);
+    updateDatabaseSettings({ retention: { usageHistory: 90, callLogs: 90 } } as Parameters<
+      typeof updateDatabaseSettings
+    >[0]);
 
     const oldTs = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     db.prepare(
@@ -158,8 +221,12 @@ test("cleanupExpiredLogs honors the dashboard usageHistory retention when env is
 
     // 30 days < the configured 90-day dashboard retention → must be kept.
     // With the old env-default (7d) behavior this row would be deleted.
-    assert.equal(result.deletedUsage, 0, "30-day usage_history must survive a 90-day dashboard retention");
-    assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM usage_history").get() as any).cnt, 1);
+    assert.equal(
+      result.deletedUsage,
+      0,
+      "30-day usage_history must survive a 90-day dashboard retention"
+    );
+    assert.equal(countRows("SELECT COUNT(*) AS cnt FROM usage_history"), 1);
   } finally {
     if (savedCall !== undefined) process.env.CALL_LOG_RETENTION_DAYS = savedCall;
     else delete process.env.CALL_LOG_RETENTION_DAYS;
@@ -199,8 +266,8 @@ test("cleanupExpiredLogs enforces row count limits", async () => {
     ).run(`proxy-${i}`, now, "success", "direct", 1);
   }
 
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as any).cnt, 10);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM proxy_logs").get() as any).cnt, 10);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM call_logs"), 10);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM proxy_logs"), 10);
 
   const result = await compliance.cleanupExpiredLogs();
 
@@ -209,8 +276,8 @@ test("cleanupExpiredLogs enforces row count limits", async () => {
   assert.equal(result.callLogsMaxRows, 5);
   assert.equal(result.proxyLogsMaxRows, 5);
 
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as any).cnt, 5);
-  assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM proxy_logs").get() as any).cnt, 5);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM call_logs"), 5);
+  assert.equal(countRows("SELECT COUNT(*) AS cnt FROM proxy_logs"), 5);
 });
 
 test("getCallLogsTableMaxRows returns configured value", async () => {

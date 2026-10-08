@@ -3,9 +3,11 @@ import { getCostSummary, setBudget, checkBudget } from "@/domain/costRules";
 import { setBudgetSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getApiKeyById } from "@/lib/db/apiKeys";
+import { getManagementTenantId } from "@/lib/api/managementTenant";
 
 export async function GET(request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
 
   try {
@@ -13,6 +15,9 @@ export async function GET(request) {
     const apiKeyId = searchParams.get("apiKeyId");
     if (!apiKeyId) {
       return NextResponse.json({ error: "apiKeyId query param is required" }, { status: 400 });
+    }
+    if (!(await getApiKeyById(apiKeyId, await getManagementTenantId(request)))) {
+      return NextResponse.json({ error: "API key not found" }, { status: 404 });
     }
     const summary = getCostSummary(apiKeyId);
     const budgetCheck = checkBudget(apiKeyId);
@@ -41,7 +46,7 @@ export async function GET(request) {
 }
 
 export async function POST(request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
 
   let rawBody;
@@ -63,6 +68,9 @@ export async function POST(request) {
     const validation = validateBody(setBudgetSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
+    }
+    if (!(await getApiKeyById(validation.data.apiKeyId, await getManagementTenantId(request)))) {
+      return NextResponse.json({ error: "API key not found" }, { status: 404 });
     }
     const {
       apiKeyId,

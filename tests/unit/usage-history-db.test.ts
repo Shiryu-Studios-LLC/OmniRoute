@@ -129,12 +129,22 @@ test("usage history persists service tier and defaults to standard", async () =>
 
 test("getUsageDb provides nextCursor when rows exceed MAX_ROWS", async () => {
   const db = core.getDbInstance();
+  const { PLATFORM_TENANT_ID } = await import("../../src/lib/db/tenantScope.ts");
   // Insert exactly MAX_ROWS + 1 = 10001 rows so getUsageDb returns a cursor
   for (let i = 0; i < 10001; i++) {
     db.prepare(
-      `INSERT INTO usage_history (provider, model, timestamp, tokens_input, tokens_output, success, latency_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(`prov-${i}`, `model-${i}`, new Date(Date.now() - i * 1000).toISOString(), 10, 5, 1, 100);
+      `INSERT INTO usage_history (tenant_id, provider, model, timestamp, tokens_input, tokens_output, success, latency_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      PLATFORM_TENANT_ID,
+      `prov-${i}`,
+      `model-${i}`,
+      new Date(Date.now() - i * 1000).toISOString(),
+      10,
+      5,
+      1,
+      100
+    );
   }
 
   const result = await usageHistory.getUsageDb();

@@ -86,14 +86,16 @@ export async function syncLeaderboard(
 
     // Overwrite local scores with remote scores (not additive)
     const db2 = (await import("../db/core")).getDbInstance();
+    const { currentDbTenantId } = await import("../db/tenantScope");
     for (const entry of data.entries) {
       db2
         .prepare(
-          `INSERT INTO leaderboard (api_key_id, scope, score, updated_at)
-         VALUES (?, 'global', ?, datetime('now'))
-         ON CONFLICT(api_key_id, scope) DO UPDATE SET score = excluded.score, updated_at = excluded.updated_at`
+          `INSERT INTO leaderboard (api_key_id, tenant_id, scope, score, updated_at)
+         VALUES (?, ?, 'global', ?, datetime('now'))
+         ON CONFLICT(api_key_id, scope) DO UPDATE SET score = excluded.score, updated_at = excluded.updated_at
+         WHERE leaderboard.tenant_id = excluded.tenant_id`
         )
-        .run(entry.apiKeyId, entry.score);
+        .run(entry.apiKeyId, currentDbTenantId(), entry.score);
     }
 
     // Update last sync time
@@ -162,8 +164,7 @@ export async function healthCheck(
   const db = (await import("../db/core")).getDbInstance();
 
   const server = db.prepare("SELECT url FROM community_servers WHERE id = ?").get(serverId) as
-    | { url: string }
-    | undefined;
+    { url: string } | undefined;
 
   if (!server) return { healthy: false, latencyMs: 0 };
 

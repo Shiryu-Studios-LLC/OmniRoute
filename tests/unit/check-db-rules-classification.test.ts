@@ -126,10 +126,11 @@ test("INTENTIONALLY_INTERNAL is exported from check-db-rules.mjs", () => {
   assert.ok(INTENTIONALLY_INTERNAL.size > 0, "INTENTIONALLY_INTERNAL must not be empty");
 });
 
-test("INTENTIONALLY_INTERNAL contains the expected 40 audited modules", () => {
+test("INTENTIONALLY_INTERNAL contains the expected 46 audited modules", () => {
   const expected = [
     "_rowTypes",
     "accessTokens",
+    "apiKeyExpiryAudit",
     "apiKeyColumnFallbacks",
     "apiKeyUsageLimitFields",
     "backupRetention",
@@ -147,6 +148,7 @@ test("INTENTIONALLY_INTERNAL contains the expected 40 audited modules", () => {
     "encryption",
     "healthCheck",
     "jsonMigration",
+    "localAgents",
     "migrationRunner",
     "modelCapabilityOverrides",
     "notion",
@@ -165,6 +167,10 @@ test("INTENTIONALLY_INTERNAL contains the expected 40 audited modules", () => {
     "serviceModels",
     "stateReset",
     "stats",
+    "tenantMemberships",
+    "tenantProvisioning",
+    "tenantScope",
+    "tenants",
     "tierConfig",
     "vacuumScheduler",
     "webSessionDedup",

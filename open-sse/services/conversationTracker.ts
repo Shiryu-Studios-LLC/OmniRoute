@@ -281,10 +281,6 @@ function chainNodeIdFromHash(parentId: string, turnHash: string): string {
   return hashHex(`${parentId} ${turnHash}`);
 }
 
-function chainNodeId(parentId: string, turn: CanonicalTurn): string {
-  return chainNodeIdFromHash(parentId, hashTurnContent(turn));
-}
-
 interface NewTurnNode {
   id: string;
   parentId: string | null;
@@ -461,11 +457,13 @@ export async function resolveConversationId(
 ): Promise<ResolveConversationIdResult> {
   // Client override wins outright — deterministic, zero heuristic risk.
   // Same header feature #8249 already reads (chatCore.ts); we don't invent a
-  // new prefix so the existing header's contract/format stays unchanged.
+  // new header or alter its input contract. The persisted ID is hashed with
+  // the current tenant by touchOrCreateExternalConversation so two customers
+  // reusing the same external session ID never share a conversation.
   if (input.clientSessionIdHeader && input.clientSessionIdHeader.trim()) {
     const id = input.clientSessionIdHeader.trim().slice(0, MAX_STORED_ID_LENGTH);
-    touchOrCreateExternalConversation(id, { apiKeyId: input.apiKeyId });
-    return { conversationId: id, isNewConversation: false };
+    const conversationId = touchOrCreateExternalConversation(id, { apiKeyId: input.apiKeyId });
+    return { conversationId, isNewConversation: false };
   }
 
   const turns = extractCanonicalTurns(input.body);

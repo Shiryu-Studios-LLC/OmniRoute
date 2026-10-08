@@ -13,9 +13,13 @@ test.after(() => resetDbInstance());
 test("sumUsageTokensThisMonth sums only the current calendar month's rolled-up tokens", () => {
   const db = getDbInstance();
   // Ensure the table exists (migrations run on getDbInstance; if not present, create defensively).
-  db.exec(`CREATE TABLE IF NOT EXISTS daily_usage_summary (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, total_requests INTEGER NOT NULL DEFAULT 0, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, total_cost REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL DEFAULT (datetime('now')));`);
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS daily_usage_summary (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, total_requests INTEGER NOT NULL DEFAULT 0, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, total_cost REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL DEFAULT (datetime('now')));`
+  );
   const thisMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
-  const insert = db.prepare("INSERT INTO daily_usage_summary (provider, model, date, total_input_tokens, total_output_tokens) VALUES (?,?,?,?,?)");
+  const insert = db.prepare(
+    "INSERT INTO daily_usage_summary (tenant_id, provider, model, date, total_input_tokens, total_output_tokens) VALUES ('tenant_shiryu_admin', ?,?,?,?,?)"
+  );
   insert.run("groq", "llama", `${thisMonth}-05`, 100, 200);
   insert.run("cerebras", "qwen", `${thisMonth}-12`, 50, 50);
   insert.run("groq", "llama", "2000-01-01", 9999, 9999); // long ago — excluded
@@ -34,7 +38,9 @@ test("sumUsageTokensThisMonth includes the current month's raw usage_history row
     tokens_cache_read INTEGER DEFAULT 0, tokens_cache_creation INTEGER DEFAULT 0, tokens_reasoning INTEGER DEFAULT 0,
     service_tier TEXT DEFAULT 'standard', status TEXT, success INTEGER DEFAULT 1, latency_ms INTEGER DEFAULT 0,
     ttft_ms INTEGER DEFAULT 0, error_code TEXT, timestamp TEXT NOT NULL);`);
-  db.exec(`CREATE TABLE IF NOT EXISTS daily_usage_summary (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, total_requests INTEGER NOT NULL DEFAULT 0, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, total_cost REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL DEFAULT (datetime('now')));`);
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS daily_usage_summary (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, total_requests INTEGER NOT NULL DEFAULT 0, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, total_cost REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL DEFAULT (datetime('now')));`
+  );
 
   // Isolate from the shared DB (getDbInstance is a singleton across test cases): start empty.
   db.exec("DELETE FROM usage_history");
@@ -46,7 +52,7 @@ test("sumUsageTokensThisMonth includes the current month's raw usage_history row
   const pastStamp = "2000-01-15T12:00:00.000Z";
 
   const insHistory = db.prepare(
-    "INSERT INTO usage_history (provider, model, tokens_input, tokens_output, timestamp) VALUES (?,?,?,?,?)"
+    "INSERT INTO usage_history (tenant_id, provider, model, tokens_input, tokens_output, timestamp) VALUES ('tenant_shiryu_admin', ?,?,?,?,?)"
   );
   insHistory.run("openai", "gpt-4.1", 150, 250, liveStamp); // 400 current-month live tokens
   insHistory.run("openai", "gpt-4.1", 9999, 9999, pastStamp); // very old — excluded
@@ -54,7 +60,7 @@ test("sumUsageTokensThisMonth includes the current month's raw usage_history row
   // A rolled-up current-month row coexisting (no double-count — the source usage_history row
   // was already deleted by the retention rollup, so both legs are additive and disjoint).
   const insSummary = db.prepare(
-    "INSERT INTO daily_usage_summary (provider, model, date, total_input_tokens, total_output_tokens) VALUES (?,?,?,?,?)"
+    "INSERT INTO daily_usage_summary (tenant_id, provider, model, date, total_input_tokens, total_output_tokens) VALUES ('tenant_shiryu_admin', ?,?,?,?,?)"
   );
   insSummary.run("groq", "llama", `${thisMonth}-20`, 25, 25); // +50 rolled-up
 
@@ -76,22 +82,22 @@ test("sumUsageTokensThisMonth uses an inclusive-start/exclusive-end UTC month ra
     tokens_cache_read INTEGER DEFAULT 0, tokens_cache_creation INTEGER DEFAULT 0, tokens_reasoning INTEGER DEFAULT 0,
     service_tier TEXT DEFAULT 'standard', status TEXT, success INTEGER DEFAULT 1, latency_ms INTEGER DEFAULT 0,
     ttft_ms INTEGER DEFAULT 0, error_code TEXT, timestamp TEXT NOT NULL);`);
-  db.exec(`CREATE TABLE IF NOT EXISTS daily_usage_summary (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, total_requests INTEGER NOT NULL DEFAULT 0, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, total_cost REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL DEFAULT (datetime('now')));`);
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS daily_usage_summary (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, total_requests INTEGER NOT NULL DEFAULT 0, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, total_cost REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL DEFAULT (datetime('now')));`
+  );
   db.exec("DELETE FROM usage_history");
   db.exec("DELETE FROM daily_usage_summary");
 
-  const monthStart = db
-    .prepare("SELECT strftime('%Y-%m-01T00:00:00.000Z','now') AS s")
-    .get() as { s: string };
+  const monthStart = db.prepare("SELECT strftime('%Y-%m-01T00:00:00.000Z','now') AS s").get() as {
+    s: string;
+  };
   const nextMonthStart = db
     .prepare("SELECT strftime('%Y-%m-01T00:00:00.000Z','now','+1 month') AS s")
     .get() as { s: string };
-  const lastInstantOfPrevMonth = new Date(
-    new Date(monthStart.s).getTime() - 1
-  ).toISOString();
+  const lastInstantOfPrevMonth = new Date(new Date(monthStart.s).getTime() - 1).toISOString();
 
   const insHistory = db.prepare(
-    "INSERT INTO usage_history (provider, model, tokens_input, tokens_output, timestamp) VALUES (?,?,?,?,?)"
+    "INSERT INTO usage_history (tenant_id, provider, model, tokens_input, tokens_output, timestamp) VALUES ('tenant_shiryu_admin', ?,?,?,?,?)"
   );
   insHistory.run("openai", "gpt-4.1", 10, 0, monthStart.s); // first instant of THIS month — included
   insHistory.run("openai", "gpt-4.1", 9999, 0, lastInstantOfPrevMonth); // last ms of PREV month — excluded

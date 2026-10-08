@@ -7,6 +7,7 @@
 
 import { getDbInstance } from "../db/core";
 import { getUserDatabaseSettings } from "../db/databaseSettings";
+import { currentDbTenantId } from "../db/tenantScope";
 
 interface AggregationResult {
   processed: number;
@@ -37,19 +38,21 @@ export async function rollupDailyUsage(
   try {
     // Aggregate quota_snapshots by provider, model, and date
     const aggregateQuery = `
-      INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+      INSERT INTO daily_usage_summary (tenant_id, provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
       SELECT 
-        provider,
-        COALESCE(json_extract(raw_data, '$.model'), 'unknown') as model,
-        DATE(created_at) as date,
+        ?,
+        snapshots.provider,
+        COALESCE(json_extract(snapshots.raw_data, '$.model'), 'unknown') as model,
+        DATE(snapshots.created_at) as date,
         COUNT(*) as total_requests,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.cost') AS REAL)), 0.0) as total_cost
-      FROM quota_snapshots
-      WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
-      GROUP BY provider, model, DATE(created_at)
-      ON CONFLICT(provider, model, date) DO UPDATE SET
+        COALESCE(SUM(CAST(json_extract(snapshots.raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
+        COALESCE(SUM(CAST(json_extract(snapshots.raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
+        COALESCE(SUM(CAST(json_extract(snapshots.raw_data, '$.cost') AS REAL)), 0.0) as total_cost
+      FROM quota_snapshots AS snapshots
+      WHERE snapshots.tenant_id = ?
+        AND DATE(snapshots.created_at) >= ? AND DATE(snapshots.created_at) <= ?
+      GROUP BY snapshots.provider, model, DATE(snapshots.created_at)
+      ON CONFLICT(tenant_id, provider, model, date) DO UPDATE SET
         total_requests = excluded.total_requests,
         total_input_tokens = excluded.total_input_tokens,
         total_output_tokens = excluded.total_output_tokens,
@@ -57,7 +60,7 @@ export async function rollupDailyUsage(
     `;
 
     const stmt = db.prepare(aggregateQuery);
-    const runResult = stmt.run(fromDate, toDate);
+    const runResult = stmt.run(currentDbTenantId(), currentDbTenantId(), fromDate, toDate);
 
     result.processed = runResult.changes;
     result.inserted = runResult.changes;
@@ -94,19 +97,21 @@ export async function rollupHourlyQuota(
   try {
     // Aggregate quota_snapshots by provider, model, and hour
     const aggregateQuery = `
-      INSERT INTO hourly_usage_summary (provider, model, date_hour, total_requests, total_input_tokens, total_output_tokens, total_cost)
+      INSERT INTO hourly_usage_summary (tenant_id, provider, model, date_hour, total_requests, total_input_tokens, total_output_tokens, total_cost)
       SELECT 
-        provider,
-        COALESCE(json_extract(raw_data, '$.model'), 'unknown') as model,
-        datetime(strftime('%Y-%m-%d %H:00:00', created_at)) as date_hour,
+        ?,
+        snapshots.provider,
+        COALESCE(json_extract(snapshots.raw_data, '$.model'), 'unknown') as model,
+        datetime(strftime('%Y-%m-%d %H:00:00', snapshots.created_at)) as date_hour,
         COUNT(*) as total_requests,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
-        COALESCE(SUM(CAST(json_extract(raw_data, '$.cost') AS REAL)), 0.0) as total_cost
-      FROM quota_snapshots
-      WHERE created_at >= ? AND created_at <= ?
-      GROUP BY provider, model, datetime(strftime('%Y-%m-%d %H:00:00', created_at))
-      ON CONFLICT(provider, model, date_hour) DO UPDATE SET
+        COALESCE(SUM(CAST(json_extract(snapshots.raw_data, '$.input_tokens') AS INTEGER)), 0) as total_input_tokens,
+        COALESCE(SUM(CAST(json_extract(snapshots.raw_data, '$.output_tokens') AS INTEGER)), 0) as total_output_tokens,
+        COALESCE(SUM(CAST(json_extract(snapshots.raw_data, '$.cost') AS REAL)), 0.0) as total_cost
+      FROM quota_snapshots AS snapshots
+      WHERE snapshots.tenant_id = ?
+        AND snapshots.created_at >= ? AND snapshots.created_at <= ?
+      GROUP BY snapshots.provider, model, datetime(strftime('%Y-%m-%d %H:00:00', snapshots.created_at))
+      ON CONFLICT(tenant_id, provider, model, date_hour) DO UPDATE SET
         total_requests = excluded.total_requests,
         total_input_tokens = excluded.total_input_tokens,
         total_output_tokens = excluded.total_output_tokens,
@@ -114,7 +119,7 @@ export async function rollupHourlyQuota(
     `;
 
     const stmt = db.prepare(aggregateQuery);
-    const runResult = stmt.run(fromDate, toDate);
+    const runResult = stmt.run(currentDbTenantId(), currentDbTenantId(), fromDate, toDate);
 
     result.processed = runResult.changes;
     result.inserted = runResult.changes;
@@ -152,8 +157,9 @@ export async function rollupUsageHistoryBeforeDate(beforeDate: string): Promise<
 
   try {
     const aggregateQuery = `
-      INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+      INSERT INTO daily_usage_summary (tenant_id, provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
       SELECT
+        ?,
         LOWER(provider) as provider,
         LOWER(model) as model,
         DATE(timestamp) as date,
@@ -162,18 +168,18 @@ export async function rollupUsageHistoryBeforeDate(beforeDate: string): Promise<
         COALESCE(SUM(tokens_output), 0) as total_output_tokens,
         0.0 as total_cost
       FROM usage_history
-      WHERE timestamp < ?
+      WHERE tenant_id = ? AND timestamp < ?
         AND provider IS NOT NULL AND provider != ''
         AND model IS NOT NULL AND model != ''
       GROUP BY LOWER(provider), LOWER(model), DATE(timestamp)
-      ON CONFLICT(provider, model, date) DO UPDATE SET
+      ON CONFLICT(tenant_id, provider, model, date) DO UPDATE SET
         total_requests = daily_usage_summary.total_requests + excluded.total_requests,
         total_input_tokens = daily_usage_summary.total_input_tokens + excluded.total_input_tokens,
         total_output_tokens = daily_usage_summary.total_output_tokens + excluded.total_output_tokens
     `;
 
     const stmt = db.prepare(aggregateQuery);
-    const runResult = stmt.run(beforeDate);
+    const runResult = stmt.run(currentDbTenantId(), currentDbTenantId(), beforeDate);
 
     result.processed = runResult.changes;
     result.inserted = runResult.changes;

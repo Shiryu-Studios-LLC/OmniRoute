@@ -1,4 +1,18 @@
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
+
+function tenantCondition(alias: string): string {
+  return `(${alias}.tenant_id = @tenantId OR (${alias}.tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))`;
+}
+
+function withTenantFilter(whereClause: string, alias: string): string {
+  const condition = tenantCondition(alias);
+  return whereClause ? `${whereClause} AND ${condition}` : `WHERE ${condition}`;
+}
+
+function withTenantParams(params: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...params, tenantId: currentDbTenantId() };
+}
 
 /**
  * Aggregation queries over `call_logs` extracted from route handlers.
@@ -91,7 +105,7 @@ export function getProviderMetrics(): ProviderMetricRow[] {
           (
             SELECT c2.status
             FROM call_logs c2
-            WHERE c2.provider = c.provider
+            WHERE c2.provider = c.provider AND ${tenantCondition("c2")}
             ORDER BY c2.timestamp DESC, c2.id DESC
             LIMIT 1
           ) as lastStatus,
@@ -99,6 +113,7 @@ export function getProviderMetrics(): ProviderMetricRow[] {
             SELECT c3.status
             FROM call_logs c3
             WHERE c3.provider = c.provider
+              AND ${tenantCondition("c3")}
               AND (
                 (c3.status IS NOT NULL AND (c3.status < 200 OR c3.status >= 400))
                 OR c3.error_summary IS NOT NULL
@@ -107,13 +122,15 @@ export function getProviderMetrics(): ProviderMetricRow[] {
             LIMIT 1
           ) as lastErrorStatus
         FROM call_logs c
-        WHERE c.provider IS NOT NULL AND c.provider != '-'
+        WHERE ${tenantCondition("c")}
+          AND c.provider IS NOT NULL AND c.provider != '-'
           AND EXISTS (
-            SELECT 1 FROM provider_connections pc WHERE pc.provider = c.provider
+            SELECT 1 FROM provider_connections pc
+            WHERE pc.provider = c.provider AND ${tenantCondition("pc")}
           )
         GROUP BY c.provider`
     )
-    .all() as ProviderMetricRow[];
+    .all(withTenantParams()) as ProviderMetricRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -143,14 +160,16 @@ export function getProviderUsageSince(since: string): ProviderUsageRow[] {
           ROUND(AVG(c.duration)) as avgLatencyMs,
           MAX(c.timestamp) as lastRequestAt
         FROM call_logs c
-        WHERE c.provider IS NOT NULL AND c.provider != '-'
+        WHERE ${tenantCondition("c")}
+          AND c.provider IS NOT NULL AND c.provider != '-'
           AND c.timestamp >= @since
           AND EXISTS (
-            SELECT 1 FROM provider_connections pc WHERE pc.provider = c.provider
+            SELECT 1 FROM provider_connections pc
+            WHERE pc.provider = c.provider AND ${tenantCondition("pc")}
           )
         GROUP BY c.provider`
     )
-    .all({ since }) as ProviderUsageRow[];
+    .all(withTenantParams({ since })) as ProviderUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -167,12 +186,12 @@ export function getSearchProviderStats(): SearchProviderStatRow[] {
       `
         SELECT provider, COUNT(*) as requests,
           CAST(AVG(duration) AS INTEGER) as avg_latency_ms
-        FROM call_logs
-        WHERE request_type = 'search'
+        FROM call_logs AS call_logs
+        ${withTenantFilter("WHERE request_type = 'search'", "call_logs")}
         GROUP BY provider
       `
     )
-    .all() as SearchProviderStatRow[];
+    .all(withTenantParams()) as SearchProviderStatRow[];
 }
 
 /**
@@ -184,13 +203,13 @@ export function getRecentSearchLogs(): SearchRecentRow[] {
     .prepare(
       `
         SELECT request_summary, provider, timestamp
-        FROM call_logs
-        WHERE request_type = 'search'
+        FROM call_logs AS call_logs
+        ${withTenantFilter("WHERE request_type = 'search'", "call_logs")}
         ORDER BY timestamp DESC
         LIMIT 10
       `
     )
-    .all() as SearchRecentRow[];
+    .all(withTenantParams()) as SearchRecentRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -207,14 +226,14 @@ export function getSearchAggregateStats(todayIso: string): SearchAggregateStats 
     .prepare(
       `SELECT
           COUNT(*) as total,
-          COALESCE(SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), 0) as today,
+          COALESCE(SUM(CASE WHEN timestamp >= @todayIso THEN 1 ELSE 0 END), 0) as today,
           COALESCE(SUM(CASE WHEN status >= 400 OR error_summary IS NOT NULL THEN 1 ELSE 0 END), 0) as errors,
           AVG(CASE WHEN duration > 0 THEN duration END) as avg_duration,
           COALESCE(SUM(CASE WHEN duration > 0 AND duration < 5 THEN 1 ELSE 0 END), 0) as cached
-         FROM call_logs
-         WHERE request_type = 'search'`
+         FROM call_logs AS call_logs
+         ${withTenantFilter("WHERE request_type = 'search'", "call_logs")}`
     )
-    .get(todayIso) as SearchAggregateStats | undefined;
+    .get(withTenantParams({ todayIso })) as SearchAggregateStats | undefined;
   return row ?? { total: 0, today: 0, errors: 0, avg_duration: null, cached: 0 };
 }
 
@@ -226,10 +245,11 @@ export function getSearchProviderCounts(): SearchProviderCountRow[] {
   return db
     .prepare(
       `SELECT provider, COUNT(*) as cnt
-         FROM call_logs WHERE request_type = 'search'
+         FROM call_logs AS call_logs
+         ${withTenantFilter("WHERE request_type = 'search'", "call_logs")}
          GROUP BY provider ORDER BY cnt DESC`
     )
-    .all() as SearchProviderCountRow[];
+    .all(withTenantParams()) as SearchProviderCountRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -278,11 +298,11 @@ export function getFallbackStats(
            AND LOWER(CASE WHEN instr(requested_model, '/') > 0 THEN substr(requested_model, instr(requested_model, '/') + 1) ELSE requested_model END) != LOWER(model)
           THEN 1 ELSE 0 END
         ) as fallbacks
-      FROM call_logs
-      ${whereClause}
+      FROM call_logs AS call_logs
+      ${withTenantFilter(whereClause, "call_logs")}
     `
     )
-    .get(params) as FallbackStatsRow | undefined;
+    .get(withTenantParams(params)) as FallbackStatsRow | undefined;
   return row ?? { total: 0, with_requested: 0, fallback_eligible: 0, fallbacks: 0 };
 }
 
@@ -307,12 +327,13 @@ export function getErrorTypeBreakdown(
       SELECT
         COALESCE(error_type, 'unclassified') AS errorType,
         COUNT(*) AS count
-      FROM call_logs
-      ${whereClause} ${whereClause ? "AND" : "WHERE"} (status >= 400 OR error_summary IS NOT NULL)
+      FROM call_logs AS call_logs
+      ${withTenantFilter(whereClause, "call_logs")}
+        AND (status >= 400 OR error_summary IS NOT NULL)
       GROUP BY 1
       ORDER BY count DESC, errorType ASC
       `
     )
-    .all(params) as Array<{ errorType: string; count: number }>;
+    .all(withTenantParams(params)) as Array<{ errorType: string; count: number }>;
   return rows.map((row) => ({ errorType: String(row.errorType), count: Number(row.count) }));
 }

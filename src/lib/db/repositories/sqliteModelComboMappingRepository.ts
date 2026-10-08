@@ -16,8 +16,17 @@ import type {
 } from "@/domain/persistence/comboRepositories";
 import { globToRegex } from "@/shared/utils/globPattern";
 import { getDbInstance } from "../core";
+import { currentDbTenantId } from "../tenantScope";
 
 export type { ModelComboMapping } from "@/domain/persistence/comboRepositories";
+
+function assertComboOwnedByCurrentTenant(comboId: string): void {
+  const exists = getDbInstance()
+    .prepare("SELECT 1 AS present FROM combos WHERE id = ? AND tenant_id = ? LIMIT 1")
+    .get(comboId, currentDbTenantId());
+  if (!exists)
+    throw new Error("Model combo mapping must reference a combo owned by the current tenant");
+}
 
 // ──────────────────────────────────────────────────────────
 // Types
@@ -72,15 +81,18 @@ export async function getModelComboMappings(options?: {
             m.priority, m.enabled, m.description,
             m.created_at, m.updated_at
      FROM model_combo_mappings m
-     LEFT JOIN combos c ON c.id = m.combo_id
-     ORDER BY m.priority DESC, m.created_at ASC`;
-  const params: unknown[] = [];
+     LEFT JOIN combos c ON c.id = m.combo_id AND c.tenant_id = m.tenant_id
+     WHERE m.tenant_id = ?
+     ORDER BY m.priority DESC, m.created_at ASC, m.rowid ASC`;
+  const params: unknown[] = [currentDbTenantId()];
   if (limit !== undefined) {
     sql += " LIMIT ? OFFSET ?";
     params.push(limit, offset);
   }
   const rows = db.prepare(sql).all(...params) as MappingRow[];
-  const totalRow = db.prepare("SELECT count(*) as cnt FROM model_combo_mappings").get() as {
+  const totalRow = db
+    .prepare("SELECT count(*) as cnt FROM model_combo_mappings WHERE tenant_id = ?")
+    .get(currentDbTenantId()) as {
     cnt: number;
   };
   return { items: rows.map(rowToMapping), total: totalRow.cnt };
@@ -97,10 +109,10 @@ export async function getModelComboMappingById(id: string): Promise<ModelComboMa
               m.priority, m.enabled, m.description,
               m.created_at, m.updated_at
        FROM model_combo_mappings m
-       LEFT JOIN combos c ON c.id = m.combo_id
-       WHERE m.id = ?`
+       LEFT JOIN combos c ON c.id = m.combo_id AND c.tenant_id = m.tenant_id
+       WHERE m.id = ? AND m.tenant_id = ?`
     )
-    .get(id) as MappingRow | undefined;
+    .get(id, currentDbTenantId()) as MappingRow | undefined;
   return row ? rowToMapping(row) : null;
 }
 
@@ -113,13 +125,15 @@ export async function createModelComboMapping(
   const db = getDbInstance();
   const now = new Date().toISOString();
   const id = uuidv4();
+  assertComboOwnedByCurrentTenant(data.comboId);
 
   db.prepare(
     `INSERT INTO model_combo_mappings
-     (id, pattern, combo_id, priority, enabled, description, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+     (id, tenant_id, pattern, combo_id, priority, enabled, description, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
+    currentDbTenantId(),
     data.pattern,
     data.comboId,
     data.priority ?? 0,
@@ -160,12 +174,13 @@ export async function updateModelComboMapping(
     enabled: data.enabled !== undefined ? (data.enabled ? 1 : 0) : existing.enabled ? 1 : 0,
     description: data.description ?? existing.description,
   };
+  assertComboOwnedByCurrentTenant(updated.combo_id);
 
   db.prepare(
     `UPDATE model_combo_mappings
      SET pattern = ?, combo_id = ?, priority = ?, enabled = ?,
          description = ?, updated_at = ?
-     WHERE id = ?`
+     WHERE id = ? AND tenant_id = ?`
   ).run(
     updated.pattern,
     updated.combo_id,
@@ -173,7 +188,8 @@ export async function updateModelComboMapping(
     updated.enabled,
     updated.description,
     now,
-    id
+    id,
+    currentDbTenantId()
   );
 
   return getModelComboMappingById(id);
@@ -184,7 +200,9 @@ export async function updateModelComboMapping(
  */
 export async function deleteModelComboMapping(id: string): Promise<boolean> {
   const db = getDbInstance();
-  const result = db.prepare("DELETE FROM model_combo_mappings WHERE id = ?").run(id);
+  const result = db
+    .prepare("DELETE FROM model_combo_mappings WHERE id = ? AND tenant_id = ?")
+    .run(id, currentDbTenantId());
   return (result.changes ?? 0) > 0;
 }
 
@@ -209,11 +227,11 @@ export async function resolveComboForModel(
     .prepare(
       `SELECT m.pattern, m.combo_id, c.data AS combo_data
        FROM model_combo_mappings m
-       JOIN combos c ON c.id = m.combo_id
-       WHERE m.enabled = 1
-       ORDER BY m.priority DESC, m.created_at ASC`
+       JOIN combos c ON c.id = m.combo_id AND c.tenant_id = m.tenant_id
+       WHERE m.tenant_id = ? AND m.enabled = 1
+       ORDER BY m.priority DESC, m.created_at ASC, m.rowid ASC`
     )
-    .all() as Array<{ pattern: string; combo_id: string; combo_data: string }>;
+    .all(currentDbTenantId()) as Array<{ pattern: string; combo_id: string; combo_data: string }>;
 
   for (const row of rows) {
     const regex = globToRegex(row.pattern);

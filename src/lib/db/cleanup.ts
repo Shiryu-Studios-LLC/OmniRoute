@@ -5,9 +5,9 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { getUserDatabaseSettings } from "./databaseSettings";
 import { rollupUsageHistoryBeforeDate } from "@/lib/usage/aggregateHistory";
-import { purgeCallLogArtifactDirectory } from "@/lib/usage/callLogArtifacts";
 import {
   collectCallLogArtifactsBefore,
   deleteAllFromTable,
@@ -41,8 +41,8 @@ export async function cleanupQuotaSnapshots(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM quota_snapshots WHERE created_at < ?");
-    const runResult = stmt.run(cutoffISO);
+    const stmt = db.prepare("DELETE FROM quota_snapshots WHERE tenant_id = ? AND created_at < ?");
+    const runResult = stmt.run(currentDbTenantId(), cutoffISO);
     result.deleted = runResult.changes;
 
     console.log(
@@ -71,8 +71,12 @@ export async function cleanupCallLogs(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM call_logs WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffISO);
+    const stmt = db.prepare(`
+      DELETE FROM call_logs
+      WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+        AND timestamp < ?
+    `);
+    const runResult = stmt.run(currentDbTenantId(), currentDbTenantId(), cutoffISO);
     result.deleted = runResult.changes;
 
     console.log(`[Cleanup] Deleted ${result.deleted} call_logs older than ${retentionDays} days`);
@@ -118,8 +122,12 @@ export async function cleanupUsageHistory(): Promise<CleanupResult> {
   }
 
   try {
-    const stmt = db.prepare("DELETE FROM usage_history WHERE timestamp < ?");
-    const runResult = stmt.run(cutoffDateStr);
+    const stmt = db.prepare(`
+      DELETE FROM usage_history
+      WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+        AND timestamp < ?
+    `);
+    const runResult = stmt.run(currentDbTenantId(), currentDbTenantId(), cutoffDateStr);
     result.deleted = runResult.changes;
 
     console.log(
@@ -196,7 +204,9 @@ export async function cleanupMcpAudit(): Promise<CleanupResult> {
 /**
  * Clean up old config_audit_log based on retention settings.
  */
-export async function cleanupConfigAudit(retentionDays = getRetentionSettings().configAudit): Promise<CleanupResult> {
+export async function cleanupConfigAudit(
+  retentionDays = getRetentionSettings().configAudit
+): Promise<CleanupResult> {
   const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
@@ -237,7 +247,9 @@ export async function cleanupA2aEvents(): Promise<CleanupResult> {
     const runResult = stmt.run(cutoffISO);
     result.deleted = runResult.changes;
 
-    console.log(`[Cleanup] Deleted ${result.deleted} a2a_task_events older than ${retentionDays} days`);
+    console.log(
+      `[Cleanup] Deleted ${result.deleted} a2a_task_events older than ${retentionDays} days`
+    );
   } catch (err: unknown) {
     console.error("[Cleanup] Error cleaning a2a_task_events:", err);
     result.errors++;
@@ -472,8 +484,8 @@ export async function purgeQuotaSnapshots(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM quota_snapshots");
-    const runResult = stmt.run();
+    const stmt = db.prepare("DELETE FROM quota_snapshots WHERE tenant_id = ?");
+    const runResult = stmt.run(currentDbTenantId());
     result.deleted = runResult.changes;
 
     console.log(`[Cleanup] Purged ${result.deleted} quota_snapshots`);
@@ -491,9 +503,16 @@ export async function purgeQuotaSnapshots(): Promise<CleanupResult> {
 export async function purgeCallLogs(): Promise<CleanupResult> {
   const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, deletedArtifacts: 0, errors: 0 };
+  const tenantId = currentDbTenantId();
+  const artifactPaths = collectCallLogArtifactsBefore("9999-12-31T23:59:59.999Z", tenantId);
 
   try {
-    const runResult = db.prepare("DELETE FROM call_logs").run();
+    const runResult = db
+      .prepare(
+        `DELETE FROM call_logs
+         WHERE tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')`
+      )
+      .run(tenantId, tenantId);
     result.deleted = runResult.changes;
 
     console.log(`[Cleanup] Purged ${result.deleted} call_logs`);
@@ -502,7 +521,7 @@ export async function purgeCallLogs(): Promise<CleanupResult> {
     result.errors++;
   }
 
-  const artifactResult = purgeCallLogArtifactDirectory();
+  const artifactResult = deleteCallLogArtifacts(artifactPaths);
   result.deletedArtifacts = artifactResult.deletedArtifacts;
   result.errors += artifactResult.errors;
 
@@ -521,8 +540,12 @@ export async function purgeDetailedLogs(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const stmt = db.prepare("DELETE FROM request_detail_logs");
-    const runResult = stmt.run();
+    const tenantId = currentDbTenantId();
+    const stmt = db.prepare(
+      `DELETE FROM request_detail_logs
+       WHERE tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')`
+    );
+    const runResult = stmt.run(tenantId, tenantId);
     result.deleted = runResult.changes;
 
     console.log(`[Cleanup] Purged ${result.deleted} request_detail_logs`);
@@ -599,17 +622,72 @@ function isResetUsageHistoryPeriod(period: string): period is ResetUsageHistoryP
  *   older than `now - period`. Throws on an invalid period.
  */
 const RESET_TARGETS: Array<DeleteByPeriodTarget & { resultKey: keyof ResetUsageHistoryResult }> = [
-  { table: "usage_history", column: "timestamp", cutoff: "iso", resultKey: "deletedUsageHistory" },
-  { table: "daily_usage_summary", column: "date", cutoff: "date", resultKey: "deletedDailySummary" },
-  { table: "hourly_usage_summary", column: "date_hour", cutoff: "dateHour", resultKey: "deletedHourlySummary" },
-  { table: "call_logs", column: "timestamp", cutoff: "iso", resultKey: "deletedCallLogs" },
-  { table: "request_detail_logs", column: "timestamp", cutoff: "iso", resultKey: "deletedRequestDetailLogs" },
+  {
+    table: "usage_history",
+    column: "timestamp",
+    cutoff: "iso",
+    tenantScoped: true,
+    resultKey: "deletedUsageHistory",
+  },
+  {
+    table: "daily_usage_summary",
+    column: "date",
+    cutoff: "date",
+    tenantScoped: true,
+    resultKey: "deletedDailySummary",
+  },
+  {
+    table: "hourly_usage_summary",
+    column: "date_hour",
+    cutoff: "dateHour",
+    tenantScoped: true,
+    resultKey: "deletedHourlySummary",
+  },
+  {
+    table: "call_logs",
+    column: "timestamp",
+    cutoff: "iso",
+    tenantScoped: true,
+    resultKey: "deletedCallLogs",
+  },
+  {
+    table: "request_detail_logs",
+    column: "timestamp",
+    cutoff: "iso",
+    tenantScoped: true,
+    resultKey: "deletedRequestDetailLogs",
+  },
   { table: "proxy_logs", column: "timestamp", cutoff: "iso", resultKey: "deletedProxyLogs" },
-  { table: "relay_logs", column: "created_at", cutoff: "epochSeconds", resultKey: "deletedRelayLogs" },
-  { table: "compression_analytics", column: "timestamp", cutoff: "iso", resultKey: "deletedCompressionAnalytics" },
-  { table: "compression_run_telemetry", column: "timestamp", cutoff: "epochMs", resultKey: "deletedCompressionRunTelemetry" },
-  { table: "routing_decisions", column: "created_at", cutoff: "iso", resultKey: "deletedRoutingDecisions" },
-  { table: "quota_consumption", column: "updated_at", cutoff: "epochMs", resultKey: "deletedQuotaConsumption" },
+  {
+    table: "relay_logs",
+    column: "created_at",
+    cutoff: "epochSeconds",
+    resultKey: "deletedRelayLogs",
+  },
+  {
+    table: "compression_analytics",
+    column: "timestamp",
+    cutoff: "iso",
+    resultKey: "deletedCompressionAnalytics",
+  },
+  {
+    table: "compression_run_telemetry",
+    column: "timestamp",
+    cutoff: "epochMs",
+    resultKey: "deletedCompressionRunTelemetry",
+  },
+  {
+    table: "routing_decisions",
+    column: "created_at",
+    cutoff: "iso",
+    resultKey: "deletedRoutingDecisions",
+  },
+  {
+    table: "quota_consumption",
+    column: "updated_at",
+    cutoff: "epochMs",
+    resultKey: "deletedQuotaConsumption",
+  },
   { table: "token_ledger", column: "created_at", cutoff: "iso", resultKey: "deletedTokenLedger" },
 ];
 
@@ -643,16 +721,27 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
 
     const runReset = db.transaction(() => {
       if (period === "all") {
+        artifactsToDelete = collectCallLogArtifactsBefore(
+          "9999-12-31T23:59:59.999Z",
+          currentDbTenantId()
+        );
         for (const target of RESET_TARGETS) {
-          (result[target.resultKey] as number) = deleteAllFromTable(target.table);
+          (result[target.resultKey] as number) = deleteAllFromTable(
+            target.table,
+            target.tenantScoped ? currentDbTenantId() : undefined
+          );
         }
         return;
       }
 
       const cutoffIso = new Date(Date.now() - RESET_USAGE_HISTORY_PERIOD_MS[period]).toISOString();
-      artifactsToDelete = collectCallLogArtifactsBefore(cutoffIso);
+      artifactsToDelete = collectCallLogArtifactsBefore(cutoffIso, currentDbTenantId());
       for (const target of RESET_TARGETS) {
-        (result[target.resultKey] as number) = deleteFromTableBefore(target, cutoffIso);
+        (result[target.resultKey] as number) = deleteFromTableBefore(
+          target,
+          cutoffIso,
+          target.tenantScoped ? currentDbTenantId() : undefined
+        );
       }
     });
 
@@ -660,7 +749,7 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
 
     let artifactResult: { deletedArtifacts: number; errors: number };
     if (period === "all") {
-      artifactResult = purgeCallLogArtifactDirectory();
+      artifactResult = deleteCallLogArtifacts(artifactsToDelete);
     } else {
       artifactResult = deleteCallLogArtifacts(artifactsToDelete);
     }

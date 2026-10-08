@@ -10,6 +10,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import type { AnalyticsParams } from "./usageAnalytics/sources";
 
 export { buildUnifiedSource, buildPresetUnifiedSource } from "./usageAnalytics/sources";
@@ -18,6 +19,11 @@ export type {
   BuildUnifiedSourceOptions,
   UnifiedSourceResult,
 } from "./usageAnalytics/sources";
+
+function withTenantFilter(whereClause: string, tableAlias = "usage_history"): string {
+  const tenantCondition = `(${tableAlias}.tenant_id = @tenantId OR (${tableAlias}.tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))`;
+  return whereClause ? `${whereClause} AND ${tenantCondition}` : `WHERE ${tenantCondition}`;
+}
 
 // ---------------------------------------------------------------------------
 // Analytics summary — /api/usage/analytics
@@ -177,12 +183,13 @@ export function getHeatmapRows(heatmapConditions: string[], params: AnalyticsPar
         DATE(timestamp) as date,
         COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
       FROM usage_history
-      WHERE ${heatmapConditions.join(" AND ")}
+      WHERE (tenant_id = @tenantId OR (tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))
+        AND (${heatmapConditions.join(" AND ")})
       GROUP BY DATE(timestamp)
       ORDER BY date ASC
     `
     )
-    .all(params) as HeatmapRow[];
+    .all({ ...params, tenantId: currentDbTenantId() }) as HeatmapRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +360,7 @@ export function getAccountCostRows(whereClause: string, params: AnalyticsParams)
           usage_history.tokens_cache_creation,
           usage_history.tokens_reasoning
         FROM usage_history
-        ${whereClause}
+        ${withTenantFilter(whereClause)}
       )
       SELECT
         account_events.resolved_account_key as accountKey,
@@ -369,7 +376,7 @@ export function getAccountCostRows(whereClause: string, params: AnalyticsParams)
       GROUP BY accountKey, LOWER(account_events.provider), LOWER(account_events.model), serviceTier
     `
     )
-    .all(params) as AccountCostRow[];
+    .all({ ...params, tenantId: currentDbTenantId() }) as AccountCostRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +412,7 @@ export function getAccountUsageRows(
           usage_history.*,
           COALESCE(NULLIF(usage_history.account_key, ''), 'connection:' || COALESCE(LOWER(usage_history.provider), 'unknown') || ':' || COALESCE(NULLIF(TRIM(usage_history.connection_id), ''), 'unknown')) as resolved_account_key
         FROM usage_history
-        ${whereClause}
+        ${withTenantFilter(whereClause)}
       ),
       stable_account_keys AS (
         SELECT DISTINCT account_key
@@ -419,6 +426,7 @@ export function getAccountUsageRows(
             SELECT TRIM(usage_history.account_label)
             FROM usage_history
             WHERE usage_history.account_key = stable_account_keys.account_key
+              AND (usage_history.tenant_id = @tenantId OR (usage_history.tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))
               AND NULLIF(TRIM(usage_history.account_label), '') IS NOT NULL
             ORDER BY COALESCE(usage_history.account_label_priority, 0) DESC,
                      usage_history.timestamp DESC,
@@ -467,7 +475,7 @@ export function getAccountUsageRows(
       LIMIT 50
     `
     )
-    .all(params) as AccountUsageRow[];
+    .all({ ...params, tenantId: currentDbTenantId() }) as AccountUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -515,11 +523,11 @@ export function getApiKeyUsageRows(
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens,
         COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
       FROM usage_history
-      ${apiKeyWhereClause}
+      ${withTenantFilter(apiKeyWhereClause)}
       GROUP BY COALESCE(NULLIF(api_key_id, ''), NULLIF(api_key_name, ''), 'unknown'), NULLIF(api_key_id, ''), LOWER(provider), LOWER(model), serviceTier
     `
     )
-    .all(params) as ApiKeyUsageRow[];
+    .all({ ...params, tenantId: currentDbTenantId() }) as ApiKeyUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -596,12 +604,12 @@ export function getApiKeyMetadataRows(
         COALESCE(NULLIF(api_key_id, ''), NULLIF(api_key_name, ''), 'unknown') as apiKeyGroupKey,
         MAX(timestamp) as lastUsed
       FROM usage_history
-      ${apiKeyWhereClause}
+      ${withTenantFilter(apiKeyWhereClause)}
       GROUP BY NULLIF(api_key_id, ''), NULLIF(api_key_name, '')
       ORDER BY lastUsed DESC
     `
     )
-    .all(params) as ApiKeyMetadataRow[];
+    .all({ ...params, tenantId: currentDbTenantId() }) as ApiKeyMetadataRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -751,12 +759,12 @@ export function getEndpointUsageRows(params: EndpointUsageParams = {}): Endpoint
         COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) as successfulRequests,
         COALESCE(MAX(timestamp), '') as lastUsed
       FROM usage_history
-      ${whereSql}
+      ${withTenantFilter(whereSql)}
       GROUP BY endpoint, LOWER(COALESCE(provider, 'unknown')), LOWER(COALESCE(model, 'unknown'))
       ORDER BY requests DESC
     `
     )
-    .all(bind) as EndpointUsageRow[];
+    .all({ ...bind, tenantId: currentDbTenantId() }) as EndpointUsageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -812,7 +820,12 @@ export function getProviderDailyUsageRows(
  */
 export function getAllUsageHistory(): Record<string, unknown>[] {
   const db = getDbInstance();
-  return db.prepare("SELECT * FROM usage_history").all() as Record<string, unknown>[];
+  return db
+    .prepare(
+      `SELECT * FROM usage_history
+       WHERE tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')`
+    )
+    .all(currentDbTenantId(), currentDbTenantId()) as Record<string, unknown>[];
 }
 
 /**
@@ -820,7 +833,14 @@ export function getAllUsageHistory(): Record<string, unknown>[] {
  */
 export function getAllDomainCostHistory(): Record<string, unknown>[] {
   const db = getDbInstance();
-  return db.prepare("SELECT * FROM domain_cost_history").all() as Record<string, unknown>[];
+  const tenantId = currentDbTenantId();
+  return db
+    .prepare(
+      `SELECT dch.* FROM domain_cost_history AS dch
+       INNER JOIN api_keys AS ak ON ak.id = dch.api_key_id
+       WHERE ak.tenant_id = ?`
+    )
+    .all(tenantId) as Record<string, unknown>[];
 }
 
 /**
@@ -828,5 +848,12 @@ export function getAllDomainCostHistory(): Record<string, unknown>[] {
  */
 export function getAllDomainBudgets(): Record<string, unknown>[] {
   const db = getDbInstance();
-  return db.prepare("SELECT * FROM domain_budgets").all() as Record<string, unknown>[];
+  const tenantId = currentDbTenantId();
+  return db
+    .prepare(
+      `SELECT db.* FROM domain_budgets AS db
+       INNER JOIN api_keys AS ak ON ak.id = db.api_key_id
+       WHERE ak.tenant_id = ?`
+    )
+    .all(tenantId) as Record<string, unknown>[];
 }

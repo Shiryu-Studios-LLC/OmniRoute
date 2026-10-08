@@ -1,8 +1,7 @@
-import {
-  hasSelfAccountQuotaScope,
-  hasSelfUsageScope,
-} from "@/shared/constants/selfServiceScopes";
+import { hasSelfAccountQuotaScope, hasSelfUsageScope } from "@/shared/constants/selfServiceScopes";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
+import { toNumber } from "@/shared/utils/numeric";
 
 type JsonRecord = Record<string, unknown>;
 type DateLike = number | string | Date | null | undefined;
@@ -67,16 +66,6 @@ interface AccountQuotaConnection {
   id: string;
   provider: string;
   lookupFailed?: boolean;
-}
-
-function toNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "bigint") return Number(value);
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
 }
 
 function roundNumber(value: number, precision = 6): number {
@@ -156,11 +145,12 @@ function aggregateTokens(db: DbLike, apiKeyId: string, periodStartAt: string): T
         COALESCE(SUM(tokens_cache_creation), 0) AS cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) AS reasoningTokens
       FROM usage_history
-      WHERE api_key_id = ?
+      WHERE tenant_id = ?
+        AND api_key_id = ?
         AND timestamp >= ?
     `
     )
-    .get(apiKeyId, periodStartAt) as JsonRecord | undefined;
+    .get(currentDbTenantId(), apiKeyId, periodStartAt) as JsonRecord | undefined;
 
   const inputTokens = toNumber(row?.inputTokens);
   const outputTokens = toNumber(row?.outputTokens);
@@ -396,11 +386,11 @@ export async function buildApiKeySelfServiceStatus(
   const tokens = aggregateTokens(
     resolvedDeps.getDbInstance() as DbLike,
     metadata.id,
-    cost.periodStartAt ?? new Date(getCurrentMonthWindow(resolvedDeps.now()).periodStartAt).toISOString()
+    cost.periodStartAt ??
+      new Date(getCurrentMonthWindow(resolvedDeps.now()).periodStartAt).toISOString()
   );
   const accountQuotas = await resolveAccountQuotas(metadata, resolvedDeps);
-  const accountQuota =
-    accountQuotas && accountQuotas.length === 1 ? accountQuotas[0] : undefined;
+  const accountQuota = accountQuotas && accountQuotas.length === 1 ? accountQuotas[0] : undefined;
 
   return {
     apiKey: {

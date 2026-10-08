@@ -5,6 +5,7 @@
  */
 
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -79,11 +80,11 @@ export async function getAnomalies(): Promise<AnomalyFlag[]> {
     .prepare(
       `SELECT api_key_id, SUM(xp_earned) AS hourly_total
        FROM xp_audit_log
-       WHERE created_at > datetime('now', '-1 hour')
+       WHERE tenant_id = ? AND created_at > datetime('now', '-1 hour')
        GROUP BY api_key_id
        HAVING hourly_total > 1000`
     )
-    .all() as Array<{ api_key_id: string; hourly_total: number }>;
+    .all(currentDbTenantId()) as Array<{ api_key_id: string; hourly_total: number }>;
 
   const results: AnomalyFlag[] = [];
   for (const r of rows) {
@@ -110,9 +111,9 @@ async function computeZScore(apiKeyId: string): Promise<number | null> {
     .prepare(
       `SELECT COALESCE(SUM(xp_earned), 0) AS total
        FROM xp_audit_log
-       WHERE api_key_id = ? AND created_at > datetime('now', '-1 hour')`
+       WHERE tenant_id = ? AND api_key_id = ? AND created_at > datetime('now', '-1 hour')`
     )
-    .get(apiKeyId) as { total: number };
+    .get(currentDbTenantId(), apiKeyId) as { total: number };
 
   const statsRow = d
     .prepare(
@@ -123,11 +124,11 @@ async function computeZScore(apiKeyId: string): Promise<number | null> {
        FROM (
          SELECT api_key_id, SUM(xp_earned) AS hourly_total
          FROM xp_audit_log
-         WHERE created_at > datetime('now', '-1 hour')
+         WHERE tenant_id = ? AND created_at > datetime('now', '-1 hour')
          GROUP BY api_key_id
        )`
     )
-    .get() as { mean: number; variance: number } | undefined;
+    .get(currentDbTenantId()) as { mean: number; variance: number } | undefined;
 
   if (!statsRow || statsRow.variance <= 0) return null;
 
@@ -144,9 +145,9 @@ async function getRecentXp(apiKeyId: string, windowMs: number): Promise<number> 
 
   const row = d
     .prepare(
-      "SELECT COALESCE(SUM(xp_earned), 0) AS total FROM xp_audit_log WHERE api_key_id = ? AND created_at > ?"
+      "SELECT COALESCE(SUM(xp_earned), 0) AS total FROM xp_audit_log WHERE tenant_id = ? AND api_key_id = ? AND created_at > ?"
     )
-    .get(apiKeyId, since) as { total: number };
+    .get(currentDbTenantId(), apiKeyId, since) as { total: number };
 
   return row.total;
 }

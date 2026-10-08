@@ -233,11 +233,11 @@ test("pruning stale connection available models during import", async () => {
   const db = core.getDbInstance();
   // Insert connections
   db.prepare(
-    "INSERT INTO provider_connections (id, provider, auth_type, name, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO provider_connections (id, provider, auth_type, name, is_active, created_at, updated_at, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'tenant_shiryu_admin')"
   ).run("conn-active", "openrouter", "apikey", "Active Connection", 1, "2026-05-29", "2026-05-29");
 
   db.prepare(
-    "INSERT INTO provider_connections (id, provider, auth_type, name, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO provider_connections (id, provider, auth_type, name, is_active, created_at, updated_at, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'tenant_shiryu_admin')"
   ).run("conn-stale", "openrouter", "apikey", "Stale Connection", 0, "2026-05-29", "2026-05-29");
 
   // Create synced available models for both
@@ -270,7 +270,7 @@ test("antigravity sync dynamically builds and saves mitmAlias mappings", async (
   const db = core.getDbInstance();
   // Create an antigravity connection
   db.prepare(
-    "INSERT INTO provider_connections (id, provider, auth_type, name, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO provider_connections (id, provider, auth_type, name, is_active, created_at, updated_at, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'tenant_shiryu_admin')"
   ).run("antigravity-conn", "antigravity", "oauth", "Antigravity", 1, "2026-05-29", "2026-05-29");
 
   await importManagedModels({

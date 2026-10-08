@@ -23,6 +23,7 @@ _tasks/
 /coverage/
 .dist/**
 .next/**
+.open-next/**
 .build/**
 .out/**
 
@@ -289,6 +290,9 @@ docker-compose.yml.bak
 
 # CLI local cache/state
 .playwright-cli
+
+# Wrangler-generated runtime types are local build output.
+/cloudflare/worker-configuration.d.ts
 
 # Ad-hoc test sandboxes (never tracked — may contain local DBs)
 /.sandbox/

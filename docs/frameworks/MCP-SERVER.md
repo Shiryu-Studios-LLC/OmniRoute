@@ -37,6 +37,21 @@ The MCP server exposes three transports, all backed by the same `createMcpServer
 
 The active HTTP transport (`sse` or `streamable-http`) is selected by the `mcpTransport` setting. Switching transports closes existing sessions on the other transport.
 
+### Tenant remote MCP egress
+
+`src/lib/mcp/tenantRemoteMcpRuntime.ts` uses an explicit `McpOutboundTransport` for every outbound
+discovery request. The Node implementation in `src/lib/mcp/nodePinnedMcpTransport.ts` resolves the
+full A/AAAA answer set, rejects the request if any answer is non-public, and gives undici an isolated
+Agent whose socket lookup can return only those validated addresses. TLS certificate validation and
+SNI continue to use the registered hostname. Redirects remain disabled and response sizes/timeouts
+are bounded by the runtime.
+
+Cloudflare Workers' `fetch` does not expose a socket lookup hook. Do not pass `globalThis.fetch` as the
+transport or enable tenant remote discovery from a Worker until a controlled egress proxy or an
+equivalent connect-time pinning adapter is deployed and wired. The Node adapter is not Worker
+compatible. Remote tool invocation remains disabled until encrypted credentials and this egress
+boundary are integrated.
+
 ### Remote access (manage-scope bypass)
 
 `/api/mcp/*` is in the LOCAL_ONLY tier (`src/server/authz/routeGuard.ts`) — by default only loopback hosts (`localhost`, `127.0.0.1`, `::1`) can reach it. Since v3.8.2, non-loopback clients may connect if they present an `Authorization: Bearer <api-key>` whose key carries the `manage` scope. This is the only way to reach the remote MCP server through a tunnel, reverse proxy, or public hostname.
@@ -66,22 +81,22 @@ Cursor, Cline, and compatible MCP client setup.
 
 ## Essential Tools (13) — Phase 1
 
-| Tool                            | Scopes                | Description                                                   |
-| :------------------------------ | :-------------------- | :------------------------------------------------------------ |
-| `omniroute_get_health`          | `read:health`         | Uptime, memory, circuit breakers, rate limits, cache stats    |
-| `omniroute_list_combos`         | `read:combos`         | All configured combos with strategies (optional metrics)      |
-| `omniroute_get_combo_metrics`   | `read:combos`         | Performance metrics for a specific combo                      |
-| `omniroute_switch_combo`        | `write:combos`        | Activate or deactivate a combo                                |
-| `omniroute_create_combo`        | `write:combos`        | Create a validated combo through the existing combo API       |
-| `omniroute_check_quota`         | `read:quota`          | Quota used/total, percent remaining, reset time, token health |
-| `omniroute_route_request`       | `execute:completions` | Send a chat completion through OmniRoute routing              |
-| `omniroute_cost_report`         | `read:usage`          | Cost report by period (session/day/week/month)                |
-| `omniroute_list_models_catalog` | `read:models`         | Full model catalog with capabilities, status, pricing         |
-| `omniroute_radar_catalog`       | `read:radar`          | Local signed Radar catalog; optional provider/family filters  |
-| `omniroute_tool_search`         | `read:tools`          | Discover tools from the registered MCP catalog                |
-| `omniroute_web_search`          | `execute:search`      | Web search through the configured search providers. Not X/Twitter. |
+| Tool                            | Scopes                | Description                                                                                                                                  |
+| :------------------------------ | :-------------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
+| `omniroute_get_health`          | `read:health`         | Uptime, memory, circuit breakers, rate limits, cache stats                                                                                   |
+| `omniroute_list_combos`         | `read:combos`         | All configured combos with strategies (optional metrics)                                                                                     |
+| `omniroute_get_combo_metrics`   | `read:combos`         | Performance metrics for a specific combo                                                                                                     |
+| `omniroute_switch_combo`        | `write:combos`        | Activate or deactivate a combo                                                                                                               |
+| `omniroute_create_combo`        | `write:combos`        | Create a validated combo through the existing combo API                                                                                      |
+| `omniroute_check_quota`         | `read:quota`          | Quota used/total, percent remaining, reset time, token health                                                                                |
+| `omniroute_route_request`       | `execute:completions` | Send a chat completion through OmniRoute routing                                                                                             |
+| `omniroute_cost_report`         | `read:usage`          | Cost report by period (session/day/week/month)                                                                                               |
+| `omniroute_list_models_catalog` | `read:models`         | Full model catalog with capabilities, status, pricing                                                                                        |
+| `omniroute_radar_catalog`       | `read:radar`          | Local signed Radar catalog; optional provider/family filters                                                                                 |
+| `omniroute_tool_search`         | `read:tools`          | Discover tools from the registered MCP catalog                                                                                               |
+| `omniroute_web_search`          | `execute:search`      | Web search through the configured search providers. Not X/Twitter.                                                                           |
 | `omniroute_x_search`            | `execute:search`      | Search X (Twitter) through SuperGrok / xAI server-side `x_search`. Requires `xai-oauth` or an xAI API key. Not the X Developer Platform MCP. |
-| `omniroute_web_fetch`           | `execute:search`      | Fetch web content through the configured fetch providers      |
+| `omniroute_web_fetch`           | `execute:search`      | Fetch web content through the configured fetch providers                                                                                     |
 
 ## Advanced Tools (11) — Phase 2
 

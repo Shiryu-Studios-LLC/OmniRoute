@@ -55,16 +55,22 @@ function startFlakyRedis(): Promise<{ port: number; close: () => void }> {
     const server = net.createServer((socket) => {
       socket.on("data", (buf) => {
         const cmd = buf.toString().toLowerCase();
-        if (cmd.includes("hgetall") || cmd.includes("hset") || cmd.includes("hget")) {
+        const commands = Array.from(
+          cmd.matchAll(/^\*\d+\r\n\$\d+\r\n([^\r\n]+)\r\n/gm),
+          (match) => match[1]
+        );
+        if (commands.some((command) => ["hgetall", "hset", "hget"].includes(command))) {
           socket.destroy(); // the outage: connection drops mid-command
           return;
         }
-        if (cmd.includes("info")) {
-          const body = "redis_version:7.0.0\r\n";
-          socket.write(`$${body.length}\r\n${body}\r\n`);
-          return;
+        for (const command of commands) {
+          if (command === "info") {
+            const body = "redis_version:7.0.0\r\n";
+            socket.write(`$${body.length}\r\n${body}\r\n`);
+          } else {
+            socket.write(command === "ping" ? "+PONG\r\n" : "+OK\r\n");
+          }
         }
-        socket.write("+PONG\r\n");
       });
       socket.on("error", () => {});
     });

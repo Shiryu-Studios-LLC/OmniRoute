@@ -1,5 +1,6 @@
 import { getDbInstance, pingDb } from "@/lib/db/core";
 import { listPools } from "@/lib/db/quotaPools";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 
 interface ProviderStatusRow {
   id: string;
@@ -13,9 +14,9 @@ function readProviderStatusRows(): ProviderStatusRow[] {
   const db = getDbInstance();
   return db
     .prepare<ProviderStatusRow>(
-      "SELECT id, provider, is_active, test_status, last_error FROM provider_connections"
+      "SELECT id, provider, is_active, test_status, last_error FROM provider_connections WHERE tenant_id = ?"
     )
-    .all();
+    .all(currentDbTenantId());
 }
 
 export async function buildOmniRouteStatus() {

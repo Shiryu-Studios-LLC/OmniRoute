@@ -103,11 +103,11 @@ test("rule subscription binds only the selected provider scope", async () => {
   await sub.applySubscription("s2");
 
   db.prepare(
-    "INSERT INTO provider_connections (id, provider, created_at, updated_at) VALUES (?,?,?,?)"
-  ).run("connA", "provA", nowIso(), nowIso());
+    "INSERT INTO provider_connections (id, provider, created_at, updated_at, tenant_id) VALUES (?,?,?,?,?)"
+  ).run("connA", "provA", nowIso(), nowIso(), "tenant_shiryu_admin");
   db.prepare(
-    "INSERT INTO provider_connections (id, provider, created_at, updated_at) VALUES (?,?,?,?)"
-  ).run("connB", "provB", nowIso(), nowIso());
+    "INSERT INTO provider_connections (id, provider, created_at, updated_at, tenant_id) VALUES (?,?,?,?,?)"
+  ).run("connB", "provB", nowIso(), nowIso(), "tenant_shiryu_admin");
 
   const rA = await proxies.resolveProxyForConnectionFromRegistry("connA");
   assert.ok(rA, "provider A should resolve the rule proxy");
@@ -171,7 +171,9 @@ test("deleteSubscription unbinds and removes its proxy rows", async () => {
   assert.equal(rows.length, 0, "subscription proxy rows should be removed");
 
   const assignments = db
-    .prepare("SELECT 1 FROM proxy_assignments a JOIN proxy_registry p ON p.id=a.proxy_id WHERE p.source='subscription' LIMIT 1")
+    .prepare(
+      "SELECT 1 FROM proxy_assignments a JOIN proxy_registry p ON p.id=a.proxy_id WHERE p.source='subscription' LIMIT 1"
+    )
     .get();
   assert.equal(assignments, undefined, "no subscription proxy should remain assigned");
 
@@ -224,8 +226,8 @@ test("global→rule switch re-evaluates binding: drops global, binds the selecte
 
   // The provider-scope binding must now resolve the node.
   db.prepare(
-    "INSERT INTO provider_connections (id, provider, created_at, updated_at) VALUES (?,?,?,?)"
-  ).run("connA", "provA", nowIso(), nowIso());
+    "INSERT INTO provider_connections (id, provider, created_at, updated_at, tenant_id) VALUES (?,?,?,?,?)"
+  ).run("connA", "provA", nowIso(), nowIso(), "tenant_shiryu_admin");
   const afterRule = await proxies.resolveProxyForConnectionFromRegistry("connA");
   assert.ok(afterRule, "rule mode should bind the node to provider provA");
   assert.equal(afterRule?.proxy.host, "10.0.0.5");

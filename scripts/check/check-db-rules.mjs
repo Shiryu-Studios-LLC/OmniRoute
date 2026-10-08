@@ -41,6 +41,7 @@ export const INTENTIONALLY_INTERNAL = new Set([
   "_rowTypes", // type-only: 5 importers internos em db/ (AgentBridge/Inspector row types)
   "accessTokens", // intentionally-internal: 4 rotas /api/cli/* (connect, whoami, tokens, tokens/[id]) + server/authz/accessTokenAuth.ts via import direto "@/lib/db/accessTokens" (Rule #2)
   "apiKeyColumnFallbacks", // db-internal: importado só por db/apiKeys.ts (API_KEY_COLUMN_FALLBACKS — fallbacks de coluna split do apiKeys.ts)
+  "apiKeyExpiryAudit", // db-internal: API-key validation helper imported only by db/apiKeys.ts to persist once-only natural-expiry audit events
   "apiKeyUsageLimitFields", // db-internal: importado só por db/apiKeys.ts (helpers de campo de limite de uso split do apiKeys.ts; mig 101)
   "backupRetention", // db-internal: importado só por db/backup.ts e db/migrationRunner.ts (política de retenção compartilhada; mora fora de backup.ts porque core.ts importa migrationRunner.ts — importar backup.ts de lá fecharia um ciclo, #10421)
   "caseMapping", // db-internal: importado só por db/core.ts (toSnakeCase/toCamelCase/objToSnake — column-mapping snake↔camel split do core.ts, #4947)
@@ -58,6 +59,7 @@ export const INTENTIONALLY_INTERNAL = new Set([
   "encryption", // intentionally-internal: 8+ callers (container, webhookDispatcher, cloudAgent/credentials, services/apiKey, 4+ routes, open-sse)
   "healthCheck", // db-internal: importado por db/core.ts (runDbHealthCheck)
   "jsonMigration", // intentionally-internal: src/app/api/settings/import-json/route.ts
+  "localAgents", // intentionally-internal: local-agent API routes import this tenant-scoped domain module directly
   "migrationRunner", // db-internal: importado por db/core.ts (runMigrations ao inicializar o DB)
   "modelCapabilityOverrides", // intentionally-internal: src/app/api/model-capability-overrides/route.ts via import direto "@/lib/db/modelCapabilityOverrides" (#6727 — evita empurrar localDb.ts para o cap de 800 linhas)
   "notion", // intentionally-internal: settings/notion API route + open-sse/mcp-server/tools/notionTools.ts
@@ -76,6 +78,10 @@ export const INTENTIONALLY_INTERNAL = new Set([
   "serviceModels", // intentionally-internal: 3 callers (services/modelSync, services/bootstrap, /api/services/9router/models)
   "stateReset", // db-internal: 3 callers dentro de src/lib/db/ (core, backup, apiKeys) para coordenação de reset
   "stats", // intentionally-internal: src/app/api/settings/database/refresh-stats/route.ts
+  "tenantMemberships", // intentionally-internal: tenant-members API routes import this domain module directly
+  "tenantProvisioning", // intentionally-internal: tenant provisioning service imports this transaction helper directly
+  "tenantScope", // intentionally-internal: tenant context helpers are imported directly throughout DB and usage modules
+  "tenants", // intentionally-internal: management auth and tenant-members API import this domain module directly
   "tierConfig", // intentionally-internal: open-sse/services/tierResolver.ts (require() dinâmico)
   "webSessionDedup", // db-internal: importado só por db/providers.ts (webSessionCredentialKey/parseProviderSpecificData — helpers puros de dedup de credencial web-session split do providers.ts, #3368 PR6)
 ]);

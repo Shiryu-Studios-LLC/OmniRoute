@@ -12,6 +12,12 @@
  *   const settings = await dbCache.getSettings();
  */
 
+import { currentDbTenantId } from "./tenantScope";
+
+function scopedCacheKey(key: string): string {
+  return JSON.stringify([currentDbTenantId(), key]);
+}
+
 type CacheEntry<T> = {
   value: T;
   expiresAt: number;
@@ -102,7 +108,9 @@ export async function getCachedPricing(): Promise<Record<string, unknown>> {
 export async function getCachedProviderConnections(
   filter?: Record<string, unknown>
 ): Promise<unknown[]> {
-  const cacheKey = filter && Object.keys(filter).length > 0 ? JSON.stringify(filter) : "all";
+  const cacheKey = scopedCacheKey(
+    filter && Object.keys(filter).length > 0 ? JSON.stringify(filter) : "all"
+  );
 
   const cached = connectionsCache.get(cacheKey);
   if (cached) return cached;
@@ -125,7 +133,7 @@ const rawConnectionsCache = new TTLCache<unknown[]>(CONNECTIONS_TTL_MS, 500);
 export async function getCachedRawProviderConnections(
   filter?: Record<string, unknown>
 ): Promise<unknown[]> {
-  const key = JSON.stringify(filter ?? {});
+  const key = scopedCacheKey(JSON.stringify(filter ?? {}));
   const cached = rawConnectionsCache.get(key);
   if (cached !== undefined) return cached;
   const { getRawProviderConnections } = await import("./providers");
@@ -149,12 +157,13 @@ export async function getCachedProviderConnectionById(
   id: string
 ): Promise<Record<string, unknown> | null> {
   if (!id) return null;
-  const cached = connectionByIdCache.get(id);
+  const cacheKey = scopedCacheKey(id);
+  const cached = connectionByIdCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
   const { getProviderConnectionById } = await import("@/lib/db/providers");
   const value = await getProviderConnectionById(id);
-  connectionByIdCache.set(id, value);
+  connectionByIdCache.set(cacheKey, value);
   return value;
 }
 
@@ -166,7 +175,7 @@ export async function getCachedProviderConnectionById(
 export async function getCachedProviderNodes(
   filter?: Record<string, unknown>
 ): Promise<(Record<string, unknown> | null)[]> {
-  const cacheKey = filter ? JSON.stringify(filter) : "all";
+  const cacheKey = scopedCacheKey(filter ? JSON.stringify(filter) : "all");
   const cached = nodesCache.get(cacheKey);
   if (cached) return cached;
 
@@ -189,7 +198,7 @@ export async function getCachedLKGP(
   comboName: string,
   modelId: string
 ): Promise<LKGPRecordCache | null> {
-  const cacheKey = `lkgp:${comboName}:${modelId}`;
+  const cacheKey = scopedCacheKey(`lkgp:${comboName}:${modelId}`);
   const cached = lkgpCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
@@ -207,7 +216,7 @@ export async function setCachedLKGP(
 ): Promise<void> {
   const { setLKGP } = await import("@/lib/db/settings");
   await setLKGP(comboName, modelId, providerId, connectionId);
-  lkgpCache.invalidate(`lkgp:${comboName}:${modelId}`);
+  lkgpCache.invalidate(scopedCacheKey(`lkgp:${comboName}:${modelId}`));
 }
 
 /**
@@ -218,7 +227,7 @@ export async function setCachedLKGP(
  * for the rest of the TTL window.
  */
 export function invalidateCachedLKGP(pinKey?: string): void {
-  lkgpCache.invalidate(pinKey ? `lkgp:${pinKey}` : undefined);
+  lkgpCache.invalidate(pinKey ? scopedCacheKey(`lkgp:${pinKey}`) : undefined);
 }
 
 // ──────────────── Combo Cache Invalidation Signal ────────────────
@@ -287,7 +296,7 @@ export function invalidateDbCache(
     connectionsCache.invalidate();
     rawConnectionsCache.invalidate();
     if (id) {
-      connectionByIdCache.invalidate(id);
+      connectionByIdCache.invalidate(scopedCacheKey(id));
     } else {
       connectionByIdCache.invalidate();
     }

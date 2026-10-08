@@ -848,3 +848,4 @@ export type {
 } from "./db/radar";
 export * from "./db/conductorBridge"; // OmniConductor hub mirror — SSE cursor (PRD Conductor RF1)
 export * from "./db/agenticConversations"; // Multi-turn conversation id tracking (X-ConversationId)
+export * from "./db/tenantMcpServers"; // Tenant-scoped cloud-safe MCP endpoint registry

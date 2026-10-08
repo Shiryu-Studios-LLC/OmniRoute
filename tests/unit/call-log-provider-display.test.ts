@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-call-log-provider-display-"));
+const TEST_DATA_DIR = fs.mkdtempSync(
+  path.join(os.tmpdir(), "omniroute-call-log-provider-display-")
+);
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
@@ -22,8 +24,8 @@ function seedProviderNode(id: string, name: string, prefix: string) {
   const db = core.getDbInstance();
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT OR REPLACE INTO provider_nodes (id, type, name, prefix, api_type, base_url, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT OR REPLACE INTO provider_nodes (id, tenant_id, type, name, prefix, api_type, base_url, created_at, updated_at)
+     VALUES (?, 'tenant_shiryu_admin', ?, ?, ?, ?, ?, ?, ?)`
   ).run(id, "provider", name, prefix, "chat", "https://example.com/v1", now, now);
 }
 
@@ -43,8 +45,8 @@ test("getCallLogs and getCallLogById expose providerDisplay from provider node n
   const db = core.getDbInstance();
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO call_logs (id, timestamp, method, path, status, model, requested_model, provider, account, connection_id, duration, tokens_in, tokens_out)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, requested_model, provider, account, connection_id, duration, tokens_in, tokens_out)
+     VALUES (?, 'tenant_shiryu_admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     "log-provider-display-1",
     now,

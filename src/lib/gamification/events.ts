@@ -160,14 +160,15 @@ async function checkAndUnlockBadge(
  */
 async function checkActionCountBadges(apiKeyId: string, action: string): Promise<void> {
   const { getDbInstance } = await import("../db/core");
+  const { currentDbTenantId } = await import("../db/tenantScope");
   const db = getDbInstance();
 
   // Count total actions of this type
   const row = db
     .prepare(
-      "SELECT COALESCE(COUNT(*), 0) AS count FROM xp_audit_log WHERE api_key_id = ? AND action = ?"
+      "SELECT COALESCE(COUNT(*), 0) AS count FROM xp_audit_log WHERE tenant_id = ? AND api_key_id = ? AND action = ?"
     )
-    .get(apiKeyId, action) as { count: number };
+    .get(currentDbTenantId(), apiKeyId, action) as { count: number };
 
   const count = row.count;
 

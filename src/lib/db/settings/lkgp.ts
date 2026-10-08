@@ -3,6 +3,12 @@
  */
 
 import { getDbInstance } from "../core";
+import { currentDbTenantId, PLATFORM_TENANT_ID } from "../tenantScope";
+
+function scopedNamespace(): string {
+  const tenantId = currentDbTenantId();
+  return tenantId === PLATFORM_TENANT_ID ? "lkgp" : `lkgp:${tenantId}`;
+}
 
 export interface LKGPRecord {
   provider: string;
@@ -13,8 +19,8 @@ export async function getLKGP(comboName: string, modelId: string): Promise<LKGPR
   const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
   const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'lkgp' AND key = ?")
-    .get(key) as { value?: string } | undefined;
+    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+    .get(scopedNamespace(), key) as { value?: string } | undefined;
   if (!row?.value) return null;
   try {
     const parsed = JSON.parse(row.value);
@@ -37,7 +43,8 @@ export async function setLKGP(
   const key = `${comboName}:${modelId}`;
   const value: LKGPRecord = { provider: providerId };
   if (connectionId) value.connectionId = connectionId;
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)").run(
+  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+    scopedNamespace(),
     key,
     JSON.stringify(value)
   );
@@ -45,7 +52,7 @@ export async function setLKGP(
 
 export function clearAllLKGP(): void {
   const db = getDbInstance();
-  db.prepare("DELETE FROM key_value WHERE namespace = 'lkgp'").run();
+  db.prepare("DELETE FROM key_value WHERE namespace = ?").run(scopedNamespace());
 }
 
 /**
@@ -62,7 +69,7 @@ export function clearAllLKGP(): void {
 export async function clearLKGP(comboName: string, modelId: string): Promise<void> {
   const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
-  db.prepare("DELETE FROM key_value WHERE namespace = 'lkgp' AND key = ?").run(key);
+  db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(scopedNamespace(), key);
   const { invalidateCachedLKGP } = await import("../readCache");
   invalidateCachedLKGP(key);
 }
@@ -83,8 +90,8 @@ export async function deleteLKGPByConnectionIds(connectionIds: string[]): Promis
 
   const db = getDbInstance();
   const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'lkgp'")
-    .all() as Array<{ key?: string; value?: string }>;
+    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
+    .all(scopedNamespace()) as Array<{ key?: string; value?: string }>;
 
   const staleKeys: string[] = [];
 
@@ -108,9 +115,9 @@ export async function deleteLKGPByConnectionIds(connectionIds: string[]): Promis
 
   if (staleKeys.length === 0) return 0;
 
-  const deleteStatement = db.prepare("DELETE FROM key_value WHERE namespace = 'lkgp' AND key = ?");
+  const deleteStatement = db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?");
   for (const key of staleKeys) {
-    deleteStatement.run(key);
+    deleteStatement.run(scopedNamespace(), key);
   }
 
   const { invalidateCachedLKGP } = await import("../readCache");

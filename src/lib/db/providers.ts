@@ -33,7 +33,7 @@ import {
 } from "./webSessionDedup";
 import { pickCodexConnectionForUser } from "@/lib/oauth/utils/codexConnectionSelection";
 import { reconcileCodexUsageHistory } from "./providers/usageIdentityReconciliation";
-import { getCurrentTenantId } from "../tenantContext";
+import { assertTenantScope, currentDbTenantId } from "./tenantScope";
 
 /**
  * normalizeProviderSpecificData + the Codex fingerprint-seed invariant: Codex
@@ -222,10 +222,7 @@ export async function getProviderConnections(
   offset?: number,
   columns?: string[]
 ) {
-  const tenantId = getCurrentTenantId();
-  const scopedFilter = tenantId && filter.tenantId === undefined
-    ? { ...filter, tenantId }
-    : filter;
+  const scopedFilter = { ...filter, tenantId: assertTenantScope(filter.tenantId) };
   const useCache = !columns?.length && limit === undefined && offset === undefined;
   const raw = useCache
     ? await getCachedRawProviderConnections(scopedFilter)
@@ -253,6 +250,7 @@ export async function getRawProviderConnections(
   columns?: string[]
 ) {
   const db = getDbInstance() as unknown as DbLike;
+  const tenantId = assertTenantScope(filter.tenantId);
   let selectCols = "*";
   if (columns?.length) {
     const invalidColumns = columns.filter((col) => !PROVIDER_CONNECTIONS_COLUMNS.has(col));
@@ -269,10 +267,8 @@ export async function getRawProviderConnections(
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
 
-  if (filter.tenantId) {
-    conditions.push("tenant_id = @tenantId");
-    params.tenantId = filter.tenantId;
-  }
+  conditions.push("tenant_id = @tenantId");
+  params.tenantId = tenantId;
   if (filter.provider) {
     conditions.push("provider = @provider");
     params.provider = filter.provider;
@@ -312,8 +308,8 @@ export async function getRawProviderConnections(
 export function getProviderConnectionsCount(filter: JsonRecord = {}): number {
   const db = getDbInstance() as unknown as DbLike;
   let sql = "SELECT count(*) as cnt FROM provider_connections";
-  const conditions: string[] = [];
-  const params: Record<string, unknown> = {};
+  const conditions: string[] = ["tenant_id = @tenantId"];
+  const params: Record<string, unknown> = { tenantId: assertTenantScope(filter.tenantId) };
 
   if (filter.provider) {
     conditions.push("provider = @provider");
@@ -338,7 +334,9 @@ export function getProviderConnectionsCount(filter: JsonRecord = {}): number {
 
 export async function getProviderConnectionById(id: string) {
   const db = getDbInstance() as unknown as DbLike;
-  const row = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
+  const row = db
+    .prepare("SELECT * FROM provider_connections WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId());
   if (!row) return null;
 
   const camelRow = rowToCamel(row);
@@ -362,6 +360,7 @@ export async function getProviderConnectionById(id: string) {
 // without decryption.
 function findExistingCookieConnection(
   db: DbLike,
+  tenantId: string,
   provider: unknown,
   name: unknown,
   normalizedProviderSpecificData: unknown
@@ -371,17 +370,19 @@ function findExistingCookieConnection(
     const byName =
       (db
         .prepare(
-          "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'cookie' AND name = ?"
+          "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'cookie' AND name = ?"
         )
-        .get(provider, name) as JsonRecord | undefined) || null;
+        .get(tenantId, provider, name) as JsonRecord | undefined) || null;
     if (byName) return byName;
   }
   // 2) Credential-value dedup against existing cookie rows.
   const newCredKey = webSessionCredentialKey(normalizedProviderSpecificData);
   if (!newCredKey) return null;
   const cookieRows = db
-    .prepare("SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'cookie'")
-    .all(provider) as JsonRecord[];
+    .prepare(
+      "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'cookie'"
+    )
+    .all(tenantId, provider) as JsonRecord[];
   for (const row of cookieRows) {
     const psd = parseProviderSpecificData(row.provider_specific_data);
     if (psd && webSessionCredentialKey(psd) === newCredKey) return row;
@@ -390,6 +391,7 @@ function findExistingCookieConnection(
 }
 
 export async function createProviderConnection(data: JsonRecord) {
+  const tenantId = assertTenantScope(data.tenantId);
   await assertApiKeyIsNotManagementPassword(data.apiKey);
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
@@ -408,23 +410,23 @@ export async function createProviderConnection(data: JsonRecord) {
 
   if (data.authType === "oauth" && data.provider === "codex" && chatgptUserId) {
     const strongSql = workspaceId
-      ? "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND json_extract(provider_specific_data, '$.workspaceId') = ? AND json_extract(provider_specific_data, '$.chatgptUserId') = ?"
-      : "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND (json_extract(provider_specific_data, '$.workspaceId') IS NULL OR json_extract(provider_specific_data, '$.workspaceId') = '') AND json_extract(provider_specific_data, '$.chatgptUserId') = ?";
+      ? "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'oauth' AND json_extract(provider_specific_data, '$.workspaceId') = ? AND json_extract(provider_specific_data, '$.chatgptUserId') = ?"
+      : "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'oauth' AND (json_extract(provider_specific_data, '$.workspaceId') IS NULL OR json_extract(provider_specific_data, '$.workspaceId') = '') AND json_extract(provider_specific_data, '$.chatgptUserId') = ?";
     existing =
       ((workspaceId
-        ? db.prepare(strongSql).get(data.provider, workspaceId, chatgptUserId)
-        : db.prepare(strongSql).get(data.provider, chatgptUserId)) as JsonRecord | undefined) ||
-      null;
+        ? db.prepare(strongSql).get(tenantId, data.provider, workspaceId, chatgptUserId)
+        : db.prepare(strongSql).get(tenantId, data.provider, chatgptUserId)) as
+        JsonRecord | undefined) || null;
 
     if (!existing && workspaceId) {
       const workspaceMatches = db
         .prepare(
           `SELECT * FROM provider_connections
-           WHERE provider = ? AND auth_type = 'oauth'
+           WHERE tenant_id = ? AND provider = ? AND auth_type = 'oauth'
              AND json_extract(provider_specific_data, '$.workspaceId') = ?
            ORDER BY created_at`
         )
-        .all(data.provider, workspaceId) as JsonRecord[];
+        .all(tenantId, data.provider, workspaceId) as JsonRecord[];
       existing = pickCodexConnectionForUser(
         workspaceMatches,
         chatgptUserId,
@@ -439,12 +441,13 @@ export async function createProviderConnection(data: JsonRecord) {
           (db
             .prepare(
               `SELECT * FROM provider_connections
-               WHERE provider = ? AND auth_type = 'oauth'
+               WHERE tenant_id = ? AND provider = ? AND auth_type = 'oauth'
                  AND json_extract(provider_specific_data, '$.workspaceId') = ?
                  AND email = ?
                LIMIT 1`
             )
-            .get(data.provider, workspaceId, data.email) as JsonRecord | undefined) || null;
+            .get(tenantId, data.provider, workspaceId, data.email) as JsonRecord | undefined) ||
+          null;
       }
     } else {
       // For other providers (or Codex without workspaceId), match on email —
@@ -460,9 +463,9 @@ export async function createProviderConnection(data: JsonRecord) {
       const incomingProfileArn = toStringOrNull(providerSpecificData.profileArn);
       const emailMatches = db
         .prepare(
-          "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'oauth' AND email = ?"
+          "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'oauth' AND email = ?"
         )
-        .all(data.provider, data.email) as JsonRecord[];
+        .all(tenantId, data.provider, data.email) as JsonRecord[];
       existing =
         emailMatches.find((row) =>
           isMatchingOauthIdentity(row, incomingUsername, incomingProfileArn)
@@ -474,9 +477,9 @@ export async function createProviderConnection(data: JsonRecord) {
       existing =
         (db
           .prepare(
-            "SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'apikey' AND name = ?"
+            "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'apikey' AND name = ?"
           )
-          .get(data.provider, data.name) as JsonRecord | undefined) || null;
+          .get(tenantId, data.provider, data.name) as JsonRecord | undefined) || null;
     }
     // #3023 — dedup by API key value: re-adding the same key (under a different
     // or blank name) must update the existing connection, not insert a duplicate
@@ -486,8 +489,10 @@ export async function createProviderConnection(data: JsonRecord) {
     const newApiKey = typeof data.apiKey === "string" ? data.apiKey.trim() : "";
     if (!existing && newApiKey) {
       const apiKeyRows = db
-        .prepare("SELECT * FROM provider_connections WHERE provider = ? AND auth_type = 'apikey'")
-        .all(data.provider) as JsonRecord[];
+        .prepare(
+          "SELECT * FROM provider_connections WHERE tenant_id = ? AND provider = ? AND auth_type = 'apikey'"
+        )
+        .all(tenantId, data.provider) as JsonRecord[];
       for (const row of apiKeyRows) {
         const decrypted = decryptConnectionFields(toRecord(rowToCamel(row)));
         if (toStringOrNull(decrypted.apiKey)?.trim() === newApiKey) {
@@ -499,6 +504,7 @@ export async function createProviderConnection(data: JsonRecord) {
   } else if (data.authType === "cookie") {
     existing = findExistingCookieConnection(
       db,
+      tenantId,
       data.provider,
       data.name,
       normalizedProviderSpecificData
@@ -518,7 +524,7 @@ export async function createProviderConnection(data: JsonRecord) {
     if (!existingId) return null;
     const rawExisting = toRecord(rowToCamel(existing));
     const decryptedExisting = decryptConnectionFields({ ...rawExisting });
-    const merged: JsonRecord = { ...decryptedExisting, ...data, updatedAt: now };
+    const merged: JsonRecord = { ...decryptedExisting, ...data, tenantId, updatedAt: now };
     merged.providerSpecificData = normalizeConnectionProviderSpecificData(
       toStringOrNull(merged.provider),
       merged.providerSpecificData,
@@ -568,14 +574,17 @@ export async function createProviderConnection(data: JsonRecord) {
   let connectionPriority = data.priority;
   if (!connectionPriority) {
     const max = db
-      .prepare("SELECT MAX(priority) as maxP FROM provider_connections WHERE provider = ?")
-      .get(data.provider) as JsonRecord | undefined;
+      .prepare(
+        "SELECT MAX(priority) as maxP FROM provider_connections WHERE tenant_id = ? AND provider = ?"
+      )
+      .get(tenantId, data.provider) as JsonRecord | undefined;
     const maxPriority = toNumberOrZero(toRecord(max).maxP);
     connectionPriority = maxPriority + 1;
   }
 
   const connection: Record<string, unknown> = {
     id: uuidv4(),
+    tenantId,
     provider: data.provider,
     authType: data.authType || "oauth",
     name: connectionName,
@@ -679,7 +688,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
   db.prepare(
     `
     INSERT INTO provider_connections (
-      id, provider, auth_type, name, email, priority, is_active,
+      id, tenant_id, provider, auth_type, name, email, priority, is_active,
       access_token, refresh_token, expires_at, token_expires_at,
       scope, project_id, test_status, error_code, last_error,
       last_error_at, last_error_type, last_error_source, backoff_level,
@@ -690,7 +699,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
       proxy_enabled, per_key_proxy_enabled, quota_visible, quota_window_thresholds_json, rate_limit_overrides_json,
       created_at, updated_at
     ) VALUES (
-      @id, @provider, @authType, @name, @email, @priority, @isActive,
+      @id, @tenantId, @provider, @authType, @name, @email, @priority, @isActive,
       @accessToken, @refreshToken, @expiresAt, @tokenExpiresAt,
       @scope, @projectId, @testStatus, @errorCode, @lastError,
       @lastErrorAt, @lastErrorType, @lastErrorSource, @backoffLevel,
@@ -704,6 +713,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
   `
   ).run({
     id: conn.id,
+    tenantId: conn.tenantId,
     provider: conn.provider,
     authType: conn.authType || null,
     name: conn.name || null,
@@ -759,6 +769,7 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
 function _buildUpdateConnectionRowParams(id: string, data: JsonRecord, now: unknown) {
   return {
     id,
+    tenantId: currentDbTenantId(),
     provider: data.provider,
     authType: data.authType || null,
     name: data.name || null,
@@ -838,14 +849,17 @@ function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
       last_ping_at = @lastPingAt,
       last_pinged_reset_key = @lastPingedResetKey,
       updated_at = @updatedAt
-    WHERE id = @id
+    WHERE id = @id AND tenant_id = @tenantId
   `
   ).run(_buildUpdateConnectionRowParams(id, data, now));
 }
 
 export async function updateProviderConnection(id: string, data: JsonRecord) {
+  const tenantId = assertTenantScope(data.tenantId);
   const db = getDbInstance() as unknown as DbLike;
-  const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
+  const existing = db
+    .prepare("SELECT * FROM provider_connections WHERE id = ? AND tenant_id = ?")
+    .get(id, tenantId);
   if (!existing) return null;
 
   // The incoming value only. A connection that already holds the password has
@@ -858,6 +872,7 @@ export async function updateProviderConnection(id: string, data: JsonRecord) {
   const merged: JsonRecord = {
     ...existingCamel,
     ...data,
+    tenantId,
     updatedAt: new Date().toISOString(),
   };
   merged.providerSpecificData = normalizeConnectionProviderSpecificData(
@@ -960,7 +975,7 @@ export async function clearConnectionErrorIfUnchanged(
       rate_limited_until = NULL,
       backoff_level = 0,
       updated_at = ?
-    WHERE id = ?
+    WHERE id = ? AND tenant_id = ?
       AND IFNULL(test_status, '') = ?
       AND IFNULL(last_error_at, '') = ?
       AND IFNULL(rate_limited_until, '') = ?
@@ -969,6 +984,7 @@ export async function clearConnectionErrorIfUnchanged(
     .run(
       new Date().toISOString(),
       id,
+      currentDbTenantId(),
       expected.testStatus ?? "",
       expected.lastErrorAt ?? "",
       expected.rateLimitedUntil ?? ""
@@ -1001,8 +1017,9 @@ export async function touchConnectionLastUsed(
       last_used_at = @lastUsedAt,
       consecutive_use_count = @consecutiveUseCount,
       updated_at = @updatedAt
-    WHERE id = @id`
+    WHERE id = @id AND tenant_id = @tenantId`
   ).run({
+    tenantId: currentDbTenantId(),
     lastUsedAt: now,
     consecutiveUseCount,
     updatedAt: now,
@@ -1031,8 +1048,9 @@ export async function resetConnectionBackoff(id: string): Promise<void> {
       last_error_source = NULL,
       error_code = NULL,
       updated_at = @updatedAt
-    WHERE id = @id`
+    WHERE id = @id AND tenant_id = @tenantId`
   ).run({
+    tenantId: currentDbTenantId(),
     updatedAt: now,
     id,
   });
@@ -1048,9 +1066,9 @@ export async function getDistinctGroups(): Promise<string[]> {
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
     .prepare(
-      'SELECT DISTINCT "group" FROM provider_connections WHERE "group" IS NOT NULL ORDER BY "group"'
+      'SELECT DISTINCT "group" FROM provider_connections WHERE tenant_id = ? AND "group" IS NOT NULL ORDER BY "group"'
     )
-    .all() as Array<{ group?: string }>;
+    .all(currentDbTenantId()) as Array<{ group?: string }>;
   return rows.map((r) => String(r.group ?? "")).filter(Boolean);
 }
 

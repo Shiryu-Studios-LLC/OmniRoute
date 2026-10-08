@@ -1,13 +1,75 @@
+import { DurableObject } from "cloudflare:workers";
+import {
+  GatewaySessionDurableObject,
+  type GatewayCoordinatorStub,
+} from "../src/cloud/connectorGatewayDurableObject";
 import { createCloudRuntime } from "../src/cloud/runtime";
 
-interface CloudflareEnv {
+type CloudflareEnv = Env & {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
+  OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+};
+
+export class GatewaySessionObject extends DurableObject<CloudflareEnv> {
+  private readonly coordinator: GatewaySessionDurableObject;
+
+  constructor(ctx: DurableObjectState, env: CloudflareEnv) {
+    super(ctx, env);
+    this.coordinator = new GatewaySessionDurableObject({
+      id: { name: ctx.id.name ?? undefined },
+      storage: ctx.storage,
+    });
+  }
+
+  putSession(...args: Parameters<GatewayCoordinatorStub["putSession"]>) {
+    return this.coordinator.putSession(...args);
+  }
+
+  getSession(...args: Parameters<GatewayCoordinatorStub["getSession"]>) {
+    return this.coordinator.getSession(...args);
+  }
+
+  touchSession(...args: Parameters<GatewayCoordinatorStub["touchSession"]>) {
+    return this.coordinator.touchSession(...args);
+  }
+
+  revokeSession(...args: Parameters<GatewayCoordinatorStub["revokeSession"]>) {
+    return this.coordinator.revokeSession(...args);
+  }
+
+  enqueueRequest(...args: Parameters<GatewayCoordinatorStub["enqueueRequest"]>) {
+    return this.coordinator.enqueueRequest(...args);
+  }
+
+  takeRequests(...args: Parameters<GatewayCoordinatorStub["takeRequests"]>) {
+    return this.coordinator.takeRequests(...args);
+  }
+
+  submitRequestResult(...args: Parameters<GatewayCoordinatorStub["submitRequestResult"]>) {
+    return this.coordinator.submitRequestResult(...args);
+  }
+
+  getRequest(...args: Parameters<GatewayCoordinatorStub["getRequest"]>) {
+    return this.coordinator.getRequest(...args);
+  }
+
+  deleteRequest(...args: Parameters<GatewayCoordinatorStub["deleteRequest"]>) {
+    return this.coordinator.deleteRequest(...args);
+  }
 }
 
 const worker = {
   fetch(request: Request, env: CloudflareEnv): Promise<Response> {
-    return createCloudRuntime({ env }).fetch(request);
+    return createCloudRuntime({
+      env: {
+        OMNIROUTE_ENV: env.OMNIROUTE_ENV,
+        OMNIROUTE_BUILD_SHA: env.OMNIROUTE_BUILD_SHA,
+        OMNIROUTE_CLOUD_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+        DB: env.DB,
+        GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,
+      },
+    }).fetch(request);
   },
 };
 

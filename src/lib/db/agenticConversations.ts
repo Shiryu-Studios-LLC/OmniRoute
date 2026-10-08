@@ -19,11 +19,14 @@
  * placeholders.
  */
 
+import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 export interface AgenticConversationRow {
   id: string;
+  tenantId: string;
   apiKeyId: string | null;
   fingerprintHash: string;
   turnCount: number;
@@ -41,6 +44,7 @@ function toRow(value: unknown): AgenticConversationRow {
   const r = asRecord(value);
   return {
     id: String(r.id ?? ""),
+    tenantId: String(r.tenant_id ?? "tenant_shiryu_admin"),
     apiKeyId: typeof r.api_key_id === "string" ? r.api_key_id : null,
     fingerprintHash: String(r.fingerprint_hash ?? ""),
     turnCount: Number(r.turn_count ?? 1),
@@ -57,17 +61,19 @@ export function createAgenticConversation(input: {
   const db = getDbInstance();
   const now = new Date().toISOString();
   const id = input.id || `conv_${uuidv4()}`;
+  const tenantId = currentDbTenantId();
 
   // last_message_count/last_messages_hash are dead columns (superseded by
   // conversation_turn_nodes, migration 156) — 0/'' placeholders only.
   db.prepare(
     `INSERT INTO agentic_conversations
-       (id, api_key_id, fingerprint_hash, last_message_count, last_messages_hash, turn_count, first_seen_at, last_seen_at)
-     VALUES (?, ?, ?, 0, '', 1, ?, ?)`
-  ).run(id, input.apiKeyId, input.fingerprintHash, now, now);
+       (id, tenant_id, api_key_id, fingerprint_hash, last_message_count, last_messages_hash, turn_count, first_seen_at, last_seen_at)
+     VALUES (?, ?, ?, ?, 0, '', 1, ?, ?)`
+  ).run(id, tenantId, input.apiKeyId, input.fingerprintHash, now, now);
 
   return {
     id,
+    tenantId,
     apiKeyId: input.apiKeyId,
     fingerprintHash: input.fingerprintHash,
     turnCount: 1,
@@ -82,19 +88,18 @@ export function findAgenticConversationsByFingerprint(
   const db = getDbInstance();
   const rows = db
     .prepare(
-      `SELECT * FROM agentic_conversations WHERE fingerprint_hash = ? ORDER BY last_seen_at DESC LIMIT 20`
+      `SELECT * FROM agentic_conversations
+       WHERE tenant_id = ? AND fingerprint_hash = ? ORDER BY last_seen_at DESC LIMIT 20`
     )
-    .all(fingerprintHash);
+    .all(currentDbTenantId(), fingerprintHash);
   return rows.map(toRow);
 }
 
 export function updateAgenticConversation(id: string, patch: { turnCount: number }): void {
   const db = getDbInstance();
-  db.prepare(`UPDATE agentic_conversations SET turn_count = ?, last_seen_at = ? WHERE id = ?`).run(
-    patch.turnCount,
-    new Date().toISOString(),
-    id
-  );
+  db.prepare(
+    `UPDATE agentic_conversations SET turn_count = ?, last_seen_at = ? WHERE id = ? AND tenant_id = ?`
+  ).run(patch.turnCount, new Date().toISOString(), id, currentDbTenantId());
 }
 
 // ── Turn-node tree (migration 156) ───────────────────────────────────────
@@ -161,9 +166,11 @@ export function getConversationTurnIndex(conversationId: string): ConversationTu
   const db = getDbInstance();
   const rows = db
     .prepare(
-      `SELECT id, parent_id, content_hash FROM conversation_turn_nodes WHERE conversation_id = ?`
+      `SELECT n.id, n.parent_id, n.content_hash FROM conversation_turn_nodes n
+       JOIN agentic_conversations ac ON ac.id = n.conversation_id
+       WHERE n.conversation_id = ? AND ac.tenant_id = ?`
     )
-    .all(conversationId);
+    .all(conversationId, currentDbTenantId());
   const nodeIds = new Set<string>();
   const byContentHash = new Map<string, string[]>();
   const parentsWithChildren = new Set<string>();
@@ -200,6 +207,10 @@ export function insertConversationTurnNodes(
 ): void {
   if (nodes.length === 0) return;
   const db = getDbInstance();
+  const conversationExists = db
+    .prepare("SELECT 1 FROM agentic_conversations WHERE id = ? AND tenant_id = ? LIMIT 1")
+    .get(conversationId, currentDbTenantId());
+  if (!conversationExists) throw new Error("Conversation not found");
   const now = new Date().toISOString();
   const insert = db.prepare(
     `INSERT OR IGNORE INTO conversation_turn_nodes
@@ -260,9 +271,12 @@ export function getConversationTurnPage(
     const rows = db
       .prepare(
         `SELECT rowid as seq, * FROM conversation_turn_nodes
-         WHERE conversation_id = ? AND rowid > ? ORDER BY rowid ASC`
+         WHERE conversation_id = ? AND EXISTS (
+           SELECT 1 FROM agentic_conversations ac
+           WHERE ac.id = conversation_turn_nodes.conversation_id AND ac.tenant_id = ?
+         ) AND rowid > ? ORDER BY rowid ASC`
       )
-      .all(conversationId, opts.afterSeq);
+      .all(conversationId, currentDbTenantId(), opts.afterSeq);
     return { nodes: rows.map(toTurnNodeWithSeq), hasMore: false };
   }
 
@@ -271,15 +285,21 @@ export function getConversationTurnPage(
       ? db
           .prepare(
             `SELECT rowid as seq, * FROM conversation_turn_nodes
-             WHERE conversation_id = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?`
+             WHERE conversation_id = ? AND EXISTS (
+               SELECT 1 FROM agentic_conversations ac
+               WHERE ac.id = conversation_turn_nodes.conversation_id AND ac.tenant_id = ?
+             ) AND rowid < ? ORDER BY rowid DESC LIMIT ?`
           )
-          .all(conversationId, opts.beforeSeq, limit + 1)
+          .all(conversationId, currentDbTenantId(), opts.beforeSeq, limit + 1)
       : db
           .prepare(
             `SELECT rowid as seq, * FROM conversation_turn_nodes
-             WHERE conversation_id = ? ORDER BY rowid DESC LIMIT ?`
+             WHERE conversation_id = ? AND EXISTS (
+               SELECT 1 FROM agentic_conversations ac
+               WHERE ac.id = conversation_turn_nodes.conversation_id AND ac.tenant_id = ?
+             ) ORDER BY rowid DESC LIMIT ?`
           )
-          .all(conversationId, limit + 1);
+          .all(conversationId, currentDbTenantId(), limit + 1);
 
   const hasMore = rows.length > limit;
   const page = (hasMore ? rows.slice(0, limit) : rows).reverse();
@@ -307,8 +327,11 @@ export function resolveCallLogIdsByCorrelationIds(correlationIds: string[]): Map
   const db = getDbInstance();
   const placeholders = unique.map(() => "?").join(",");
   const rows = db
-    .prepare(`SELECT id, correlation_id FROM call_logs WHERE correlation_id IN (${placeholders})`)
-    .all(...unique);
+    .prepare(
+      `SELECT id, correlation_id FROM call_logs
+       WHERE tenant_id = ? AND correlation_id IN (${placeholders})`
+    )
+    .all(currentDbTenantId(), ...unique);
   for (const r of rows) {
     const rec = asRecord(r);
     const correlationId = typeof rec.correlation_id === "string" ? rec.correlation_id : null;
@@ -325,31 +348,40 @@ export function resolveCallLogIdsByCorrelationIds(correlationIds: string[]): Map
 
 /**
  * Upsert for the client-supplied `x-omniroute-session-id` path: the header
- * value is used directly as the conversation id, so this only needs to keep
- * `turn_count`/`last_seen_at` moving — the fingerprint/prefix-hash fields are
- * unused for header-pinned conversations (continuation is guaranteed by the
- * client, not detected heuristically).
+ * value is hashed together with the current tenant to form the persisted
+ * conversation id. This only needs to keep `turn_count`/`last_seen_at` moving
+ * — the fingerprint/prefix-hash fields are unused for header-pinned
+ * conversations (continuation is guaranteed by the client, not detected
+ * heuristically).
  */
 export function touchOrCreateExternalConversation(
   id: string,
   ctx: { apiKeyId: string | null }
-): void {
+): string {
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
+  // Client-provided session IDs are not globally unique. Hash both the value
+  // and tenant so two tenants may reuse a session id without sharing data.
+  const sessionHash = createHash("sha256").update(`${tenantId}\0${id}`).digest("hex");
+  const conversationId = `ext_${sessionHash}`;
   const now = new Date().toISOString();
-  const existing = db.prepare(`SELECT id FROM agentic_conversations WHERE id = ?`).get(id);
+  const existing = db
+    .prepare(`SELECT id FROM agentic_conversations WHERE id = ? AND tenant_id = ?`)
+    .get(conversationId, tenantId);
 
   if (existing) {
     db.prepare(
-      `UPDATE agentic_conversations SET turn_count = turn_count + 1, last_seen_at = ? WHERE id = ?`
-    ).run(now, id);
-    return;
+      `UPDATE agentic_conversations SET turn_count = turn_count + 1, last_seen_at = ? WHERE id = ? AND tenant_id = ?`
+    ).run(now, conversationId, tenantId);
+    return conversationId;
   }
 
   db.prepare(
     `INSERT INTO agentic_conversations
-       (id, api_key_id, fingerprint_hash, last_message_count, last_messages_hash, turn_count, first_seen_at, last_seen_at)
-     VALUES (?, ?, '', 0, '', 1, ?, ?)`
-  ).run(id, ctx.apiKeyId, now, now);
+       (id, tenant_id, api_key_id, fingerprint_hash, last_message_count, last_messages_hash, turn_count, first_seen_at, last_seen_at)
+     VALUES (?, ?, ?, ?, 0, '', 1, ?, ?)`
+  ).run(conversationId, tenantId, ctx.apiKeyId, "", now, now);
+  return conversationId;
 }
 
 export interface MultiTurnConversationRow extends AgenticConversationRow {
@@ -393,9 +425,10 @@ export function listMultiTurnConversations(
     db
       .prepare(
         `SELECT COUNT(*) as c FROM agentic_conversations ac
-         WHERE (SELECT COUNT(*) FROM conversation_turn_nodes n WHERE n.conversation_id = ac.id) >= 2`
+         WHERE ac.tenant_id = ?
+           AND (SELECT COUNT(*) FROM conversation_turn_nodes n WHERE n.conversation_id = ac.id) >= 2`
       )
-      .get()
+      .get(currentDbTenantId())
   ).c as number;
 
   const rows = db
@@ -406,15 +439,17 @@ export function listMultiTurnConversations(
        LEFT JOIN (
          SELECT cl1.id, cl1.session_tag, cl1.model, cl1.provider, cl1.status
          FROM call_logs cl1
-         WHERE cl1.timestamp = (
-           SELECT MAX(cl2.timestamp) FROM call_logs cl2 WHERE cl2.session_tag = cl1.session_tag
+         WHERE cl1.tenant_id = ? AND cl1.timestamp = (
+           SELECT MAX(cl2.timestamp) FROM call_logs cl2
+           WHERE cl2.session_tag = cl1.session_tag AND cl2.tenant_id = cl1.tenant_id
          )
-       ) latest ON latest.session_tag = ac.id
-       WHERE (SELECT COUNT(*) FROM conversation_turn_nodes n WHERE n.conversation_id = ac.id) >= 2
+       ) latest ON latest.session_tag = ac.id AND ac.tenant_id = ?
+       WHERE ac.tenant_id = ?
+         AND (SELECT COUNT(*) FROM conversation_turn_nodes n WHERE n.conversation_id = ac.id) >= 2
        ORDER BY ac.last_seen_at DESC
        LIMIT ? OFFSET ?`
     )
-    .all(limit, offset);
+    .all(currentDbTenantId(), currentDbTenantId(), currentDbTenantId(), limit, offset);
 
   return {
     total: Number(total ?? 0),

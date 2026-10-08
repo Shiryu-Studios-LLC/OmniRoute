@@ -11,6 +11,7 @@ process.env.CALL_LOG_RETENTION_DAYS = "5";
 
 const core = await import("../../src/lib/db/core.ts");
 const compliance = await import("../../src/lib/compliance/index.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 function resetDb() {
   core.resetDbInstance();
@@ -169,6 +170,16 @@ test("compliance noLog helpers cover missing ids, in-memory overrides and persis
   assert.deepEqual(compliance.getRetentionDays(), { app: 10, call: 5 });
 });
 
+test("noLog in-memory overrides are scoped to the active tenant", () => {
+  runWithTenantContext({ tenantId: "tenant_no_log_a", role: "owner" }, () => {
+    compliance.setNoLog("same-key-id", true);
+    assert.equal(compliance.isNoLog("same-key-id"), true);
+  });
+  runWithTenantContext({ tenantId: "tenant_no_log_b", role: "owner" }, () => {
+    assert.equal(compliance.isNoLog("same-key-id"), false);
+  });
+});
+
 test("cleanupExpiredLogs removes stale rows across all log tables and records an audit entry", async () => {
   compliance.initAuditLog();
   const db = core.getDbInstance();
@@ -285,20 +296,23 @@ test("cleanupExpiredLogs removes stale rows across all log tables and records an
 test("cleanupExpiredLogs tolerates missing tables and logAuditEvent failures without breaking", async () => {
   compliance.initAuditLog();
   const db = core.getDbInstance();
+  const auditFailureCount = compliance.getAuditLogWriteFailureCount();
 
   db.exec(`
     DROP TABLE usage_history;
     DROP TABLE call_logs;
     DROP TABLE proxy_logs;
     DROP TABLE request_detail_logs;
-    DROP TABLE audit_log;
     DROP TABLE mcp_tool_audit;
+    CREATE TRIGGER reject_audit_writes BEFORE INSERT ON audit_log
+    BEGIN SELECT RAISE(FAIL, 'audit write rejected'); END;
   `);
 
   compliance.logAuditEvent({
     action: "will.fail.silently",
     details: { reason: "table dropped" },
   });
+  assert.equal(compliance.getAuditLogWriteFailureCount(), auditFailureCount + 1);
 
   const result = await compliance.cleanupExpiredLogs();
 

@@ -23,6 +23,20 @@ import {
 import { getUserDatabaseSettings } from "../db/databaseSettings";
 import { generateRequestId, getRequestId } from "@/shared/utils/requestId";
 import { HIGH_LEVEL_ACTIONS } from "@/lib/audit/highLevelActions";
+import { getTenantContext } from "@/lib/tenantContext";
+import { currentDbTenantId, PLATFORM_TENANT_ID } from "@/lib/db/tenantScope";
+import { createLogger } from "@/shared/utils/logger";
+
+const log = createLogger("compliance");
+let auditLogWriteFailures = 0;
+
+/**
+ * Process-local count of audit writes that failed since startup.
+ * Exposed for operational health reporting without retaining failure details.
+ */
+export function getAuditLogWriteFailureCount(): number {
+  return auditLogWriteFailures;
+}
 
 /** @returns {SqliteAdapter | null} */
 function getDb() {
@@ -32,19 +46,6 @@ function getDb() {
     return null;
   }
 }
-
-type AuditLogWriteEntry = {
-  action: string;
-  actor?: string;
-  target?: string;
-  details?: unknown;
-  metadata?: unknown;
-  ipAddress?: string;
-  resourceType?: string;
-  status?: string;
-  requestId?: string;
-  createdAt?: string;
-};
 
 type AuditLogFilter = {
   action?: string;
@@ -103,6 +104,7 @@ export type AuditLogEntry = Record<string, unknown> & {
 };
 
 const AUDIT_LOG_REQUIRED_COLUMNS: Record<string, string> = {
+  tenant_id: "TEXT NOT NULL DEFAULT 'tenant_shiryu_admin'",
   resource_type: "TEXT",
   status: "TEXT",
   request_id: "TEXT",
@@ -188,6 +190,7 @@ function ensureAuditLogSchema(db: SqliteAdapter) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id TEXT NOT NULL DEFAULT 'tenant_shiryu_admin',
       timestamp TEXT NOT NULL DEFAULT (datetime('now')),
       action TEXT NOT NULL,
       actor TEXT NOT NULL DEFAULT 'system',
@@ -220,6 +223,7 @@ function ensureAuditLogSchema(db: SqliteAdapter) {
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_audit_tenant_timestamp ON audit_log(tenant_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
     CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);
     CREATE INDEX IF NOT EXISTS idx_audit_resource_type ON audit_log(resource_type);
@@ -234,8 +238,8 @@ type AuditLogQuery = {
 };
 
 function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
-  const conditions: string[] = [];
-  const params: string[] = [];
+  const conditions: string[] = ["tenant_id = ?"];
+  const params: string[] = [currentDbTenantId()];
 
   const addLikeFilter = (column: string, value?: string) => {
     if (!value) return;
@@ -353,8 +357,23 @@ export function logAuditEvent(entry: {
         : entry.details && typeof entry.details === "object"
           ? entry.details
           : null;
+    const tenantContext = getTenantContext();
+    const tenantId = tenantContext?.tenantId ?? PLATFORM_TENANT_ID;
+    const auditMetadataSource = tenantContext
+      ? {
+          ...(metadataSource && typeof metadataSource === "object" && !Array.isArray(metadataSource)
+            ? (metadataSource as Record<string, unknown>)
+            : metadataSource === null
+              ? {}
+              : { value: metadataSource }),
+          tenantId: tenantContext.tenantId,
+          ...(tenantContext.principalId ? { principalId: tenantContext.principalId } : {}),
+          ...(tenantContext.role ? { tenantRole: tenantContext.role } : {}),
+        }
+      : metadataSource;
     const stmt = db.prepare(`
       INSERT INTO audit_log (
+        tenant_id,
         timestamp,
         action,
         actor,
@@ -366,22 +385,25 @@ export function logAuditEvent(entry: {
         request_id,
         metadata
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
+      tenantId,
       createdAt,
       entry.action,
-      entry.actor || "system",
+      entry.actor || tenantContext?.principalId || "system",
       entry.target || null,
       serializedDetails,
       entry.ipAddress || null,
       entry.resourceType || null,
       entry.status || null,
       entry.requestId || null,
-      serializeAuditValue(metadataSource)
+      serializeAuditValue(auditMetadataSource)
     );
   } catch {
-    // Silently fail — audit logging should never break the main flow
+    // Keep the product request resilient, while making audit loss observable.
+    auditLogWriteFailures += 1;
+    log.error("Audit log write failed; failure details omitted");
   }
 }
 
@@ -421,8 +443,7 @@ export function countAuditLog(filter: AuditLogFilter = {}) {
   ensureAuditLogSchema(db);
   const { where, params } = buildAuditLogQuery(filter);
   const row = db.prepare(`SELECT COUNT(*) as count FROM audit_log ${where}`).get(...params) as
-    | { count?: number }
-    | undefined;
+    { count?: number } | undefined;
   return Number(row?.count || 0);
 }
 
@@ -522,7 +543,13 @@ export async function cleanupExpiredLogs() {
   let trimmedProxyLogs = 0;
 
   try {
-    const r1 = db.prepare("DELETE FROM usage_history WHERE timestamp < ?").run(usageCutoff);
+    const r1 = db
+      .prepare(
+        `DELETE FROM usage_history
+         WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+           AND timestamp < ?`
+      )
+      .run(currentDbTenantId(), currentDbTenantId(), usageCutoff);
     deletedUsage = r1.changes;
   } catch {
     /* table may not exist */
@@ -544,14 +571,23 @@ export async function cleanupExpiredLogs() {
   }
 
   try {
-    const r4 = db.prepare("DELETE FROM request_detail_logs WHERE timestamp < ?").run(callCutoff);
+    const tenantId = currentDbTenantId();
+    const r4 = db
+      .prepare(
+        `DELETE FROM request_detail_logs
+         WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+           AND timestamp < ?`
+      )
+      .run(tenantId, tenantId, callCutoff);
     deletedRequestDetailLogs = r4.changes;
   } catch {
     /* legacy table may not exist */
   }
 
   try {
-    const r5 = db.prepare("DELETE FROM audit_log WHERE timestamp < ?").run(appCutoff);
+    const r5 = db
+      .prepare("DELETE FROM audit_log WHERE tenant_id = ? AND timestamp < ?")
+      .run(currentDbTenantId(), appCutoff);
     deletedAuditLogs = r5.changes;
   } catch {
     /* table may not exist */

@@ -11,6 +11,7 @@ import {
   DEFAULT_RESILIENCE_SETTINGS,
   type ResilienceSettings,
 } from "../../src/lib/resilience/settings";
+import { currentDbTenantId } from "../../src/lib/db/tenantScope.ts";
 
 interface CooldownEntry {
   /** Timestamp of last recorded failure (ms since epoch) */
@@ -64,7 +65,11 @@ export function cleanupExpiredCooldownEntries(now = Date.now()): void {
  * Build a cooldown key from provider and optional connectionId.
  */
 function cooldownKey(provider: string, connectionId?: string): string {
-  return connectionId ? `${provider}:${connectionId}` : provider;
+  // Provider-wide cooldowns are meaningful only inside the tenant that saw the
+  // failure. Without the tenant component, one customer's outage can suppress
+  // healthy traffic from another customer using the same provider.
+  const tenantId = currentDbTenantId();
+  return connectionId ? `${tenantId}:${provider}:${connectionId}` : `${tenantId}:${provider}`;
 }
 
 /**

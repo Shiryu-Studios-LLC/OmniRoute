@@ -7,6 +7,7 @@ import { evaluateAccessTokenAuth } from "@/server/authz/accessTokenAuth";
 import { isTrustedLoopbackInternalServiceRequest } from "@/lib/api/internalServiceAuth";
 import { AUTHZ_HEADER_AUTH_KIND, AUTHZ_HEADER_AUTH_LABEL } from "@/server/authz/headers";
 import { enterTenantContext } from "@/lib/tenantContext";
+import { enterApiKeyTenantContext } from "@/server/authz/tenantMembership";
 import { SHIRYU_ADMIN_TENANT_ID } from "@/lib/db/tenants";
 import {
   MANAGE_SCOPE,
@@ -57,7 +58,11 @@ export async function requireManagementAuth(
   }
 
   if (await isDashboardSessionAuthenticated(request)) {
-    enterTenantContext({ tenantId: SHIRYU_ADMIN_TENANT_ID, principalId: "dashboard", role: "owner" });
+    enterTenantContext({
+      tenantId: SHIRYU_ADMIN_TENANT_ID,
+      principalId: "dashboard",
+      role: "owner",
+    });
     return null;
   }
 
@@ -136,7 +141,7 @@ export async function requireManagementAuth(
     // through to the same 403 as the default path for every caller, keeping
     // the error contract uniform.
     if (meta?.tenantId) {
-      enterTenantContext({ tenantId: meta.tenantId, principalId: meta.id });
+      enterApiKeyTenantContext(meta.tenantId, meta.id);
     }
 
     if (

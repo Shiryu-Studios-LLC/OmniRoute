@@ -10,6 +10,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 const core = await import("../../src/lib/db/core.ts");
 const combosDb = await import("../../src/lib/db/combos.ts");
 const mappingsDb = await import("../../src/lib/db/modelComboMappings.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
@@ -228,4 +229,44 @@ test("resolveComboForModel returns null when nothing matches", async () => {
   const resolved = await mappingsDb.resolveComboForModel("gpt-4o");
 
   assert.equal(resolved, null);
+});
+
+test("model combo mappings and resolution stay within the active tenant", async () => {
+  const comboA = await runWithTenantContext({ tenantId: "tenant_mapping_a", role: "owner" }, () =>
+    createCombo("same-name", "gpt-4o")
+  );
+  const comboB = await runWithTenantContext({ tenantId: "tenant_mapping_b", role: "owner" }, () =>
+    createCombo("same-name", "claude-sonnet-4")
+  );
+  const mappingA = await runWithTenantContext({ tenantId: "tenant_mapping_a", role: "owner" }, () =>
+    mappingsDb.createModelComboMapping({ pattern: "shared-*", comboId: comboA.id })
+  );
+  const mappingB = await runWithTenantContext({ tenantId: "tenant_mapping_b", role: "owner" }, () =>
+    mappingsDb.createModelComboMapping({ pattern: "shared-*", comboId: comboB.id })
+  );
+
+  const resolvedA = await runWithTenantContext(
+    { tenantId: "tenant_mapping_a", role: "owner" },
+    () => mappingsDb.resolveComboForModel("shared-model")
+  );
+  const resolvedB = await runWithTenantContext(
+    { tenantId: "tenant_mapping_b", role: "owner" },
+    () => mappingsDb.resolveComboForModel("shared-model")
+  );
+  assert.equal(resolvedA?.models[0].model, "openai/gpt-4o");
+  assert.equal(resolvedB?.models[0].model, "openai/claude-sonnet-4");
+
+  await runWithTenantContext({ tenantId: "tenant_mapping_a", role: "owner" }, async () => {
+    const listed = await mappingsDb.getModelComboMappings();
+    assert.deepEqual(
+      listed.items.map((mapping) => mapping.id),
+      [mappingA.id]
+    );
+    assert.equal(await mappingsDb.getModelComboMappingById(mappingB.id), null);
+    assert.equal(await mappingsDb.deleteModelComboMapping(mappingB.id), false);
+    await assert.rejects(
+      mappingsDb.updateModelComboMapping(mappingA.id, { comboId: comboB.id }),
+      /owned by the current tenant/
+    );
+  });
 });

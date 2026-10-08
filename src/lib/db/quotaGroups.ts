@@ -10,6 +10,7 @@
 
 import { getDbInstance } from "./core";
 import { invalidateModelCatalogCache } from "./readCache";
+import { currentDbTenantId } from "./tenantScope";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +44,7 @@ interface GroupRow {
   id: string;
   name: string;
   created_at: string;
+  tenant_id: string;
 }
 
 function rowToGroup(row: GroupRow): QuotaGroup {
@@ -70,8 +72,8 @@ export function createGroup(name: string): QuotaGroup {
   const now = new Date().toISOString();
 
   getDb()
-    .prepare("INSERT INTO quota_groups (id, name, created_at) VALUES (?, ?, ?)")
-    .run(id, name, now);
+    .prepare("INSERT INTO quota_groups (id, tenant_id, name, created_at) VALUES (?, ?, ?, ?)")
+    .run(id, currentDbTenantId(), name, now);
 
   return { id, name, createdAt: now };
 }
@@ -82,8 +84,10 @@ export function createGroup(name: string): QuotaGroup {
  */
 export function getGroup(id: string): QuotaGroup | null {
   const row = getDb()
-    .prepare<GroupRow>("SELECT id, name, created_at FROM quota_groups WHERE id = ?")
-    .get(id);
+    .prepare<GroupRow>(
+      "SELECT id, tenant_id, name, created_at FROM quota_groups WHERE id = ? AND (tenant_id = ? OR id = 'group-demo')"
+    )
+    .get(id, currentDbTenantId());
   if (!row) return null;
   return rowToGroup(row);
 }
@@ -93,8 +97,10 @@ export function getGroup(id: string): QuotaGroup | null {
  */
 export function getGroupName(id: string): string | null {
   const row = getDb()
-    .prepare<{ name: string }>("SELECT name FROM quota_groups WHERE id = ?")
-    .get(id);
+    .prepare<{ name: string }>(
+      "SELECT name FROM quota_groups WHERE id = ? AND (tenant_id = ? OR id = 'group-demo')"
+    )
+    .get(id, currentDbTenantId());
   return row ? row.name : null;
 }
 
@@ -103,8 +109,10 @@ export function getGroupName(id: string): string | null {
  */
 export function listGroups(): QuotaGroup[] {
   const rows = getDb()
-    .prepare<GroupRow>("SELECT id, name, created_at FROM quota_groups ORDER BY created_at ASC")
-    .all();
+    .prepare<GroupRow>(
+      "SELECT id, tenant_id, name, created_at FROM quota_groups WHERE tenant_id = ? OR id = 'group-demo' ORDER BY created_at ASC"
+    )
+    .all(currentDbTenantId());
   return rows.map(rowToGroup);
 }
 
@@ -113,7 +121,9 @@ export function listGroups(): QuotaGroup[] {
  * Returns true if the row was updated, false if the group was not found.
  */
 export function renameGroup(id: string, name: string): boolean {
-  const result = getDb().prepare("UPDATE quota_groups SET name = ? WHERE id = ?").run(name, id);
+  const result = getDb()
+    .prepare("UPDATE quota_groups SET name = ? WHERE id = ? AND tenant_id = ?")
+    .run(name, id, currentDbTenantId());
   if (result.changes > 0) {
     invalidateModelCatalogCache();
     return true;
@@ -135,18 +145,22 @@ export function deleteGroup(id: string): boolean {
   // Protect the seed group.
   if (id === "group-demo") {
     throw new Error(
-      "Cannot delete the protected seed group 'group-demo'. Reassign its pools to another group first.",
+      "Cannot delete the protected seed group 'group-demo'. Reassign its pools to another group first."
     );
   }
 
   // Guard: refuse deletion when pools still reference this group.
   const refRow = getDb()
-    .prepare<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM quota_pools WHERE group_id = ?")
-    .get(id);
+    .prepare<{ cnt: number }>(
+      "SELECT COUNT(*) AS cnt FROM quota_pools WHERE tenant_id = ? AND group_id = ?"
+    )
+    .get(currentDbTenantId(), id);
   if (refRow && refRow.cnt > 0) {
     throw new Error(`Group '${id}' has pools; reassign or delete them first.`);
   }
 
-  const result = getDb().prepare("DELETE FROM quota_groups WHERE id = ?").run(id);
+  const result = getDb()
+    .prepare("DELETE FROM quota_groups WHERE id = ? AND tenant_id = ?")
+    .run(id, currentDbTenantId());
   return result.changes > 0;
 }

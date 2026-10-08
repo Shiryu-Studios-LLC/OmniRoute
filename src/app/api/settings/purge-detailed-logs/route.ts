@@ -1,19 +1,20 @@
 import { NextResponse } from "next/server";
+import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { purgeDetailedLogs } from "@/lib/db/cleanup";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 export async function POST(request: Request) {
-  if (!(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
   try {
     const result = await purgeDetailedLogs();
     return NextResponse.json({
       deleted: result.deleted,
       errors: result.errors,
     });
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
-    return NextResponse.json({ error }, { status: 500 });
+  } catch {
+    return NextResponse.json(buildErrorBody(500, "Failed to purge detailed logs"), {
+      status: 500,
+    });
   }
 }

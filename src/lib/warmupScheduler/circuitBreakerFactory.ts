@@ -92,6 +92,8 @@ async function buildStore(): Promise<CircuitBreakerStore> {
       const redis = new RedisCtor(redisUrl, {
         maxRetriesPerRequest: 3,
         connectTimeout: 3000,
+        commandTimeout: 5000,
+        enableReadyCheck: false,
         lazyConnect: true,
         retryStrategy: () => null,
       });

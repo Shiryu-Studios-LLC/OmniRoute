@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getCostSummary, checkBudget } from "@/domain/costRules";
 import { getApiKeys } from "@/lib/db/apiKeys";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getManagementTenantId } from "@/lib/api/managementTenant";
 
 /**
  * GET /api/usage/budget/bulk — Bulk budget summary for every API key.
@@ -14,10 +15,10 @@ import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
  * so it must not be reachable without the dashboard/management token.
  */
 export async function GET(request: Request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
   try {
-    const keys = await getApiKeys();
+    const keys = await getApiKeys(undefined, undefined, await getManagementTenantId(request));
     const budgets: Record<
       string,
       ReturnType<typeof getCostSummary> & { budgetCheck: ReturnType<typeof checkBudget> }

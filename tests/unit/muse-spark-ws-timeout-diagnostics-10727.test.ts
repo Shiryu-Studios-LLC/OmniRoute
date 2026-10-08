@@ -30,12 +30,21 @@ import { WebSocket } from "ws";
  * advancing a fake clock — keeps the test fast and avoids interleaving
  * bugs between fake timers and the executor's real async/await chain.
  */
-function interceptWsTimeout(): { fire: () => void; restore: () => void } {
+function interceptWsTimeout(): {
+  fire: () => void;
+  registered: Promise<void>;
+  restore: () => void;
+} {
   const original = globalThis.setTimeout;
   let captured: (() => void) | null = null;
+  let markRegistered = () => {};
+  const registered = new Promise<void>((resolve) => {
+    markRegistered = resolve;
+  });
   globalThis.setTimeout = ((cb: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
     if (ms === 30000 && captured === null) {
       captured = cb as () => void;
+      markRegistered();
       return 0 as unknown as ReturnType<typeof setTimeout>;
     }
     return original(cb as () => void, ms, ...args);
@@ -45,6 +54,7 @@ function interceptWsTimeout(): { fire: () => void; restore: () => void } {
       assert.ok(captured, "the 30000ms wsChat timeout was never registered");
       captured?.();
     },
+    registered,
     restore: () => {
       globalThis.setTimeout = original;
     },
@@ -67,6 +77,8 @@ class NeverOpensWebSocket {
   close() {}
 }
 
+let opensThenSilentSocket: OpensThenSilentWebSocket | null = null;
+
 class OpensThenSilentWebSocket {
   onopen: (() => void) | null = null;
   onmessage: ((evt: { data: string }) => void) | null = null;
@@ -74,12 +86,17 @@ class OpensThenSilentWebSocket {
   onerror: ((evt: Error) => void) | null = null;
   readyState = WebSocket.CONNECTING;
   url: string;
+  opened: Promise<void>;
   constructor(url: string) {
     this.url = url;
-    setTimeout(() => {
-      this.readyState = WebSocket.OPEN;
-      this.onopen?.();
-    }, 0);
+    opensThenSilentSocket = this;
+    this.opened = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.readyState = WebSocket.OPEN;
+        this.onopen?.();
+        resolve();
+      }, 0);
+    });
   }
   send(_data: Uint8Array | string) {}
   close() {}
@@ -112,9 +129,7 @@ test("#10727: WS timeout while still CONNECTING reports readyState=0 (never open
   const timeoutHook = interceptWsTimeout();
   try {
     const resultPromise = executor.execute(baseInput("conn-10727-never-opens"));
-    // Let the GraphQL warmup/mode-switch awaits and the WS constructor run
-    // before the 30s timeout is registered.
-    await new Promise((r) => setTimeout(r, 20));
+    await timeoutHook.registered;
     timeoutHook.fire();
 
     const result = await resultPromise;
@@ -143,9 +158,9 @@ test("#10727: WS timeout after a successful open reports readyState=1 (opened, t
   const timeoutHook = interceptWsTimeout();
   try {
     const resultPromise = executor.execute(baseInput("conn-10727-opens-silent"));
-    // Let the GraphQL awaits run, the WS open (its own real setTimeout(...,0)),
-    // and the intro/prompt frames send before the 30s timeout is registered.
-    await new Promise((r) => setTimeout(r, 20));
+    await timeoutHook.registered;
+    assert.ok(opensThenSilentSocket, "the mock WebSocket was not constructed");
+    await opensThenSilentSocket.opened;
     timeoutHook.fire();
 
     const result = await resultPromise;
@@ -160,5 +175,6 @@ test("#10727: WS timeout after a successful open reports readyState=1 (opened, t
     globalThis.fetch = originalFetch;
     restore();
     timeoutHook.restore();
+    opensThenSilentSocket = null;
   }
 });

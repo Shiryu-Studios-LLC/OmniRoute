@@ -10,6 +10,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 const core = await import("../../src/lib/db/core.ts");
 const tokenLimits = await import("../../src/lib/db/tokenLimits.ts");
 const counter = await import("../../open-sse/services/tokenLimitCounter.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 const flush = () => new Promise((r) => setImmediate(r));
 
@@ -50,18 +51,24 @@ function insertUsage(
   tokensInput: number,
   tokensOutput: number,
   ts: string,
-  extra: { cacheRead?: number; cacheCreation?: number; reasoning?: number } = {}
+  extra: {
+    cacheRead?: number;
+    cacheCreation?: number;
+    reasoning?: number;
+    tenantId?: string | null;
+  } = {}
 ) {
   const db = core.getDbInstance();
   db.prepare(
     `INSERT INTO usage_history
-       (provider, model, api_key_id, tokens_input, tokens_output,
+       (provider, model, api_key_id, tenant_id, tokens_input, tokens_output,
         tokens_cache_read, tokens_cache_creation, tokens_reasoning, success, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
   ).run(
     provider,
     model,
     apiKeyId,
+    extra.tenantId ?? null,
     tokensInput,
     tokensOutput,
     extra.cacheRead ?? 0,
@@ -151,7 +158,14 @@ test("seed-on-miss equals usage_history SUM for the active window", async () => 
   // Different month (excluded).
   insertUsage("k2", "openai", "gpt-4o", 999, 999, new Date(Date.UTC(2025, 11, 31)).toISOString());
   // Different model (excluded).
-  insertUsage("k2", "openai", "gpt-4o-mini", 777, 777, new Date(Date.UTC(2026, 0, 13)).toISOString());
+  insertUsage(
+    "k2",
+    "openai",
+    "gpt-4o-mini",
+    777,
+    777,
+    new Date(Date.UTC(2026, 0, 13)).toISOString()
+  );
 
   const expected = 100 + 50 + 30 + 20;
   assert.equal(counter.seedWindowUsageFromHistory(limit, NOW_JAN), expected);
@@ -194,14 +208,44 @@ test("seed total excludes cache tokens (no double-count) (FIX 2)", async () => {
 
   // tokens_input ALREADY INCLUDES cache_read + cache_creation (these columns are a
   // breakdown, per migration 012). Billable = input + output + reasoning ONLY.
-  insertUsage("k2c", "anthropic", "claude-sonnet", 500, 200, new Date(Date.UTC(2026, 0, 12)).toISOString(), {
-    cacheRead: 300,
-    cacheCreation: 100,
-    reasoning: 40,
-  });
+  insertUsage(
+    "k2c",
+    "anthropic",
+    "claude-sonnet",
+    500,
+    200,
+    new Date(Date.UTC(2026, 0, 12)).toISOString(),
+    {
+      cacheRead: 300,
+      cacheCreation: 100,
+      reasoning: 40,
+    }
+  );
 
   // 500 + 200 + 40 = 740. Must NOT add cacheRead/cacheCreation again (would be 1140).
   assert.equal(counter.seedWindowUsageFromHistory(limit, NOW_JAN), 740);
+});
+
+test("history seed excludes rows owned by another tenant even when key ID matches", async () => {
+  const limit = tokenLimits.upsertTokenLimit({
+    apiKeyId: "tenant-key-A",
+    scopeType: "global",
+    tokenLimit: 100000,
+    resetInterval: "monthly",
+  });
+  const timestamp = new Date(Date.UTC(2026, 0, 12)).toISOString();
+
+  insertUsage("tenant-key-A", "openai", "gpt-4o", 100, 25, timestamp, {
+    tenantId: "tenant_A",
+  });
+  insertUsage("tenant-key-A", "openai", "gpt-4o", 9000, 1000, timestamp, {
+    tenantId: "tenant_B",
+  });
+
+  const seeded = runWithTenantContext({ tenantId: "tenant_A", role: "owner" }, () =>
+    counter.seedWindowUsageFromHistory(limit, NOW_JAN)
+  );
+  assert.equal(seeded, 125);
 });
 
 test("cold-window recordTokenUsage seeds from history before increment (FIX 4)", async () => {

@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { createServer } from "node:net";
+import os from "node:os";
 import { join } from "node:path";
 import {
   decodeAdobeJwtPayload,
@@ -174,13 +175,22 @@ export function extractUserJwtFromStorageRaw(raw: string): string {
 }
 
 function resolveAdobeFireflyDataRoot(): string {
-  const dataRoot =
-    String(process.env.DATA_DIR || process.env.OMNIROUTE_DATA_DIR || "").trim() ||
-    (process.env.LOCALAPPDATA
-      ? join(process.env.LOCALAPPDATA, "OmniRoute")
-      : join(process.cwd(), ".data"));
-  mkdirSync(dataRoot, { recursive: true });
-  return dataRoot;
+  const configured = String(process.env.DATA_DIR || process.env.OMNIROUTE_DATA_DIR || "").trim();
+  if (configured) return join(configured);
+  return process.env.LOCALAPPDATA
+    ? join(process.env.LOCALAPPDATA, "OmniRoute")
+    : join(process.cwd(), ".data");
+}
+
+function resolveAdobeFireflyBrowserProfileRoot(): string {
+  const profileRoot = String(process.env.OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR || "").trim();
+  if (profileRoot) return join(profileRoot);
+
+  const configured = String(process.env.DATA_DIR || process.env.OMNIROUTE_DATA_DIR || "").trim();
+  if (configured) return join(configured);
+  if (process.env.LOCALAPPDATA) return join(process.env.LOCALAPPDATA, "OmniRoute");
+  if (process.env.XDG_DATA_HOME) return join(process.env.XDG_DATA_HOME, "omniroute");
+  return join(os.homedir(), ".omniroute");
 }
 
 export function adobeFireflyBrowserSessionKey(value: unknown): string {
@@ -191,7 +201,7 @@ export function adobeFireflyBrowserSessionKey(value: unknown): string {
 /** Chrome 136+ requires a non-default user-data-dir for remote debugging. */
 export function resolveAdobeFireflyBrowserProfileDir(sessionKey?: string): string {
   const profile = join(
-    resolveAdobeFireflyDataRoot(),
+    resolveAdobeFireflyBrowserProfileRoot(),
     "adobe-chrome-profiles",
     adobeFireflyBrowserSessionKey(sessionKey)
   );

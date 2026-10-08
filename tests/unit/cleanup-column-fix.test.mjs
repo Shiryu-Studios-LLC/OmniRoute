@@ -24,14 +24,12 @@ test("cleanup: compression_analytics uses 'timestamp' column (not 'created_at')"
 
 test("cleanup: call_logs uses 'timestamp' column (not 'created_at')", () => {
   // Same bug as compression_analytics.
-  assert.ok(
-    source.includes("DELETE FROM call_logs WHERE timestamp < ?"),
-    "call_logs cleanup must use 'timestamp' column"
+  assert.match(
+    source,
+    /DELETE FROM call_logs\s+WHERE\s+\(tenant_id = \? OR \(tenant_id IS NULL AND \? = 'tenant_shiryu_admin'\)\)\s+AND timestamp < \?/,
+    "call_logs cleanup must retain its timestamp cutoff while scoping deletion to the active tenant"
   );
-  assert.ok(
-    !source.includes("DELETE FROM call_logs WHERE created_at"),
-    "must NOT use created_at for call_logs (column doesn't exist)"
-  );
+  assert.ok(!/DELETE FROM call_logs\s+WHERE\s+created_at/.test(source));
 });
 
 test("cleanup: has proxy_logs cleanup function", () => {
@@ -57,10 +55,7 @@ test("cleanup: has background scheduler (startCleanupScheduler)", () => {
     source.includes("startCleanupScheduler"),
     "must export startCleanupScheduler for periodic background cleanup"
   );
-  assert.ok(
-    source.includes("CLEANUP_INTERVAL_MS"),
-    "must have a cleanup interval constant"
-  );
+  assert.ok(source.includes("CLEANUP_INTERVAL_MS"), "must have a cleanup interval constant");
   assert.ok(
     source.includes("VACUUM"),
     "scheduler must run VACUUM after deletes to reclaim disk space"
@@ -114,10 +109,7 @@ test("cleanup: a2a_task_events uses correct table name (not 'a2a_events')", () =
 });
 
 test("cleanup: memories uses correct table name (not 'memory_entries')", () => {
-  assert.ok(
-    source.includes("DELETE FROM memories WHERE"),
-    "must use correct table name memories"
-  );
+  assert.ok(source.includes("DELETE FROM memories WHERE"), "must use correct table name memories");
   assert.ok(
     !source.includes("DELETE FROM memory_entries WHERE"),
     "must NOT use non-existent table name memory_entries"

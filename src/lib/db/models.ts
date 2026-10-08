@@ -8,6 +8,7 @@ import { isRetiredGitHubCopilotModelId } from "@omniroute/open-sse/config/provid
 
 import type { SqliteAdapter } from "./adapters/types";
 import { getDbInstance } from "./core";
+import { currentDbTenantId, PLATFORM_TENANT_ID } from "./tenantScope";
 import { getProviderConnectionsCount } from "./providers";
 import { type JsonRecord, getKeyValue } from "./models/shared";
 import {
@@ -20,6 +21,13 @@ import {
   persistCanonicalSyncedAvailableModels,
 } from "./models/syncedAvailableModelPersistence";
 import { finishModelCatalogWriteWithBackup } from "./models/modelCatalogWriteSignals";
+
+function syncedModelsNamespace(): string {
+  const tenantId = currentDbTenantId();
+  return tenantId === PLATFORM_TENANT_ID
+    ? "syncedAvailableModels"
+    : `syncedAvailableModels:${tenantId}`;
+}
 import {
   readCompatList,
   writeCompatList,
@@ -448,10 +456,11 @@ export async function getSyncedAvailableModelsForConnection(
   connectionId: string
 ): Promise<SyncedAvailableModel[]> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const key = `${providerId}:${connectionId}`;
   const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
-    .get(key);
+    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+    .get(namespace, key);
   const value = getKeyValue(row).value;
   if (!value) return [];
   try {
@@ -469,11 +478,10 @@ export async function getSyncedAvailableModels(
   providerId: string
 ): Promise<SyncedAvailableModel[]> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${providerId}:%`);
+    .prepare("SELECT key, value FROM key_value WHERE namespace = ? AND key LIKE ?")
+    .all(namespace, `${providerId}:%`);
   const map = new Map<string, SyncedAvailableModel>();
   for (const row of rows) {
     const { key, value } = getKeyValue(row);
@@ -500,12 +508,11 @@ export async function getSyncedAvailableModelsByConnection(
   providerId: string
 ): Promise<SyncedAvailableModelsByConnection> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const prefix = `${providerId}:`;
   const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${prefix}%`);
+    .prepare("SELECT key, value FROM key_value WHERE namespace = ? AND key LIKE ?")
+    .all(namespace, `${prefix}%`);
   const result: SyncedAvailableModelsByConnection = {};
   for (const row of rows) {
     const { key, value } = getKeyValue(row);
@@ -530,9 +537,8 @@ export async function getAllSyncedAvailableModels(): Promise<
   Record<string, SyncedAvailableModel[]>
 > {
   const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels'")
-    .all();
+  const namespace = syncedModelsNamespace();
+  const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(namespace);
   // Group by providerId (before the colon)
   const byProvider = new Map<string, Map<string, SyncedAvailableModel>>();
   for (const row of rows) {
@@ -564,22 +570,23 @@ export async function getActiveProvidersWithSyncedModel(modelId: string): Promis
   if (!modelId) return [];
 
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const rows = db
     .prepare(
       `SELECT DISTINCT pc.provider AS provider
        FROM provider_connections pc
        JOIN key_value kv
-         ON kv.namespace = 'syncedAvailableModels'
+         ON kv.namespace = ?
         AND kv.key = pc.provider || ':' || pc.id
        JOIN json_each(CASE WHEN json_valid(kv.value) THEN kv.value ELSE '[]' END) synced_model
-       WHERE pc.is_active = 1
+       WHERE pc.tenant_id = ? AND pc.is_active = 1
          AND COALESCE(
            json_extract(synced_model.value, '$.id'),
            json_extract(synced_model.value, '$.name'),
            json_extract(synced_model.value, '$.model')
          ) = ?`
     )
-    .all(modelId) as Array<{ provider?: unknown }>;
+    .all(namespace, currentDbTenantId(), modelId) as Array<{ provider?: unknown }>;
 
   return rows
     .map((row) => row.provider)
@@ -612,12 +619,11 @@ export async function removeSyncedAvailableModel(
   modelId: string
 ): Promise<boolean> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const prefix = `${providerId}:`;
   const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${prefix}%`);
+    .prepare("SELECT key, value FROM key_value WHERE namespace = ? AND key LIKE ?")
+    .all(namespace, `${prefix}%`);
 
   let removedAny = false;
   const removeModel = db.transaction(() => {
@@ -638,13 +644,13 @@ export async function removeSyncedAvailableModel(
       if (filtered.length !== models.length) {
         removedAny = true;
         if (filtered.length === 0) {
-          db.prepare(
-            "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?"
-          ).run(key);
+          db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(namespace, key);
         } else {
-          db.prepare(
-            "UPDATE key_value SET value = ? WHERE namespace = 'syncedAvailableModels' AND key = ?"
-          ).run(JSON.stringify(filtered), key);
+          db.prepare("UPDATE key_value SET value = ? WHERE namespace = ? AND key = ?").run(
+            JSON.stringify(filtered),
+            namespace,
+            key
+          );
         }
       }
     }
@@ -664,10 +670,11 @@ export async function deleteSyncedAvailableModelsForConnection(
   connectionId: string
 ): Promise<SyncedAvailableModel[]> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const key = `${providerId}:${connectionId}`;
   const result = db
-    .prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
-    .run(key);
+    .prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?")
+    .run(namespace, key);
   if (result.changes > 0) finishSyncedAvailableModelsWrite();
   return getSyncedAvailableModels(providerId);
 }
@@ -701,12 +708,11 @@ export async function cleanupProviderModelsAfterConnectionDelete(
  */
 export async function deleteSyncedAvailableModelsForProvider(providerId: string): Promise<number> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const keyPrefix = `${providerId}:`;
   const result = db
-    .prepare(
-      "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND substr(key, 1, ?) = ?"
-    )
-    .run(keyPrefix.length, keyPrefix);
+    .prepare("DELETE FROM key_value WHERE namespace = ? AND substr(key, 1, ?) = ?")
+    .run(namespace, keyPrefix.length, keyPrefix);
   const changes = Number(result.changes || 0);
   if (changes > 0) finishSyncedAvailableModelsWrite();
   return changes;
@@ -721,6 +727,7 @@ export async function pruneStaleSyncedAvailableModelsForProvider(
   allowedConnectionIds: string[]
 ): Promise<number> {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   if (allowedConnectionIds.length === 0) {
     return deleteSyncedAvailableModelsForProvider(providerId);
   }
@@ -729,9 +736,9 @@ export async function pruneStaleSyncedAvailableModelsForProvider(
   const allowedKeys = allowedConnectionIds.map((id) => `${providerId}:${id}`);
   const result = db
     .prepare(
-      `DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ? AND key NOT IN (${placeholders})`
+      `DELETE FROM key_value WHERE namespace = ? AND key LIKE ? AND key NOT IN (${placeholders})`
     )
-    .run(`${keyPrefix}%`, ...allowedKeys);
+    .run(namespace, `${keyPrefix}%`, ...allowedKeys);
   const changes = Number(result.changes || 0);
   if (changes > 0) finishSyncedAvailableModelsWrite();
   return changes;

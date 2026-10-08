@@ -5,6 +5,8 @@
 import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel } from "./core";
+import { currentDbTenantId } from "./tenantScope";
+import { auditNaturalApiKeyExpiry } from "./apiKeyExpiryAudit";
 import { backupDbFile } from "./backup";
 import { registerDbStateResetter } from "./stateReset";
 import { invalidateReasoningRoutingRuleCache } from "./reasoningRoutingRules";
@@ -177,6 +179,7 @@ interface StatementLike<TRow = unknown> {
 interface ApiKeysDbLike {
   prepare: <TRow = unknown>(sql: string) => StatementLike<TRow>;
   exec: (sql: string) => void;
+  transaction: <T>(callback: () => T) => () => T;
 }
 
 interface ApiKeysStatements {
@@ -219,7 +222,10 @@ interface ApiKeyView extends JsonRecord {
 }
 
 // LRU cache for API key validation (valid keys only)
-const _keyValidationCache = new Map<string, { valid: boolean; timestamp: number }>();
+const _keyValidationCache = new Map<
+  string,
+  { valid: boolean; timestamp: number; expiresAt: string | null }
+>();
 const _keyMetadataCache = new Map<string, CacheEntry<ApiKeyMetadata>>();
 const _lastUsedUpdateCache = new Map<string, number>();
 const CACHE_TTL = 60 * 1000; // 1 minute TTL
@@ -236,9 +242,7 @@ function assertExclusiveLeaseKeyPolicy(
   allowedConnections: readonly string[]
 ): void {
   if (scopes.includes(EXCLUSIVE_LEASE_SCOPE) && allowedConnections.length === 0) {
-    throw new ApiKeyPolicyInvariantError(
-      "lease:exclusive requires explicit allowedConnections"
-    );
+    throw new ApiKeyPolicyInvariantError("lease:exclusive requires explicit allowedConnections");
   }
 }
 
@@ -349,7 +353,7 @@ async function getModelPermissionCandidates(modelId: string): Promise<string[]> 
         providerOrAlias,
         providerScopedModel,
         resolveProviderId,
-        getProviderAlias,
+        getProviderAlias
       );
     }
     return Array.from(candidates);
@@ -367,7 +371,7 @@ async function getModelPermissionCandidates(modelId: string): Promise<string[]> 
 }
 
 async function getPublishedModelLookupTarget(
-  modelId: string,
+  modelId: string
 ): Promise<{ providerId: string; modelId: string } | null> {
   const cleanModelId = stripExtendedContextSuffix(modelId.trim());
   if (!cleanModelId) return null;
@@ -396,7 +400,7 @@ async function getPublishedModelLookupTarget(
 function ensureApiKeyColumn(
   db: ApiKeysDbLike,
   columnNames: Set<string>,
-  column: (typeof API_KEY_COLUMN_FALLBACKS)[number],
+  column: (typeof API_KEY_COLUMN_FALLBACKS)[number]
 ): void {
   if (columnNames.has(column.name)) return;
   db.exec(`ALTER TABLE api_keys ADD COLUMN ${column.definition}`);
@@ -433,18 +437,22 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
     _stmtDb !== db
   ) {
     _stmtDb = db;
-    _stmtGetAllKeys = db.prepare<ApiKeyRow>("SELECT * FROM api_keys ORDER BY created_at");
-    _stmtGetKeyById = db.prepare<ApiKeyRow>("SELECT * FROM api_keys WHERE id = ?");
+    _stmtGetAllKeys = db.prepare<ApiKeyRow>(
+      "SELECT * FROM api_keys WHERE tenant_id = ? ORDER BY created_at"
+    );
+    _stmtGetKeyById = db.prepare<ApiKeyRow>(
+      "SELECT * FROM api_keys WHERE id = ? AND tenant_id = ?"
+    );
     _stmtValidateKey = db.prepare<JsonRecord>(
-      "SELECT id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key = ? OR key_hash = ?",
+      "SELECT id, tenant_id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key = ? OR key_hash = ?"
     );
     _stmtGetKeyMetadata = db.prepare<ApiKeyRow>(
-      "SELECT id, tenant_id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?",
+      "SELECT id, tenant_id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?"
     );
     _stmtInsertKey = db.prepare(
       "INSERT INTO api_keys (id, tenant_id, name, key, machine_id, allowed_models, allowed_combos, allowed_connections, no_log, created_at, key_prefix, key_hash, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
-    _stmtDeleteKey = db.prepare("DELETE FROM api_keys WHERE id = ?");
+    _stmtDeleteKey = db.prepare("DELETE FROM api_keys WHERE id = ? AND tenant_id = ?");
   }
 
   if (
@@ -468,15 +476,15 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
   };
 }
 
-export async function getApiKeys(limit?: number, offset?: number) {
+export async function getApiKeys(limit?: number, offset?: number, tenantId = currentDbTenantId()) {
   const db = getDbInstance() as ApiKeysDbLike;
   let rows: ApiKeyRow[];
   if (limit !== undefined) {
-    const sql = "SELECT * FROM api_keys ORDER BY created_at LIMIT ? OFFSET ?";
-    rows = db.prepare(sql).all(limit, offset ?? 0) as ApiKeyRow[];
+    const sql = "SELECT * FROM api_keys WHERE tenant_id = ? ORDER BY created_at LIMIT ? OFFSET ?";
+    rows = db.prepare(sql).all(tenantId, limit, offset ?? 0) as ApiKeyRow[];
   } else {
     const stmt = getPreparedStatements(db);
-    rows = stmt.getAllKeys.all();
+    rows = stmt.getAllKeys.all(tenantId);
   }
   return rows.map((row) => {
     const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
@@ -500,7 +508,7 @@ export async function getApiKeys(limit?: number, offset?: number) {
     camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
     camelRow.cacheDefaultMode = parseCacheDefaultMode((camelRow as JsonRecord).cacheDefaultMode);
     camelRow.disableNonPublicModels = parseDisableNonPublicModels(
-      (camelRow as JsonRecord).disableNonPublicModels,
+      (camelRow as JsonRecord).disableNonPublicModels
     );
     camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
     camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
@@ -517,7 +525,9 @@ export async function getApiKeys(limit?: number, offset?: number) {
 
 export function getApiKeysCount(): number {
   const db = getDbInstance() as ApiKeysDbLike;
-  const row = db.prepare("SELECT count(*) as cnt FROM api_keys").get() as { cnt: number };
+  const row = db
+    .prepare("SELECT count(*) as cnt FROM api_keys WHERE tenant_id = ?")
+    .get(currentDbTenantId()) as { cnt: number };
   return row.cnt;
 }
 
@@ -528,9 +538,9 @@ export async function getExclusiveLeaseConnectionIds(): Promise<Set<string>> {
     .prepare<ApiKeyRow>(
       `SELECT allowed_connections FROM api_keys
        WHERE is_active != 0 AND is_banned != 1 AND revoked_at IS NULL
-       AND (expires_at IS NULL OR expires_at > ?) AND scopes LIKE ?`
+       AND (expires_at IS NULL OR expires_at > ?) AND scopes LIKE ? AND tenant_id = ?`
     )
-    .all(new Date().toISOString(), `%"${EXCLUSIVE_LEASE_SCOPE}"%`);
+    .all(new Date().toISOString(), `%"${EXCLUSIVE_LEASE_SCOPE}"%`, currentDbTenantId());
   return new Set(rows.flatMap((row) => parseAllowedConnections(row.allowed_connections)));
 }
 
@@ -559,7 +569,7 @@ export async function getExclusiveLeaseConnectionIds(): Promise<Set<string>> {
  * inactive, banned, or hard-lease key, and it never widens a key's allowedModels.
  */
 export async function pickApiKeyForInternalUse(
-  purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe",
+  purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe"
 ): Promise<string | null> {
   try {
     const keys = (await getApiKeys()) as Array<{
@@ -582,7 +592,7 @@ export async function pickApiKeyForInternalUse(
 
     // 1. Management-scoped key (preferred for any internal probe).
     const manageKey = keys.find(
-      (k) => isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage"),
+      (k) => isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage")
     );
     if (manageKey?.key) return manageKey.key;
 
@@ -614,10 +624,10 @@ export async function pickApiKeyForInternalUse(
   }
 }
 
-export async function getApiKeyById(id: string) {
+export async function getApiKeyById(id: string, tenantId = currentDbTenantId()) {
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
-  const row = stmt.getKeyById.get(id);
+  const row = stmt.getKeyById.get(id, tenantId);
   if (!row) return null;
   const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
   camelRow.modelAccessMode = parseModelAccessMode(camelRow.modelAccessMode, camelRow.allowedModels);
@@ -637,7 +647,7 @@ export async function getApiKeyById(id: string) {
   camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
   camelRow.cacheDefaultMode = parseCacheDefaultMode((camelRow as JsonRecord).cacheDefaultMode);
   camelRow.disableNonPublicModels = parseDisableNonPublicModels(
-    (camelRow as JsonRecord).disableNonPublicModels,
+    (camelRow as JsonRecord).disableNonPublicModels
   );
   camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
   camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
@@ -661,6 +671,26 @@ async function hashKey(key: string): Promise<string> {
   return createHash("sha256").update(key).digest("hex"); // nosemgrep: insufficient-password-hash
 }
 
+async function logApiKeyLifecycleEvent(
+  action: string,
+  id: string,
+  name: string,
+  details: Record<string, unknown> = {}
+) {
+  const { logAuditEvent } = await import("@/lib/compliance");
+  logAuditEvent({
+    action,
+    target: id,
+    resourceType: "api_key",
+    status: "success",
+    details: {
+      tenantId: currentDbTenantId(),
+      name,
+      ...details,
+    },
+  });
+}
+
 export async function createApiKey(
   name: string,
   machineId: string,
@@ -681,7 +711,7 @@ export async function createApiKey(
 
   const apiKey = {
     id: uuidv4(),
-    tenantId: "tenant_shiryu_admin",
+    tenantId: currentDbTenantId(),
     name: name,
     key: result.key,
     machineId: machineId,
@@ -709,9 +739,14 @@ export async function createApiKey(
     apiKey.createdAt,
     apiKey.key.slice(0, 12),
     await hashKey(apiKey.key),
-    JSON.stringify(scopes),
+    JSON.stringify(scopes)
   );
   setNoLog(apiKey.id, false);
+
+  await logApiKeyLifecycleEvent("apiKey.create", apiKey.id, apiKey.name, {
+    machineId: apiKey.machineId,
+    scopes: apiKey.scopes,
+  });
 
   backupDbFile("pre-write");
   return apiKey;
@@ -720,7 +755,7 @@ export async function createApiKey(
 export async function regenerateApiKey(id: string) {
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
-  const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
+  const row = stmt.getKeyById.get(id, currentDbTenantId()) as ApiKeyRow | undefined;
   if (!row) return null;
 
   const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
@@ -731,33 +766,34 @@ export async function regenerateApiKey(id: string) {
 
   // Update in DB
   const updateStmt = db.prepare(
-    "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ?",
+    "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ? AND tenant_id = ?"
   );
-  updateStmt.run(newKey, newHash, newPrefix, id);
+  updateStmt.run(newKey, newHash, newPrefix, id, currentDbTenantId());
 
   // Invalidate all caches
   clearApiKeyCaches();
 
   await deleteRedisAuthCacheEntries(row.key_hash, newHash);
 
-  const { logAuditEvent } = await import("@/lib/compliance");
-  logAuditEvent({
-    action: "apiKey.regenerate",
-    target: id,
-    details: { name: String(row.name || "") },
-  });
+  await logApiKeyLifecycleEvent("apiKey.regenerate", id, String(row.name || ""));
 
   return { id, key: newKey };
 }
 
 export async function updateApiKeyPermissions(
   id: string,
-  update: string[] | ApiKeyPermissionsUpdate,
+  update: string[] | ApiKeyPermissionsUpdate
 ) {
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
 
   const normalized = normalizeApiKeyPermissionsUpdate(update);
+  const expiryAuditName =
+    normalized.expiresAt === undefined
+      ? null
+      : (db
+          .prepare<{ name: string }>("SELECT name FROM api_keys WHERE id = ? AND tenant_id = ?")
+          .get(id, currentDbTenantId())?.name ?? null);
   const shouldInvalidateModelCatalog =
     normalized.modelAccessMode !== undefined ||
     normalized.allowedModels !== undefined ||
@@ -1015,9 +1051,9 @@ export async function updateApiKeyPermissions(
     try {
       const prevRow = db
         .prepare<{ scopes: string | null; allowed_connections: string | null }>(
-          "SELECT scopes, allowed_connections FROM api_keys WHERE id = ?"
+          "SELECT scopes, allowed_connections FROM api_keys WHERE id = ? AND tenant_id = ?"
         )
-        .get(id);
+        .get(id, currentDbTenantId());
       if (!prevRow) {
         db.exec("ROLLBACK");
         return false;
@@ -1029,8 +1065,10 @@ export async function updateApiKeyPermissions(
           : normalized.allowedConnections;
       assertExclusiveLeaseKeyPolicy(nextScopes, nextAllowedConnections);
       const upd = db
-        .prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`)
-        .run(params);
+        .prepare(
+          `UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id AND tenant_id = @tenantId`
+        )
+        .run({ ...params, tenantId: currentDbTenantId() });
       changedRows = upd.changes ?? 0;
       db.exec("COMMIT");
     } catch (err) {
@@ -1048,14 +1086,20 @@ export async function updateApiKeyPermissions(
     db.exec("BEGIN IMMEDIATE");
     try {
       const row = db
-        .prepare<{ scopes: string | null }>("SELECT scopes FROM api_keys WHERE id = ?")
-        .get(id);
+        .prepare<{ scopes: string | null }>(
+          "SELECT scopes FROM api_keys WHERE id = ? AND tenant_id = ?"
+        )
+        .get(id, currentDbTenantId());
       if (!row) {
         db.exec("ROLLBACK");
         return false;
       }
       assertExclusiveLeaseKeyPolicy(parseStringList(row.scopes), normalized.allowedConnections);
-      const upd = db.prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`).run(params);
+      const upd = db
+        .prepare(
+          `UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id AND tenant_id = @tenantId`
+        )
+        .run({ ...params, tenantId: currentDbTenantId() });
       changedRows = upd.changes ?? 0;
       db.exec("COMMIT");
     } catch (err) {
@@ -1067,13 +1111,21 @@ export async function updateApiKeyPermissions(
       throw err;
     }
   } else {
-    const upd = db.prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`).run(params);
+    const upd = db
+      .prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id AND tenant_id = @tenantId`)
+      .run({ ...params, tenantId: currentDbTenantId() });
     changedRows = upd.changes ?? 0;
   }
 
   if (changedRows === 0) return false;
 
   const { logAuditEvent } = await import("@/lib/compliance");
+
+  if (normalized.expiresAt !== undefined && expiryAuditName !== null) {
+    await logApiKeyLifecycleEvent("apiKey.expiry.update", id, String(expiryAuditName), {
+      expiresAt: normalized.expiresAt,
+    });
+  }
 
   if (normalized.isBanned !== undefined) {
     logAuditEvent({
@@ -1138,10 +1190,12 @@ export async function updateApiKeyPermissions(
 export async function deleteApiKey(id: string) {
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
-  const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
-  const result = stmt.deleteKey.run(id);
+  const row = stmt.getKeyById.get(id, currentDbTenantId()) as ApiKeyRow | undefined;
+  const result = stmt.deleteKey.run(id, currentDbTenantId());
 
   if (result.changes === 0) return false;
+
+  await logApiKeyLifecycleEvent("apiKey.delete", id, String(row?.name || ""));
 
   db.prepare("DELETE FROM domain_budgets WHERE api_key_id = ?").run(id);
   db.prepare("DELETE FROM domain_cost_history WHERE api_key_id = ?").run(id);
@@ -1164,14 +1218,20 @@ export async function deleteApiKey(id: string) {
 export async function revokeApiKey(id: string): Promise<boolean> {
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
+  const previous = db
+    .prepare<{ name: string }>("SELECT name FROM api_keys WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId());
+  if (!previous) return false;
 
   const result = db
     .prepare(
-      "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, @ts), is_active = 0 WHERE id = @id",
+      "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, @ts), is_active = 0 WHERE id = @id AND tenant_id = @tenantId"
     )
-    .run({ id, ts: new Date().toISOString() });
+    .run({ id, tenantId: currentDbTenantId(), ts: new Date().toISOString() });
 
   if ((result.changes ?? 0) === 0) return false;
+
+  await logApiKeyLifecycleEvent("apiKey.revoke", id, String(previous.name || ""));
 
   invalidateCaches();
   await deleteRedisAuthCacheForKeyId(db, id);
@@ -1185,12 +1245,20 @@ export async function revokeApiKey(id: string): Promise<boolean> {
 export async function setApiKeyExpiry(id: string, expiresAt: string | null): Promise<boolean> {
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
+  const previous = db
+    .prepare<{ name: string }>("SELECT name FROM api_keys WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId());
+  if (!previous) return false;
 
   const result = db
-    .prepare("UPDATE api_keys SET expires_at = @expiresAt WHERE id = @id")
-    .run({ id, expiresAt });
+    .prepare("UPDATE api_keys SET expires_at = @expiresAt WHERE id = @id AND tenant_id = @tenantId")
+    .run({ id, tenantId: currentDbTenantId(), expiresAt });
 
   if ((result.changes ?? 0) === 0) return false;
+
+  await logApiKeyLifecycleEvent("apiKey.expiry.update", id, String(previous.name || ""), {
+    expiresAt,
+  });
 
   invalidateCaches();
   await deleteRedisAuthCacheForKeyId(db, id);
@@ -1223,7 +1291,11 @@ export async function validateApiKey(key: string | null | undefined) {
 
   const cached = _keyValidationCache.get(cacheKey);
   if (cached && now - cached.timestamp < CACHE_TTL) {
-    return cached.valid;
+    const cachedExpiryMs = cached.expiresAt ? Date.parse(cached.expiresAt) : Number.NaN;
+    if (!Number.isFinite(cachedExpiryMs) || cachedExpiryMs > now) return cached.valid;
+    // Preserve the natural-expiry audit path when an in-process positive cache
+    // entry reaches its key's expiration instant.
+    _keyValidationCache.delete(cacheKey);
   }
 
   if (isRedisAuthCacheEnabled()) {
@@ -1245,9 +1317,12 @@ export async function validateApiKey(key: string | null | undefined) {
           if (typeof revokedAt === "string" && revokedAt.trim() !== "") return false;
           if (typeof expiresAt === "string" && expiresAt.trim() !== "") {
             const expiresMs = Date.parse(expiresAt);
-            if (Number.isFinite(expiresMs) && expiresMs <= now) return false;
+            // Resolve expired Redis hits through SQLite so the durable, atomic
+            // transition audit can be recorded before rejecting the key.
+            if (!Number.isFinite(expiresMs) || expiresMs > now) return true;
+          } else {
+            return true;
           }
-          return true;
         }
       }
     } catch {
@@ -1273,11 +1348,24 @@ export async function validateApiKey(key: string | null | undefined) {
   const expiresAt = row.expires_at ?? row.expiresAt;
   if (typeof expiresAt === "string" && expiresAt.trim() !== "") {
     const expiresMs = Date.parse(expiresAt);
-    if (Number.isFinite(expiresMs) && expiresMs <= now) return false;
+    if (Number.isFinite(expiresMs) && expiresMs <= now) {
+      if (typeof row.id === "string" && typeof row.tenant_id === "string") {
+        auditNaturalApiKeyExpiry(db, {
+          id: row.id,
+          tenantId: row.tenant_id,
+          expiresAt,
+        });
+      }
+      return false;
+    }
   }
 
   evictIfNeeded(_keyValidationCache);
-  _keyValidationCache.set(cacheKey, { valid: true, timestamp: now });
+  _keyValidationCache.set(cacheKey, {
+    valid: true,
+    timestamp: now,
+    expiresAt: typeof expiresAt === "string" && expiresAt.trim() !== "" ? expiresAt : null,
+  });
 
   if (isRedisAuthCacheEnabled()) {
     // Update Redis cache for fast validation
@@ -1296,7 +1384,7 @@ export async function validateApiKey(key: string | null | undefined) {
             revokedAt: row.revoked_at,
           }),
           "EX",
-          3600, // 1 hour cache
+          3600 // 1 hour cache
         );
       }
     } catch {
@@ -1313,7 +1401,7 @@ export async function validateApiKey(key: string | null | undefined) {
  * Get API key metadata with caching for performance
  */
 export async function getApiKeyMetadata(
-  key: string | null | undefined,
+  key: string | null | undefined
 ): Promise<ApiKeyMetadata | null> {
   if (!key || typeof key !== "string") return null;
 
@@ -1427,10 +1515,10 @@ export async function getApiKeyMetadata(
     blockedModels: parseAllowedModels(record.blocked_models ?? record.blockedModels),
     allowedCombos: parseAllowedCombos(record.allowed_combos ?? record.allowedCombos),
     allowedConnections: parseAllowedConnections(
-      record.allowed_connections ?? record.allowedConnections,
+      record.allowed_connections ?? record.allowedConnections
     ),
     allowedQuotas: parseAllowedQuotas(
-      (record as JsonRecord).allowed_quotas ?? (record as JsonRecord).allowedQuotas,
+      (record as JsonRecord).allowed_quotas ?? (record as JsonRecord).allowedQuotas
     ),
     noLog: parseNoLog(record.no_log ?? record.noLog),
     autoResolve: parseAutoResolve(record.auto_resolve ?? record.autoResolve),
@@ -1452,26 +1540,26 @@ export async function getApiKeyMetadata(
     proxyId:
       typeof record.proxy_id === "string" && record.proxy_id.trim() !== "" ? record.proxy_id : null,
     allowedEndpoints: parseStringList(
-      (record as JsonRecord).allowed_endpoints ?? (record as JsonRecord).allowedEndpoints,
+      (record as JsonRecord).allowed_endpoints ?? (record as JsonRecord).allowedEndpoints
     ),
     streamDefaultMode: parseStreamDefaultMode(
-      (record as JsonRecord).stream_default_mode ?? (record as JsonRecord).streamDefaultMode,
+      (record as JsonRecord).stream_default_mode ?? (record as JsonRecord).streamDefaultMode
     ),
     cacheDefaultMode: parseCacheDefaultMode(
       (record as JsonRecord).cache_default_mode ?? (record as JsonRecord).cacheDefaultMode
     ),
     disableNonPublicModels: parseDisableNonPublicModels(
       (record as JsonRecord).disable_non_public_models ??
-        (record as JsonRecord).disableNonPublicModels,
+        (record as JsonRecord).disableNonPublicModels
     ),
     allowUsageCommand: parseAllowUsageCommand(
-      (record as JsonRecord).allow_usage_command ?? (record as JsonRecord).allowUsageCommand,
+      (record as JsonRecord).allow_usage_command ?? (record as JsonRecord).allowUsageCommand
     ),
     chaosModeEnabled: parseChaosModeEnabled(
-      (record as JsonRecord).chaos_mode_enabled ?? (record as JsonRecord).chaosModeEnabled,
+      (record as JsonRecord).chaos_mode_enabled ?? (record as JsonRecord).chaosModeEnabled
     ),
     compressionEnabled: parseCompressionEnabled(
-      (record as JsonRecord).compression_enabled ?? (record as JsonRecord).compressionEnabled,
+      (record as JsonRecord).compression_enabled ?? (record as JsonRecord).compressionEnabled
     ),
     ...parseApiKeyUsageLimitFields(record as JsonRecord),
   };
@@ -1497,7 +1585,7 @@ export async function getApiKeyMetadata(
  */
 export async function isModelAllowedForKey(
   key: string | null | undefined,
-  modelId: string | null | undefined,
+  modelId: string | null | undefined
 ) {
   // If no key provided, allow (request may be using different auth method like JWT)
   // If no modelId provided, deny (invalid request)

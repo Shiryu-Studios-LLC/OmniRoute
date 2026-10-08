@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 import { getRequestDetailLogByCallLogId } from "../db/detailedLogs";
 import { shouldPersistToDisk } from "./migrations";
 import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
@@ -118,11 +119,6 @@ type LegacyInlineRow = {
   request_body: string | null;
   response_body: string | null;
   error: string | null;
-};
-
-type DeleteResult = {
-  deletedRows: number;
-  deletedArtifacts: number;
 };
 
 let logIdCounter = 0;
@@ -545,7 +541,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     db.prepare(
       `
       INSERT INTO call_logs (
-        id, timestamp, method, path, status, model, requested_model, provider,
+        id, tenant_id, timestamp, method, path, status, model, requested_model, provider,
         account, connection_id, duration, tokens_in, tokens_out,
         tokens_cache_read, tokens_cache_creation, tokens_reasoning, tokens_compressed,
         reasoning_source, reasoning_chars,
@@ -556,7 +552,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         correlation_id, model_pinned, session_tag, response_id, error_type
       )
       VALUES (
-        @id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
+        @id, @tenantId, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
         @account, @connectionId, @duration, @tokensIn, @tokensOut,
         @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
         @reasoningSource, @reasoningChars,
@@ -569,6 +565,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     `
     ).run({
       ...logEntry,
+      tenantId: currentDbTenantId(),
       errorSummary: toStoredErrorSummary(protectedError),
       detailState,
       artifactRelPath,
@@ -659,11 +656,15 @@ export async function getCallLogs(filter: any = {}) {
       pn.name AS provider_node_name, pn.prefix AS provider_node_prefix,
       ${RESOLVED_ACCOUNT_SQL} AS resolved_account
     FROM call_logs cl
-    LEFT JOIN provider_nodes pn ON pn.id = cl.provider
-    LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
+    LEFT JOIN provider_nodes pn
+      ON pn.id = cl.provider AND pn.tenant_id = COALESCE(cl.tenant_id, 'tenant_shiryu_admin')
+    LEFT JOIN provider_connections pc
+      ON pc.id = cl.connection_id AND pc.tenant_id = COALESCE(cl.tenant_id, 'tenant_shiryu_admin')
   `;
-  const conditions: string[] = [];
-  const params: Record<string, unknown> = {};
+  const conditions: string[] = [
+    "(cl.tenant_id = @tenantId OR (cl.tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))",
+  ];
+  const params: Record<string, unknown> = { tenantId: currentDbTenantId() };
 
   if (filter.status) {
     if (filter.status === "error") {
@@ -753,11 +754,14 @@ export async function getCallLogById(id: string) {
         pn.prefix AS provider_node_prefix,
         ${RESOLVED_ACCOUNT_SQL} AS resolved_account
        FROM call_logs cl
-       LEFT JOIN provider_nodes pn ON pn.id = cl.provider
-       LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
-       WHERE cl.id = ?`
+       LEFT JOIN provider_nodes pn
+         ON pn.id = cl.provider AND pn.tenant_id = COALESCE(cl.tenant_id, 'tenant_shiryu_admin')
+       LEFT JOIN provider_connections pc
+         ON pc.id = cl.connection_id AND pc.tenant_id = COALESCE(cl.tenant_id, 'tenant_shiryu_admin')
+       WHERE cl.id = ?
+         AND (cl.tenant_id = ? OR (cl.tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))`
     )
-    .get(id) as CallLogSummaryRow | undefined;
+    .get(id, currentDbTenantId(), currentDbTenantId()) as CallLogSummaryRow | undefined;
   if (!row) return null;
 
   const entry = mapSummaryRow(row);
@@ -784,7 +788,10 @@ export async function getCallLogById(id: string) {
       clearArtifactReference(artifactRelPath, "missing");
       artifactRelPath = null;
     } else {
-      db.prepare("UPDATE call_logs SET detail_state = ? WHERE id = ?").run("corrupt", id);
+      db.prepare(
+        `UPDATE call_logs SET detail_state = ? WHERE id = ?
+         AND (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))`
+      ).run("corrupt", id, currentDbTenantId(), currentDbTenantId());
     }
   }
 
@@ -837,8 +844,13 @@ export async function getCallLogById(id: string) {
 export async function exportCallLogsSince(since: string) {
   const db = getDbInstance();
   const ids = db
-    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC")
-    .all(since)
+    .prepare(
+      `SELECT id FROM call_logs
+       WHERE timestamp >= ?
+         AND (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+       ORDER BY timestamp DESC`
+    )
+    .all(since, currentDbTenantId(), currentDbTenantId())
     .map((row) => String((row as { id: string }).id));
 
   const logs: unknown[] = [];

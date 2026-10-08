@@ -22,10 +22,10 @@ test("ttft() is null when nothing was forwarded", () => {
 test("ttft() measures first-forwarded-chunk latency (byte vs forward distinguished)", async () => {
   const t = createStreamTiming();
   t.markByte(); // first upstream byte arrives immediately
-  await new Promise((r) => setTimeout(r, 20));
-  t.markForward(); // first chunk forwarded 20ms later
+  await new Promise((r) => setTimeout(r, 50));
+  t.markForward(); // first chunk forwarded after a measurable delay
   const ttft = t.ttftMs();
-  assert.ok(ttft !== null && ttft >= 20 && ttft < 5000, `ttft=${ttft}`);
+  assert.ok(ttft !== null && ttft >= 40 && ttft < 5000, `ttft=${ttft}`);
   assert.ok(t.firstByteAt !== null);
   assert.ok(t.firstByteAt! < t.firstForwardAt!, "first byte precedes first forward");
 });
@@ -71,11 +71,11 @@ test("interruption is recorded and does not reset other timing", async () => {
 
 test("normal completion: totalMs() is monotonic and >= first-forward latency", async () => {
   const t = createStreamTiming();
-  await new Promise((r) => setTimeout(r, 15));
+  await new Promise((r) => setTimeout(r, 50));
   t.markForward();
   const total = t.totalMs();
   const ttft = t.ttftMs();
-  assert.ok(total >= 15);
+  assert.ok(total >= 40);
   assert.ok(ttft !== null && ttft <= total, "ttft must be <= total duration");
 });
 

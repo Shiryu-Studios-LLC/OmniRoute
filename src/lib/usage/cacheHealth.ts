@@ -18,6 +18,7 @@
  */
 
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import type { UtilizationTimeRange } from "@/shared/types/utilization";
 
 /** One `call_logs` row, already narrowed to the cache columns. Both counters are nullable in the schema. */
@@ -252,7 +253,8 @@ export function buildCacheHealthResponse(opts: {
   const since = new Date((opts.now ?? Date.now()) - RANGE_MS[opts.range]).toISOString();
   const db = getDbInstance();
 
-  const params: (string | number)[] = [since];
+  const tenantId = currentDbTenantId();
+  const params: (string | number)[] = [since, tenantId, tenantId];
   let modelFilter = "";
   if (opts.model) {
     modelFilter = " AND (model = ? OR requested_model = ?)";
@@ -263,8 +265,9 @@ export function buildCacheHealthResponse(opts: {
   const rows = db
     .prepare(
       `SELECT model, requested_model, tokens_cache_read, tokens_cache_creation, timestamp
-         FROM call_logs
+        FROM call_logs
         WHERE timestamp >= ?
+          AND (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
           AND status = 200
           AND (tokens_cache_read IS NOT NULL OR tokens_cache_creation IS NOT NULL)
           ${modelFilter}

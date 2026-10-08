@@ -53,8 +53,8 @@ function seedConnection(id: string, provider: string, maxConcurrent: number) {
   const db = getDbInstance();
   db.prepare(
     `INSERT OR REPLACE INTO provider_connections
-      (id, provider, auth_type, is_active, max_concurrent, created_at, updated_at)
-     VALUES (?, ?, 'apikey', 1, ?, datetime('now'), datetime('now'))`
+      (id, provider, auth_type, is_active, max_concurrent, created_at, updated_at, tenant_id)
+     VALUES (?, ?, 'apikey', 1, ?, datetime('now'), datetime('now'), 'tenant_shiryu_admin')`
   ).run(id, provider, maxConcurrent);
 }
 

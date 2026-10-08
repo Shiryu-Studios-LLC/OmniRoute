@@ -101,6 +101,10 @@ const ENV_VAR_ALLOWLIST = new Set([
   // by tests/unit/docker-build-memory-budget.test.ts.
   "OMNIROUTE_BUILD_WORKERS",
   "CIRCLE_NODE_TOTAL",
+  // GitHub Environment secrets consumed by the manual Cloudflare staging workflow.
+  // They are injected into Actions/Wrangler, not read by the OmniRoute runtime.
+  "CLOUDFLARE_API_TOKEN",
+  "CLOUDFLARE_STAGING_D1_DATABASE_ID",
   "OMNIROUTE_BUILD_SHA",
   "OMNIROUTE_URL", // used by ad-hoc tooling, validated elsewhere
   "OMNIROUTE_KEY", // ditto

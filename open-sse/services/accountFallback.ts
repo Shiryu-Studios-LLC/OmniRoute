@@ -57,6 +57,7 @@ import {
   isTpmExhausted,
 } from "./geminiRateLimitTracker.ts";
 import { setConnectionRateLimitUntil } from "@/lib/db/providers";
+import { currentDbTenantId } from "../../src/lib/db/tenantScope.ts";
 import {
   parseRetryHintFromJsonBody,
   parseDelayString,
@@ -1066,10 +1067,11 @@ export function recordProviderFailure(
   // declaration). A dead proxy persists across requests and still accumulates.
   if (opts?.isNetworkError) {
     const now = Date.now();
-    const last = lastNetworkErrorByProvider.get(provider);
+    const networkErrorKey = `${currentDbTenantId()}:${provider}`;
+    const last = lastNetworkErrorByProvider.get(networkErrorKey);
     if (last && now - last < NETWORK_ERROR_DEDUP_MS) return;
-    lastNetworkErrorByProvider.delete(provider);
-    lastNetworkErrorByProvider.set(provider, now);
+    lastNetworkErrorByProvider.delete(networkErrorKey);
+    lastNetworkErrorByProvider.set(networkErrorKey, now);
     while (lastNetworkErrorByProvider.size > MAX_NETWORK_ERROR_DEDUP_ENTRIES) {
       const oldestKey = lastNetworkErrorByProvider.keys().next().value;
       if (typeof oldestKey !== "string") break;
@@ -1079,7 +1081,7 @@ export function recordProviderFailure(
 
   // Deduplicate rapid-fire failures from the same connection
   if (connectionId) {
-    const dedupKey = `${provider}:${connectionId}`;
+    const dedupKey = `${currentDbTenantId()}:${provider}:${connectionId}`;
     const now = Date.now();
     const lastFailure = lastConnectionFailure.get(dedupKey);
     if (lastFailure && now - lastFailure < CONNECTION_FAILURE_DEDUP_MS) {
@@ -1135,7 +1137,7 @@ export function recordProviderSuccess(
 
   // Clear failure-dedup window so the next genuine failure is not suppressed.
   if (connectionId) {
-    lastConnectionFailure.delete(`${provider}:${connectionId}`);
+    lastConnectionFailure.delete(`${currentDbTenantId()}:${provider}:${connectionId}`);
   }
 
   // Transition breaker on success, matching execute()'s behavior:

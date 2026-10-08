@@ -1,5 +1,6 @@
 import type { SqliteAdapter } from "@/lib/db/adapters/types";
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 
 // #2650: extracted from compliance/index.ts to break the
 // callLogs.ts → compliance/index.ts → callLogs.ts cycle that deadlocks
@@ -28,12 +29,7 @@ for (const id of noLogIdsFromEnv) {
 }
 
 export function setNoLog(apiKeyId: string, noLog: boolean): void {
-  if (noLog) {
-    noLogKeys.add(apiKeyId);
-  } else {
-    noLogKeys.delete(apiKeyId);
-  }
-  noLogDbCache.set(apiKeyId, { value: noLog, timestamp: Date.now() });
+  noLogDbCache.set(`${currentDbTenantId()}:${apiKeyId}`, { value: noLog, timestamp: Date.now() });
 }
 
 function ensureNoLogColumn(db: SqliteAdapter): boolean {
@@ -53,21 +49,25 @@ function ensureNoLogColumn(db: SqliteAdapter): boolean {
 }
 
 function readNoLogFromDb(apiKeyId: string): boolean {
-  const db = getDb();
-  if (!db || !apiKeyId) return false;
-  if (!ensureNoLogColumn(db)) return false;
-
-  const cached = noLogDbCache.get(apiKeyId);
+  const tenantId = currentDbTenantId();
+  const cacheKey = `${tenantId}:${apiKeyId}`;
+  const cached = noLogDbCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < NO_LOG_CACHE_TTL_MS) {
     return cached.value;
   }
 
+  const db = getDb();
+  if (!db || !apiKeyId) return false;
+  if (!ensureNoLogColumn(db)) return false;
+
   try {
-    const row = db.prepare("SELECT no_log FROM api_keys WHERE id = ?").get(apiKeyId) as
-      | { no_log?: number }
-      | undefined;
+    const row = db
+      .prepare(
+        "SELECT no_log FROM api_keys WHERE id = ? AND (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))"
+      )
+      .get(apiKeyId, tenantId, tenantId) as { no_log?: number } | undefined;
     const value = Boolean(row && Number(row.no_log) === 1);
-    noLogDbCache.set(apiKeyId, { value, timestamp: Date.now() });
+    noLogDbCache.set(cacheKey, { value, timestamp: Date.now() });
     return value;
   } catch {
     return false;
@@ -78,9 +78,5 @@ export function isNoLog(apiKeyId: string): boolean {
   if (!apiKeyId) return false;
   if (noLogKeys.has(apiKeyId)) return true;
 
-  const persistedNoLog = readNoLogFromDb(apiKeyId);
-  if (persistedNoLog) {
-    noLogKeys.add(apiKeyId);
-  }
-  return persistedNoLog;
+  return readNoLogFromDb(apiKeyId);
 }

@@ -157,14 +157,14 @@ const makeValidator = makeNumberClaimValidator as (
 ) => (content: string) => { ok: boolean; detail: string };
 
 test("MCP-tools gate accepts the aggregate and rejects a stale one", () => {
-  const v = makeValidator(109, {
+  const v = makeValidator(110, {
     what: "MCP tools",
     pattern: /(\d+) tools/gi,
     skipBefore: /(tools?|definitions?)\s*\(\s*$/i,
     skipAfter: /^\s*\(\d+ CLI/,
   });
-  assert.equal(v("MCP Server (109 tools)").ok, true);
-  assert.equal(v("with 109 tools total").ok, true);
+  assert.equal(v("MCP Server (110 tools)").ok, true);
+  assert.equal(v("with 110 tools total").ok, true);
   assert.equal(v("MCP Server (94 tools)").ok, false);
 });
 
@@ -189,11 +189,11 @@ test("compression-engines and CLI-tools gates catch their v3.8.49 drift", () => 
   assert.equal(eng("12-engine stack").ok, true);
   assert.equal(eng("11-engine stack").ok, false);
 
-  const cli = makeValidator(33, {
+  const cli = makeValidator(35, {
     what: "CLI tools",
     pattern: /(\d+) tools(?=\s*\(\d+ CLI)/gi,
   });
-  assert.equal(cli("all 33 tools (25 CLI Code's)").ok, true);
+  assert.equal(cli("all 35 tools (25 CLI Code's)").ok, true);
   assert.equal(cli("all 26 tools (25 CLI Code's)").ok, false);
 });
 
@@ -225,8 +225,8 @@ test("countMigrations reads a real, positive migration count", () => {
 });
 
 test("provider-reference validator accepts the live total and rejects a stale doc", () => {
-  const v = makeRefValidator(338);
-  assert.equal(v("Total providers: **338**. See category breakdown below.").ok, true);
+  const v = makeRefValidator(352);
+  assert.equal(v("Total providers: **352**. See category breakdown below.").ok, true);
   const stale = v("Total providers: **291**. See category breakdown below.");
   assert.equal(stale.ok, false, "a hand-stale doc total must be a red, not a silent pass");
   assert.match(stale.detail, /gen:provider-reference/);
@@ -234,8 +234,8 @@ test("provider-reference validator accepts the live total and rejects a stale do
 });
 
 test("package.json description validator catches a stale provider count", () => {
-  const v = makePkgValidator(338);
-  assert.equal(v(JSON.stringify({ description: "Unified AI router with 338 providers" })).ok, true);
+  const v = makePkgValidator(352);
+  assert.equal(v(JSON.stringify({ description: "Unified AI router with 352 providers" })).ok, true);
   assert.equal(
     v(JSON.stringify({ description: "Unified AI router with 291 providers" })).ok,
     false
@@ -244,18 +244,18 @@ test("package.json description validator catches a stale provider count", () => 
 });
 
 test("migrations claim validator accepts the real count and rejects stale styles", () => {
-  const v = makeValidator(146, { what: "migrations", pattern: /(\d+)\+? migrations?\b/gi });
-  assert.equal(v("SQLite domain modules (146 migrations)").ok, true);
+  const v = makeValidator(173, { what: "migrations", pattern: /(\d+)\+? migrations?\b/gi });
+  assert.equal(v("SQLite domain modules (173 migrations)").ok, true);
   assert.equal(v("local, zero-config, 110+ migrations").ok, false);
   assert.equal(v("(130 migrations)").ok, false);
 });
 
-const SVG_EXPECTED = { providers: 339, mcpTools: 109, strategies: 19, pools: 41 };
+const SVG_EXPECTED = { providers: 352, mcpTools: 110, strategies: 19, pools: 40 };
 
 test("SVG gate accepts canonical numbers in text and aria-label claims", () => {
   const good =
-    'aria-label="339 AI providers, 19 routing strategies, MCP with 109 tools, ' +
-    '41 provider pools" <text>339 providers</text><text>MCP (109</text>';
+    'aria-label="352 AI providers, 19 routing strategies, MCP with 110 tools, ' +
+    '40 provider pools" <text>352 providers</text><text>MCP (110</text>';
   assert.equal(checkSvg(good, SVG_EXPECTED).ok, true);
 });
 

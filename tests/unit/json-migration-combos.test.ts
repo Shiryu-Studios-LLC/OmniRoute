@@ -7,8 +7,10 @@ import path from "node:path";
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-json-migration-"));
 const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
 process.env.DATA_DIR = TEST_DATA_DIR;
+process.env.API_KEY_SECRET = "json-migration-export-test-secret";
 
 const core = await import("../../src/lib/db/core.ts");
+const apiKeys = await import("../../src/lib/db/apiKeys.ts");
 const { runJsonMigration } = await import("../../src/lib/db/jsonMigration.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
 const usageHistory = await import("../../src/lib/usage/usageHistory.ts");
@@ -92,7 +94,13 @@ test("usage snapshots survive an export, connection deletion, and import round t
   });
 
   const response = await exportRoute.GET(
-    new Request("http://localhost/api/settings/export-json?includeHistory=true")
+    new Request("http://localhost/api/settings/export-json?includeHistory=true", {
+      headers: {
+        authorization: `Bearer ${
+          (await apiKeys.createApiKey("Backup test", "backup-test", ["manage"])).key
+        }`,
+      },
+    })
   );
   assert.equal(response.status, 200);
   const exported = await response.json();
@@ -143,7 +151,6 @@ test("runJsonMigration normalizes legacy combo strategy names at the import boun
   assert.equal(byId.get("combo-usage").config.strategy, "context-optimized");
   assert.equal(byId.get("combo-unknown").strategy, "priority");
 });
-
 
 test("runJsonMigration rejects invalid combo invariants atomically", () => {
   const db = core.getDbInstance();

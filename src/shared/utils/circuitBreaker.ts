@@ -23,7 +23,16 @@ import {
   deleteCircuitBreakerState,
   deleteAllCircuitBreakerStates,
 } from "../../lib/db/domainState";
+import { currentDbTenantId } from "../../lib/db/tenantScope";
 import type { FailureKind } from "./classify429";
+
+function circuitBreakerStoragePrefix(tenantId = currentDbTenantId()): string {
+  return `${tenantId.length}:${tenantId}:`;
+}
+
+function circuitBreakerStorageName(name: string, tenantId = currentDbTenantId()): string {
+  return `${circuitBreakerStoragePrefix(tenantId)}${name}`;
+}
 
 /**
  * #4602 — Detect a LOCAL stream-lifecycle error that must NOT count as a
@@ -137,6 +146,7 @@ export interface CircuitBreakerStatus {
 
 export class CircuitBreaker {
   name: string;
+  storageName: string;
   failureThreshold: number;
   resetTimeout: number;
   halfOpenRequests: number;
@@ -164,8 +174,13 @@ export class CircuitBreaker {
   /** Max transition history entries */
   maxTransitionHistory: number;
 
-  constructor(name: string, options: CircuitBreakerOptions = {}) {
+  constructor(
+    name: string,
+    options: CircuitBreakerOptions = {},
+    storageName = circuitBreakerStorageName(name)
+  ) {
     this.name = name;
+    this.storageName = storageName;
     this.failureThreshold = options.failureThreshold ?? 5;
     this.resetTimeout = options.resetTimeout ?? 30000;
     this.halfOpenRequests = options.halfOpenRequests ?? 1;
@@ -196,7 +211,7 @@ export class CircuitBreaker {
 
   _restoreFromDb() {
     try {
-      const saved = loadCircuitBreakerState(this.name);
+      const saved = loadCircuitBreakerState(this.storageName);
       if (saved) {
         if (
           saved.state === STATE.CLOSED ||
@@ -230,7 +245,7 @@ export class CircuitBreaker {
 
   _persistToDb() {
     try {
-      saveCircuitBreakerState(this.name, {
+      saveCircuitBreakerState(this.storageName, {
         state: this.state,
         failureCount: this.failureCount,
         lastFailureTime: this.lastFailureTime,
@@ -517,16 +532,16 @@ export function __getCircuitRegistrySizeForTests(): number {
 
 const _registrySweep = setInterval(() => {
   const now = Date.now();
-  for (const [name, breaker] of registry) {
+  for (const [storageName, breaker] of registry) {
     const status = breaker.getStatus();
     if (
       status.state === STATE.CLOSED &&
       status.failureCount === 0 &&
       (!status.lastFailureTime || now - status.lastFailureTime > 30 * 60 * 1000)
     ) {
-      registry.delete(name);
+      registry.delete(storageName);
       try {
-        deleteCircuitBreakerState(name);
+        deleteCircuitBreakerState(storageName);
       } catch {}
     }
   }
@@ -564,11 +579,12 @@ function evictColdBreakersIfNeeded(): void {
 }
 
 export function getCircuitBreaker(name: string, options?: CircuitBreakerOptions): CircuitBreaker {
-  if (!registry.has(name)) {
+  const storageName = circuitBreakerStorageName(name);
+  if (!registry.has(storageName)) {
     evictColdBreakersIfNeeded();
-    registry.set(name, new CircuitBreaker(name, options));
+    registry.set(storageName, new CircuitBreaker(name, options, storageName));
   }
-  const breaker = registry.get(name)!;
+  const breaker = registry.get(storageName)!;
   if (options) {
     if (typeof options.failureThreshold === "number") {
       breaker.failureThreshold = options.failureThreshold;
@@ -619,25 +635,33 @@ export function getCircuitBreaker(name: string, options?: CircuitBreakerOptions)
 
 export function getAllCircuitBreakerStatuses() {
   try {
-    const persisted = loadAllCircuitBreakerStates();
+    const prefix = circuitBreakerStoragePrefix();
+    const persisted = loadAllCircuitBreakerStates(prefix);
     for (const cb of persisted) {
+      const name = cb.name.slice(prefix.length);
       if (!registry.has(cb.name)) {
-        getCircuitBreaker(cb.name);
+        getCircuitBreaker(name);
       }
     }
   } catch {
     // Use registry only
   }
-  return Array.from(registry.values()).map((cb) => cb.getStatus());
+  const prefix = circuitBreakerStoragePrefix();
+  return Array.from(registry.values())
+    .filter((cb) => cb.storageName.startsWith(prefix))
+    .map((cb) => cb.getStatus());
 }
 
 export function resetAllCircuitBreakers() {
+  const prefix = circuitBreakerStoragePrefix();
   for (const cb of registry.values()) {
-    cb.reset();
+    if (cb.storageName.startsWith(prefix)) cb.reset();
   }
-  registry.clear();
+  for (const [storageName, cb] of registry) {
+    if (cb.storageName.startsWith(prefix)) registry.delete(storageName);
+  }
   try {
-    deleteAllCircuitBreakerStates();
+    deleteAllCircuitBreakerStates(prefix);
   } catch {
     // Non-critical
   }

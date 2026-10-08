@@ -1,4 +1,5 @@
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 /**
  * Provider/model call statistics aggregated from `call_logs`.
@@ -39,12 +40,13 @@ export function getProviderCallStats(): ProviderCallStat[] {
          SUM(c.tokens_in) AS totalTokensIn,
          SUM(c.tokens_out) AS totalTokensOut
        FROM call_logs c
-       LEFT JOIN provider_nodes pn ON pn.id = c.provider
-       WHERE c.provider IS NOT NULL AND c.provider != '-'
+       LEFT JOIN provider_nodes pn ON pn.id = c.provider AND pn.tenant_id = c.tenant_id
+       WHERE (c.tenant_id = ? OR (c.tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+         AND c.provider IS NOT NULL AND c.provider != '-'
        GROUP BY c.provider
        ORDER BY totalRequests DESC`
     )
-    .all() as ProviderCallStat[];
+    .all(currentDbTenantId(), currentDbTenantId()) as ProviderCallStat[];
 }
 
 export function getModelCallStats(): ModelCallStat[] {
@@ -59,10 +61,11 @@ export function getModelCallStats(): ModelCallStat[] {
          ROUND(AVG(c.duration)) AS avgLatencyMs,
          SUM(CASE WHEN c.status >= 200 AND c.status < 400 THEN 1 ELSE 0 END) AS successfulRequests
        FROM call_logs c
-       LEFT JOIN provider_nodes pn ON pn.id = c.provider
-       WHERE c.provider IS NOT NULL AND c.model IS NOT NULL
+       LEFT JOIN provider_nodes pn ON pn.id = c.provider AND pn.tenant_id = c.tenant_id
+       WHERE (c.tenant_id = ? OR (c.tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+         AND c.provider IS NOT NULL AND c.model IS NOT NULL
        GROUP BY c.provider, c.model
        ORDER BY c.provider, requests DESC`
     )
-    .all() as ModelCallStat[];
+    .all(currentDbTenantId(), currentDbTenantId()) as ModelCallStat[];
 }

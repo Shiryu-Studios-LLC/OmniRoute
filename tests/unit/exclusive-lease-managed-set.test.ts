@@ -26,8 +26,8 @@ function insertKey(input: {
     .prepare(
       `INSERT INTO api_keys
        (id, name, key, machine_id, allowed_models, allowed_connections, scopes, no_log, is_active,
-        revoked_at, expires_at, created_at)
-       VALUES (?, ?, ?, 'test', '[]', ?, ?, 1, ?, ?, ?, ?)`
+        revoked_at, expires_at, created_at, tenant_id)
+       VALUES (?, ?, ?, 'test', '[]', ?, ?, 1, ?, ?, ?, ?, 'tenant_shiryu_admin')`
     )
     .run(
       input.id,

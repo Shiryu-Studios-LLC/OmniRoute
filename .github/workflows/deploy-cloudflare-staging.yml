@@ -1,0 +1,240 @@
+name: Deploy Cloudflare staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_staging:
+        description: Type deploy-staging to deploy the isolated staging Worker
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    name: Validate and deploy staging Worker
+    runs-on: ubuntu-latest
+    environment: cloudflare-staging
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_STAGING_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_STAGING_D1_DATABASE_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate staging-only credentials and migration inputs
+        shell: bash
+        env:
+          CONFIRM_STAGING: ${{ inputs.confirm_staging }}
+          OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM_STAGING" != "deploy-staging" ]]; then
+            echo "Type deploy-staging in the workflow input to continue."
+            exit 1
+          fi
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || { echo "Missing CLOUDFLARE_API_TOKEN in cloudflare-staging environment."; exit 1; }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_ACCOUNT_ID must be a 32-character Cloudflare account ID."; exit 1; }
+          [[ "$CLOUDFLARE_STAGING_D1_DATABASE_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_STAGING_D1_DATABASE_ID must be a 32-character staging D1 ID."; exit 1; }
+          [[ "$OMNIROUTE_CLOUD_ADMIN_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "OMNIROUTE_CLOUD_ADMIN_TOKEN must be 32–512 URL-safe characters with no whitespace or control characters."; exit 1; }
+          if [[ ! -d cloudflare/migrations ]] || ! find cloudflare/migrations -maxdepth 1 -type f -name '*.sql' -print -quit | grep -q .; then
+            echo "No Cloudflare D1 SQL migrations found."
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Validate Worker graph and migration numbering
+        run: |
+          npm run cloudflare:build
+          npm run check:migration-numbering
+
+      - name: Prepare isolated staging config
+        id: staging-config
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/wrangler-cloudflare-staging-${GITHUB_RUN_ID}.json"
+          CONFIG_PATH="$config" node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const sourcePath = path.resolve("wrangler.jsonc");
+          const source = fs.readFileSync(sourcePath, "utf8");
+          // The checked-in Wrangler file is JSONC without comments. Strip JSONC
+          // trailing commas before parsing so edits remain schema checked below.
+          const config = JSON.parse(source.replace(/,\s*([}\]])/g, "$1"));
+          const allowedTopLevel = new Set([
+            "$schema",
+            "name",
+            "main",
+            "compatibility_date",
+            "compatibility_flags",
+            "observability",
+            "d1_databases",
+            "durable_objects",
+            "migrations",
+          ]);
+          const unexpectedTopLevel = Object.keys(config).filter((key) => !allowedTopLevel.has(key));
+          if (unexpectedTopLevel.length) {
+            throw new Error(`Refusing staging config with unexpected Wrangler fields: ${unexpectedTopLevel.join(", ")}`);
+          }
+          if (!Array.isArray(config.d1_databases) || config.d1_databases.length !== 1) {
+            throw new Error("Expected exactly one D1 binding in wrangler.jsonc");
+          }
+          const db = config.d1_databases[0];
+          const allowedDatabaseFields = new Set(["binding", "database_name", "database_id", "migrations_dir"]);
+          if (Object.keys(db).some((key) => !allowedDatabaseFields.has(key)) || db.binding !== "DB") {
+            throw new Error("Refusing staging config with an unexpected D1 binding");
+          }
+          const gatewayBindings = config.durable_objects?.bindings;
+          if (
+            !Array.isArray(gatewayBindings) ||
+            gatewayBindings.length !== 1 ||
+            gatewayBindings[0].name !== "GATEWAY_SESSIONS" ||
+            gatewayBindings[0].class_name !== "GatewaySessionObject" ||
+            Object.keys(gatewayBindings[0]).some((key) => !["name", "class_name"].includes(key))
+          ) {
+            throw new Error("Refusing staging config with an unexpected Durable Object binding");
+          }
+          if (config.routes?.length || config.route || config.custom_domains?.length) {
+            throw new Error("Refusing staging deployment: base config declares route/custom-domain targets");
+          }
+
+          config.name = "omniroute-cloud-runtime-staging";
+          config.workers_dev = true;
+          config.routes = [];
+          config.main = path.resolve(config.main);
+          config.d1_databases[0].database_name = "omniroute-cloud-runtime-staging";
+          config.d1_databases[0].database_id = process.env.CLOUDFLARE_STAGING_D1_DATABASE_ID;
+          config.durable_objects = config.durable_objects ?? { bindings: [] };
+          config.vars = {
+            ...config.vars,
+            OMNIROUTE_ENV: "staging",
+            OMNIROUTE_BUILD_SHA: process.env.GITHUB_SHA,
+          };
+          config.d1_databases[0].migrations_dir = path.resolve("cloudflare/migrations");
+
+          fs.writeFileSync(process.env.CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+          NODE
+          echo "path=$config" >> "$GITHUB_OUTPUT"
+
+      - name: Apply outstanding migrations to the staging D1 database
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const expectedName = "omniroute-cloud-runtime-staging";
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const databaseId = process.env.CLOUDFLARE_STAGING_D1_DATABASE_ID;
+
+          async function main() {
+            let response;
+            try {
+              response = await fetch(
+                `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}`,
+                {
+                  headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+                  signal: AbortSignal.timeout(30_000),
+                },
+              );
+            } catch {
+              throw new Error("Could not verify the configured D1 database with Cloudflare.");
+            }
+            if (!response.ok) {
+              throw new Error(`Cloudflare D1 metadata check failed (HTTP ${response.status}).`);
+            }
+            let payload;
+            try {
+              payload = await response.json();
+            } catch {
+              throw new Error("Cloudflare returned invalid D1 metadata.");
+            }
+            if (payload?.success !== true || payload?.result?.name !== expectedName) {
+              throw new Error("Configured D1 ID is not the dedicated staging database; refusing migrations.");
+            }
+          }
+
+          main().catch((error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+          npx wrangler d1 migrations list omniroute-cloud-runtime-staging --remote --config "$WRANGLER_CONFIG"
+          npx wrangler d1 migrations apply omniroute-cloud-runtime-staging --remote --config "$WRANGLER_CONFIG"
+
+      - name: Deploy staging Worker without routes or production bindings
+        id: deploy
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/wrangler-staging-deploy-${GITHUB_RUN_ID}.log"
+          npx wrangler deploy --config "$WRANGLER_CONFIG" 2>&1 | tee "$output"
+          url="$(grep -Eo 'https://[[:alnum:].-]+\.workers\.dev' "$output" | tail -n 1 || true)"
+          [[ "$url" == https://omniroute-cloud-runtime-staging.*.workers.dev ]] || {
+            echo "Could not verify the deployed staging workers.dev URL from Wrangler output."
+            exit 1
+          }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Bind staging cloud admin token
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+
+      - name: Verify staging health and D1 binding
+        shell: bash
+        env:
+          STAGING_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          health="$(curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused "$STAGING_URL/__cloud/health")"
+          printf '%s' "$health" | node -e '
+            let body = "";
+            process.stdin.on("data", (chunk) => { body += chunk; });
+            process.stdin.on("end", () => {
+              const value = JSON.parse(body);
+              if (value.status !== "ok" || value.runtime !== "cloudflare") process.exit(1);
+            });
+          '
+          db="$(curl --fail --silent --show-error "$STAGING_URL/__cloud/db")"
+          printf '%s' "$db" | node -e '
+            let body = "";
+            process.stdin.on("data", (chunk) => { body += chunk; });
+            process.stdin.on("end", () => {
+              const value = JSON.parse(body);
+              if (value.status !== "ok" || value.runtime !== "cloudflare" || value.database !== "d1") process.exit(1);
+            });
+          '
+          echo "Staging Worker health and D1 binding are healthy."
+
+      - name: Remove temporary Wrangler configuration and deployment log
+        if: always()
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+        run: |
+          rm -f -- "${WRANGLER_CONFIG:-}" "$RUNNER_TEMP/wrangler-staging-deploy-${GITHUB_RUN_ID}.log"

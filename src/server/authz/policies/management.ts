@@ -5,6 +5,7 @@ import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow, reject } from "../context";
 import { extractApiKey, isValidApiKey } from "../../../sse/services/auth";
 import { getApiKeyMetadata } from "../../../lib/db/apiKeys";
+import { getTenantById, getTenantMemberRole } from "../../../lib/db/tenants";
 import { hasManageScope } from "../../../lib/api/requireManagementAuth";
 import {
   hasMcpConnectOrManageScope,
@@ -28,6 +29,7 @@ import {
   isLocalOnlyBypassableByManageScope,
   isLocalOnlyPath,
 } from "../routeGuard";
+import { getTenantManagementPermission, hasTenantManagementPermission } from "../tenantPermissions";
 
 const MODEL_SYNC_MANAGEMENT_PATH = /^\/api\/providers\/[^/]+\/(sync-models|models)$/;
 
@@ -306,6 +308,31 @@ export const managementPolicy: RoutePolicy = {
           // getApiKeyMetadata returns null whenever the row has no id,
           // so when `meta` is truthy `meta.id` is guaranteed non-empty.
           if (meta && hasManageScope(meta.scopes)) {
+            const requiredPermission = getTenantManagementPermission(path, ctx.request.method);
+            if (requiredPermission) {
+              if (!meta.tenantId) {
+                return reject(403, "TENANT_CONTEXT_INVALID", "API key tenant is not available");
+              }
+              const tenant = getTenantById(meta.tenantId);
+              if (!tenant) {
+                return reject(403, "TENANT_CONTEXT_INVALID", "API key tenant is not available");
+              }
+              const role = getTenantMemberRole(meta.tenantId, meta.id);
+              if (tenant.kind === "customer" && !role) {
+                return reject(
+                  403,
+                  "TENANT_MEMBERSHIP_REQUIRED",
+                  "Tenant membership is required for customer management access"
+                );
+              }
+              if (role && !hasTenantManagementPermission(role, requiredPermission)) {
+                return reject(
+                  403,
+                  "TENANT_ROLE_FORBIDDEN",
+                  "Tenant role does not permit this operation"
+                );
+              }
+            }
             return allow({
               kind: "management_key",
               id: meta.id,

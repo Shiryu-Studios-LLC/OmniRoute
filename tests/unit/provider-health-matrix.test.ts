@@ -20,6 +20,7 @@ const callLogs = await import("../../src/lib/usage/callLogs.ts");
 const matrix = await import("../../src/lib/monitoring/providerHealthMatrix.ts");
 const route = await import("../../src/app/api/providers/health-matrix/route.ts");
 const accountFallback = await import("@omniroute/open-sse/services/accountFallback");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 const PROVIDER = "matrix-test-provider";
 const ALIAS_PROVIDER = "nous";
@@ -248,6 +249,97 @@ test("provider health matrix treats recovered models as degraded instead of erro
   assert.equal(model.lastErrorStatus, 503);
   assert.equal(model.successRate, 50);
   assert.equal(model.status, "degraded");
+});
+
+test("provider health matrix excludes other tenants' call-log telemetry", async () => {
+  const tenantAConnection = (await runWithTenantContext(
+    { tenantId: "tenant_matrix_a", role: "owner" },
+    () =>
+      providersDb.createProviderConnection({
+        id: "matrix-tenant-a-connection",
+        provider: PROVIDER,
+        authType: "apikey",
+        name: "tenant-a-key",
+        apiKey: "test-key-a",
+        isActive: true,
+      })
+  )) as Record<string, unknown>;
+  const tenantBConnection = (await runWithTenantContext(
+    { tenantId: "tenant_matrix_b", role: "owner" },
+    () =>
+      providersDb.createProviderConnection({
+        id: "matrix-tenant-b-connection",
+        provider: PROVIDER,
+        authType: "apikey",
+        name: "tenant-b-key",
+        apiKey: "test-key-b",
+        isActive: true,
+      })
+  )) as Record<string, unknown>;
+  const tenantBOnlyConnection = (await runWithTenantContext(
+    { tenantId: "tenant_matrix_b", role: "owner" },
+    () =>
+      providersDb.createProviderConnection({
+        id: "matrix-tenant-b-only-connection",
+        provider: "matrix-tenant-b-only-provider",
+        authType: "apikey",
+        name: "tenant-b-only-key",
+        apiKey: "test-key-b-only",
+        isActive: true,
+      })
+  )) as Record<string, unknown>;
+  const startedAt = Date.now();
+
+  await runWithTenantContext({ tenantId: "tenant_matrix_a", role: "owner" }, () =>
+    callLogs.saveCallLog({
+      id: "matrix-tenant-a-log",
+      timestamp: new Date(startedAt).toISOString(),
+      status: 200,
+      provider: PROVIDER,
+      connectionId: String(tenantAConnection.id),
+      model: "matrix-tenant-model",
+      duration: 100,
+    })
+  );
+  await runWithTenantContext({ tenantId: "tenant_matrix_b", role: "owner" }, async () => {
+    await callLogs.saveCallLog({
+      id: "matrix-tenant-b-log",
+      timestamp: new Date(startedAt + 1_000).toISOString(),
+      status: 503,
+      provider: PROVIDER,
+      connectionId: String(tenantBConnection.id),
+      model: "matrix-tenant-model",
+      duration: 900,
+      error: "tenant B upstream failure",
+    });
+    await callLogs.saveCallLog({
+      id: "matrix-tenant-b-only-log",
+      timestamp: new Date(startedAt + 2_000).toISOString(),
+      status: 503,
+      provider: "matrix-tenant-b-only-provider",
+      connectionId: String(tenantBOnlyConnection.id),
+      model: "tenant-b-only-model",
+      duration: 900,
+      error: "tenant B only upstream failure",
+    });
+  });
+
+  const report = await runWithTenantContext({ tenantId: "tenant_matrix_a", role: "owner" }, () =>
+    matrix.buildProviderHealthMatrix({ includeHealthy: true, range: "24h" })
+  );
+
+  const provider = report.providers.find((row) => row.provider === PROVIDER);
+  assert.ok(provider);
+  assert.equal(provider.requests, 1);
+  assert.equal(provider.successRate, 100);
+  assert.equal(
+    provider.accounts.some((account) => account.connectionId === tenantBConnection.id),
+    false
+  );
+  assert.equal(
+    report.providers.some((row) => row.provider === "matrix-tenant-b-only-provider"),
+    false
+  );
 });
 
 test("provider health matrix route requires management auth", async () => {

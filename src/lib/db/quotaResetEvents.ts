@@ -1,4 +1,5 @@
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -116,14 +117,14 @@ function getLatestSnapshotObservation(
           next_reset_at as nextResetAt,
           remaining_percentage as remainingPercentage
         FROM quota_snapshots
-        WHERE connection_id = ?
+        WHERE tenant_id = ? AND connection_id = ?
           AND LOWER(window_key) = LOWER(?)
           AND next_reset_at IS NOT NULL
         ORDER BY created_at DESC, id DESC
         LIMIT 1
       `
       )
-      .get(connectionId, windowKey);
+      .get(currentDbTenantId(), connectionId, windowKey);
     if (!row) return null;
     return {
       resetAt: row.nextResetAt,
@@ -171,12 +172,13 @@ export function recordProviderQuotaResetEventIfChanged(input: ResetEventInput): 
     db.prepare(
       `
       INSERT OR IGNORE INTO provider_quota_reset_events
-        (provider, connection_id, window_key, window_started_at, window_resets_at,
+        (tenant_id, provider, connection_id, window_key, window_started_at, window_resets_at,
          observed_at, previous_remaining_percentage, new_remaining_percentage,
          previous_used_percentage, new_used_percentage, raw_data)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
     ).run(
+      currentDbTenantId(),
       input.provider,
       input.connectionId,
       input.windowKey,
@@ -216,14 +218,14 @@ function getRecordedQuotaWindowStartIso(
           window_resets_at as windowResetsAt,
           observed_at as observedAt
         FROM provider_quota_reset_events
-        WHERE connection_id = @connectionId
+        WHERE tenant_id = @tenantId AND connection_id = @connectionId
           AND LOWER(window_key) LIKE '%weekly%'
           AND LOWER(window_key) NOT LIKE '%sonnet%'
           AND observed_at <= @nowIso
         ORDER BY observed_at DESC, id DESC
       `
       )
-      .all({ connectionId, nowIso });
+      .all({ tenantId: currentDbTenantId(), connectionId, nowIso });
 
     for (const row of rows) {
       if (resetDay(row.windowResetsAt) === targetDay) {

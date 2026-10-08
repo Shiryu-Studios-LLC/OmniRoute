@@ -35,8 +35,8 @@ test("connection verification skips an ACTIVE exclusive lease before any probe o
   const db = core.getDbInstance();
   db.prepare(
     `INSERT INTO provider_connections
-     (id, provider, auth_type, name, api_key, is_active, test_status, created_at, updated_at)
-     VALUES (?, ?, 'apikey', ?, ?, 1, 'active', ?, ?)`
+     (id, provider, auth_type, name, api_key, is_active, test_status, created_at, updated_at, tenant_id)
+     VALUES (?, ?, 'apikey', ?, ?, 1, 'active', ?, ?, 'tenant_shiryu_admin')`
   ).run(
     "leased-test-connection",
     "openai",

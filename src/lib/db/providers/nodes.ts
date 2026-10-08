@@ -8,6 +8,7 @@ import { selectProviderNodeForConnection } from "../providerNodeSelect";
 import { backupDbFile } from "../backup";
 import { invalidateDbCache } from "../readCache";
 import { toRecord, type JsonRecord } from "./columns";
+import { assertTenantScope, currentDbTenantId } from "../tenantScope";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -21,11 +22,11 @@ interface DbLike {
 
 export async function getProviderNodes(filter: JsonRecord = {}, limit?: number, offset?: number) {
   const db = getDbInstance() as unknown as DbLike;
-  let sql = "SELECT * FROM provider_nodes";
-  const params: Record<string, unknown> = {};
+  let sql = "SELECT * FROM provider_nodes WHERE tenant_id = @tenantId";
+  const params: Record<string, unknown> = { tenantId: assertTenantScope(filter.tenantId) };
 
   if (filter.type) {
-    sql += " WHERE type = @type";
+    sql += " AND type = @type";
     params.type = filter.type;
   }
   sql += " ORDER BY id ASC";
@@ -40,11 +41,11 @@ export async function getProviderNodes(filter: JsonRecord = {}, limit?: number, 
 
 export function getProviderNodesCount(filter: JsonRecord = {}): number {
   const db = getDbInstance() as unknown as DbLike;
-  let sql = "SELECT count(*) as cnt FROM provider_nodes";
-  const params: Record<string, unknown> = {};
+  let sql = "SELECT count(*) as cnt FROM provider_nodes WHERE tenant_id = @tenantId";
+  const params: Record<string, unknown> = { tenantId: assertTenantScope(filter.tenantId) };
 
   if (filter.type) {
-    sql += " WHERE type = @type";
+    sql += " AND type = @type";
     params.type = filter.type;
   }
 
@@ -54,7 +55,9 @@ export function getProviderNodesCount(filter: JsonRecord = {}): number {
 
 export async function getProviderNodeById(id: string) {
   const db = getDbInstance() as unknown as DbLike;
-  const row = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
+  const row = db
+    .prepare("SELECT * FROM provider_nodes WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId());
   return row ? rowToCamel(row) : null;
 }
 
@@ -71,6 +74,7 @@ export async function resolveProviderNodeForConnection(idOrType: string) {
 }
 
 export async function createProviderNode(data: JsonRecord) {
+  const tenantId = assertTenantScope(data.tenantId);
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
 
@@ -78,6 +82,7 @@ export async function createProviderNode(data: JsonRecord) {
 
   const node = {
     id: data.id || uuidv4(),
+    tenantId,
     type: data.type,
     name: data.name,
     prefix: data.prefix || null,
@@ -94,8 +99,8 @@ export async function createProviderNode(data: JsonRecord) {
 
   db.prepare(
     `
-    INSERT INTO provider_nodes (id, type, name, prefix, api_type, base_url, chat_path, models_path, icon_url, custom_headers_json, created_at, updated_at)
-    VALUES (@id, @type, @name, @prefix, @apiType, @baseUrl, @chatPath, @modelsPath, @iconUrl, @customHeadersJson, @createdAt, @updatedAt)
+    INSERT INTO provider_nodes (id, tenant_id, type, name, prefix, api_type, base_url, chat_path, models_path, icon_url, custom_headers_json, created_at, updated_at)
+    VALUES (@id, @tenantId, @type, @name, @prefix, @apiType, @baseUrl, @chatPath, @modelsPath, @iconUrl, @customHeadersJson, @createdAt, @updatedAt)
   `
   ).run(node);
 
@@ -117,13 +122,17 @@ export async function createProviderNode(data: JsonRecord) {
 }
 
 export async function updateProviderNode(id: string, data: JsonRecord) {
+  const tenantId = assertTenantScope(data.tenantId);
   const db = getDbInstance() as unknown as DbLike;
-  const existing = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
+  const existing = db
+    .prepare("SELECT * FROM provider_nodes WHERE id = ? AND tenant_id = ?")
+    .get(id, tenantId);
   if (!existing) return null;
 
   const merged: JsonRecord = {
     ...toRecord(rowToCamel(existing)),
     ...data,
+    tenantId,
     updatedAt: new Date().toISOString(),
   };
 
@@ -145,10 +154,11 @@ export async function updateProviderNode(id: string, data: JsonRecord) {
     api_type = @apiType, base_url = @baseUrl, chat_path = @chatPath,
     models_path = @modelsPath, icon_url = @iconUrl,
     custom_headers_json = @customHeadersJson, updated_at = @updatedAt
-    WHERE id = @id
+    WHERE id = @id AND tenant_id = @tenantId
   `
   ).run({
     id,
+    tenantId,
     type: merged["type"],
     name: merged["name"],
     prefix: merged["prefix"] || null,
@@ -183,10 +193,13 @@ export async function updateProviderNode(id: string, data: JsonRecord) {
 
 export async function deleteProviderNode(id: string) {
   const db = getDbInstance() as unknown as DbLike;
-  const existing = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
+  const tenantId = currentDbTenantId();
+  const existing = db
+    .prepare("SELECT * FROM provider_nodes WHERE id = ? AND tenant_id = ?")
+    .get(id, tenantId);
   if (!existing) return null;
 
-  db.prepare("DELETE FROM provider_nodes WHERE id = ?").run(id);
+  db.prepare("DELETE FROM provider_nodes WHERE id = ? AND tenant_id = ?").run(id, tenantId);
   backupDbFile("pre-write");
   invalidateDbCache("nodes");
   return rowToCamel(existing);

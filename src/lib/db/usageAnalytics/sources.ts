@@ -6,6 +6,8 @@
  * and are consumed by the query functions in the parent `usageAnalytics.ts` module.
  */
 
+import { currentDbTenantId } from "../tenantScope";
+
 export type AnalyticsParams = Record<string, string>;
 
 // ---------------------------------------------------------------------------
@@ -53,9 +55,13 @@ export function buildUnifiedSource(opts: BuildUnifiedSourceOptions): UnifiedSour
   const needsAggregated = (!sinceDate || sinceDate < rawCutoffDate) && !apiKeyWhere;
 
   const unifiedParams: AnalyticsParams = {};
+  unifiedParams.tenantId = currentDbTenantId();
 
   // Floor raw rows at rawCutoffDate when summary rows are included to avoid double-counting.
   const rawConditions: string[] = [];
+  rawConditions.push(
+    "(tenant_id = @tenantId OR (tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))"
+  );
   if (needsAggregated) {
     rawConditions.push("timestamp >= @rawCutoff");
     unifiedParams.rawCutoff = rawCutoffDate;
@@ -75,6 +81,7 @@ export function buildUnifiedSource(opts: BuildUnifiedSourceOptions): UnifiedSour
 
   // Aggregated leg: bounded strictly before rawCutoffDate so it never overlaps raw.
   const aggConditions: string[] = [];
+  aggConditions.push("tenant_id = @tenantId");
   if (needsAggregated) {
     if (sinceIso) {
       aggConditions.push("date >= @sinceDate");
@@ -155,8 +162,12 @@ export function buildPresetUnifiedSource(opts: BuildUnifiedSourceOptions): Unifi
   const needsAggregated = (!sinceDate || sinceDate < rawCutoffDate) && !apiKeyWhere;
 
   const presetParams: AnalyticsParams = {};
+  presetParams.tenantId = currentDbTenantId();
 
   const rawConditions: string[] = [];
+  rawConditions.push(
+    "(tenant_id = @tenantId OR (tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))"
+  );
   if (needsAggregated) {
     rawConditions.push("timestamp >= @presetRawCutoff");
     presetParams.presetRawCutoff = rawCutoffDate;
@@ -168,13 +179,22 @@ export function buildPresetUnifiedSource(opts: BuildUnifiedSourceOptions): Unifi
     rawConditions.push(apiKeyWhere);
     Object.assign(presetParams, apiKeyParams);
   }
+  if (untilIso) {
+    rawConditions.push("timestamp <= @presetUntil");
+    presetParams.presetUntil = untilIso;
+  }
   const presetRawWhere = rawConditions.length > 0 ? `WHERE ${rawConditions.join(" AND ")}` : "";
 
   const aggConditions: string[] = [];
+  aggConditions.push("tenant_id = @tenantId");
   if (needsAggregated) {
     if (sinceIso) {
       aggConditions.push("date >= @presetSinceDate");
       presetParams.presetSinceDate = sinceDate!;
+    }
+    if (untilIso) {
+      aggConditions.push("date <= @presetUntilDate");
+      presetParams.presetUntilDate = untilIso.split("T")[0];
     }
     aggConditions.push("date < @presetRawCutoffDate");
     presetParams.presetRawCutoffDate = rawCutoffDate;

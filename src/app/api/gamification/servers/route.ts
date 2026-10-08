@@ -2,7 +2,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { connectServer, disconnectServer, listServers } from "@/lib/gamification/servers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getManagementTenantId } from "@/lib/api/managementTenant";
+import { PLATFORM_TENANT_ID } from "@/lib/db/tenantScope";
 import { z } from "zod";
+
+async function requirePlatformManagementAuth(request: NextRequest) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+  if ((await getManagementTenantId(request)) !== PLATFORM_TENANT_ID) {
+    return NextResponse.json(
+      { error: "Platform administration required" },
+      { status: 403, headers: CORS_HEADERS }
+    );
+  }
+  return null;
+}
 
 export async function OPTIONS() {
   return handleCorsOptions();
@@ -12,7 +26,7 @@ export async function OPTIONS() {
  * GET /api/gamification/servers — List connected servers
  */
 export async function GET(request: NextRequest) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requirePlatformManagementAuth(request);
   if (authError) return authError;
 
   const servers = await listServers();
@@ -23,7 +37,7 @@ export async function GET(request: NextRequest) {
  * POST /api/gamification/servers — Connect to a server
  */
 export async function POST(request: NextRequest) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requirePlatformManagementAuth(request);
   if (authError) return authError;
 
   const body = await request.json();
@@ -49,7 +63,7 @@ export async function POST(request: NextRequest) {
  * DELETE /api/gamification/servers — Disconnect from a server
  */
 export async function DELETE(request: NextRequest) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requirePlatformManagementAuth(request);
   if (authError) return authError;
 
   const url = new URL(request.url);

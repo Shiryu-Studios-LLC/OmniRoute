@@ -13,6 +13,7 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-conv-turn
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 const { hashTurnContent } = await import("../../open-sse/services/conversationTracker.ts");
 const { resolveTurnDisplayContent } =
   await import("../../open-sse/services/conversationTurnContent.ts");
@@ -22,12 +23,23 @@ test.after(() => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
-function insertCallLog(row: { id: string; correlationId: string; artifactRelPath: string | null }) {
+function insertCallLog(row: {
+  id: string;
+  tenantId?: string;
+  correlationId: string;
+  artifactRelPath: string | null;
+}) {
   const db = core.getDbInstance();
   db.prepare(
-    `INSERT INTO call_logs (id, timestamp, method, path, status, model, correlation_id, artifact_relpath)
-     VALUES (?, ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', ?, ?)`
-  ).run(row.id, new Date().toISOString(), row.correlationId, row.artifactRelPath);
+    `INSERT INTO call_logs (id, tenant_id, timestamp, method, path, status, model, correlation_id, artifact_relpath)
+     VALUES (?, ?, ?, 'POST', '/v1/chat/completions', 200, 'big-pickle', ?, ?)`
+  ).run(
+    row.id,
+    row.tenantId ?? "tenant_shiryu_admin",
+    new Date().toISOString(),
+    row.correlationId,
+    row.artifactRelPath
+  );
 }
 
 function writeArtifact(relPath: string, clientRawRequestBody: unknown) {
@@ -138,4 +150,42 @@ test("resolveTurnDisplayContent omits content for an unresolvable correlation id
   });
   const missingFile = resolveTurnDisplayContent([{ lastCorrelationId: "corr-5" }]);
   assert.equal(missingFile.size, 0);
+});
+
+test("resolveTurnDisplayContent reads duplicate correlation IDs only from the current tenant", () => {
+  const correlationId = "same-correlation-across-tenants";
+  insertCallLog({
+    id: "tenant-a-log",
+    tenantId: "tenant_a",
+    correlationId,
+    artifactRelPath: "tenant-a/request.json",
+  });
+  insertCallLog({
+    id: "tenant-b-log",
+    tenantId: "tenant_b",
+    correlationId,
+    artifactRelPath: "tenant-b/request.json",
+  });
+  writeArtifact("tenant-a/request.json", {
+    messages: [{ role: "user", content: "Tenant A private prompt" }],
+  });
+  writeArtifact("tenant-b/request.json", {
+    messages: [{ role: "user", content: "Tenant B private prompt" }],
+  });
+
+  const forTenantA = runWithTenantContext({ tenantId: "tenant_a" }, () =>
+    resolveTurnDisplayContent([{ lastCorrelationId: correlationId }])
+  );
+  const forTenantB = runWithTenantContext({ tenantId: "tenant_b" }, () =>
+    resolveTurnDisplayContent([{ lastCorrelationId: correlationId }])
+  );
+
+  assert.deepEqual(
+    [...forTenantA.values()].map((content) => content.textPreview),
+    ["Tenant A private prompt"]
+  );
+  assert.deepEqual(
+    [...forTenantB.values()].map((content) => content.textPreview),
+    ["Tenant B private prompt"]
+  );
 });

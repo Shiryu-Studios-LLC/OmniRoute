@@ -60,8 +60,8 @@ async function seedSyncedModels(
   // (which the Alibaba drained-models test depends on).
   db.prepare(
     `INSERT INTO provider_connections
-       (id, provider, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)
+       (id, provider, is_active, created_at, updated_at, tenant_id)
+     VALUES (?, ?, ?, ?, ?, 'tenant_shiryu_admin')
      ON CONFLICT(id) DO UPDATE SET
        provider = excluded.provider,
        is_active = excluded.is_active,

@@ -13,6 +13,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,10 +77,11 @@ export function getModelCap(poolId: string, apiKeyId: string, model: string): Mo
   const row = getDb()
     .prepare<ModelCapRow>(
       `SELECT pool_id, api_key_id, model, cap_value, cap_unit
-       FROM quota_allocation_model_caps
-       WHERE pool_id = ? AND api_key_id = ? AND model = ?`
+       FROM quota_allocation_model_caps caps
+       JOIN quota_pools pools ON pools.id = caps.pool_id
+       WHERE pools.tenant_id = ? AND caps.pool_id = ? AND caps.api_key_id = ? AND caps.model = ?`
     )
-    .get(poolId, apiKeyId, model);
+    .get(currentDbTenantId(), poolId, apiKeyId, model);
   return row ? rowToModelCap(row) : null;
 }
 
@@ -90,10 +92,11 @@ export function listModelCaps(poolId: string, apiKeyId: string): ModelCap[] {
   const rows = getDb()
     .prepare<ModelCapRow>(
       `SELECT pool_id, api_key_id, model, cap_value, cap_unit
-       FROM quota_allocation_model_caps
-       WHERE pool_id = ? AND api_key_id = ?`
+       FROM quota_allocation_model_caps caps
+       JOIN quota_pools pools ON pools.id = caps.pool_id
+       WHERE pools.tenant_id = ? AND caps.pool_id = ? AND caps.api_key_id = ?`
     )
-    .all(poolId, apiKeyId);
+    .all(currentDbTenantId(), poolId, apiKeyId);
   return rows.map(rowToModelCap);
 }
 
@@ -102,6 +105,19 @@ export function listModelCaps(poolId: string, apiKeyId: string): ModelCap[] {
  * cap_value must be > 0 (enforced by DB CHECK constraint).
  */
 export function setModelCap(cap: ModelCap): void {
+  const tenantId = currentDbTenantId();
+  const owner = getDb()
+    .prepare<{ tenant_id: string }>("SELECT tenant_id FROM quota_pools WHERE id = ?")
+    .get(cap.poolId);
+  if (!owner || owner.tenant_id !== tenantId) {
+    throw new Error("Quota pool does not belong to the active tenant");
+  }
+  const apiKeyOwner = getDb()
+    .prepare<{ tenant_id: string }>("SELECT tenant_id FROM api_keys WHERE id = ?")
+    .get(cap.apiKeyId);
+  if (apiKeyOwner && apiKeyOwner.tenant_id !== tenantId) {
+    throw new Error("API key does not belong to the active tenant");
+  }
   getDb()
     .prepare(
       `INSERT INTO quota_allocation_model_caps
@@ -122,7 +138,8 @@ export function deleteModelCap(poolId: string, apiKeyId: string, model: string):
   getDb()
     .prepare(
       `DELETE FROM quota_allocation_model_caps
-       WHERE pool_id = ? AND api_key_id = ? AND model = ?`
+       WHERE pool_id = ? AND api_key_id = ? AND model = ?
+         AND EXISTS (SELECT 1 FROM quota_pools WHERE quota_pools.id = quota_allocation_model_caps.pool_id AND quota_pools.tenant_id = ?)`
     )
-    .run(poolId, apiKeyId, model);
+    .run(poolId, apiKeyId, model, currentDbTenantId());
 }

@@ -2,9 +2,30 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "omniroute-cloud-runtime",
   "main": "cloudflare/worker.ts",
-  "compatibility_date": "2026-10-02",
+  "compatibility_date": "2026-10-08",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
-    "enabled": true
-  }
+    "enabled": true,
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "omniroute-cloud-runtime",
+      "migrations_dir": "cloudflare/migrations",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GATEWAY_SESSIONS",
+        "class_name": "GatewaySessionObject",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GatewaySessionObject"],
+    },
+  ],
 }

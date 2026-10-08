@@ -323,6 +323,7 @@ type BadgeCriteria =
  */
 async function getActionCount(apiKeyId: string, action: string): Promise<number> {
   const { getDbInstance } = await import("../db/core");
+  const { currentDbTenantId } = await import("../db/tenantScope");
   const db = getDbInstance();
 
   const row = db
@@ -334,9 +335,9 @@ async function getActionCount(apiKeyId: string, action: string): Promise<number>
         END
       ), 0) AS total
       FROM xp_audit_log
-      WHERE api_key_id = ? AND action = ?`
+      WHERE tenant_id = ? AND api_key_id = ? AND action = ?`
     )
-    .get(apiKeyId, action) as { total: number } | undefined;
+    .get(currentDbTenantId(), apiKeyId, action) as { total: number } | undefined;
 
   return row?.total ?? 0;
 }
@@ -349,15 +350,16 @@ async function getActionCount(apiKeyId: string, action: string): Promise<number>
  */
 async function getUniqueCount(apiKeyId: string, type: string): Promise<number> {
   const { getDbInstance } = await import("../db/core");
+  const { currentDbTenantId } = await import("../db/tenantScope");
   const db = getDbInstance();
 
   const row = db
     .prepare(
       `SELECT COUNT(DISTINCT json_extract(metadata, '$.' || ?)) AS total
       FROM xp_audit_log
-      WHERE api_key_id = ? AND metadata IS NOT NULL`
+      WHERE tenant_id = ? AND api_key_id = ? AND metadata IS NOT NULL`
     )
-    .get(type, apiKeyId) as { total: number } | undefined;
+    .get(type, currentDbTenantId(), apiKeyId) as { total: number } | undefined;
 
   return row?.total ?? 0;
 }
@@ -382,17 +384,20 @@ async function getStreak(apiKeyId: string): Promise<number> {
  */
 async function getRank(apiKeyId: string, scope: string): Promise<number> {
   const { getDbInstance } = await import("../db/core");
+  const { currentDbTenantId } = await import("../db/tenantScope");
   const db = getDbInstance();
 
   const scoreRow = db
-    .prepare("SELECT score FROM leaderboard WHERE api_key_id = ? AND scope = ?")
-    .get(apiKeyId, scope) as { score: number } | undefined;
+    .prepare("SELECT score FROM leaderboard WHERE tenant_id = ? AND api_key_id = ? AND scope = ?")
+    .get(currentDbTenantId(), apiKeyId, scope) as { score: number } | undefined;
 
   if (!scoreRow) return Infinity;
 
   const rankRow = db
-    .prepare("SELECT COUNT(*) AS rank FROM leaderboard WHERE scope = ? AND score > ?")
-    .get(scope, scoreRow.score) as { rank: number } | undefined;
+    .prepare(
+      "SELECT COUNT(*) AS rank FROM leaderboard WHERE tenant_id = ? AND scope = ? AND score > ?"
+    )
+    .get(currentDbTenantId(), scope, scoreRow.score) as { rank: number } | undefined;
 
   return (rankRow?.rank ?? 0) + 1;
 }
@@ -485,11 +490,14 @@ export async function evaluateBadges(
       case "first": {
         // Time-limited badge: check if user joined within window
         const { getDbInstance } = await import("../db/core");
+        const { currentDbTenantId } = await import("../db/tenantScope");
         const db = getDbInstance();
 
         const firstLog = db
-          .prepare(`SELECT MIN(created_at) AS first_at FROM xp_audit_log WHERE api_key_id = ?`)
-          .get(apiKeyId) as { first_at: string | null } | undefined;
+          .prepare(
+            `SELECT MIN(created_at) AS first_at FROM xp_audit_log WHERE tenant_id = ? AND api_key_id = ?`
+          )
+          .get(currentDbTenantId(), apiKeyId) as { first_at: string | null } | undefined;
 
         if (firstLog?.first_at) {
           const joinDate = new Date(firstLog.first_at);

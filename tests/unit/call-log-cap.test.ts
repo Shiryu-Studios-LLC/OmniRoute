@@ -18,9 +18,11 @@ const core = await import("../../src/lib/db/core.ts");
 const callLogs = await import("../../src/lib/usage/callLogs.ts");
 const detailedLogs = await import("../../src/lib/db/detailedLogs.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
+const { enterTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
+  enterTenantContext({ tenantId: "tenant_shiryu_admin", role: "owner" });
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }

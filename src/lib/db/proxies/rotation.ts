@@ -8,6 +8,7 @@
 // setScopeRotationStrategy) stay in ../proxies.ts and import the pure helpers here.
 import { randomInt } from "crypto";
 import { getDbInstance } from "../core";
+import { currentDbTenantId } from "../tenantScope";
 import { pickByLatency } from "../proxyLatency";
 import type { JsonRecord, ProxyScope, ProxyRotationStrategy } from "./types";
 import { PROXY_ROTATION_STRATEGIES, DEFAULT_PROXY_ROTATION_STRATEGY } from "./types";
@@ -248,8 +249,8 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
     if (account) return account;
 
     const connection = db
-      .prepare("SELECT provider FROM provider_connections WHERE id = ?")
-      .get(connectionId) as { provider?: string } | undefined;
+      .prepare("SELECT provider FROM provider_connections WHERE id = ? AND tenant_id = ?")
+      .get(connectionId, currentDbTenantId()) as { provider?: string } | undefined;
 
     if (connection?.provider) {
       const provider = resolveScopePoolInternal(db, "provider", connection.provider, {

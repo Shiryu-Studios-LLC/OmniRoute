@@ -1,14 +1,25 @@
 import type { CloudDb } from "./db";
+import { handleCloudApiRequest } from "./httpApi";
+import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
+import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
+import type {
+  GatewayCoordinatorStub,
+  GatewayDurableObjectNamespace,
+} from "./connectorGatewayDurableObject";
 
 export interface CloudRuntimeEnv {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
   DB?: CloudDb;
+  OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+  GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
 }
 
 export interface CloudRuntimeOptions {
   env?: CloudRuntimeEnv;
   now?: () => Date;
+  adminRateLimit?: { limit: number; windowMs: number };
+  customerInvokeRateLimit?: { limit: number; windowMs: number };
 }
 
 export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
@@ -64,6 +75,47 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             headers: { "Cache-Control": "no-store" },
           }
         );
+      }
+
+      if (url.pathname.startsWith("/__gateway/v1/device/")) {
+        try {
+          return await handleGatewayDeviceRequest(request, {
+            db: options.env?.DB,
+            sessions: options.env?.GATEWAY_SESSIONS,
+            now: () => now().getTime(),
+          });
+        } catch {
+          return Response.json(
+            { error: "Gateway request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (url.pathname.startsWith("/__gateway/v1/customer/")) {
+        try {
+          return await handleGatewayCustomerRequest(request, {
+            db: options.env?.DB,
+            sessions: options.env?.GATEWAY_SESSIONS,
+            now: () => now().getTime(),
+            rateLimit: options.customerInvokeRateLimit,
+          });
+        } catch {
+          return Response.json(
+            { error: "Gateway invocation could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (url.pathname.startsWith("/__cloud/v1/")) {
+        return handleCloudApiRequest(request, {
+          db: options.env?.DB,
+          adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+          sessions: options.env?.GATEWAY_SESSIONS,
+          now,
+          adminRateLimit: options.adminRateLimit,
+        });
       }
 
       return new Response("Not Found", { status: 404 });

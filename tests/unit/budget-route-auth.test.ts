@@ -20,17 +20,38 @@ test("/api/usage/budget enforces management auth inside GET and POST handlers", 
   const getBody = source.slice(getIndex, postIndex);
   const postBody = source.slice(postIndex);
 
-  assert.match(getBody, /const authError = await requireManagementAuth\(request\);/);
+  assert.match(
+    getBody,
+    /const authError = await requireManagementAuth\(request, \{ alwaysRequireAuth: true \}\);/
+  );
   assert.match(getBody, /if \(authError\) return authError;/);
   assert.ok(
     getBody.indexOf("requireManagementAuth(request)") < getBody.indexOf("new URL(request.url)"),
     "GET must authorize before reading arbitrary apiKeyId"
   );
 
-  assert.match(postBody, /const authError = await requireManagementAuth\(request\);/);
+  assert.match(
+    postBody,
+    /const authError = await requireManagementAuth\(request, \{ alwaysRequireAuth: true \}\);/
+  );
   assert.match(postBody, /if \(authError\) return authError;/);
   assert.ok(
     postBody.indexOf("requireManagementAuth(request)") < postBody.indexOf("request.json()"),
     "POST must authorize before parsing budget mutations"
+  );
+});
+
+test("/api/usage/budget/bulk requires management auth and enumerates the authenticated tenant", () => {
+  const bulkSource = fs.readFileSync(
+    path.join(repoRoot, "src/app/api/usage/budget/bulk/route.ts"),
+    "utf8"
+  );
+  assert.match(
+    bulkSource,
+    /const authError = await requireManagementAuth\(request, \{ alwaysRequireAuth: true \}\);/
+  );
+  assert.match(
+    bulkSource,
+    /getApiKeys\(undefined, undefined, await getManagementTenantId\(request\)\)/
   );
 });

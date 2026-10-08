@@ -14,11 +14,12 @@
  * and already retained/cleaned up by the existing call-log lifecycle)
  * instead of duplicating conversation content into a second store. Only a
  * lightweight `call_logs.response_id` index (154_call_logs_response_id.sql)
- * is new. Every lookup is scoped by `api_key_id` -- one client can never
- * resolve another client's stored conversation.
+ * is new. Every lookup is scoped by tenant and `api_key_id` -- one client
+ * can never resolve another tenant's or client's stored conversation.
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { readCallArtifact } from "../usage/callLogArtifacts";
 
 export type ResponsesContinuationState = {
@@ -51,9 +52,11 @@ export function resolvePreviousResponseState(
     .prepare(
       `SELECT artifact_relpath, api_key_id FROM call_logs
        WHERE response_id = ? AND detail_state = 'ready'
+         AND (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
        ORDER BY timestamp DESC LIMIT 1`
     )
-    .get(responseId) as { artifact_relpath: string | null; api_key_id: string | null } | undefined;
+    .get(responseId, currentDbTenantId(), currentDbTenantId()) as
+    { artifact_relpath: string | null; api_key_id: string | null } | undefined;
 
   if (!row || !row.artifact_relpath) return null;
   // Tenant isolation: a response id is only ever handed back to the API key

@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import { ZipFile } from "yazl";
 import { getDbInstance, isCloud, isBuildPhase, DATA_DIR } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 import { getLegacyDotDataDir, isSamePath } from "../dataPaths";
 import { getAppLogFilePath } from "../logEnv";
 import { protectPayloadForLog } from "../logPayloads";
@@ -313,26 +314,30 @@ export function migrateUsageJsonToSqlite() {
         console.log(`[usageDb] Migrating ${history.length} usage entries from JSON → SQLite...`);
 
         const insert = db.prepare(`
-          INSERT INTO usage_history (provider, model, connection_id, account_key, account_label,
+          INSERT INTO usage_history (tenant_id, provider, model, connection_id, account_key, account_label,
             account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
             tokens_cache_read, tokens_cache_creation, tokens_reasoning, status, success, latency_ms,
             ttft_ms, error_code, combo_strategy, timestamp)
-          VALUES (@provider, @model, @connectionId, @accountKey, @accountLabel,
+          VALUES (@tenantId, @provider, @model, @connectionId, @accountKey, @accountLabel,
             @accountLabelPriority, @apiKeyId, @apiKeyName, @tokensInput, @tokensOutput,
             @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @status, @success,
             @latencyMs, @ttftMs, @errorCode, @comboStrategy, @timestamp)
         `);
-        const findConnection = db.prepare("SELECT * FROM provider_connections WHERE id = ?");
+        const findConnection = db.prepare(
+          "SELECT * FROM provider_connections WHERE id = ? AND tenant_id = ?"
+        );
 
         const tx = db.transaction(() => {
           for (const entry of history) {
             const connectionId = entry.connectionId || entry.connection_id || null;
-            const connection = connectionId ? findConnection.get(connectionId) : null;
+            const tenantId = currentDbTenantId();
+            const connection = connectionId ? findConnection.get(connectionId, tenantId) : null;
             const fallbackIdentity = connection
               ? resolveUsageAccountIdentity(connection)
               : resolveOrphanedUsageAccountIdentity(entry.provider, connectionId);
             const identity = resolveImportedUsageAccountIdentity(entry, fallbackIdentity);
             insert.run({
+              tenantId,
               provider: entry.provider || null,
               model: entry.model || null,
               connectionId,
@@ -383,12 +388,12 @@ export function migrateUsageJsonToSqlite() {
         console.log(`[usageDb] Migrating ${logs.length} call log entries from JSON → SQLite...`);
 
         const insert = db.prepare(`
-          INSERT OR IGNORE INTO call_logs (id, timestamp, method, path, status, model, requested_model, provider,
+          INSERT OR IGNORE INTO call_logs (id, tenant_id, timestamp, method, path, status, model, requested_model, provider,
             account, connection_id, duration, tokens_in, tokens_out, source_format, target_format,
             api_key_id, api_key_name, combo_name, combo_step_id, combo_execution_key, error_summary,
             detail_state, artifact_relpath, artifact_size_bytes, artifact_sha256,
             has_request_body, has_response_body, has_pipeline_details, request_summary)
-          VALUES (@id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
+          VALUES (@id, @tenantId, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
             @account, @connectionId, @duration, @tokensIn, @tokensOut, @sourceFormat, @targetFormat,
             @apiKeyId, @apiKeyName, @comboName, @comboStepId, @comboExecutionKey, @errorSummary,
             @detailState, @artifactRelPath, @artifactSizeBytes, @artifactSha256,
@@ -467,6 +472,7 @@ export function migrateUsageJsonToSqlite() {
 
             insert.run({
               id,
+              tenantId: currentDbTenantId(),
               timestamp,
               method: log.method || "POST",
               path: log.path || null,

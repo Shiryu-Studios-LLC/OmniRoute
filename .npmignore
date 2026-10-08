@@ -75,6 +75,7 @@ bun.lock
 
 # Build artifacts (pre-built goes inside app/)
 /.next/
+/.open-next/
 /node_modules/
 
 # Ignore large binary files and other build directories

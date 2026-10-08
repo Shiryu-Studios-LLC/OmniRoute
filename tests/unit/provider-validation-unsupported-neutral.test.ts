@@ -55,7 +55,7 @@ test.after(() => {
     force: true,
 
     maxRetries: 5,
-  retryDelay: 100,
+    retryDelay: 100,
   });
 });
 
@@ -100,10 +100,11 @@ test("unsupported provider verification is neutral and does not poison stored co
          test_status,
          health_check_interval,
          created_at,
-         updated_at
+         updated_at,
+         tenant_id
        )
      VALUES
-       (?, ?, 'apikey', ?, ?, 1, 'active', 60, ?, ?)`
+       (?, ?, 'apikey', ?, ?, 1, 'active', 60, ?, ?, 'tenant_shiryu_admin')`
   ).run(
     "unsupported-probe-test",
     "openai",

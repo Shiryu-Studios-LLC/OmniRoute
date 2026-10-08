@@ -10,6 +10,7 @@ process.env.DATA_DIR = testDataDir;
 
 const core = await import("../../src/lib/db/core.ts");
 const usageLogs = await import("../../src/lib/db/usageLogs.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 test.before(() => {
   core.resetDbInstance();
@@ -28,8 +29,8 @@ test.after(() => {
 test("auto-routing analytics use requested models from the runtime schema", () => {
   const db = core.getDbInstance();
   const insert = db.prepare(
-    `INSERT INTO call_logs (id, model, requested_model, provider, timestamp)
-     VALUES (?, ?, ?, ?, ?)`
+    `INSERT INTO call_logs (id, tenant_id, model, requested_model, provider, timestamp)
+     VALUES (?, 'tenant_shiryu_admin', ?, ?, ?, ?)`
   );
   const timestamp = new Date().toISOString();
 
@@ -47,4 +48,20 @@ test("auto-routing analytics use requested models from the runtime schema", () =
     { provider: "openai", count: 2 },
     { provider: "anthropic", count: 1 },
   ]);
+
+  db.prepare(
+    `INSERT INTO call_logs (id, tenant_id, model, requested_model, provider, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run("tenant-b-auto", "tenant_b", "gpt-5.6-terra", "auto/fast", "openai", timestamp);
+
+  assert.deepEqual(
+    runWithTenantContext({ tenantId: "tenant_b" }, () => usageLogs.getAutoRoutingTotalCount()),
+    { count: 1 }
+  );
+  assert.deepEqual(
+    runWithTenantContext({ tenantId: "tenant_b" }, () =>
+      usageLogs.getAutoRoutingVariantBreakdown()
+    ),
+    [{ variant: "fast", count: 1 }]
+  );
 });

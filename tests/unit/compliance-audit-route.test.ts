@@ -10,6 +10,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 const core = await import("../../src/lib/db/core.ts");
 const compliance = await import("../../src/lib/compliance/index.ts");
 const auditRoute = await import("../../src/app/api/compliance/audit-log/route.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 function resetDb() {
   core.resetDbInstance();
@@ -60,10 +61,46 @@ test("compliance audit route keeps array payloads and exposes total count with s
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("x-total-count"), "1");
   assert.equal(response.headers.get("x-page-limit"), "10");
-  const payload = (await response.json()) as any;
+  const payload: unknown = await response.json();
   assert.equal(Array.isArray(payload), true);
-  assert.equal(payload.length, 1);
-  assert.equal(payload[0].action, "provider.validation.ssrf_blocked");
-  assert.equal(payload[0].resourceType, "provider_validation");
-  assert.equal(payload[0].requestId, "req-validation-1");
+  const entries = payload as Array<Record<string, unknown>>;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].action, "provider.validation.ssrf_blocked");
+  assert.equal(entries[0].resourceType, "provider_validation");
+  assert.equal(entries[0].requestId, "req-validation-1");
+});
+
+test("audit log queries and route results are isolated by the current tenant", async () => {
+  compliance.initAuditLog();
+  runWithTenantContext({ tenantId: "tenant_a", role: "owner" }, () =>
+    compliance.logAuditEvent({ action: "tenant.a.secret", target: "a-only" })
+  );
+  runWithTenantContext({ tenantId: "tenant_b", role: "owner" }, () =>
+    compliance.logAuditEvent({ action: "tenant.b.secret", target: "b-only" })
+  );
+
+  const entriesA = runWithTenantContext({ tenantId: "tenant_a", role: "owner" }, () =>
+    compliance.getAuditLog()
+  );
+  const entriesB = runWithTenantContext({ tenantId: "tenant_b", role: "owner" }, () =>
+    compliance.getAuditLog()
+  );
+  assert.deepEqual(
+    entriesA.map((entry) => entry.target),
+    ["a-only"]
+  );
+  assert.deepEqual(
+    entriesB.map((entry) => entry.target),
+    ["b-only"]
+  );
+
+  const response = await runWithTenantContext({ tenantId: "tenant_a", role: "owner" }, () =>
+    auditRoute.GET(new Request("http://localhost/api/compliance/audit-log"))
+  );
+  assert.equal(response.status, 200);
+  const payload = (await response.json()) as Array<{ target: string }>;
+  assert.deepEqual(
+    payload.map((entry) => entry.target),
+    ["a-only"]
+  );
 });

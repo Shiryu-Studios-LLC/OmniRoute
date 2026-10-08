@@ -15,6 +15,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 // ---------------------------------------------------------------------------
 // Queries
@@ -29,9 +30,9 @@ import { getDbInstance } from "./core";
 export function exportProxyLogsSince(since: string): Record<string, unknown>[] {
   const db = getDbInstance();
   const stmt = db.prepare(
-    "SELECT * FROM proxy_logs WHERE timestamp >= @since ORDER BY timestamp DESC"
+    "SELECT * FROM proxy_logs WHERE tenant_id = @tenantId AND timestamp >= @since ORDER BY timestamp DESC"
   );
-  return stmt.all({ since }) as Record<string, unknown>[];
+  return stmt.all({ since, tenantId: currentDbTenantId() }) as Record<string, unknown>[];
 }
 
 // 24h window for "last known egress IP" lookups. This helper answers a
@@ -61,9 +62,11 @@ export function getRecentEgressIpForConnection(
     .prepare(
       `SELECT egress_ip, timestamp FROM proxy_logs
        WHERE connection_id = ? AND egress_ip IS NOT NULL AND timestamp >= ?
+         AND tenant_id = ?
        ORDER BY timestamp DESC LIMIT 1`
     )
-    .get(connectionId, since) as { egress_ip: string; timestamp: string } | undefined;
+    .get(connectionId, since, currentDbTenantId()) as
+    { egress_ip: string; timestamp: string } | undefined;
   if (!row) return null;
   return { egressIp: row.egress_ip, at: row.timestamp };
 }

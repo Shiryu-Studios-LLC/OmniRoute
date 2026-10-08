@@ -18,8 +18,8 @@ test("getProviderCredentials('opencode-zen') finds active connection stored unde
   // Seed an active connection under provider='opencode'
   db.prepare(
     `INSERT OR REPLACE INTO provider_connections
-       (id, provider, is_active, api_key, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+       (id, provider, is_active, api_key, created_at, updated_at, tenant_id)
+     VALUES (?, ?, ?, ?, ?, ?, 'tenant_shiryu_admin')`
   ).run("opencode-conn-1", "opencode", 1, "test-opencode-key", now, now);
 
   const creds = (await getProviderCredentials("opencode-zen")) as { apiKey?: string } | null;

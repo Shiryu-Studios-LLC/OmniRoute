@@ -42,12 +42,21 @@ function startCountingRedis(): Promise<{
       n += 1;
       socket.on("error", () => {});
       socket.on("data", (buf) => {
-        if (buf.toString().toLowerCase().includes("info")) {
-          const body = "redis_version:7.0.0\r\n";
-          socket.write(`$${body.length}\r\n${body}\r\n`);
-          return;
+        const commands = Array.from(
+          buf
+            .toString()
+            .toLowerCase()
+            .matchAll(/^\*\d+\r\n\$\d+\r\n([^\r\n]+)\r\n/gm),
+          (match) => match[1]
+        );
+        for (const command of commands) {
+          if (command === "info") {
+            const body = "redis_version:7.0.0\r\n";
+            socket.write(`$${body.length}\r\n${body}\r\n`);
+          } else {
+            socket.write(command === "ping" ? "+PONG\r\n" : "+OK\r\n");
+          }
         }
-        socket.write("+PONG\r\n");
       });
     });
     server.listen(0, "127.0.0.1", () => {

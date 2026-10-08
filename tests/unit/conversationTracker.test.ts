@@ -22,6 +22,7 @@ process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "conversation-tracker
 const { extractCanonicalTurns, computeFingerprintHash, resolveConversationId, hashTurnContent } =
   await import("../../open-sse/services/conversationTracker.ts");
 const { getConversationTurnPage } = await import("../../src/lib/db/agenticConversations.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 let correlationCounter = 0;
 function nextCorrelationId(): string {
@@ -618,11 +619,10 @@ test("resolveConversationId: client-supplied X-Omniroute-Session-Id wins outrigh
     clientSessionIdHeader: headerValue,
     correlationId: nextCorrelationId(),
   });
-  assert.equal(first.conversationId, headerValue);
+  assert.match(first.conversationId, /^ext_[0-9a-f]{64}$/);
 
   // A second, otherwise-unrelated conversation sending the SAME header value
-  // merges under that one id — the header is authoritative, no heuristic
-  // check runs at all.
+  // in this same tenant merges under that namespaced id.
   const second = await resolveConversationId({
     body: { model: "gpt-4o", messages: [{ role: "user", content: "conversation B, unrelated" }] },
     model: "gpt-4o",
@@ -630,7 +630,26 @@ test("resolveConversationId: client-supplied X-Omniroute-Session-Id wins outrigh
     clientSessionIdHeader: headerValue,
     correlationId: nextCorrelationId(),
   });
-  assert.equal(second.conversationId, headerValue);
+  assert.equal(second.conversationId, first.conversationId);
+});
+
+test("resolveConversationId isolates duplicate external session IDs by tenant", async () => {
+  const headerValue = "session-id-reused-by-two-customers";
+  const input = {
+    body: { messages: [{ role: "user", content: "same client session" }] },
+    model: "big-pickle",
+    apiKeyId: "api-key",
+    clientSessionIdHeader: headerValue,
+    correlationId: nextCorrelationId(),
+  };
+  const firstA = runWithTenantContext({ tenantId: "tenant_a" }, () => resolveConversationId(input));
+  const firstB = runWithTenantContext({ tenantId: "tenant_b" }, () => resolveConversationId(input));
+  const secondA = runWithTenantContext({ tenantId: "tenant_a" }, () =>
+    resolveConversationId(input)
+  );
+  const [a, b, aAgain] = await Promise.all([firstA, firstB, secondA]);
+  assert.notEqual(a.conversationId, b.conversationId);
+  assert.equal(aAgain.conversationId, a.conversationId);
 });
 
 // The old 8000-char text_preview truncation (and the JSON-validity-after-

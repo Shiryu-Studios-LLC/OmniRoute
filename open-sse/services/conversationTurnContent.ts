@@ -14,6 +14,7 @@
  */
 
 import { getDbInstance } from "../../src/lib/db/core.ts";
+import { currentDbTenantId } from "../../src/lib/db/tenantScope.ts";
 import { readCallArtifact } from "../../src/lib/usage/callLogArtifacts.ts";
 import { extractCanonicalTurns, hashTurnContent } from "./conversationTracker.ts";
 
@@ -46,10 +47,13 @@ export function resolveTurnDisplayContent(
   const rows = db
     .prepare(
       `SELECT correlation_id, artifact_relpath FROM call_logs
-       WHERE correlation_id IN (${placeholders}) AND artifact_relpath IS NOT NULL
+       WHERE tenant_id = ? AND correlation_id IN (${placeholders}) AND artifact_relpath IS NOT NULL
        ORDER BY timestamp ASC`
     )
-    .all(...correlationIds) as Array<{ correlation_id: string; artifact_relpath: string }>;
+    .all(currentDbTenantId(), ...correlationIds) as Array<{
+    correlation_id: string;
+    artifact_relpath: string;
+  }>;
 
   // A retry/combo-fallback attempt can share one correlation_id across a few
   // call_logs rows; they all carry the same client-facing request body, so

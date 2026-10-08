@@ -20,6 +20,7 @@ import { invalidateDbCache } from "../readCache";
 import { invalidateReasoningRoutingRuleCache } from "../reasoningRoutingRules";
 import { bumpProxyConfigGeneration } from "../settings";
 import { toRecord } from "./columns";
+import { currentDbTenantId } from "../tenantScope";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -49,8 +50,8 @@ function _selectExistingConnectionIds(db: DbLike, ids: string[]): string[] {
   const placeholders = ids.map(() => "?").join(",");
 
   return db
-    .prepare(`SELECT id FROM provider_connections WHERE id IN (${placeholders})`)
-    .all(...ids)
+    .prepare(`SELECT id FROM provider_connections WHERE tenant_id = ? AND id IN (${placeholders})`)
+    .all(currentDbTenantId(), ...ids)
     .map((row) => {
       const record = toRecord(row);
       return typeof record.id === "string" ? record.id : null;
@@ -79,13 +80,18 @@ async function _cleanupDeletedLKGPConnectionRefs(connectionIds: string | string[
 
 export async function deleteProviderConnection(id: string) {
   const db = getDbInstance() as unknown as DbLike;
-  const existing = db.prepare("SELECT provider FROM provider_connections WHERE id = ?").get(id);
+  const existing = db
+    .prepare("SELECT provider FROM provider_connections WHERE id = ? AND tenant_id = ?")
+    .get(id, currentDbTenantId());
   if (!existing) return false;
 
   db.transaction(() => {
     _deleteAccountProxyAssignments(db, [id]);
     db.prepare("DELETE FROM quota_snapshots WHERE connection_id = ?").run(id);
-    db.prepare("DELETE FROM provider_connections WHERE id = ?").run(id);
+    db.prepare("DELETE FROM provider_connections WHERE id = ? AND tenant_id = ?").run(
+      id,
+      currentDbTenantId()
+    );
   })();
 
   await _cleanupDeletedComboConnectionRefs(id);
@@ -114,17 +120,20 @@ export async function deleteProviderConnections(ids: string[]): Promise<number> 
 
   const db = getDbInstance() as unknown as DbLike;
   const existingIds = _selectExistingConnectionIds(db, ids);
+  if (existingIds.length === 0) return 0;
 
   const deletedCount = db.transaction(() => {
-    const placeholders = ids.map(() => "?").join(",");
+    const placeholders = existingIds.map(() => "?").join(",");
 
-    db.prepare(`DELETE FROM quota_snapshots WHERE connection_id IN (${placeholders})`).run(...ids);
+    db.prepare(`DELETE FROM quota_snapshots WHERE connection_id IN (${placeholders})`).run(
+      ...existingIds
+    );
 
-    _deleteAccountProxyAssignments(db, ids);
+    _deleteAccountProxyAssignments(db, existingIds);
 
     const result = db
-      .prepare(`DELETE FROM provider_connections WHERE id IN (${placeholders})`)
-      .run(...ids);
+      .prepare(`DELETE FROM provider_connections WHERE tenant_id = ? AND id IN (${placeholders})`)
+      .run(currentDbTenantId(), ...existingIds);
 
     return result.changes ?? 0;
   })();
@@ -132,7 +141,7 @@ export async function deleteProviderConnections(ids: string[]): Promise<number> 
   await _cleanupDeletedComboConnectionRefs(existingIds);
   await _cleanupDeletedLKGPConnectionRefs(existingIds);
 
-  for (const id of ids) {
+  for (const id of existingIds) {
     removeConnectionHealth(id);
     removeConnectionIndex(id);
     void import("@omniroute/open-sse/services/combo/nativeCodexTurnPin.ts")
@@ -150,8 +159,8 @@ export async function deleteProviderConnections(ids: string[]): Promise<number> 
 export async function deleteProviderConnectionsByProvider(providerId: string) {
   const db = getDbInstance() as unknown as DbLike;
   const connectionIds = db
-    .prepare("SELECT id FROM provider_connections WHERE provider = ?")
-    .all(providerId)
+    .prepare("SELECT id FROM provider_connections WHERE tenant_id = ? AND provider = ?")
+    .all(currentDbTenantId(), providerId)
     .map((row) => {
       const record = toRecord(row);
       return typeof record.id === "string" ? record.id : null;
@@ -166,7 +175,9 @@ export async function deleteProviderConnectionsByProvider(providerId: string) {
       }
       _deleteAccountProxyAssignments(db, connectionIds);
     }
-    return db.prepare("DELETE FROM provider_connections WHERE provider = ?").run(providerId);
+    return db
+      .prepare("DELETE FROM provider_connections WHERE tenant_id = ? AND provider = ?")
+      .run(currentDbTenantId(), providerId);
   })();
 
   await _cleanupDeletedComboConnectionRefs(connectionIds);
@@ -193,13 +204,15 @@ export async function reorderProviderConnections(providerId: string) {
 export function reorderConnections(db: DbLike, providerId: string) {
   const rows = db
     .prepare(
-      "SELECT id, priority, updated_at FROM provider_connections WHERE provider = ? ORDER BY priority ASC, updated_at DESC"
+      "SELECT id, priority, updated_at FROM provider_connections WHERE tenant_id = ? AND provider = ? ORDER BY priority ASC, updated_at DESC"
     )
-    .all(providerId);
+    .all(currentDbTenantId(), providerId);
 
-  const update = db.prepare("UPDATE provider_connections SET priority = ? WHERE id = ?");
+  const update = db.prepare(
+    "UPDATE provider_connections SET priority = ? WHERE id = ? AND tenant_id = ?"
+  );
   rows.forEach((row, index) => {
     const current = toRecord(row);
-    update.run(index + 1, current.id);
+    update.run(index + 1, current.id, currentDbTenantId());
   });
 }

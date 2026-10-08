@@ -15,6 +15,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
 const store = await import("../../src/lib/db/responsesContinuationStore.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
 test.after(() => {
   core.resetDbInstance();
@@ -25,17 +26,19 @@ function insertCallLog(row: {
   id: string;
   responseId: string | null;
   apiKeyId: string | null;
+  tenantId?: string;
   detailState: string;
   artifactRelPath: string | null;
 }) {
   const db = core.getDbInstance();
   db.prepare(
     `INSERT INTO call_logs
-      (id, timestamp, method, path, status, model, provider, account, duration,
+      (id, tenant_id, timestamp, method, path, status, model, provider, account, duration,
        tokens_in, tokens_out, api_key_id, detail_state, artifact_relpath, response_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     row.id,
+    row.tenantId ?? "tenant_shiryu_admin",
     new Date().toISOString(),
     "POST",
     "/v1/responses",
@@ -97,9 +100,10 @@ test("resolvePreviousResponseState returns null for an unknown response id", () 
   assert.equal(result, null);
 });
 
-test("resolvePreviousResponseState never crosses tenants (scoped by api_key_id)", () => {
+test("resolvePreviousResponseState requires both tenant and API-key ownership", () => {
   insertCallLog({
     id: "log-2",
+    tenantId: "tenant_a",
     responseId: "resp_tenant_a",
     apiKeyId: "key-a",
     detailState: "ready",
@@ -110,9 +114,24 @@ test("resolvePreviousResponseState never crosses tenants (scoped by api_key_id)"
     clientResponse: { id: "resp_tenant_a", output: [{ role: "assistant", content: "reply" }] },
   });
 
-  assert.equal(store.resolvePreviousResponseState("resp_tenant_a", "key-b"), null);
-  assert.equal(store.resolvePreviousResponseState("resp_tenant_a", null), null);
-  assert.notEqual(store.resolvePreviousResponseState("resp_tenant_a", "key-a"), null);
+  assert.equal(
+    runWithTenantContext({ tenantId: "tenant_b", role: "owner" }, () =>
+      store.resolvePreviousResponseState("resp_tenant_a", "key-a")
+    ),
+    null
+  );
+  assert.equal(
+    runWithTenantContext({ tenantId: "tenant_a", role: "owner" }, () =>
+      store.resolvePreviousResponseState("resp_tenant_a", "key-b")
+    ),
+    null
+  );
+  assert.notEqual(
+    runWithTenantContext({ tenantId: "tenant_a", role: "owner" }, () =>
+      store.resolvePreviousResponseState("resp_tenant_a", "key-a")
+    ),
+    null
+  );
 });
 
 test("resolvePreviousResponseState returns null when the artifact is missing on disk", () => {

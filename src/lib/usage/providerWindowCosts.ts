@@ -12,6 +12,8 @@ import { getDbInstance } from "@/lib/db/core";
 import { getAllProviderLimitsCache, getProviderLimitsCache } from "@/lib/db/providerLimits";
 import { getProviderQuotaWindowStart } from "@/lib/db/quotaResetEvents";
 import { calculateCost } from "@/lib/usage/costCalculator";
+import { toNumber } from "@/shared/utils/numeric";
+import { currentDbTenantId } from "../db/tenantScope";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const RECORDED_COST_MATCH_TOLERANCE_MS = 30_000;
@@ -120,15 +122,6 @@ function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
 
-function toNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
-}
-
 function toString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -196,7 +189,7 @@ function scoreWeeklyQuota(name: string): number {
 }
 
 function selectWeeklyWindow(
-  provider: string,
+  _provider: string,
   connectionId: string | null,
   nowMs: number
 ): {
@@ -316,12 +309,14 @@ function buildUsageHistoryFilter(
   connectionId: string | null
 ): UsageHistoryFilter {
   const where = [
+    "(tenant_id = @tenantId OR (tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))",
     "LOWER(provider) = @provider",
     "timestamp >= @since",
     "timestamp <= @nowIso",
     "COALESCE(success, 1) = 1",
   ];
   const params: Record<string, unknown> = {
+    tenantId: currentDbTenantId(),
     provider: providerKey,
     since: windowStartAt,
     nowIso,

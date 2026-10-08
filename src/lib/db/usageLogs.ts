@@ -4,6 +4,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 // ---------------------------------------------------------------------------
 // Auto-routing analytics
@@ -23,10 +24,10 @@ export function getAutoRoutingTotalCount(): AutoRoutingTotalResult {
       `
       SELECT COUNT(*) as count
       FROM call_logs
-      WHERE requested_model = 'auto' OR requested_model LIKE 'auto/%'
+      WHERE tenant_id = ? AND (requested_model = 'auto' OR requested_model LIKE 'auto/%')
     `
     )
-    .get() as AutoRoutingTotalResult | undefined;
+    .get(currentDbTenantId()) as AutoRoutingTotalResult | undefined;
   return row ?? { count: 0 };
 }
 
@@ -51,12 +52,12 @@ export function getAutoRoutingVariantBreakdown(): AutoRoutingVariantRow[] {
         END as variant,
         COUNT(*) as count
       FROM call_logs
-      WHERE requested_model = 'auto' OR requested_model LIKE 'auto/%'
+      WHERE tenant_id = ? AND (requested_model = 'auto' OR requested_model LIKE 'auto/%')
       GROUP BY variant
       ORDER BY count DESC
     `
     )
-    .all() as AutoRoutingVariantRow[];
+    .all(currentDbTenantId()) as AutoRoutingVariantRow[];
 }
 
 export interface AutoRoutingTopProviderRow {
@@ -74,7 +75,8 @@ export function getAutoRoutingTopProviders(): AutoRoutingTopProviderRow[] {
       `
       SELECT provider, COUNT(*) as count
       FROM call_logs
-      WHERE (requested_model = 'auto' OR requested_model LIKE 'auto/%')
+      WHERE tenant_id = ?
+        AND (requested_model = 'auto' OR requested_model LIKE 'auto/%')
         AND provider IS NOT NULL
         AND TRIM(provider) != ''
       GROUP BY provider
@@ -82,5 +84,5 @@ export function getAutoRoutingTopProviders(): AutoRoutingTopProviderRow[] {
       LIMIT 10
       `
     )
-    .all() as AutoRoutingTopProviderRow[];
+    .all(currentDbTenantId()) as AutoRoutingTopProviderRow[];
 }

@@ -20,6 +20,22 @@ delete process.env.NEXT_PHASE;
 const migrations = await import("../../src/lib/usage/migrations.ts");
 const { getDbInstance } = await import("../../src/lib/db/core.ts");
 
+type MigratedCallLogRow = {
+  id: string;
+  tenant_id: string;
+  method: string;
+  path: string | null;
+  status: number;
+  provider: string | null;
+  account: string | null;
+  connection_id: string | null;
+  detail_state: string;
+  artifact_relpath: string | null;
+  has_request_body: number;
+  has_response_body: number;
+  error_summary: string | null;
+};
+
 const LEGACY_DATA_DIR = path.join(TEST_HOME_DIR, ".omniroute");
 const LEGACY_USAGE_JSON_FILE = path.join(LEGACY_DATA_DIR, "usage.json");
 const LEGACY_CALL_LOGS_JSON_FILE = path.join(LEGACY_DATA_DIR, "call_logs.json");
@@ -144,8 +160,8 @@ test("migrateUsageJsonToSqlite migrates usage history aliases, TTFT, and account
   const db = getDbInstance();
   db.prepare(
     `INSERT INTO provider_connections
-      (id, provider, auth_type, email, provider_specific_data, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+      (id, tenant_id, provider, auth_type, email, provider_specific_data, created_at, updated_at)
+     VALUES (?, 'tenant_shiryu_admin', ?, ?, ?, ?, ?, ?)`
   ).run(
     "conn-openai",
     "openai",
@@ -201,7 +217,7 @@ test("migrateUsageJsonToSqlite migrates usage history aliases, TTFT, and account
   const rows = db
     .prepare(
       `
-        SELECT provider, model, connection_id, account_key, account_label,
+        SELECT tenant_id, provider, model, connection_id, account_key, account_label,
                account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
                tokens_cache_read, tokens_cache_creation, tokens_reasoning, status, success,
                latency_ms, ttft_ms, error_code
@@ -214,6 +230,7 @@ test("migrateUsageJsonToSqlite migrates usage history aliases, TTFT, and account
 
   assert.deepEqual(rows, [
     {
+      tenant_id: "tenant_shiryu_admin",
       provider: "openai",
       model: "gpt-4o-mini",
       connection_id: "conn-openai",
@@ -234,6 +251,7 @@ test("migrateUsageJsonToSqlite migrates usage history aliases, TTFT, and account
       error_code: "timeout",
     },
     {
+      tenant_id: "tenant_shiryu_admin",
       provider: "gemini",
       model: "gemini-2.5-flash",
       connection_id: null,
@@ -301,19 +319,20 @@ test("migrateUsageJsonToSqlite migrates call logs to summary rows and ignores du
   const rows = db
     .prepare(
       `
-        SELECT id, method, path, status, provider, account, connection_id,
+        SELECT id, tenant_id, method, path, status, provider, account, connection_id,
                detail_state, artifact_relpath, has_request_body, has_response_body, error_summary
         FROM call_logs
         ORDER BY timestamp ASC
       `
     )
-    .all();
+    .all() as MigratedCallLogRow[];
 
   assert.equal(rows.length, 2);
   assert.deepEqual(
     { ...rows[0] },
     {
       id: "call-1",
+      tenant_id: "tenant_shiryu_admin",
       method: "GET",
       path: "/v1/chat/completions",
       status: 201,
@@ -321,24 +340,25 @@ test("migrateUsageJsonToSqlite migrates call logs to summary rows and ignores du
       account: "acct-a",
       connection_id: "conn-a",
       detail_state: "ready",
-      artifact_relpath: (rows[0] as any).artifact_relpath,
+      artifact_relpath: rows[0].artifact_relpath,
       has_request_body: 1,
       has_response_body: 1,
       error_summary: "bad upstream",
     }
   );
   assert.equal(typeof rows[0].artifact_relpath, "string");
-  assert.equal((rows[1] as any).id.length > 0, true);
-  assert.equal((rows[1] as any).method, "POST");
-  assert.equal((rows[1] as any).path, null);
-  assert.equal((rows[1] as any).status, 0);
-  assert.equal((rows[1] as any).provider, null);
-  assert.equal((rows[1] as any).account, null);
-  assert.equal((rows[1] as any).connection_id, null);
-  assert.equal((rows[1] as any).detail_state, "ready");
-  assert.equal((rows[1] as any).has_request_body, 1);
-  assert.equal((rows[1] as any).has_response_body, 0);
-  assert.equal((rows[1] as any).error_summary, null);
+  assert.equal(rows[1].id.length > 0, true);
+  assert.equal(rows[1].tenant_id, "tenant_shiryu_admin");
+  assert.equal(rows[1].method, "POST");
+  assert.equal(rows[1].path, null);
+  assert.equal(rows[1].status, 0);
+  assert.equal(rows[1].provider, null);
+  assert.equal(rows[1].account, null);
+  assert.equal(rows[1].connection_id, null);
+  assert.equal(rows[1].detail_state, "ready");
+  assert.equal(rows[1].has_request_body, 1);
+  assert.equal(rows[1].has_response_body, 0);
+  assert.equal(rows[1].error_summary, null);
 
   const firstArtifact = JSON.parse(
     fs.readFileSync(path.join(TEST_DATA_DIR, "call_logs", rows[0].artifact_relpath), "utf8")
@@ -347,10 +367,7 @@ test("migrateUsageJsonToSqlite migrates call logs to summary rows and ignores du
   assert.deepEqual(firstArtifact.responseBody, { id: "resp-1" });
 
   const secondArtifact = JSON.parse(
-    fs.readFileSync(
-      path.join(TEST_DATA_DIR, "call_logs", (rows as any)[1].artifact_relpath),
-      "utf8"
-    )
+    fs.readFileSync(path.join(TEST_DATA_DIR, "call_logs", rows[1].artifact_relpath ?? ""), "utf8")
   );
   assert.deepEqual(secondArtifact.requestBody, { foo: "bar" });
   assert.equal(secondArtifact.responseBody, null);
@@ -366,8 +383,14 @@ test("migrateUsageJsonToSqlite renames empty JSON payloads without inserting row
   assert.equal(fs.existsSync(`${CALL_LOGS_JSON_FILE}.migrated`), true);
 
   const db = getDbInstance();
-  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM usage_history").get() as any).count, 0);
-  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM call_logs").get() as any).count, 0);
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM usage_history").get() as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM call_logs").get() as { count: number }).count,
+    0
+  );
 });
 
 test("migrateUsageJsonToSqlite leaves malformed JSON files in place and reports both failures", () => {
@@ -393,8 +416,14 @@ test("migrateUsageJsonToSqlite leaves malformed JSON files in place and reports 
   assert.equal(fs.existsSync(`${CALL_LOGS_JSON_FILE}.migrated`), false);
 
   const db = getDbInstance();
-  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM usage_history").get() as any).count, 0);
-  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM call_logs").get() as any).count, 0);
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM usage_history").get() as { count: number }).count,
+    0
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM call_logs").get() as { count: number }).count,
+    0
+  );
   assert.ok(errors.some((entry) => entry.includes("Failed to migrate usage.json")));
   assert.ok(errors.some((entry) => entry.includes("Failed to migrate call_logs.json")));
 });

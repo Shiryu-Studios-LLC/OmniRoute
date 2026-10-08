@@ -22,17 +22,18 @@ process.env.CALL_LOG_RETENTION_DAYS = "3650";
 
 const core = await import("../../src/lib/db/core.ts");
 const callLogs = await import("../../src/lib/usage/callLogs.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 
-function insertCallLog(id: string, timestamp: string) {
+function insertCallLog(id: string, timestamp: string, tenantId = "tenant_shiryu_admin") {
   const db = core.getDbInstance();
   db.prepare(
     `
     INSERT INTO call_logs (
-      id, timestamp, method, path, status, model, provider, detail_state
+      id, tenant_id, timestamp, method, path, status, model, provider, detail_state
     )
-    VALUES (@id, @timestamp, 'POST', '/v1/chat/completions', 200, 'openai/gpt-4.1', 'openai', 'none')
+    VALUES (@id, @tenantId, @timestamp, 'POST', '/v1/chat/completions', 200, 'openai/gpt-4.1', 'openai', 'none')
   `
-  ).run({ id, timestamp });
+  ).run({ id, tenantId, timestamp });
 }
 
 test.beforeEach(() => {
@@ -74,6 +75,39 @@ test("trimCallLogsToMaxRows deletes >999 rows in one pass without 'too many SQL 
     (db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as { cnt: number }).cnt,
     10,
     "exactly maxRows rows must remain"
+  );
+});
+
+test("call-log rotation and retention only delete the active tenant's rows", () => {
+  const db = core.getDbInstance();
+  insertCallLog("tenant-a-old", "2026-01-01T00:00:00.000Z", "tenant_a");
+  insertCallLog("tenant-a-new", "2026-01-02T00:00:00.000Z", "tenant_a");
+  insertCallLog("tenant-a-latest", "2026-01-03T00:00:00.000Z", "tenant_a");
+  insertCallLog("tenant-b-old", "2026-01-01T00:00:00.000Z", "tenant_b");
+
+  const result = runWithTenantContext({ tenantId: "tenant_a", role: "owner" }, () => {
+    const expired = callLogs.deleteCallLogsBefore("2026-01-01T12:00:00.000Z");
+    const trimmed = callLogs.trimCallLogsToMaxRows(1);
+    return { expired, trimmed };
+  });
+
+  assert.equal(result.expired.deletedRows, 1);
+  assert.equal(result.trimmed.deletedRows, 1);
+  assert.equal(
+    (
+      db.prepare("SELECT COUNT(*) AS cnt FROM call_logs WHERE tenant_id = 'tenant_a'").get() as {
+        cnt: number;
+      }
+    ).cnt,
+    1
+  );
+  assert.equal(
+    (
+      db.prepare("SELECT COUNT(*) AS cnt FROM call_logs WHERE tenant_id = 'tenant_b'").get() as {
+        cnt: number;
+      }
+    ).cnt,
+    1
   );
 });
 

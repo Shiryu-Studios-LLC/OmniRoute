@@ -175,6 +175,7 @@ const eslintConfig = [
     ignores: [
       // Next.js build output (distDir now .build/next; keep .next for legacy)
       ".next/**",
+      ".open-next/**",
       ".build/**",
       "src/.next/**",
       "out/**",

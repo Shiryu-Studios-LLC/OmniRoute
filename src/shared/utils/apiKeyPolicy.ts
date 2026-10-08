@@ -32,7 +32,7 @@ import { resolveQuotaKeyScope } from "@/lib/quota/quotaKey";
 import { isQuotaModelName, parseQuotaModelName } from "@/lib/quota/quotaModelNaming";
 import { buildApiKeyUsageLimitPolicyRejection } from "@/lib/usage/apiKeyUsageLimits";
 import { ALL_COMBOS_ACCESS_RULE } from "@/shared/constants/comboAccess";
-import { enterTenantContext } from "@/lib/tenantContext";
+import { enterApiKeyTenantContext } from "@/server/authz/tenantMembership";
 
 // Default to no per-key request cap. API keys can still opt into explicit
 // limits via Settings/API Keys, while provider/account quota controls remain
@@ -704,7 +704,7 @@ export async function enforceApiKeyPolicy(
   }
 
   if (apiKeyInfo.tenantId) {
-    enterTenantContext({ tenantId: apiKeyInfo.tenantId, principalId: apiKeyInfo.id });
+    enterApiKeyTenantContext(apiKeyInfo.tenantId, apiKeyInfo.id);
   }
 
   const context = { request, apiKey, apiKeyInfo, modelStr };

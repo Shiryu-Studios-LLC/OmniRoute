@@ -3,6 +3,7 @@
  */
 
 import { getDbInstance } from "../core";
+import { currentDbTenantId } from "../tenantScope";
 
 export async function getCacheMetrics() {
   const db = getDbInstance();
@@ -18,10 +19,10 @@ export async function getCacheMetrics() {
         SUM(tokens_cache_read) as totalCachedTokens,
         SUM(tokens_cache_creation) as totalCacheCreationTokens
       FROM usage_history
-      WHERE tokens_cache_read > 0 OR tokens_cache_creation > 0
+      WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0) AND tenant_id = @tenantId
     `
       )
-      .get() as
+      .get({ tenantId: currentDbTenantId() }) as
       | {
           totalRequests: number;
           totalInputTokens: number | null;
@@ -36,9 +37,10 @@ export async function getCacheMetrics() {
         `
       SELECT COUNT(*) as totalRequests
       FROM usage_history
+      WHERE tenant_id = @tenantId
     `
       )
-      .get() as { totalRequests: number } | undefined;
+      .get({ tenantId: currentDbTenantId() }) as { totalRequests: number } | undefined;
 
     // Aggregate by provider
     const byProviderRows = db
@@ -52,12 +54,12 @@ export async function getCacheMetrics() {
         SUM(tokens_cache_read) as cachedTokens,
         SUM(tokens_cache_creation) as cacheCreationTokens
       FROM usage_history
-      WHERE provider IS NOT NULL
+      WHERE provider IS NOT NULL AND tenant_id = @tenantId
       GROUP BY provider
       HAVING cachedRequests > 0
     `
       )
-      .all() as Array<{
+      .all({ tenantId: currentDbTenantId() }) as Array<{
       provider: string;
       totalRequests: number;
       cachedRequests: number;
@@ -77,11 +79,11 @@ export async function getCacheMetrics() {
         SUM(tokens_cache_read) as cachedTokens,
         SUM(tokens_cache_creation) as cacheCreationTokens
       FROM usage_history
-      WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0)
+      WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0) AND tenant_id = @tenantId
       GROUP BY combo_strategy
     `
       )
-      .all() as Array<{
+      .all({ tenantId: currentDbTenantId() }) as Array<{
       strategy: string;
       requests: number;
       inputTokens: number | null;
@@ -198,12 +200,12 @@ export async function getCacheTrend(hours = 24): Promise<CacheTrendPoint[]> {
           SUM(tokens_cache_read) as cachedTokens,
           SUM(tokens_cache_creation) as cacheCreationTokens
         FROM usage_history
-        WHERE timestamp >= datetime('now', ?)
+        WHERE tenant_id = @tenantId AND timestamp >= datetime('now', @window)
         GROUP BY hour
         ORDER BY hour ASC
       `
       )
-      .all(`-${hours} hours`) as Array<{
+      .all({ tenantId: currentDbTenantId(), window: `-${hours} hours` }) as Array<{
       hour: string;
       requests: number;
       cachedRequests: number;

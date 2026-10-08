@@ -125,8 +125,8 @@ test("getCachedProviderConnections caches only the unfiltered query", async () =
   db.prepare(
     `
     INSERT INTO provider_connections (
-      id, provider, auth_type, name, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      id, provider, auth_type, name, is_active, created_at, updated_at, tenant_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'tenant_shiryu_admin')
   `
   ).run("direct-insert", "openai", "apikey", "Secondary", 1, now, now);
 
@@ -269,7 +269,7 @@ test("getCachedProviderNodes caches results and invalidates on nodes write", asy
   assert.equal(matching[0].name, "Cached Node");
 
   db.prepare(
-    "INSERT INTO provider_nodes (id, type, name, base_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT INTO provider_nodes (id, type, name, base_url, created_at, updated_at, tenant_id) VALUES (?, ?, ?, ?, ?, ?, 'tenant_shiryu_admin')"
   ).run("node-direct-test", "openai", "Direct Insert Node", "https://direct.example.com", now, now);
 
   const cachedNodes = await readCache.getCachedProviderNodes();

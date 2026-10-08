@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
-import {
-  getSettings,
-  getProviderConnections,
-  getCachedProviderNodes,
-  getCombos,
-  getApiKeys,
-} from "@/lib/localDb";
-import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getSettings } from "@/lib/db/settings";
+import { getProviderConnections } from "@/lib/db/providers";
+import { getCachedProviderNodes } from "@/lib/db/readCache";
+import { getCombos } from "@/lib/db/repositories/sqliteComboRepository";
+import { getApiKeys } from "@/lib/db/apiKeys";
+import { PLATFORM_TENANT_ID } from "@/lib/db/tenantScope";
+import { getManagementTenantId } from "@/lib/api/managementTenant";
 import {
   getAllUsageHistory,
   getAllDomainCostHistory,
@@ -49,10 +49,13 @@ export function filterPaidComboSteps<T extends { models?: unknown }>(combos: T[]
  * Exports a legacy OmniRoute-compatible JSON backup.
  */
 export async function GET(request: Request) {
-  if (await isAuthRequired(request)) {
-    if (!(await isAuthenticated(request))) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
+  if (authError) return authError;
+  if ((await getManagementTenantId(request)) !== PLATFORM_TENANT_ID) {
+    return NextResponse.json(
+      { error: "Platform backup is available to platform admins only" },
+      { status: 403 }
+    );
   }
 
   try {
@@ -75,9 +78,10 @@ export async function GET(request: Request) {
 
     // #6328: honor hidePaidModels at the export boundary so backup files
     // cannot silently smuggle paid model ids back in on import.
-    const combos = rawSettings.hidePaidModels === true
-      ? filterPaidComboSteps(combosRaw as Array<{ models?: unknown }>)
-      : combosRaw;
+    const combos =
+      rawSettings.hidePaidModels === true
+        ? filterPaidComboSteps(combosRaw as Array<{ models?: unknown }>)
+        : combosRaw;
 
     const exportData: Record<string, unknown> = {
       settings: safeSettings,

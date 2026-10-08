@@ -1,6 +1,7 @@
 import { resolveUsageAccountIdentity } from "@/lib/usage/accountIdentity";
 import { parseProviderSpecificData } from "../webSessionDedup";
 import { toStringOrNull } from "./columns";
+import { currentDbTenantId } from "../tenantScope";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -9,7 +10,7 @@ interface StatementLike {
 }
 
 interface DbLike {
-  prepare: <TRow = unknown>(sql: string) => StatementLike;
+  prepare: (sql: string) => StatementLike;
 }
 
 function nonEmptyString(value: unknown): string | null {
@@ -75,9 +76,11 @@ export function reconcileCodexUsageHistory(
            COALESCE(account_label_priority, 0),
            @newLabelPriority
          )
-     WHERE connection_id = @connectionId
+     WHERE tenant_id = @tenantId
+       AND connection_id = @connectionId
        AND account_key = @oldAccountKey`
   ).run({
+    tenantId: currentDbTenantId(),
     connectionId: input.connectionId,
     oldAccountKey: oldIdentity.accountKey,
     newAccountKey: newIdentity.accountKey,

@@ -7,6 +7,7 @@
  */
 import { randomUUID } from "crypto";
 import { getDbInstance } from "./core";
+import { PLATFORM_TENANT_ID, currentDbTenantId } from "./tenantScope";
 
 export const SHIRYU_ADMIN_TENANT_ID = "tenant_shiryu_admin";
 
@@ -49,17 +50,26 @@ function toTenant(row: TenantRow | undefined): TenantRecord | null {
 export function getTenantById(id: string): TenantRecord | null {
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM tenants WHERE id = ? LIMIT 1").get(id) as unknown as
-    | TenantRow
-    | undefined;
+    TenantRow | undefined;
   return toTenant(row);
 }
 
 export function getTenantBySlug(slug: string): TenantRecord | null {
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM tenants WHERE slug = ? LIMIT 1").get(slug) as unknown as
-    | TenantRow
-    | undefined;
+    TenantRow | undefined;
   return toTenant(row);
+}
+
+/** Internal scheduler helper for jobs that must run inside each tenant context. */
+export function listActiveTenantIdsForMaintenance(): string[] {
+  if (currentDbTenantId() !== PLATFORM_TENANT_ID) {
+    throw new Error("Tenant maintenance enumeration is platform-only");
+  }
+  const rows = getDbInstance()
+    .prepare("SELECT id FROM tenants WHERE is_active = 1 ORDER BY id")
+    .all() as Array<{ id: string }>;
+  return rows.map((row) => row.id);
 }
 
 export function getShiryuAdminTenant(): TenantRecord {
@@ -70,15 +80,10 @@ export function getShiryuAdminTenant(): TenantRecord {
   return tenant;
 }
 
-export function getTenantMemberRole(
-  tenantId: string,
-  principalId: string
-): TenantRole | null {
+export function getTenantMemberRole(tenantId: string, principalId: string): TenantRole | null {
   const db = getDbInstance();
   const row = db
-    .prepare(
-      "SELECT role FROM tenant_members WHERE tenant_id = ? AND principal_id = ? LIMIT 1"
-    )
+    .prepare("SELECT role FROM tenant_members WHERE tenant_id = ? AND principal_id = ? LIMIT 1")
     .get(tenantId, principalId) as { role?: unknown } | undefined;
   return typeof row?.role === "string" ? (row.role as TenantRole) : null;
 }

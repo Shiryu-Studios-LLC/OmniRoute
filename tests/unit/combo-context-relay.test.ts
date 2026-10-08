@@ -553,8 +553,8 @@ test("context_cache_protection: pins body.model to last session model when histo
   // dropped by isPinnedModelDurablyUnhealthy (no connections = durably down).
   const db = core.getDbInstance();
   db.prepare(
-    `INSERT OR IGNORE INTO provider_connections (id, provider, auth_type, name, is_active, test_status, created_at, updated_at)
-     VALUES ('test-anthropic-conn', 'anthropic', 'api_key', 'test-anthropic', 1, 'active', datetime('now'), datetime('now'))`
+    `INSERT OR IGNORE INTO provider_connections (id, provider, auth_type, name, is_active, test_status, created_at, updated_at, tenant_id)
+     VALUES ('test-anthropic-conn', 'anthropic', 'api_key', 'test-anthropic', 1, 'active', datetime('now'), datetime('now'), 'tenant_shiryu_admin')`
   ).run();
 
   const capturedModels: string[] = [];

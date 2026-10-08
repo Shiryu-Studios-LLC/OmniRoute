@@ -21,6 +21,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.API_KEY_SECRET = "test-ag-local-usage-secret";
 
 const core = await import("../../src/lib/db/core.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 // Load usage.ts up-front (its index.ts proxyFetch patch runs at module eval) before mocks.
 const usageModule = await import("../../open-sse/services/usage.ts");
 const { getUsageForProvider } = usageModule;
@@ -45,9 +46,31 @@ test("Antigravity fetchAvailableModels(used=0) → localUsageHistory when usage_
     prepare: (sql: string) => { run: (...a: unknown[]) => unknown };
   };
   db.prepare(
-    `INSERT INTO usage_history (provider, model, connection_id, tokens_input, tokens_output, tokens_reasoning, success, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
-  ).run("antigravity", "gemini-3.7-flash-high", "conn-local-1", 1000, 1500, 500, seededTimestamp);
+    `INSERT INTO usage_history (tenant_id, provider, model, connection_id, tokens_input, tokens_output, tokens_reasoning, success, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`
+  ).run(
+    "tenant_a",
+    "antigravity",
+    "gemini-3.7-flash-high",
+    "conn-local-1",
+    9000,
+    0,
+    0,
+    seededTimestamp
+  );
+  db.prepare(
+    `INSERT INTO usage_history (tenant_id, provider, model, connection_id, tokens_input, tokens_output, tokens_reasoning, success, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`
+  ).run(
+    "tenant_b",
+    "antigravity",
+    "gemini-3.7-flash-high",
+    "conn-local-1",
+    1000,
+    1500,
+    500,
+    seededTimestamp
+  );
   // Total seeded tokens = 3000 → ceil(3000/1000) = 3 units used.
 
   globalThis.fetch = (async (input: any) => {
@@ -77,7 +100,9 @@ test("Antigravity fetchAvailableModels(used=0) → localUsageHistory when usage_
     projectId: undefined,
   };
 
-  const result = await getUsageForProvider(connection, { forceRefresh: true });
+  const result = await runWithTenantContext({ tenantId: "tenant_b", role: "owner" }, () =>
+    getUsageForProvider(connection, { forceRefresh: true })
+  );
   assert.ok(result && "quotas" in result, "should return quotas");
   const quota = (result as any).quotas["gemini-3.7-flash-high"];
   assert.ok(quota, "should have the gemini-3.7-flash-high quota");

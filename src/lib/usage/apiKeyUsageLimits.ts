@@ -1,8 +1,10 @@
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import type { ProviderLimitsCacheEntry } from "@/lib/db/providerLimits";
 import { getProviderQuotaWindowStartIso } from "@/lib/db/quotaResetEvents";
 import { calculateCost } from "./costCalculator";
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
+import { toNumber } from "@/shared/utils/numeric";
 
 const FORTALEZA_UTC_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -61,15 +63,6 @@ interface QuotaSnapshotRow {
   remainingPercentage: number | null;
   nextResetAt: string | null;
   createdAt: string | null;
-}
-
-function toNumber(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -240,14 +233,18 @@ function getObservedWeeklyWindowStartIso(
           next_reset_at as nextResetAt,
           created_at as createdAt
         FROM quota_snapshots
-        WHERE connection_id = @connectionId
+        WHERE tenant_id = @tenantId AND connection_id = @connectionId
           AND LOWER(window_key) LIKE '%weekly%'
           AND LOWER(window_key) NOT LIKE '%sonnet%'
           AND created_at <= @nowIso
         ORDER BY created_at ASC, id ASC
       `
       )
-      .all({ connectionId, nowIso: new Date(nowMs).toISOString() }) as QuotaSnapshotRow[];
+      .all({
+        tenantId: currentDbTenantId(),
+        connectionId,
+        nowIso: new Date(nowMs).toISOString(),
+      }) as QuotaSnapshotRow[];
 
     let observedStartIso: string | null = null;
     let previousUsedPercent: number | null = null;
@@ -389,13 +386,14 @@ async function getApiKeyUsdSpendSince(apiKeyId: string, sinceIso: string): Promi
         COALESCE(SUM(tokens_cache_creation), 0) as cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens
       FROM usage_history
-      WHERE api_key_id = @apiKeyId
+      WHERE tenant_id = @tenantId
+        AND api_key_id = @apiKeyId
         AND timestamp >= @sinceIso
         AND success = 1
       GROUP BY LOWER(provider), LOWER(model), serviceTier
     `
     )
-    .all({ apiKeyId, sinceIso }) as UsageCostRow[];
+    .all({ apiKeyId, sinceIso, tenantId: currentDbTenantId() }) as UsageCostRow[];
 
   let total = 0;
   for (const row of rows) {

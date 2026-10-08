@@ -1,4 +1,5 @@
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 
 export type ComboForecastUsageRow = {
   comboName: string;
@@ -54,8 +55,16 @@ export function getComboForecastUsageRows(opts: {
   comboName?: string;
 }): ComboForecastUsageRow[] {
   const db = getDbInstance();
-  const conditions = ["combo_name IS NOT NULL", "combo_name != ''", "timestamp >= @since"];
-  const params: Record<string, unknown> = { since: opts.since };
+  const conditions = [
+    "combo_name IS NOT NULL",
+    "combo_name != ''",
+    "timestamp >= @since",
+    "(tenant_id = @tenantId OR (tenant_id IS NULL AND @tenantId = 'tenant_shiryu_admin'))",
+  ];
+  const params: Record<string, unknown> = {
+    since: opts.since,
+    tenantId: currentDbTenantId(),
+  };
 
   if (opts.until) {
     conditions.push("timestamp <= @until");

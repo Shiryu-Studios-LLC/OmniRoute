@@ -9,7 +9,9 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { clearApiKeyCaches } from "./apiKeys";
+import { getGroup } from "./quotaGroups";
 import { invalidateModelCatalogCache } from "./readCache";
 // Phase B2: auto-mint/prune quotaShared-* combos when pool allocations change.
 // Imported lazily (dynamic import in the hook) to avoid circular-dependency
@@ -50,7 +52,7 @@ async function removeQuotaCombosGuarded(poolId: string): Promise<void> {
   } catch (err) {
     console.warn(
       "[quota-pools] removeQuotaCombosForPool failed (non-fatal):",
-      (err as Error)?.message,
+      (err as Error)?.message
     );
   }
 }
@@ -134,25 +136,60 @@ function getDb(): DbLike {
   return getDbInstance() as unknown as DbLike;
 }
 
+function assertAllocationApiKeyOwnership(
+  database: DbLike,
+  allocations: PoolAllocation[] = []
+): void {
+  const apiKeyIds = [
+    ...new Set(allocations.map((allocation) => allocation.apiKeyId).filter(Boolean)),
+  ];
+  if (apiKeyIds.length === 0) return;
+
+  const placeholders = apiKeyIds.map(() => "?").join(",");
+  const rows = database
+    .prepare<{ id: string; tenant_id: string }>(
+      `SELECT id, tenant_id FROM api_keys WHERE id IN (${placeholders})`
+    )
+    .all(...apiKeyIds);
+  const tenantId = currentDbTenantId();
+  if (rows.some((row) => row.tenant_id !== tenantId)) {
+    throw new Error("Quota pool allocations must reference API keys owned by the current tenant");
+  }
+}
+
 /**
  * Asserts that all connections in the list belong to the same provider.
  * Throws if mixed providers are detected. No-op when list has 0 or 1 entry.
  * Uses a single DISTINCT query against provider_connections (sync — better-sqlite3).
  */
 function assertSingleProvider(connectionIds: string[]): void {
-  if (!connectionIds || connectionIds.length <= 1) return;
+  if (!connectionIds || connectionIds.length === 0) return;
   const db = getDb();
-  const placeholders = connectionIds.map(() => "?").join(",");
+  const uniqueConnectionIds = [...new Set(connectionIds)];
+  const placeholders = uniqueConnectionIds.map(() => "?").join(",");
   const rows = db
-    .prepare<{
-      provider: string;
-    }>(`SELECT DISTINCT provider FROM provider_connections WHERE id IN (${placeholders})`)
-    .all(...connectionIds);
+    .prepare<{ id: string; provider: string; tenant_id: string }>(
+      `SELECT DISTINCT id, provider, tenant_id FROM provider_connections WHERE id IN (${placeholders})`
+    )
+    .all(...uniqueConnectionIds);
+  const rowsById = new Map(rows.map((row) => [row.id, row]));
+  for (const row of rowsById.values()) {
+    if (row.tenant_id !== currentDbTenantId()) {
+      throw new Error("Quota pool connections must belong to the current tenant");
+    }
+  }
+  // Legacy pools may refer to connection IDs that have since been removed.
   const providers = rows.map((r) => r.provider).filter(Boolean);
   if (new Set(providers).size > 1) {
     throw new Error(
-      `A quota pool must use a single provider (got: ${[...new Set(providers)].join(", ")})`,
+      `A quota pool must use a single provider (got: ${[...new Set(providers)].join(", ")})`
     );
+  }
+}
+
+function assertQuotaGroupOwnership(groupId: string): void {
+  if (!getGroup(groupId)) {
+    throw new Error("Quota pool group must belong to the current tenant");
   }
 }
 
@@ -162,6 +199,7 @@ interface PoolRow {
   name: string;
   group_id: string | null;
   created_at: string;
+  tenant_id: string;
 }
 
 interface AllocationRow {
@@ -205,7 +243,7 @@ interface PoolConnectionRow {
 function getConnectionIds(poolId: string, fallbackConnectionId: string): string[] {
   const rows = getDb()
     .prepare<PoolConnectionRow>(
-      "SELECT connection_id FROM quota_pool_connections WHERE pool_id = ? ORDER BY created_at ASC",
+      "SELECT connection_id FROM quota_pool_connections WHERE pool_id = ? ORDER BY created_at ASC"
     )
     .all(poolId);
   if (rows.length > 0) {
@@ -236,7 +274,7 @@ function batchBuildPools(rows: PoolRow[]): QuotaPool[] {
   // Batch allocations: 1 query for all pools
   const allocRows = db
     .prepare<AllocationRow>(
-      `SELECT pool_id, api_key_id, weight, cap_value, cap_unit, policy FROM quota_allocations WHERE pool_id IN (${ph})`,
+      `SELECT pool_id, api_key_id, weight, cap_value, cap_unit, policy FROM quota_allocations WHERE pool_id IN (${ph})`
     )
     .all(...poolIds);
   const allocsByPool = new Map<string, AllocationRow[]>();
@@ -252,7 +290,7 @@ function batchBuildPools(rows: PoolRow[]): QuotaPool[] {
   // Batch connections: 1 query for all pools
   const connRows = db
     .prepare<{ pool_id: string; connection_id: string }>(
-      `SELECT pool_id, connection_id FROM quota_pool_connections WHERE pool_id IN (${ph}) ORDER BY created_at ASC`,
+      `SELECT pool_id, connection_id FROM quota_pool_connections WHERE pool_id IN (${ph}) ORDER BY created_at ASC`
     )
     .all(...poolIds);
   const connsByPool = new Map<string, string[]>();
@@ -279,7 +317,7 @@ function batchBuildPools(rows: PoolRow[]): QuotaPool[] {
 function getAllocations(poolId: string): PoolAllocation[] {
   const rows = getDb()
     .prepare<AllocationRow>(
-      "SELECT pool_id, api_key_id, weight, cap_value, cap_unit, policy FROM quota_allocations WHERE pool_id = ?",
+      "SELECT pool_id, api_key_id, weight, cap_value, cap_unit, policy FROM quota_allocations WHERE pool_id = ?"
     )
     .all(poolId);
   return rows.map(rowToAllocation);
@@ -299,8 +337,8 @@ function makeId(): string {
  */
 export function getPoolsByGroup(groupId: string, limit?: number, offset?: number): QuotaPool[] {
   let sql =
-    "SELECT id, connection_id, name, group_id, created_at FROM quota_pools WHERE group_id = ? ORDER BY created_at ASC";
-  const params: unknown[] = [groupId];
+    "SELECT id, connection_id, name, group_id, created_at, tenant_id FROM quota_pools WHERE tenant_id = ? AND group_id = ? ORDER BY created_at ASC";
+  const params: unknown[] = [currentDbTenantId(), groupId];
   if (limit !== undefined && limit > 0) {
     sql += " LIMIT ?";
     params.push(limit);
@@ -325,8 +363,8 @@ export function listPools(options?: { limit?: number; offset?: number }): {
   const limit = options?.limit;
   const offset = options?.offset;
   let sql =
-    "SELECT id, connection_id, name, group_id, created_at FROM quota_pools ORDER BY created_at ASC";
-  const params: unknown[] = [];
+    "SELECT id, connection_id, name, group_id, created_at, tenant_id FROM quota_pools WHERE tenant_id = ? ORDER BY created_at ASC";
+  const params: unknown[] = [currentDbTenantId()];
   if (limit !== undefined && limit > 0) {
     sql += " LIMIT ?";
     params.push(limit);
@@ -338,7 +376,9 @@ export function listPools(options?: { limit?: number; offset?: number }): {
   const rows = getDb()
     .prepare<PoolRow>(sql)
     .all(...params);
-  const totalRow = getDb().prepare("SELECT count(*) as cnt FROM quota_pools").get() as {
+  const totalRow = getDb()
+    .prepare("SELECT count(*) as cnt FROM quota_pools WHERE tenant_id = ?")
+    .get(currentDbTenantId()) as {
     cnt: number;
   };
   return { items: batchBuildPools(rows), total: totalRow.cnt };
@@ -350,9 +390,9 @@ export function listPools(options?: { limit?: number; offset?: number }): {
 export function getPool(id: string): QuotaPool | null {
   const row = getDb()
     .prepare<PoolRow>(
-      "SELECT id, connection_id, name, group_id, created_at FROM quota_pools WHERE id = ?",
+      "SELECT id, connection_id, name, group_id, created_at, tenant_id FROM quota_pools WHERE tenant_id = ? AND id = ?"
     )
-    .get(id);
+    .get(currentDbTenantId(), id);
   if (!row) return null;
   return batchBuildPools([row])[0];
 }
@@ -374,22 +414,22 @@ export function createPool(input: PoolCreate): QuotaPool {
   const primaryConnectionId = members[0];
 
   // Guard: a pool must use a single provider.
-  if (input.connectionIds && input.connectionIds.length > 1) {
-    assertSingleProvider(input.connectionIds);
-  }
+  assertSingleProvider(members);
 
   const groupId = input.groupId || "group-demo";
+  assertQuotaGroupOwnership(groupId);
 
   const database = getDb();
   const doCreate = database.transaction(() => {
+    assertAllocationApiKeyOwnership(database, input.allocations);
     database
       .prepare(
-        "INSERT INTO quota_pools (id, connection_id, name, group_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO quota_pools (id, connection_id, name, group_id, created_at, tenant_id) VALUES (?, ?, ?, ?, ?, ?)"
       )
-      .run(id, primaryConnectionId, input.name, groupId, now);
+      .run(id, primaryConnectionId, input.name, groupId, now, currentDbTenantId());
 
     const insertConn = database.prepare(
-      "INSERT OR IGNORE INTO quota_pool_connections (pool_id, connection_id) VALUES (?, ?)",
+      "INSERT OR IGNORE INTO quota_pool_connections (pool_id, connection_id) VALUES (?, ?)"
     );
     for (const connId of members) {
       insertConn.run(id, connId);
@@ -398,7 +438,7 @@ export function createPool(input: PoolCreate): QuotaPool {
     if (input.allocations && input.allocations.length > 0) {
       const insertAlloc = database.prepare(
         `INSERT INTO quota_allocations (pool_id, api_key_id, weight, cap_value, cap_unit, policy)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?)`
       );
       for (const alloc of input.allocations) {
         insertAlloc.run(
@@ -407,7 +447,7 @@ export function createPool(input: PoolCreate): QuotaPool {
           alloc.weight,
           alloc.capValue ?? null,
           alloc.capUnit ?? null,
-          alloc.policy,
+          alloc.policy
         );
       }
     }
@@ -421,8 +461,9 @@ export function createPool(input: PoolCreate): QuotaPool {
       name: input.name,
       group_id: groupId,
       created_at: now,
+      tenant_id: currentDbTenantId(),
     },
-    getAllocations(id),
+    getAllocations(id)
   );
 
   // Phase B2: fire-and-forget combo sync; failures are logged but never thrown.
@@ -449,9 +490,10 @@ function allocationFingerprint(allocations: PoolAllocation[] = []): string {
 
 /** Idempotent pool management for automation and bounded CLI callers. */
 export function ensurePool(input: PoolCreate): EnsurePoolResult {
-  const members = input.connectionIds && input.connectionIds.length > 0
-    ? input.connectionIds
-    : [input.connectionId];
+  const members =
+    input.connectionIds && input.connectionIds.length > 0
+      ? input.connectionIds
+      : [input.connectionId];
   const groupId = input.groupId || "group-demo";
   const existing = listPools().items.find((pool) => {
     return pool.name === input.name && pool.groupId === groupId;
@@ -486,18 +528,18 @@ export function ensurePool(input: PoolCreate): EnsurePoolResult {
 export function updatePool(id: string, input: PoolUpdate): QuotaPool | null {
   if (deletingPools.has(id)) return null;
 
+  if (input.groupId !== undefined) assertQuotaGroupOwnership(input.groupId);
+
   const database = getDb();
   const existing = database
     .prepare<PoolRow>(
-      "SELECT id, connection_id, name, group_id, created_at FROM quota_pools WHERE id = ?",
+      "SELECT id, connection_id, name, group_id, created_at, tenant_id FROM quota_pools WHERE tenant_id = ? AND id = ?"
     )
-    .get(id);
+    .get(currentDbTenantId(), id);
   if (!existing) return null;
 
   // Guard: a pool must use a single provider.
-  if (input.connectionIds && input.connectionIds.length > 1) {
-    assertSingleProvider(input.connectionIds);
-  }
+  if (input.connectionIds !== undefined) assertSingleProvider(input.connectionIds);
 
   const doUpdate = database.transaction(() => {
     if (input.name !== undefined) {
@@ -515,7 +557,7 @@ export function updatePool(id: string, input: PoolUpdate): QuotaPool | null {
       // Replace join rows.
       database.prepare("DELETE FROM quota_pool_connections WHERE pool_id = ?").run(id);
       const insertConn = database.prepare(
-        "INSERT OR IGNORE INTO quota_pool_connections (pool_id, connection_id) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO quota_pool_connections (pool_id, connection_id) VALUES (?, ?)"
       );
       for (const connId of input.connectionIds) {
         insertConn.run(id, connId);
@@ -526,11 +568,12 @@ export function updatePool(id: string, input: PoolUpdate): QuotaPool | null {
     }
 
     if (input.allocations !== undefined) {
+      assertAllocationApiKeyOwnership(database, input.allocations);
       // Inline the allocation upsert inside the transaction (avoids nested transaction).
       database.prepare("DELETE FROM quota_allocations WHERE pool_id = ?").run(id);
       const insertAlloc = database.prepare(
         `INSERT INTO quota_allocations (pool_id, api_key_id, weight, cap_value, cap_unit, policy)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?)`
       );
       for (const alloc of input.allocations) {
         insertAlloc.run(
@@ -539,7 +582,7 @@ export function updatePool(id: string, input: PoolUpdate): QuotaPool | null {
           alloc.weight,
           alloc.capValue ?? null,
           alloc.capUnit ?? null,
-          alloc.policy,
+          alloc.policy
         );
       }
     }
@@ -563,7 +606,9 @@ export function updatePool(id: string, input: PoolUpdate): QuotaPool | null {
  */
 export async function deletePool(id: string): Promise<boolean> {
   if (deletingPools.has(id)) return false;
-  const exists = getDb().prepare<{ id: string }>("SELECT id FROM quota_pools WHERE id = ?").get(id);
+  const exists = getDb()
+    .prepare<{ id: string }>("SELECT id FROM quota_pools WHERE tenant_id = ? AND id = ?")
+    .get(currentDbTenantId(), id);
   if (!exists) return false;
   deletingPools.add(id);
 
@@ -581,11 +626,13 @@ export async function deletePool(id: string): Promise<boolean> {
           `UPDATE api_keys SET allowed_quotas = COALESCE(
          (SELECT json_group_array(value) FROM json_each(api_keys.allowed_quotas) WHERE value != ?),
          '[]')
-       WHERE allowed_quotas IS NOT NULL AND allowed_quotas != '[]'
+       WHERE tenant_id = ? AND allowed_quotas IS NOT NULL AND allowed_quotas != '[]'
          AND EXISTS (SELECT 1 FROM json_each(api_keys.allowed_quotas) WHERE value = ?)`
         )
-        .run(id, id);
-      return database.prepare("DELETE FROM quota_pools WHERE id = ?").run(id);
+        .run(id, currentDbTenantId(), id);
+      return database
+        .prepare("DELETE FROM quota_pools WHERE tenant_id = ? AND id = ?")
+        .run(currentDbTenantId(), id);
     });
     const result = doDelete();
     if (result.changes <= 0) return false;
@@ -647,7 +694,7 @@ export function upsertAllocations(poolId: string, allocations: PoolAllocation[])
   // without requiring a manual re-save. Persists the normalized weights.
   const totalWeight = allocations.reduce(
     (s, a) => s + (Number.isFinite(a.weight) ? a.weight : 0),
-    0,
+    0
   );
   const normalizedAllocations =
     totalWeight === 0 && allocations.length > 0
@@ -658,26 +705,28 @@ export function upsertAllocations(poolId: string, allocations: PoolAllocation[])
   // Defensive: fall back to [poolId] (single-pool semantics) if pool not found.
   const targetPool = database
     .prepare<PoolRow>(
-      "SELECT id, connection_id, name, group_id, created_at FROM quota_pools WHERE id = ?",
+      "SELECT id, connection_id, name, group_id, created_at, tenant_id FROM quota_pools WHERE tenant_id = ? AND id = ?"
     )
-    .get(poolId);
+    .get(currentDbTenantId(), poolId);
+  if (!targetPool) return;
 
   // Collect all pools in the group (includes the target pool itself).
   // If the pool has no group or is not found, default to writing only poolId.
   let poolIdsInGroup: string[] = [poolId];
   if (targetPool?.group_id) {
     const groupRows = database
-      .prepare<{ id: string }>("SELECT id FROM quota_pools WHERE group_id = ?")
-      .all(targetPool.group_id);
+      .prepare<{ id: string }>("SELECT id FROM quota_pools WHERE tenant_id = ? AND group_id = ?")
+      .all(currentDbTenantId(), targetPool.group_id);
     if (groupRows.length > 0) {
       poolIdsInGroup = groupRows.map((r) => r.id);
     }
   }
 
   const doUpsert = database.transaction(() => {
+    assertAllocationApiKeyOwnership(database, normalizedAllocations);
     const insert = database.prepare(
       `INSERT INTO quota_allocations (pool_id, api_key_id, weight, cap_value, cap_unit, policy)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?)`
     );
     for (const pid of poolIdsInGroup) {
       database.prepare("DELETE FROM quota_allocations WHERE pool_id = ?").run(pid);
@@ -688,7 +737,7 @@ export function upsertAllocations(poolId: string, allocations: PoolAllocation[])
           alloc.weight,
           alloc.capValue ?? null,
           alloc.capUnit ?? null,
-          alloc.policy,
+          alloc.policy
         );
       }
     }
@@ -705,14 +754,15 @@ export function upsertAllocations(poolId: string, allocations: PoolAllocation[])
  * Returns pairs of { poolId, allocation }.
  */
 export function listAllocationsForApiKey(
-  apiKeyId: string,
+  apiKeyId: string
 ): Array<{ poolId: string; allocation: PoolAllocation }> {
   const rows = getDb()
     .prepare<AllocationRow>(
       `SELECT pool_id, api_key_id, weight, cap_value, cap_unit, policy
-       FROM quota_allocations
-       WHERE api_key_id = ?`,
+       FROM quota_allocations AS allocations
+       INNER JOIN quota_pools AS pools ON pools.id = allocations.pool_id
+       WHERE pools.tenant_id = ? AND allocations.api_key_id = ?`
     )
-    .all(apiKeyId);
+    .all(currentDbTenantId(), apiKeyId);
   return rows.map((row) => ({ poolId: row.pool_id, allocation: rowToAllocation(row) }));
 }

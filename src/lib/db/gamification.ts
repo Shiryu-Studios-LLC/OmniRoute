@@ -6,6 +6,7 @@
  */
 
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { calculateLevel } from "../gamification/xp";
 
 // ──────────────── Types ────────────────
@@ -107,27 +108,42 @@ function db(): DbLike {
   return getDbInstance() as unknown as DbLike;
 }
 
+function assertApiKeysBelongToCurrentTenant(...apiKeyIds: string[]): void {
+  const tenantId = currentDbTenantId();
+  const statement = getDbInstance().prepare("SELECT tenant_id FROM api_keys WHERE id = ?");
+  for (const apiKeyId of new Set(apiKeyIds)) {
+    const owner = statement.get(apiKeyId) as { tenant_id?: string } | undefined;
+    if (owner && owner.tenant_id !== tenantId) {
+      throw new Error("API key does not belong to the active tenant");
+    }
+  }
+}
+
 // ──────────────── Leaderboard ────────────────
 
 export function updateScore(apiKeyId: string, scope: string, points: number): void {
+  assertApiKeysBelongToCurrentTenant(apiKeyId);
   db()
     .prepare(
-      `INSERT INTO leaderboard (api_key_id, scope, score, updated_at)
-     VALUES (?, ?, ?, datetime('now'))
+      `INSERT INTO leaderboard (api_key_id, tenant_id, scope, score, updated_at)
+     VALUES (?, ?, ?, ?, datetime('now'))
      ON CONFLICT(api_key_id, scope)
-     DO UPDATE SET score = score + excluded.score, updated_at = datetime('now')`
+     DO UPDATE SET score = score + excluded.score, updated_at = datetime('now')
+     WHERE leaderboard.tenant_id = excluded.tenant_id`
     )
-    .run(apiKeyId, scope, points);
+    .run(apiKeyId, currentDbTenantId(), scope, points);
 }
 
 export function getRank(apiKeyId: string, scope: string): number {
   const row = db()
-    .prepare(`SELECT score FROM leaderboard WHERE api_key_id = ? AND scope = ?`)
-    .get(apiKeyId, scope) as { score: number } | undefined;
+    .prepare(`SELECT score FROM leaderboard WHERE api_key_id = ? AND tenant_id = ? AND scope = ?`)
+    .get(apiKeyId, currentDbTenantId(), scope) as { score: number } | undefined;
   if (!row) return 0;
   const rankRow = db()
-    .prepare(`SELECT COUNT(*) + 1 AS rank FROM leaderboard WHERE scope = ? AND score > ?`)
-    .get(scope, row.score) as { rank: number };
+    .prepare(
+      `SELECT COUNT(*) + 1 AS rank FROM leaderboard WHERE tenant_id = ? AND scope = ? AND score > ?`
+    )
+    .get(currentDbTenantId(), scope, row.score) as { rank: number };
   return rankRow.rank;
 }
 
@@ -146,9 +162,9 @@ export function getTopN(scope: string, limit: number, offset: number = 0): Leade
   const rows = db()
     .prepare(
       `SELECT api_key_id, scope, score, updated_at FROM leaderboard
-     WHERE scope = ? ORDER BY score DESC LIMIT ? OFFSET ?`
+     WHERE tenant_id = ? AND scope = ? ORDER BY score DESC LIMIT ? OFFSET ?`
     )
-    .all(scope, safeLimit, safeOffset) as Array<{
+    .all(currentDbTenantId(), scope, safeLimit, safeOffset) as Array<{
     api_key_id: string;
     scope: string;
     score: number;
@@ -165,29 +181,32 @@ export function getTopN(scope: string, limit: number, offset: number = 0): Leade
 // ──────────────── XP & Levels ────────────────
 
 export function addXp(apiKeyId: string, action: string, amount: number, metadata?: string): void {
+  assertApiKeysBelongToCurrentTenant(apiKeyId);
   db()
     .prepare(
-      `INSERT INTO xp_audit_log (api_key_id, action, xp_earned, metadata)
-     VALUES (?, ?, ?, ?)`
+      `INSERT INTO xp_audit_log (api_key_id, tenant_id, action, xp_earned, metadata)
+     VALUES (?, ?, ?, ?, ?)`
     )
-    .run(apiKeyId, action, amount, metadata ?? null);
+    .run(apiKeyId, currentDbTenantId(), action, amount, metadata ?? null);
 
   db()
     .prepare(
-      `INSERT INTO user_levels (api_key_id, total_xp, current_level, updated_at)
-     VALUES (?, ?, ?, datetime('now'))
+      `INSERT INTO user_levels (api_key_id, tenant_id, total_xp, current_level, updated_at)
+     VALUES (?, ?, ?, ?, datetime('now'))
      ON CONFLICT(api_key_id)
-     DO UPDATE SET total_xp = total_xp + excluded.total_xp, updated_at = datetime('now')`
+     DO UPDATE SET total_xp = total_xp + excluded.total_xp, updated_at = datetime('now')
+     WHERE user_levels.tenant_id = excluded.tenant_id`
     )
-    .run(apiKeyId, amount, calculateLevel(amount));
+    .run(apiKeyId, currentDbTenantId(), amount, calculateLevel(amount));
 }
 
 export function getXp(apiKeyId: string): UserLevelRow | null {
   const row = db()
     .prepare(
-      `SELECT api_key_id, total_xp, current_level, updated_at FROM user_levels WHERE api_key_id = ?`
+      `SELECT api_key_id, total_xp, current_level, updated_at FROM user_levels
+       WHERE api_key_id = ? AND tenant_id = ?`
     )
-    .get(apiKeyId) as
+    .get(apiKeyId, currentDbTenantId()) as
     | {
         api_key_id: string;
         total_xp: number;
@@ -205,22 +224,25 @@ export function getXp(apiKeyId: string): UserLevelRow | null {
 }
 
 export function updateLevel(apiKeyId: string, level: number): void {
+  assertApiKeysBelongToCurrentTenant(apiKeyId);
   db()
     .prepare(
-      `INSERT INTO user_levels (api_key_id, total_xp, current_level, updated_at)
-     VALUES (?, 0, ?, datetime('now'))
+      `INSERT INTO user_levels (api_key_id, tenant_id, total_xp, current_level, updated_at)
+     VALUES (?, ?, 0, ?, datetime('now'))
      ON CONFLICT(api_key_id)
-     DO UPDATE SET current_level = ?, updated_at = datetime('now')`
+     DO UPDATE SET current_level = ?, updated_at = datetime('now')
+     WHERE user_levels.tenant_id = excluded.tenant_id`
     )
-    .run(apiKeyId, level, level);
+    .run(apiKeyId, currentDbTenantId(), level, level);
 }
 
 // ──────────────── Badges ────────────────
 
 export function unlockBadge(apiKeyId: string, badgeId: string): void {
+  assertApiKeysBelongToCurrentTenant(apiKeyId);
   db()
-    .prepare(`INSERT OR IGNORE INTO user_badges (api_key_id, badge_id) VALUES (?, ?)`)
-    .run(apiKeyId, badgeId);
+    .prepare(`INSERT OR IGNORE INTO user_badges (api_key_id, tenant_id, badge_id) VALUES (?, ?, ?)`)
+    .run(apiKeyId, currentDbTenantId(), badgeId);
 }
 
 /**
@@ -233,8 +255,10 @@ export function unlockBadge(apiKeyId: string, badgeId: string): void {
  */
 export function hasBadge(apiKeyId: string, badgeId: string): boolean {
   const row = db()
-    .prepare(`SELECT 1 FROM user_badges WHERE api_key_id = ? AND badge_id = ? LIMIT 1`)
-    .get(apiKeyId, badgeId);
+    .prepare(
+      `SELECT 1 FROM user_badges WHERE api_key_id = ? AND tenant_id = ? AND badge_id = ? LIMIT 1`
+    )
+    .get(apiKeyId, currentDbTenantId(), badgeId);
   return !!row;
 }
 
@@ -245,9 +269,9 @@ export function getBadges(apiKeyId: string): UserBadge[] {
             bd.name, bd.description, bd.icon, bd.category, bd.rarity
      FROM user_badges ub
      JOIN badge_definitions bd ON bd.id = ub.badge_id
-     WHERE ub.api_key_id = ?`
+     WHERE ub.api_key_id = ? AND ub.tenant_id = ?`
     )
-    .all(apiKeyId) as Array<{
+    .all(apiKeyId, currentDbTenantId()) as Array<{
     api_key_id: string;
     badge_id: string;
     unlocked_at: string;
@@ -308,9 +332,13 @@ export function getAggregateXp(): UserLevelRow {
       `SELECT COALESCE(SUM(total_xp), 0) AS total_xp,
               COALESCE(MAX(current_level), 1) AS current_level,
               MAX(updated_at) AS updated_at
-       FROM user_levels`
+       FROM user_levels WHERE tenant_id = ?`
     )
-    .get() as { total_xp: number; current_level: number; updated_at: string | null };
+    .get(currentDbTenantId()) as {
+    total_xp: number;
+    current_level: number;
+    updated_at: string | null;
+  };
   return {
     apiKeyId: "*",
     totalXp: row?.total_xp ?? 0,
@@ -330,9 +358,10 @@ export function getAllEarnedBadges(): UserBadge[] {
               bd.name, bd.description, bd.icon, bd.category, bd.rarity
        FROM user_badges ub
        JOIN badge_definitions bd ON bd.id = ub.badge_id
+       WHERE ub.tenant_id = ?
        GROUP BY ub.badge_id`
     )
-    .all() as Array<{
+    .all(currentDbTenantId()) as Array<{
     badge_id: string;
     unlocked_at: string;
     name: string;
@@ -362,13 +391,15 @@ export function transferTokens(
   reason: string,
   idempotencyKey: string
 ): { success: boolean; error?: string } {
+  assertApiKeysBelongToCurrentTenant(fromId, toId);
   // Atomic transaction: balance check + insert
   const instance = getDbInstance();
   const txn = instance.transaction(() => {
     // Check for duplicate
+    const tenantId = currentDbTenantId();
     const existing = instance
-      .prepare(`SELECT id FROM token_ledger WHERE idempotency_key = ?`)
-      .get(idempotencyKey) as { id: number } | undefined;
+      .prepare(`SELECT id FROM token_ledger WHERE tenant_id = ? AND idempotency_key = ?`)
+      .get(tenantId, idempotencyKey) as { id: number } | undefined;
     if (existing) return { success: true };
 
     // Balance check (inside transaction to prevent race)
@@ -379,10 +410,10 @@ export function transferTokens(
 
     instance
       .prepare(
-        `INSERT INTO token_ledger (from_api_key_id, to_api_key_id, amount, reason, idempotency_key)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO token_ledger (tenant_id, from_api_key_id, to_api_key_id, amount, reason, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(fromId, toId, amount, reason, idempotencyKey);
+      .run(tenantId, fromId, toId, amount, reason, idempotencyKey);
 
     return { success: true };
   });
@@ -392,11 +423,17 @@ export function transferTokens(
 
 export function getBalance(apiKeyId: string): number {
   const received = db()
-    .prepare(`SELECT COALESCE(SUM(amount), 0) AS total FROM token_ledger WHERE to_api_key_id = ?`)
-    .get(apiKeyId) as { total: number };
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM token_ledger
+       WHERE tenant_id = ? AND to_api_key_id = ?`
+    )
+    .get(currentDbTenantId(), apiKeyId) as { total: number };
   const sent = db()
-    .prepare(`SELECT COALESCE(SUM(amount), 0) AS total FROM token_ledger WHERE from_api_key_id = ?`)
-    .get(apiKeyId) as { total: number };
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM token_ledger
+       WHERE tenant_id = ? AND from_api_key_id = ?`
+    )
+    .get(currentDbTenantId(), apiKeyId) as { total: number };
   return received.total - sent.total;
 }
 
@@ -404,10 +441,10 @@ export function getHistory(apiKeyId: string, limit: number): TokenLedgerEntry[] 
   const rows = db()
     .prepare(
       `SELECT * FROM token_ledger
-     WHERE from_api_key_id = ? OR to_api_key_id = ?
+     WHERE tenant_id = ? AND (from_api_key_id = ? OR to_api_key_id = ?)
      ORDER BY created_at DESC LIMIT ?`
     )
-    .all(apiKeyId, apiKeyId, limit) as Array<{
+    .all(currentDbTenantId(), apiKeyId, apiKeyId, limit) as Array<{
     id: number;
     from_api_key_id: string;
     to_api_key_id: string;
@@ -437,12 +474,13 @@ export function createInviteToken(
   serverUrl?: string,
   maxUses?: number
 ): void {
+  assertApiKeysBelongToCurrentTenant(createdBy);
   db()
     .prepare(
-      `INSERT INTO invite_tokens (id, code, token_hash, created_by, server_url, max_uses)
-     VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO invite_tokens (id, tenant_id, code, token_hash, created_by, server_url, max_uses)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(id, code, tokenHash, createdBy, serverUrl ?? null, maxUses ?? 1);
+    .run(id, currentDbTenantId(), code, tokenHash, createdBy, serverUrl ?? null, maxUses ?? 1);
 }
 
 export function getInviteByCode(code: string): InviteToken | null {
@@ -481,17 +519,20 @@ export function redeemInvite(code: string, usedBy: string): boolean {
   const result = db()
     .prepare(
       `UPDATE invite_tokens
-     SET use_count = use_count + 1, used_by = ?
+     SET use_count = use_count + 1, used_by = ?, used_by_tenant_id = ?
      WHERE code = ? AND revoked_at IS NULL
        AND use_count < max_uses
        AND (expires_at IS NULL OR expires_at > datetime('now'))`
     )
-    .run(usedBy, code);
+    .run(usedBy, currentDbTenantId(), code);
   return result.changes > 0;
 }
 
-export function revokeInvite(id: string): void {
-  db().prepare(`UPDATE invite_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(id);
+export function revokeInvite(id: string): boolean {
+  const result = db()
+    .prepare(`UPDATE invite_tokens SET revoked_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+    .run(id, currentDbTenantId());
+  return result.changes > 0;
 }
 
 // ──────────────── Community Servers ────────────────
@@ -560,26 +601,32 @@ export function getLeaderboardNeighbors(
   const d = db();
 
   const scoreRow = d
-    .prepare("SELECT score FROM leaderboard WHERE api_key_id = ? AND scope = ?")
-    .get(apiKeyId, scope) as { score: number } | undefined;
+    .prepare("SELECT score FROM leaderboard WHERE api_key_id = ? AND tenant_id = ? AND scope = ?")
+    .get(apiKeyId, currentDbTenantId(), scope) as { score: number } | undefined;
 
   if (!scoreRow) return { above: [], below: [] };
 
   const above = d
     .prepare(
       `SELECT api_key_id, score FROM leaderboard
-       WHERE scope = ? AND score > ?
+       WHERE tenant_id = ? AND scope = ? AND score > ?
        ORDER BY score ASC LIMIT ?`
     )
-    .all(scope, scoreRow.score, radius) as Array<{ api_key_id: string; score: number }>;
+    .all(currentDbTenantId(), scope, scoreRow.score, radius) as Array<{
+    api_key_id: string;
+    score: number;
+  }>;
 
   const below = d
     .prepare(
       `SELECT api_key_id, score FROM leaderboard
-       WHERE scope = ? AND score < ?
+       WHERE tenant_id = ? AND scope = ? AND score < ?
        ORDER BY score DESC LIMIT ?`
     )
-    .all(scope, scoreRow.score, radius) as Array<{ api_key_id: string; score: number }>;
+    .all(currentDbTenantId(), scope, scoreRow.score, radius) as Array<{
+    api_key_id: string;
+    score: number;
+  }>;
 
   return {
     above: above.reverse().map((r) => ({ apiKeyId: r.api_key_id, score: r.score })),
@@ -601,24 +648,33 @@ export function rotateLeaderboardScope(scope: "weekly" | "monthly"): void {
 
   // Double-run protection: skip if archive scope already has data
   const existing = d
-    .prepare("SELECT COUNT(*) AS cnt FROM leaderboard WHERE scope = ?")
-    .get(archiveSuffix) as { cnt: number };
+    .prepare("SELECT COUNT(*) AS cnt FROM leaderboard WHERE tenant_id = ? AND scope = ?")
+    .get(currentDbTenantId(), archiveSuffix) as { cnt: number };
   if (existing.cnt > 0) return;
 
   // Step 1: SELECT rows into memory
   const rows = d
-    .prepare("SELECT api_key_id, score, updated_at FROM leaderboard WHERE scope = ?")
-    .all(scope) as Array<{ api_key_id: string; score: number; updated_at: string }>;
+    .prepare(
+      "SELECT api_key_id, score, updated_at FROM leaderboard WHERE tenant_id = ? AND scope = ?"
+    )
+    .all(currentDbTenantId(), scope) as Array<{
+    api_key_id: string;
+    score: number;
+    updated_at: string;
+  }>;
 
   // Step 2: INSERT with parameters (no string interpolation)
   if (rows.length > 0) {
     const insert = d.prepare(
-      "INSERT OR IGNORE INTO leaderboard (api_key_id, scope, score, updated_at) VALUES (?, ?, ?, ?)"
+      "INSERT OR IGNORE INTO leaderboard (api_key_id, tenant_id, scope, score, updated_at) VALUES (?, ?, ?, ?, ?)"
     );
     for (const row of rows) {
-      insert.run(row.api_key_id, archiveSuffix, row.score, row.updated_at);
+      insert.run(row.api_key_id, currentDbTenantId(), archiveSuffix, row.score, row.updated_at);
     }
   }
 
-  d.prepare("DELETE FROM leaderboard WHERE scope = ?").run(scope);
+  d.prepare("DELETE FROM leaderboard WHERE tenant_id = ? AND scope = ?").run(
+    currentDbTenantId(),
+    scope
+  );
 }

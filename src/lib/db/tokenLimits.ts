@@ -13,7 +13,9 @@
 
 import { randomUUID } from "crypto";
 import { getDbInstance } from "./core";
+import { currentDbTenantId } from "./tenantScope";
 import { getBudgetWindow, type BudgetResetInterval } from "@/domain/costRules";
+import { toNumber } from "@/shared/utils/numeric";
 
 export type TokenLimitScopeType = "model" | "provider" | "global";
 
@@ -56,15 +58,6 @@ function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
 
-function toNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
-}
-
 function normalizeScopeType(value: unknown): TokenLimitScopeType {
   if (value === "model" || value === "provider" || value === "global") return value;
   return "global";
@@ -82,6 +75,7 @@ function ensureSchema() {
     CREATE TABLE IF NOT EXISTS api_key_token_limits (
       id              TEXT PRIMARY KEY,
       api_key_id      TEXT NOT NULL,
+      tenant_id       TEXT NOT NULL DEFAULT 'tenant_shiryu_admin',
       scope_type      TEXT NOT NULL CHECK (scope_type IN ('model', 'provider', 'global')),
       scope_value     TEXT NOT NULL DEFAULT '',
       token_limit     INTEGER NOT NULL CHECK (token_limit > 0),
@@ -139,6 +133,13 @@ function rowToTokenLimit(row: unknown): TokenLimit {
 export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
   ensureSchema();
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
+  const apiKeyOwner = db
+    .prepare("SELECT tenant_id FROM api_keys WHERE id = ?")
+    .get(input.apiKeyId) as { tenant_id?: string } | undefined;
+  if (apiKeyOwner && apiKeyOwner.tenant_id !== tenantId) {
+    throw new Error("API key does not belong to the active tenant");
+  }
   const scopeType = normalizeScopeType(input.scopeType);
   const scopeValue = scopeType === "global" ? "" : (input.scopeValue ?? "").trim();
   const resetInterval = normalizeResetInterval(input.resetInterval);
@@ -150,21 +151,33 @@ export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
 
   db.prepare(
     `INSERT INTO api_key_token_limits
-       (id, api_key_id, scope_type, scope_value, token_limit, reset_interval, reset_time, enabled, created_at, updated_at)
-     VALUES (@id, @apiKeyId, @scopeType, @scopeValue, @tokenLimit, @resetInterval, @resetTime, @enabled, datetime('now'), datetime('now'))
+       (id, api_key_id, tenant_id, scope_type, scope_value, token_limit, reset_interval, reset_time, enabled, created_at, updated_at)
+     VALUES (@id, @apiKeyId, @tenantId, @scopeType, @scopeValue, @tokenLimit, @resetInterval, @resetTime, @enabled, datetime('now'), datetime('now'))
      ON CONFLICT(api_key_id, scope_type, scope_value)
      DO UPDATE SET token_limit    = excluded.token_limit,
                    reset_interval = excluded.reset_interval,
                    reset_time     = excluded.reset_time,
                    enabled        = excluded.enabled,
-                   updated_at     = datetime('now')`
-  ).run({ id, apiKeyId: input.apiKeyId, scopeType, scopeValue, tokenLimit, resetInterval, resetTime, enabled });
+                   updated_at     = datetime('now')
+     WHERE api_key_token_limits.tenant_id = excluded.tenant_id`
+  ).run({
+    id,
+    apiKeyId: input.apiKeyId,
+    tenantId,
+    scopeType,
+    scopeValue,
+    tokenLimit,
+    resetInterval,
+    resetTime,
+    enabled,
+  });
 
   const row = db
     .prepare(
-      "SELECT * FROM api_key_token_limits WHERE api_key_id = ? AND scope_type = ? AND scope_value = ?"
+      "SELECT * FROM api_key_token_limits WHERE tenant_id = ? AND api_key_id = ? AND scope_type = ? AND scope_value = ?"
     )
-    .get(input.apiKeyId, scopeType, scopeValue);
+    .get(tenantId, input.apiKeyId, scopeType, scopeValue);
+  if (!row) throw new Error("Token limit not found in the active tenant");
   return rowToTokenLimit(row);
 }
 
@@ -175,10 +188,10 @@ export function listTokenLimits(apiKeyId: string): TokenLimit[] {
   return db
     .prepare(
       `SELECT * FROM api_key_token_limits
-       WHERE api_key_id = ?
+       WHERE tenant_id = ? AND api_key_id = ?
        ORDER BY CASE scope_type WHEN 'model' THEN 0 WHEN 'provider' THEN 1 ELSE 2 END, scope_value`
     )
-    .all(apiKeyId)
+    .all(currentDbTenantId(), apiKeyId)
     .map(rowToTokenLimit);
 }
 
@@ -197,7 +210,7 @@ export function getTokenLimitsForRequest(
   return db
     .prepare(
       `SELECT * FROM api_key_token_limits
-       WHERE api_key_id = @apiKeyId
+       WHERE tenant_id = @tenantId AND api_key_id = @apiKeyId
          AND enabled = 1
          AND (
            (scope_type = 'global')
@@ -205,7 +218,12 @@ export function getTokenLimitsForRequest(
            OR (scope_type = 'provider' AND scope_value = @provider)
          )`
     )
-    .all({ apiKeyId, model: model || "", provider: provider || "" } as JsonRecord)
+    .all({
+      tenantId: currentDbTenantId(),
+      apiKeyId,
+      model: model || "",
+      provider: provider || "",
+    } as JsonRecord)
     .map(rowToTokenLimit);
 }
 
@@ -214,9 +232,16 @@ export function deleteTokenLimit(id: string): boolean {
   ensureSchema();
   const db = getDbInstance();
   // FK pragma is OFF in this build; delete dependents explicitly.
-  db.prepare("DELETE FROM api_key_token_counters WHERE limit_id = ?").run(id);
-  db.prepare("DELETE FROM api_key_token_limit_reset_logs WHERE limit_id = ?").run(id);
-  const info = db.prepare("DELETE FROM api_key_token_limits WHERE id = ?").run(id);
+  const tenantId = currentDbTenantId();
+  db.prepare(
+    "DELETE FROM api_key_token_counters WHERE limit_id IN (SELECT id FROM api_key_token_limits WHERE id = ? AND tenant_id = ?)"
+  ).run(id, tenantId);
+  db.prepare(
+    "DELETE FROM api_key_token_limit_reset_logs WHERE limit_id IN (SELECT id FROM api_key_token_limits WHERE id = ? AND tenant_id = ?)"
+  ).run(id, tenantId);
+  const info = db
+    .prepare("DELETE FROM api_key_token_limits WHERE id = ? AND tenant_id = ?")
+    .run(id, tenantId);
   return info.changes > 0;
 }
 
@@ -248,9 +273,11 @@ export function getWindowUsage(limit: TokenLimit, now = Date.now()): number {
   const { windowStart } = resetWindowIfElapsed(limit, now);
   const row = db
     .prepare(
-      "SELECT tokens_used FROM api_key_token_counters WHERE limit_id = ? AND window_start = ?"
+      `SELECT counters.tokens_used FROM api_key_token_counters counters
+       JOIN api_key_token_limits limits ON limits.id = counters.limit_id
+       WHERE counters.limit_id = ? AND limits.tenant_id = ? AND counters.window_start = ?`
     )
-    .get(limit.id, windowStart);
+    .get(limit.id, currentDbTenantId(), windowStart);
   return toNumber(asRecord(row).tokens_used);
 }
 
@@ -266,6 +293,11 @@ export function incrementWindowTokens(
 ): number {
   ensureSchema();
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
+  const limit = db
+    .prepare("SELECT 1 AS owned FROM api_key_token_limits WHERE id = ? AND tenant_id = ?")
+    .get(limitId, tenantId) as { owned?: number } | undefined;
+  if (limit?.owned !== 1) return 0;
   const delta = Math.max(0, Math.floor(toNumber(tokens)));
   const row = db
     .prepare(
@@ -281,13 +313,13 @@ export function incrementWindowTokens(
 }
 
 /** Append a window-reset audit log row. */
-export function logTokenLimitReset(
-  limitId: string,
-  prevTokens: number,
-  windowStart: string
-): void {
+export function logTokenLimitReset(limitId: string, prevTokens: number, windowStart: string): void {
   ensureSchema();
   const db = getDbInstance();
+  const limit = db
+    .prepare("SELECT 1 AS owned FROM api_key_token_limits WHERE id = ? AND tenant_id = ?")
+    .get(limitId, currentDbTenantId()) as { owned?: number } | undefined;
+  if (limit?.owned !== 1) return;
   db.prepare(
     `INSERT INTO api_key_token_limit_reset_logs (limit_id, reset_at, prev_tokens, window_start)
      VALUES (?, datetime('now'), ?, ?)`

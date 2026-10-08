@@ -9,6 +9,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, isCloud, isBuildPhase } from "./db/core";
 import { ensureProxyLogsColumns } from "./db/schemaColumns";
+import { currentDbTenantId } from "./db/tenantScope";
 
 const shouldPersistToDisk = !isCloud && !isBuildPhase;
 
@@ -22,6 +23,7 @@ interface ProxyInfo {
 
 interface ProxyLogEntry {
   id: string;
+  tenantId: string;
   timestamp: string;
   status: string;
   proxy: ProxyInfo | null;
@@ -69,12 +71,13 @@ function loadFromDb() {
     // guarantees egress_ip on every migrated DB; this covers restored/odd states).
     ensureProxyLogsColumns(db);
     const rows = db
-      .prepare("SELECT * FROM proxy_logs ORDER BY timestamp DESC LIMIT ?")
-      .all(MAX_IN_MEMORY_ENTRIES) as any[];
+      .prepare("SELECT * FROM proxy_logs WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?")
+      .all(currentDbTenantId(), MAX_IN_MEMORY_ENTRIES) as any[];
 
     for (const row of rows) {
       proxyLogs.push({
         id: row.id,
+        tenantId: row.tenant_id,
         timestamp: row.timestamp,
         status: row.status || "success",
         proxy: row.proxy_host
@@ -113,10 +116,7 @@ loadFromDb();
 
 /** Read at call time so tests can toggle it between imports. */
 export function isProxyLogIncludeIps(): boolean {
-  return (
-    process.env.PROXY_LOG_INCLUDE_IPS === "true" ||
-    process.env.PROXY_LOG_INCLUDE_IPS === "1"
-  );
+  return process.env.PROXY_LOG_INCLUDE_IPS === "true" || process.env.PROXY_LOG_INCLUDE_IPS === "1";
 }
 
 /**
@@ -154,6 +154,7 @@ export function formatProxyEgressConsoleLine(params: {
 export function logProxyEvent(entry: ProxyLogInput) {
   const log: ProxyLogEntry = {
     id: uuidv4(),
+    tenantId: currentDbTenantId(),
     timestamp: new Date().toISOString(),
     status: entry.status || "success",
     proxy: entry.proxy || null,
@@ -236,15 +237,17 @@ export function flushProxyLogsSync() {
   // 1. If Redis driver is active, asynchronously publish batch to Redis Stream/Channel
   if (process.env.QUOTA_STORE_DRIVER === "redis" || process.env.QUOTA_STORE_REDIS_URL) {
     try {
-      import("@/lib/quota/redisQuotaStore").then(({ getRedisQuotaStore }) => {
-        const store = getRedisQuotaStore(process.env.QUOTA_STORE_REDIS_URL || "");
-        const client = (store as any)?.client;
-        if (client && typeof client.publish === "function") {
-          for (const entry of batch) {
-            client.publish("omniroute:proxy_logs", JSON.stringify(entry)).catch(() => {});
+      import("@/lib/quota/redisQuotaStore")
+        .then(({ getRedisQuotaStore }) => {
+          const store = getRedisQuotaStore(process.env.QUOTA_STORE_REDIS_URL || "");
+          const client = (store as any)?.client;
+          if (client && typeof client.publish === "function") {
+            for (const entry of batch) {
+              client.publish("omniroute:proxy_logs", JSON.stringify(entry)).catch(() => {});
+            }
           }
-        }
-      }).catch(() => {});
+        })
+        .catch(() => {});
     } catch {
       /* ignore redis pub errors */
     }
@@ -256,16 +259,17 @@ export function flushProxyLogsSync() {
     const insertStmt = db.prepare(
       `INSERT INTO proxy_logs (id, timestamp, status, proxy_type, proxy_host, proxy_port,
         level, level_id, provider, target_url, public_ip, egress_ip, latency_ms, error,
-        connection_id, combo_id, account, tls_fingerprint)
+        connection_id, combo_id, account, tls_fingerprint, tenant_id)
       VALUES (@id, @timestamp, @status, @proxyType, @proxyHost, @proxyPort,
         @level, @levelId, @provider, @targetUrl, @clientIp, @egressIp, @latencyMs, @error,
-        @connectionId, @comboId, @account, @tlsFingerprint)`
+        @connectionId, @comboId, @account, @tlsFingerprint, @tenantId)`
     );
 
     const transaction = db.transaction((entries: ProxyLogEntry[]) => {
       for (const item of entries) {
         insertStmt.run({
           id: item.id,
+          tenantId: item.tenantId,
           timestamp: item.timestamp,
           status: item.status,
           proxyType: item.proxy?.type || null,
@@ -300,7 +304,7 @@ export function flushProxyLogsSync() {
  * Reads from in-memory for speed (already hydrated from DB on startup).
  */
 export function getProxyLogs(filters: ProxyLogFilters = {}) {
-  let logs = [...proxyLogs];
+  let logs = proxyLogs.filter((log) => log.tenantId === currentDbTenantId());
 
   if (filters.status) {
     if (filters.status === "ok") {
@@ -338,18 +342,21 @@ export function getProxyLogs(filters: ProxyLogFilters = {}) {
   }
 
   const limit = filters.limit || 300;
-  return logs.slice(0, limit);
+  return logs.slice(0, limit).map(({ tenantId: _tenantId, ...entry }) => entry);
 }
 
 // ──────────────── Clear ────────────────
 
 export function clearProxyLogs() {
-  proxyLogs.length = 0;
+  const tenantId = currentDbTenantId();
+  for (let index = proxyLogs.length - 1; index >= 0; index--) {
+    if (proxyLogs[index].tenantId === tenantId) proxyLogs.splice(index, 1);
+  }
 
   if (shouldPersistToDisk) {
     try {
       const db = getDbInstance();
-      db.prepare("DELETE FROM proxy_logs").run();
+      db.prepare("DELETE FROM proxy_logs WHERE tenant_id = ?").run(tenantId);
     } catch (err: any) {
       console.warn("[proxyLogger] Failed to clear DB:", err.message);
     }

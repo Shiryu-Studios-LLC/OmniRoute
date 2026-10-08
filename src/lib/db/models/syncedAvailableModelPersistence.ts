@@ -3,9 +3,17 @@
 import { backupDbFile } from "../backup";
 import { getDbInstance } from "../core";
 import { invalidateModelCatalogCache } from "../readCache";
+import { currentDbTenantId, PLATFORM_TENANT_ID } from "../tenantScope";
 import { getKeyValue } from "./shared";
 
 type ModelNormalizer<T> = (models: unknown) => T[];
+
+function syncedModelsNamespace(): string {
+  const tenantId = currentDbTenantId();
+  return tenantId === PLATFORM_TENANT_ID
+    ? "syncedAvailableModels"
+    : `syncedAvailableModels:${tenantId}`;
+}
 
 // #11016: the Feature 5004 reconciler copies provider-declared windows
 // (`inputTokenLimit`, captured at /models discovery) into `auto:discovery`
@@ -45,9 +53,10 @@ export function persistCanonicalSyncedAvailableModels<T>(
   normalizeModels: ModelNormalizer<T>
 ): boolean {
   const db = getDbInstance();
+  const namespace = syncedModelsNamespace();
   const existingRow = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
-    .get(key);
+    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+    .get(namespace, key);
   const existingValue = getKeyValue(existingRow).value;
   let existingModels: T[] | null = null;
   if (existingValue !== null) {
@@ -66,13 +75,13 @@ export function persistCanonicalSyncedAvailableModels<T>(
   if (unchanged) return false;
 
   if (normalizedModels.length === 0) {
-    db.prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?").run(
-      key
-    );
+    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(namespace, key);
   } else {
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('syncedAvailableModels', ?, ?)"
-    ).run(key, JSON.stringify(normalizedModels));
+    db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+      namespace,
+      key,
+      JSON.stringify(normalizedModels)
+    );
   }
   finishSyncedAvailableModelsWrite();
   scheduleReconcileAfterSyncWrite();

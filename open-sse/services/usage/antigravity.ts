@@ -22,6 +22,7 @@ import {
 } from "../../config/antigravityModelAliases.ts";
 import { isUserCallableAgyModelId } from "../../config/agyModels.ts";
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import {
   applyAntigravityClientProfileHeaders,
   getAntigravityClientProfile,
@@ -139,11 +140,12 @@ function getAntigravityLocalUsageUnits(
          WHERE provider = ?
            AND connection_id = ?
            AND model = ?
+           AND tenant_id = ?
            AND success = 1
            AND timestamp >= ?
            AND timestamp < ?`
       )
-      .get(provider, connectionId, modelId, windowStart, windowEnd) as
+      .get(provider, connectionId, modelId, currentDbTenantId(), windowStart, windowEnd) as
       { tokens?: unknown } | undefined;
 
     const tokens = Number(row?.tokens || 0);

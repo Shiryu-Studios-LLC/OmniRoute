@@ -13,6 +13,7 @@ const ORIGINAL_JWT_SECRET = process.env.JWT_SECRET;
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
+const comboForecastDb = await import("../../src/lib/db/comboForecast.ts");
 const combosDb = await import("../../src/lib/db/combos.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
 const quotaSnapshotsDb = await import("../../src/lib/db/quotaSnapshots.ts");
@@ -20,6 +21,11 @@ const callLogs = await import("../../src/lib/usage/callLogs.ts");
 const comboForecast = await import("../../src/lib/usage/comboForecast.ts");
 const route = await import("../../src/app/api/usage/combo-forecast/route.ts");
 const { normalizeComboStep } = await import("../../src/lib/combos/steps.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
+
+function asTenant<T>(tenantId: string, callback: () => T): T {
+  return runWithTenantContext({ tenantId, role: "owner" }, callback);
+}
 
 async function resetStorage() {
   core.resetDbInstance();
@@ -179,6 +185,48 @@ test("combo forecast returns no_data confidence for combos without history", asy
   assert.equal(forecast.combos[0].confidence, "no_data");
   assert.equal(forecast.combos[0].history.requests, 0);
   assert.equal(forecast.combos[0].forecast.projectedCostUsd, 0);
+});
+
+test("combo forecast usage rows stay isolated when tenants use the same combo name", async () => {
+  const timestamp = "2026-08-01T12:00:00.000Z";
+  for (const [tenantId, id, inputTokens, outputTokens] of [
+    ["tenant_a", "tenant-a-combo-call", 11, 3],
+    ["tenant_b", "tenant-b-combo-call", 97, 29],
+  ] as const) {
+    await asTenant(tenantId, () =>
+      callLogs.saveCallLog({
+        id,
+        timestamp,
+        status: 200,
+        model: "openai/shared-model",
+        requestedModel: "shared-combo",
+        provider: "openai",
+        tokens: { prompt_tokens: inputTokens, completion_tokens: outputTokens },
+        comboName: "shared-combo",
+        comboStepId: "shared-step",
+        comboExecutionKey: "shared-execution",
+      })
+    );
+  }
+
+  const tenantA = asTenant("tenant_a", () =>
+    comboForecastDb.getComboForecastUsageRows({ since: "2026-08-01T00:00:00.000Z" })
+  );
+  const tenantB = asTenant("tenant_b", () =>
+    comboForecastDb.getComboForecastUsageRows({ since: "2026-08-01T00:00:00.000Z" })
+  );
+
+  assert.equal(tenantA.length, 1);
+  assert.equal(tenantA[0].comboName, "shared-combo");
+  assert.equal(tenantA[0].requests, 1);
+  assert.equal(tenantA[0].inputTokens, 11);
+  assert.equal(tenantA[0].outputTokens, 3);
+
+  assert.equal(tenantB.length, 1);
+  assert.equal(tenantB[0].comboName, "shared-combo");
+  assert.equal(tenantB[0].requests, 1);
+  assert.equal(tenantB[0].inputTokens, 97);
+  assert.equal(tenantB[0].outputTokens, 29);
 });
 
 test("combo forecast API requires management auth and validates query", async () => {

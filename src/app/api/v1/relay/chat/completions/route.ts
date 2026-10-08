@@ -99,7 +99,7 @@ async function forwardToBifrost(
   }, config.timeoutMs);
 
   try {
-    const upstream = await fetch(`${config.baseUrl}/v1/chat/completions`, {
+    const upstream = await globalThis.fetch(`${config.baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(body),

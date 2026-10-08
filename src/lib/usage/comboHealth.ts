@@ -1,5 +1,6 @@
 import { getComboById, getCombos } from "@/lib/db/combos";
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import { getQuotaSnapshots } from "@/lib/db/quotaSnapshots";
 import { getComboMetrics } from "@omniroute/open-sse/services/comboMetrics.ts";
 import { resolveNestedComboTargets } from "@omniroute/open-sse/services/combo.ts";
@@ -249,11 +250,12 @@ function buildUsageSkew(
          COUNT(*) as requests,
          SUM(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) as totalTokens
        FROM call_logs
-       WHERE combo_name = ?
+       WHERE tenant_id = ?
+         AND combo_name = ?
          AND timestamp >= ?
        GROUP BY model`
     )
-    .all(comboName, since) as ModelUsageRow[];
+    .all(currentDbTenantId(), comboName, since) as ModelUsageRow[];
 
   const usageByModel = new Map<string, { requests: number; tokens: number }>();
   for (const model of comboModels) {
@@ -301,10 +303,11 @@ function buildPerformance(comboName: string, since: string): ComboHealthMetrics[
          SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END) as successCount,
          AVG(duration) as avgLatencyMs
        FROM call_logs
-       WHERE combo_name = ?
+       WHERE tenant_id = ?
+         AND combo_name = ?
          AND timestamp >= ?`
     )
-    .get(comboName, since) as PerformanceRow | undefined;
+    .get(currentDbTenantId(), comboName, since) as PerformanceRow | undefined;
 
   const totalRequests = toSafeNumber(row?.totalRequests);
   const successCount = toSafeNumber(row?.successCount);
@@ -352,7 +355,8 @@ function getHistoricalTargetMetrics(
            duration,
            timestamp
          FROM call_logs
-         WHERE combo_name = ?
+         WHERE tenant_id = ?
+           AND combo_name = ?
            AND timestamp >= ?
            AND COALESCE(NULLIF(combo_execution_key, ''), NULLIF(combo_step_id, '')) IS NOT NULL
        ),
@@ -394,7 +398,7 @@ function getHistoricalTargetMetrics(
        LEFT JOIN latest_metrics ON latest_metrics.executionKey = aggregate_metrics.executionKey
        ORDER BY aggregate_metrics.executionKey ASC`
     )
-    .all(comboName, since) as HistoricalTargetAggregateRow[];
+    .all(currentDbTenantId(), comboName, since) as HistoricalTargetAggregateRow[];
 
   const metrics = new Map<string, HistoricalTargetMetricView>();
   for (const row of rows) {

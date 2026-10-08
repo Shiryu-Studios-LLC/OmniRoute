@@ -490,9 +490,6 @@
     "@typescript-eslint/no-explicit-any": {
       "count": 17
     },
-    "no-restricted-imports": {
-      "count": 2
-    },
     "no-restricted-syntax": {
       "count": 1
     }
@@ -601,11 +598,6 @@
   "open-sse/services/compression/stats.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
-    }
-  },
-  "open-sse/services/conversationTracker.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
     }
   },
   "open-sse/services/credentialGate.ts": {
@@ -1666,11 +1658,6 @@
       "count": 1
     }
   },
-  "src/app/api/settings/export-json/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
   "src/app/api/settings/free-proxies/[id]/add-to-pool/route.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -2204,11 +2191,6 @@
       "count": 1
     }
   },
-  "src/lib/compliance/index.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/container.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -2272,11 +2254,6 @@
       "count": 1
     }
   },
-  "src/lib/db/files.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/db/healthCheck.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
@@ -2317,11 +2294,6 @@
       "count": 1
     }
   },
-  "src/lib/db/providers/usageIdentityReconciliation.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/db/proxies.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
@@ -2332,24 +2304,9 @@
       "count": 1
     }
   },
-  "src/lib/db/quotaSnapshots.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/db/registeredKeys.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
-    }
-  },
-  "src/lib/db/tokenLimits.ts": {
-    "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "src/lib/db/usageAnalytics/sources.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
     }
   },
   "src/lib/evals/runtime.ts": {
@@ -2722,21 +2679,6 @@
       "count": 1
     }
   },
-  "src/lib/usage/apiKeySelfService.ts": {
-    "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "src/lib/usage/apiKeyUsageLimits.ts": {
-    "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "src/lib/usage/callLogs.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/usage/codexResetCredits.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -2753,14 +2695,6 @@
     }
   },
   "src/lib/usage/internalUsageCommand.ts": {
-    "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "src/lib/usage/providerWindowCosts.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    },
     "no-restricted-syntax": {
       "count": 1
     }
@@ -4489,11 +4423,6 @@
       "count": 1
     }
   },
-  "tests/unit/compliance-audit-route.test.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 1
-    }
-  },
   "tests/unit/compliance-index.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 5
@@ -5188,11 +5117,6 @@
   "tests/unit/lmarena-string-chunk-repro.test.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
-    }
-  },
-  "tests/unit/log-retention.test.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 12
     }
   },
   "tests/unit/log-rotation.test.ts": {
@@ -6491,11 +6415,6 @@
   "tests/unit/usage-analytics.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 5
-    }
-  },
-  "tests/unit/usage-migrations.test.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 17
     }
   },
   "tests/unit/usage-providers.test.ts": {

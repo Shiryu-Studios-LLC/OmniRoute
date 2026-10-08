@@ -1,6 +1,7 @@
 import { getSyncedAvailableModelsByConnection } from "@/lib/db/models";
 import { getProviderConnections } from "@/lib/db/providers";
 import { getDbInstance } from "@/lib/db/core";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import { getAllCircuitBreakerStatuses } from "@/shared/utils/circuitBreaker";
 import { getAllModelLockouts } from "@omniroute/open-sse/services/accountFallback";
 import { resolveProviderAlias } from "@omniroute/open-sse/services/model";
@@ -219,7 +220,9 @@ function queryCallLogTargetStats(
 ): CallLogTargetStats[] {
   const db = getDbInstance();
   const providerClause = providerFilter ? "AND c.provider = @provider" : "";
-  const params = providerFilter ? { cutoff, provider: providerFilter } : { cutoff };
+  const params = providerFilter
+    ? { cutoff, provider: providerFilter, tenantId: currentDbTenantId() }
+    : { cutoff, tenantId: currentDbTenantId() };
   const rows = db
     .prepare(
       `WITH log_targets AS (
@@ -235,6 +238,7 @@ function queryCallLogTargetStats(
         FROM call_logs c
         WHERE c.provider IS NOT NULL
           AND c.provider != '-'
+          AND c.tenant_id = @tenantId
           AND c.timestamp >= @cutoff
           ${providerClause}
       ), ranked AS (

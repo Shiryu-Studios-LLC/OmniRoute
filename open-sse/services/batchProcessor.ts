@@ -1,25 +1,24 @@
 import { v4 as uuidv4 } from "uuid";
-import type { BatchItemCheckpoint, BatchRecord } from "@/lib/localDb";
+import type { BatchItemCheckpoint, BatchRecord } from "@/lib/db/batches";
 import {
   countBatchItemCheckpoints,
-  createFile,
-  deleteFile,
   ensureBatchItemCheckpoints,
-  getApiKeyById,
   getBatch,
-  getFileContent,
   getPendingBatches,
   getTerminalBatches,
   listBatchItemCheckpoints,
-  listFiles,
   markBatchItemError,
   markBatchItemProcessing,
   markBatchItemResult,
   updateBatch,
-} from "@/lib/localDb";
+} from "@/lib/db/batches";
+import { getApiKeyById } from "@/lib/db/apiKeys";
+import { createFile, deleteFile, getFileContent, listFiles } from "@/lib/db/files";
 import { dispatch } from "@/lib/batches/dispatch";
 import type { SupportedBatchEndpoint } from "@/shared/constants/batchEndpoints";
 import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
+import { listActiveTenantIdsForMaintenance } from "@/lib/db/tenants";
+import { runWithTenantContext } from "@/lib/tenantContext";
 
 let isProcessing: boolean = false;
 let pollInterval: NodeJS.Timeout | null = null;
@@ -70,6 +69,15 @@ export function stopBatchProcessor(): void {
 }
 
 export async function processPendingBatches(): Promise<void> {
+  for (const tenantId of listActiveTenantIdsForMaintenance()) {
+    await runWithTenantContext(
+      { tenantId, role: "maintenance" },
+      processPendingBatchesForCurrentTenant
+    );
+  }
+}
+
+async function processPendingBatchesForCurrentTenant(): Promise<void> {
   const pending = getPendingBatches();
 
   // Phase 1: Stale recovery — in_progress/finalizing batches not in activeBatches

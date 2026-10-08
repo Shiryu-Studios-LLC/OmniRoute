@@ -37,8 +37,8 @@ function seedProviderCatalog(
 
   db.prepare(
     `INSERT OR REPLACE INTO provider_connections
-       (id, provider, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)`
+       (id, provider, is_active, created_at, updated_at, tenant_id)
+     VALUES (?, ?, ?, ?, ?, 'tenant_shiryu_admin')`
   ).run(connectionId, providerId, isActive ? 1 : 0, now, now);
 
   return replaceSyncedAvailableModelsForConnection(

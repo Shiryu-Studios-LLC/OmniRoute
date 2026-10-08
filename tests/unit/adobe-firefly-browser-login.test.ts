@@ -4,6 +4,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   adobeFireflyBackgroundUsesHeadlessChrome,
   adobeFireflyBrowserSessionKey,
@@ -18,9 +21,65 @@ import {
   filterSeedCookiesForWarm,
   isAdobeRiskCookieName,
   resolveAdobeAccountLabel,
+  resolveAdobeFireflyBrowserProfileDir,
   resolveSystemBrowserExecutable,
   killProcessTree,
 } from "../../open-sse/services/adobeFireflyBrowserLogin.ts";
+
+test("Adobe browser profiles honor a dedicated runtime profile root", (t) => {
+  const previousRoot = process.env.OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR;
+  const profileRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-adobe-profile-test-"));
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR;
+    else process.env.OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR = previousRoot;
+    fs.rmSync(profileRoot, { recursive: true, force: true });
+  });
+
+  process.env.OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR = profileRoot;
+  const profile = resolveAdobeFireflyBrowserProfileDir("customer-account");
+  assert.equal(
+    profile,
+    path.join(
+      profileRoot,
+      "adobe-chrome-profiles",
+      adobeFireflyBrowserSessionKey("customer-account")
+    )
+  );
+  assert.equal(fs.existsSync(profile), true);
+});
+
+test("Adobe browser profiles default to the configured user data directory", (t) => {
+  const envNames = [
+    "OMNIROUTE_INTERNAL_ADOBE_BROWSER_PROFILE_DIR",
+    "DATA_DIR",
+    "OMNIROUTE_DATA_DIR",
+    "LOCALAPPDATA",
+    "XDG_DATA_HOME",
+  ] as const;
+  const previous = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
+  const userDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-user-data-test-"));
+  t.after(() => {
+    for (const name of envNames) {
+      const value = previous[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(userDataRoot, { recursive: true, force: true });
+  });
+
+  for (const name of envNames.slice(0, -1)) delete process.env[name];
+  process.env.XDG_DATA_HOME = userDataRoot;
+  const profile = resolveAdobeFireflyBrowserProfileDir("customer-account");
+  assert.equal(
+    profile,
+    path.join(
+      userDataRoot,
+      "omniroute",
+      "adobe-chrome-profiles",
+      adobeFireflyBrowserSessionKey("customer-account")
+    )
+  );
+});
 
 test("clampAdobeFireflyLoginTimeout defaults and clamps", () => {
   assert.equal(clampAdobeFireflyLoginTimeout(undefined), 300_000);
@@ -261,7 +320,11 @@ test("killProcessTree on Linux targets process group (-pid) with SIGTERM and sch
   assert.equal(killedSignals.length, 1, "expected immediate SIGTERM call to process group");
   assert.equal(killedSignals[0].pid, -54321, "Linux must target process group with negative PID");
   assert.equal(killedSignals[0].signal, "SIGTERM");
-  assert.equal(procKillCalled, false, "should not call direct child.kill when process group kill succeeds");
+  assert.equal(
+    procKillCalled,
+    false,
+    "should not call direct child.kill when process group kill succeeds"
+  );
 });
 
 test("killProcessTree falls back to child.kill on Linux when process group kill fails", () => {
@@ -347,5 +410,3 @@ test("killProcessTree handles null / undefined / pid-less gracefully without thr
   assert.doesNotThrow(() => killProcessTree({}));
   assert.doesNotThrow(() => killProcessTree({ pid: undefined }));
 });
-
-

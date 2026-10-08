@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
+import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { getCallLogRetentionDays } from "@/lib/logEnv";
 import { deleteCallLogsBefore } from "@/lib/usage/callLogs";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 export async function POST(request: Request) {
-  if (!(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
   try {
     const retentionMs = getCallLogRetentionDays() * 24 * 60 * 60 * 1000;
     const cutoff = new Date(Date.now() - retentionMs).toISOString();
@@ -15,8 +15,7 @@ export async function POST(request: Request) {
       deleted: result.deletedRows,
       deletedArtifacts: result.deletedArtifacts,
     });
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
-    return NextResponse.json({ error }, { status: 500 });
+  } catch {
+    return NextResponse.json(buildErrorBody(500, "Failed to purge call logs"), { status: 500 });
   }
 }

@@ -27,8 +27,8 @@ async function seedCatalogScaleDataset() {
   const db = core.getDbInstance();
   const now = new Date().toISOString();
   const insertConn = db.prepare(
-    `INSERT INTO provider_connections (id, provider, auth_type, name, priority, is_active, api_key, created_at, updated_at)
-     VALUES (?, 'openai-compatible', 'apikey', ?, ?, 1, ?, ?, ?)`
+    `INSERT INTO provider_connections (id, provider, auth_type, name, priority, is_active, api_key, created_at, updated_at, tenant_id)
+     VALUES (?, 'openai-compatible', 'apikey', ?, ?, 1, ?, ?, ?, 'tenant_shiryu_admin')`
   );
   const insertModels = db.prepare(
     `INSERT INTO key_value (namespace, key, value) VALUES ('syncedAvailableModels', ?, ?)`

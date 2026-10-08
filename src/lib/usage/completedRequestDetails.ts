@@ -1,4 +1,5 @@
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 import type { PendingRequestDetail } from "./usageHistory";
 
 const COMPLETED_DETAIL_TTL_MS = 120_000;
@@ -62,17 +63,18 @@ export function maybeEnrichCompletedDetail(updated: PendingRequestDetail, connec
       const sinceIso = new Date(Date.now() - 30_000).toISOString();
       const rows = db
         .prepare(
-          `SELECT artifact_relpath FROM call_logs WHERE connection_id = ? AND model = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 5`
+          `SELECT artifact_relpath FROM call_logs WHERE tenant_id = ? AND connection_id = ? AND model = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 5`
         )
-        .all(connectionId, updated.model, sinceIso) as Array<{ artifact_relpath: string | null }>;
+        .all(currentDbTenantId(), connectionId, updated.model, sinceIso) as Array<{
+        artifact_relpath: string | null;
+      }>;
       for (const row of rows) {
         if (!row.artifact_relpath) continue;
         const { readCallArtifact } = await import("./callLogArtifacts");
         const art = readCallArtifact(row.artifact_relpath);
         if (art.state !== "ready" || !art.artifact) continue;
         const pipeline = art.artifact.pipeline as
-          | { providerResponse?: unknown; clientResponse?: unknown }
-          | undefined;
+          { providerResponse?: unknown; clientResponse?: unknown } | undefined;
         if (missingProvider && pipeline?.providerResponse) {
           updated.providerResponse = pipeline.providerResponse;
         }

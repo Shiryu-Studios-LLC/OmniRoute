@@ -14,6 +14,7 @@ import { getAccountDisplayName } from "@/lib/display/names";
 import { calculateCost } from "./costCalculator";
 import { getRawDataCutoffDate, isAggregationEnabled } from "./aggregateHistory";
 import { toNumber } from "@/shared/utils/numeric";
+import { currentDbTenantId } from "../db/tenantScope";
 
 type JsonRecord = Record<string, unknown>;
 type UsageBucket = {
@@ -73,6 +74,7 @@ function buildUsageSourceSql(aggregationEnabled: boolean) {
         COALESCE(service_tier, 'standard') as service_tier,
         1 as request_count
       FROM usage_history
+      WHERE tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')
     `;
   }
 
@@ -98,7 +100,7 @@ function buildUsageSourceSql(aggregationEnabled: boolean) {
       COALESCE(service_tier, 'standard') as service_tier,
       1 as request_count
     FROM usage_history
-    WHERE DATE(timestamp) >= ?
+    WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')) AND DATE(timestamp) >= ?
 
     UNION ALL
 
@@ -123,7 +125,7 @@ function buildUsageSourceSql(aggregationEnabled: boolean) {
       'standard' as service_tier,
       COALESCE(total_requests, 0) as request_count
     FROM daily_usage_summary
-    WHERE date < ?
+    WHERE tenant_id = ? AND date < ?
   `;
 }
 
@@ -205,9 +207,11 @@ export function getMonthlyProviderTokensForConnection(
             + COALESCE(SUM(tokens_cache_creation), 0)
             + COALESCE(SUM(tokens_reasoning), 0) AS total
        FROM usage_history
-       WHERE provider = ? AND connection_id = ? AND timestamp >= ?`
+       WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+         AND provider = ? AND connection_id = ? AND timestamp >= ?`
     )
-    .get(provider, connectionId, monthStartIso) as { total?: number } | undefined;
+    .get(currentDbTenantId(), currentDbTenantId(), provider, connectionId, monthStartIso) as
+    { total?: number } | undefined;
   return Math.max(0, Number(row?.total ?? 0));
 }
 
@@ -239,10 +243,11 @@ export async function getConnectionSpendUsdSinceAdded(
           COALESCE(SUM(tokens_reasoning), 0) AS reasoning,
           COUNT(*) AS requests
        FROM usage_history
-       WHERE connection_id = ? AND provider = ? AND success = 1
+       WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+         AND connection_id = ? AND provider = ? AND success = 1
        GROUP BY model`
     )
-    .all(connectionId, provider) as Array<{
+    .all(currentDbTenantId(), currentDbTenantId(), connectionId, provider) as Array<{
     model?: string;
     input?: number;
     output?: number;
@@ -283,7 +288,11 @@ export async function getUsageStats() {
   const aggregationEnabled = await isAggregationEnabled();
   const cutoffDate = aggregationEnabled ? await getRawDataCutoffDate() : null;
   const sourceSql = buildUsageSourceSql(aggregationEnabled);
-  const sourceParams = aggregationEnabled && cutoffDate ? [cutoffDate, cutoffDate] : [];
+  const tenantId = currentDbTenantId();
+  const sourceParams =
+    aggregationEnabled && cutoffDate
+      ? [tenantId, tenantId, cutoffDate, tenantId, cutoffDate]
+      : [tenantId, tenantId];
 
   const { getProviderConnections } = await import("@/lib/localDb");
   let allConnections: unknown[] = [];
@@ -550,11 +559,12 @@ export async function getUsageStats() {
           COALESCE(SUM(tokens_cache_creation), 0) as tokens_cache_creation,
           COALESCE(SUM(tokens_reasoning), 0) as tokens_reasoning
         FROM usage_history
-        WHERE timestamp >= ? AND timestamp <= ?
+        WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+          AND timestamp >= ? AND timestamp <= ?
         GROUP BY minute, provider, model, service_tier
       `
     )
-    .all(tenMinutesAgo.toISOString(), now.toISOString()) as unknown[];
+    .all(tenantId, tenantId, tenMinutesAgo.toISOString(), now.toISOString()) as unknown[];
 
   for (const rowRaw of recentRows) {
     const row = asRecord(rowRaw);

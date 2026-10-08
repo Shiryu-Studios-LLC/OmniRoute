@@ -8,6 +8,7 @@
  */
 
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId } from "../db/tenantScope";
 import { protectPayloadForLog } from "../logPayloads";
 import {
   resolveOrphanedUsageAccountIdentity,
@@ -545,20 +546,26 @@ export async function getUsageDb(sinceIso?: string | null, limit?: number, curso
     rows = sinceIso
       ? db
           .prepare(
-            `SELECT * FROM usage_history WHERE timestamp >= ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`
+            `SELECT * FROM usage_history WHERE tenant_id = ? AND timestamp >= ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`
           )
-          .all(sinceIso, cursor, maxRows)
+          .all(currentDbTenantId(), sinceIso, cursor, maxRows)
       : db
-          .prepare(`SELECT * FROM usage_history WHERE timestamp > ? ORDER BY timestamp ASC LIMIT ?`)
-          .all(cursor, maxRows);
+          .prepare(
+            `SELECT * FROM usage_history WHERE tenant_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`
+          )
+          .all(currentDbTenantId(), cursor, maxRows);
   } else if (sinceIso) {
     // Initial query with date filter
     rows = db
-      .prepare(`SELECT * FROM usage_history WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT ?`)
-      .all(sinceIso, maxRows);
+      .prepare(
+        `SELECT * FROM usage_history WHERE tenant_id = ? AND timestamp >= ? ORDER BY timestamp ASC LIMIT ?`
+      )
+      .all(currentDbTenantId(), sinceIso, maxRows);
   } else {
     // No filter - get all (with limit)
-    rows = db.prepare(`SELECT * FROM usage_history ORDER BY timestamp ASC LIMIT ?`).all(maxRows);
+    rows = db
+      .prepare(`SELECT * FROM usage_history WHERE tenant_id = ? ORDER BY timestamp ASC LIMIT ?`)
+      .all(currentDbTenantId(), maxRows);
   }
 
   const history = rows.map((row) => {
@@ -649,8 +656,9 @@ export async function saveRequestUsage(entry: UsageEntry) {
     const tokensInput = getLoggedInputTokens(entry.tokens);
     const tokensOutput = getLoggedOutputTokens(entry.tokens);
     const connection = entry.connectionId
-      ? (db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(entry.connectionId) as
-          Record<string, unknown> | undefined)
+      ? (db
+          .prepare("SELECT * FROM provider_connections WHERE id = ? AND tenant_id = ?")
+          .get(entry.connectionId, currentDbTenantId()) as Record<string, unknown> | undefined)
       : undefined;
     const accountIdentity = connection
       ? resolveUsageAccountIdentity(connection)
@@ -669,7 +677,8 @@ export async function saveRequestUsage(entry: UsageEntry) {
       const existing = db
         .prepare(
           `SELECT id, endpoint FROM usage_history
-           WHERE timestamp = ?
+           WHERE tenant_id = ?
+             AND timestamp = ?
              AND COALESCE(provider, '')     = COALESCE(?, '')
              AND COALESCE(model, '')        = COALESCE(?, '')
              AND COALESCE(connection_id, '') = COALESCE(?, '')
@@ -679,6 +688,7 @@ export async function saveRequestUsage(entry: UsageEntry) {
            ORDER BY id DESC LIMIT 1`
         )
         .get(
+          currentDbTenantId(),
           timestamp,
           entry.provider || null,
           entry.model || null,
@@ -691,9 +701,10 @@ export async function saveRequestUsage(entry: UsageEntry) {
       if (existing) {
         // Back-fill endpoint if the original row missed it.
         if (!existing.endpoint && entry.endpoint) {
-          db.prepare(`UPDATE usage_history SET endpoint = ? WHERE id = ?`).run(
+          db.prepare(`UPDATE usage_history SET endpoint = ? WHERE id = ? AND tenant_id = ?`).run(
             entry.endpoint,
-            existing.id
+            existing.id,
+            currentDbTenantId()
           );
         }
         return; // duplicate — do not insert
@@ -701,13 +712,14 @@ export async function saveRequestUsage(entry: UsageEntry) {
 
       db.prepare(
         `
-        INSERT INTO usage_history (provider, model, connection_id, account_key, account_label,
+        INSERT INTO usage_history (tenant_id, provider, model, connection_id, account_key, account_label,
           account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
           tokens_cache_read, tokens_cache_creation, tokens_reasoning, service_tier, status, success,
           latency_ms, ttft_ms, error_code, combo_strategy, endpoint, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       ).run(
+        currentDbTenantId(),
         entry.provider || null,
         entry.model || null,
         entry.connectionId || null,
@@ -765,8 +777,8 @@ export interface UsageHistoryFilter {
 export async function getUsageHistory(filter: UsageHistoryFilter = {}) {
   const db = getDbInstance();
   let sql = "SELECT * FROM usage_history";
-  const conditions: string[] = [];
-  const params: Record<string, unknown> = {};
+  const conditions: string[] = ["tenant_id = @tenantId"];
+  const params: Record<string, unknown> = { tenantId: currentDbTenantId() };
 
   if (filter.provider) {
     conditions.push("provider = @provider");
@@ -850,8 +862,13 @@ export async function getModelLatencyStats(
     tokens_output: number | null;
   };
 
-  const conditions = ["timestamp >= @sinceIso", "provider IS NOT NULL", "model IS NOT NULL"];
-  const queryParams: Record<string, unknown> = { sinceIso, maxRows };
+  const conditions = [
+    "tenant_id = @tenantId",
+    "timestamp >= @sinceIso",
+    "provider IS NOT NULL",
+    "model IS NOT NULL",
+  ];
+  const queryParams: Record<string, unknown> = { tenantId: currentDbTenantId(), sinceIso, maxRows };
   if (options.provider) {
     conditions.push("provider = @provider");
     queryParams.provider = options.provider;
@@ -940,11 +957,12 @@ export async function getRecentLogs(limit = 200) {
         `
         SELECT timestamp, model, provider, account, tokens_in, tokens_out, status
         FROM call_logs
+        WHERE tenant_id = ?
         ORDER BY timestamp DESC
         LIMIT ?
       `
       )
-      .all(limit) as Array<Record<string, unknown>>;
+      .all(currentDbTenantId(), limit) as Array<Record<string, unknown>>;
 
     return rows.map((row) => {
       const timestamp =

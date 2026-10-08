@@ -1,5 +1,7 @@
 import type { CloudDb } from "./db";
 
+export const CLOUD_PLATFORM_TENANT_ID = "tenant_shiryu_admin";
+
 export interface CloudTenant {
   id: string;
   name: string;
@@ -67,4 +69,23 @@ export async function createCloudCustomerTenant(
   const tenant = await getCloudTenantById(db, input.id);
   if (!tenant) throw new Error("Failed to create cloud tenant");
   return tenant;
+}
+
+/** Change lifecycle state for an existing customer tenant. Platform tenants cannot be changed here. */
+export async function setCloudCustomerTenantActive(
+  db: CloudDb,
+  tenantId: string,
+  isActive: boolean,
+  now = new Date().toISOString()
+): Promise<CloudTenant | null> {
+  const result = await db
+    .prepare(
+      `UPDATE tenants
+          SET is_active = ?, updated_at = ?
+        WHERE id = ? AND kind = 'customer'`
+    )
+    .bind(isActive ? 1 : 0, now, tenantId)
+    .run();
+  if (!result.success || Number(result.meta?.changes ?? 0) !== 1) return null;
+  return getCloudTenantById(db, tenantId);
 }

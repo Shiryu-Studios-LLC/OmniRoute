@@ -18,6 +18,7 @@ const core = await import("../../src/lib/db/core.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
 const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
 const detailedLogsDb = await import("../../src/lib/db/detailedLogs.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 const { createStructuredSSECollector } =
   await import("../../open-sse/utils/streamPayloadCollector.ts");
 
@@ -197,6 +198,62 @@ test("latest log lookup by call_log_id and paginated listing use newest-first or
   assert.equal(detailedLogsDb.getRequestDetailLogCount(), 3);
 });
 
+test("detailed log reads and counts are isolated by tenant", () => {
+  runWithTenantContext({ tenantId: "tenant_detail_a", role: "owner" }, () => {
+    detailedLogsDb.saveRequestDetailLog({
+      id: "detail-tenant-a",
+      call_log_id: "shared-call-log-id",
+      timestamp: "2026-04-05T18:00:00.000Z",
+      client_request: { marker: "tenant-a-secret" },
+      provider: "openai",
+      model: "gpt-4.1",
+    });
+  });
+  runWithTenantContext({ tenantId: "tenant_detail_b", role: "owner" }, () => {
+    detailedLogsDb.saveRequestDetailLog({
+      id: "detail-tenant-b",
+      call_log_id: "shared-call-log-id",
+      timestamp: "2026-04-05T18:00:01.000Z",
+      client_request: { marker: "tenant-b-secret" },
+      provider: "anthropic",
+      model: "claude-sonnet",
+    });
+  });
+
+  runWithTenantContext({ tenantId: "tenant_detail_a", role: "owner" }, () => {
+    assert.equal(detailedLogsDb.getRequestDetailLogCount(), 1);
+    assert.deepEqual(
+      detailedLogsDb.getRequestDetailLogs().map((row) => row.id),
+      ["detail-tenant-a"]
+    );
+    assert.equal(
+      (
+        detailedLogsDb.getRequestDetailLogById("detail-tenant-a")?.client_request as {
+          marker?: string;
+        }
+      ).marker,
+      "tenant-a-secret"
+    );
+    assert.equal(detailedLogsDb.getRequestDetailLogById("detail-tenant-b"), null);
+    assert.equal(
+      detailedLogsDb.getRequestDetailLogByCallLogId("shared-call-log-id")?.id,
+      "detail-tenant-a"
+    );
+  });
+  runWithTenantContext({ tenantId: "tenant_detail_b", role: "owner" }, () => {
+    assert.equal(detailedLogsDb.getRequestDetailLogCount(), 1);
+    assert.deepEqual(
+      detailedLogsDb.getRequestDetailLogs().map((row) => row.id),
+      ["detail-tenant-b"]
+    );
+    assert.equal(detailedLogsDb.getRequestDetailLogById("detail-tenant-a"), null);
+    assert.equal(
+      detailedLogsDb.getRequestDetailLogByCallLogId("shared-call-log-id")?.id,
+      "detail-tenant-b"
+    );
+  });
+});
+
 test("logs are skipped when the associated API key is marked as no_log", async () => {
   const apiKey = await apiKeysDb.createApiKey("No Log Key", "machine-303");
   await apiKeysDb.updateApiKeyPermissions(apiKey.id, { noLog: true });
@@ -231,4 +288,26 @@ test("request_detail_logs trigger keeps only the latest 500 rows", () => {
   assert.equal(detailedLogsDb.getRequestDetailLogById("ring-5")?.id, "ring-5");
   assert.equal(rows[0].id, "ring-504");
   assert.equal(rows.at(-1)?.id, "ring-5");
+
+  const tenantB = (callback: () => void) =>
+    runWithTenantContext({ tenantId: "tenant_ring_b", role: "owner" }, callback);
+  tenantB(() => {
+    for (let i = 0; i < 505; i += 1) {
+      detailedLogsDb.saveRequestDetailLog({
+        id: `ring-b-${i}`,
+        timestamp: new Date(Date.UTC(2026, 3, 6, 18, 0, 0, i)).toISOString(),
+        provider: "anthropic",
+        model: "claude-sonnet",
+      });
+    }
+    assert.equal(detailedLogsDb.getRequestDetailLogCount(), 500);
+    assert.equal(detailedLogsDb.getRequestDetailLogById("ring-b-0"), null);
+    assert.equal(detailedLogsDb.getRequestDetailLogById("ring-b-5")?.id, "ring-b-5");
+  });
+  assert.equal(
+    detailedLogsDb.getRequestDetailLogCount(),
+    500,
+    "platform rows retain their own cap"
+  );
+  assert.equal(detailedLogsDb.getRequestDetailLogById("ring-5")?.id, "ring-5");
 });

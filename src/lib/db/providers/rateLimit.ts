@@ -4,6 +4,7 @@
 
 import { getDbInstance } from "../core";
 import { invalidateDbCache } from "../readCache";
+import { currentDbTenantId } from "../tenantScope";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -30,8 +31,8 @@ interface DbLike {
 export function setConnectionRateLimitUntil(connectionId: string, until: number | null): void {
   const db = getDbInstance() as unknown as DbLike;
   db.prepare(
-    "UPDATE provider_connections SET rate_limited_until = ?, updated_at = ? WHERE id = ?"
-  ).run(until, new Date().toISOString(), connectionId);
+    "UPDATE provider_connections SET rate_limited_until = ?, updated_at = ? WHERE id = ? AND tenant_id = ?"
+  ).run(until, new Date().toISOString(), connectionId, currentDbTenantId());
   invalidateDbCache("connections");
 }
 
@@ -77,8 +78,8 @@ export function clearConnectionRateLimit(connectionId: string): void {
 export function isConnectionRateLimited(connectionId: string): boolean {
   const db = getDbInstance() as unknown as DbLike;
   const row = db
-    .prepare("SELECT rate_limited_until FROM provider_connections WHERE id = ?")
-    .get(connectionId) as { rate_limited_until?: number | null } | undefined;
+    .prepare("SELECT rate_limited_until FROM provider_connections WHERE id = ? AND tenant_id = ?")
+    .get(connectionId, currentDbTenantId()) as { rate_limited_until?: number | null } | undefined;
   if (!row?.rate_limited_until) return false;
   return Date.now() < row.rate_limited_until;
 }
@@ -94,9 +95,9 @@ export function getRateLimitedConnections(
   const now = Date.now();
   const rows = db
     .prepare(
-      "SELECT id, rate_limited_until FROM provider_connections WHERE provider = ? AND rate_limited_until > ?"
+      "SELECT id, rate_limited_until FROM provider_connections WHERE tenant_id = ? AND provider = ? AND rate_limited_until > ?"
     )
-    .all(provider, now) as Array<{ id: string; rate_limited_until: number }>;
+    .all(currentDbTenantId(), provider, now) as Array<{ id: string; rate_limited_until: number }>;
   return rows.map((r) => ({ id: r.id, rateLimitedUntil: r.rate_limited_until }));
 }
 
@@ -188,9 +189,9 @@ export function clearStaleCrashCooldowns(): { cleared: number } {
 
   const rows = db
     .prepare(
-      `SELECT id, test_status, rate_limited_until FROM provider_connections WHERE rate_limited_until IS NOT NULL`
+      `SELECT id, test_status, rate_limited_until FROM provider_connections WHERE tenant_id = ? AND rate_limited_until IS NOT NULL`
     )
-    .all() as Array<{
+    .all(currentDbTenantId()) as Array<{
     id: string;
     test_status: string | null;
     rate_limited_until: string | number | null;
@@ -217,11 +218,11 @@ export function clearStaleCrashCooldowns(): { cleared: number } {
        last_error_source  = NULL,
        error_code         = NULL,
        updated_at         = ?
-     WHERE id = ?`
+     WHERE id = ? AND tenant_id = ?`
   );
 
   for (const row of toReset) {
-    stmt.run(now, row.id);
+    stmt.run(now, row.id, currentDbTenantId());
   }
 
   invalidateDbCache("connections");

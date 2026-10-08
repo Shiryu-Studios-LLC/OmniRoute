@@ -2,23 +2,20 @@
  * Bounded call-log rotation and pruning.
  *
  * Extracted from callLogs.ts (#8249/#10125 file-size gate) — deletion of expired/overflow
- * rows, orphan artifact scanning, and the throttled rotation scheduler. Pure extraction, no
- * behavior change: callLogs.ts re-exports these symbols so existing importers are unaffected.
+ * rows, orphan artifact scanning, and the throttled rotation scheduler. Rotation is scoped
+ * to the active tenant; callLogs.ts re-exports these symbols for existing importers.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import { getDbInstance } from "../db/core";
+import { currentDbTenantId, PLATFORM_TENANT_ID } from "../db/tenantScope";
 import {
   findReferencedArtifacts,
   selectCallLogIdsBefore,
   selectOverflowArtifactPaths,
 } from "./callLogsBoundedQueries";
-import {
-  CALL_LOGS_DIR,
-  deleteCallArtifact,
-  type CallLogDetailState,
-} from "./callLogArtifacts";
+import { CALL_LOGS_DIR, deleteCallArtifact, type CallLogDetailState } from "./callLogArtifacts";
 import { getCallLogMaxEntries, getCallLogRetentionDays, getCallLogsTableMaxRows } from "../logEnv";
 import { isSqlitePagerCorruptError, notePagerCorruption } from "../db/healthCheck";
 
@@ -34,18 +31,24 @@ export type DeleteResult = {
   deletedArtifacts: number;
 };
 
-export function clearArtifactReference(relativePath: string, nextState: CallLogDetailState) {
+export function clearArtifactReference(
+  relativePath: string,
+  nextState: CallLogDetailState
+): number {
   const db = getDbInstance();
-  db.prepare(
-    `
+  return db
+    .prepare(
+      `
       UPDATE call_logs
       SET detail_state = ?,
           artifact_relpath = NULL,
           artifact_size_bytes = NULL,
           artifact_sha256 = NULL
       WHERE artifact_relpath = ?
+        AND (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
     `
-  ).run(nextState, relativePath);
+    )
+    .run(nextState, relativePath, currentDbTenantId(), currentDbTenantId()).changes;
 }
 
 // #5217: SQLite caps a statement at SQLITE_MAX_VARIABLE_NUMBER bound params
@@ -60,6 +63,7 @@ function deleteCallLogRowsByIds(ids: string[]): DeleteResult {
   }
 
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   let deletedRows = 0;
   let deletedArtifacts = 0;
 
@@ -67,15 +71,27 @@ function deleteCallLogRowsByIds(ids: string[]): DeleteResult {
     const chunk = ids.slice(i, i + DELETE_ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => "?").join(", ");
     const rows = db
-      .prepare(`SELECT artifact_relpath FROM call_logs WHERE id IN (${placeholders})`)
-      .all(...chunk) as Array<{ artifact_relpath: string | null }>;
+      .prepare(
+        `SELECT artifact_relpath FROM call_logs
+         WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+           AND id IN (${placeholders})`
+      )
+      .all(tenantId, tenantId, ...chunk) as Array<{ artifact_relpath: string | null }>;
 
-    const result = db.prepare(`DELETE FROM call_logs WHERE id IN (${placeholders})`).run(...chunk);
+    const result = db
+      .prepare(
+        `DELETE FROM call_logs
+         WHERE (tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin'))
+           AND id IN (${placeholders})`
+      )
+      .run(tenantId, tenantId, ...chunk);
     deletedRows += result.changes;
-    for (const row of rows) {
-      if (deleteCallArtifact(row.artifact_relpath)) {
-        deletedArtifacts++;
-      }
+    const artifactPaths = rows
+      .map((row) => row.artifact_relpath)
+      .filter((relPath): relPath is string => typeof relPath === "string");
+    const referenced = findReferencedArtifacts(artifactPaths);
+    for (const relPath of new Set(artifactPaths)) {
+      if (!referenced.has(relPath) && deleteCallArtifact(relPath)) deletedArtifacts++;
     }
   }
 
@@ -181,6 +197,10 @@ export function cleanupOrphanCallLogFiles(
   baseDir = CALL_LOGS_DIR,
   options: { maxCandidates?: number; maxScanEntries?: number; minAgeMs?: number } = {}
 ) {
+  // Orphan files have no durable tenant owner. Only the platform cleanup pass
+  // may remove them; customer-triggered rotation must not scan another tenant's
+  // artifact namespace and guess ownership.
+  if (currentDbTenantId() !== PLATFORM_TENANT_ID) return 0;
   if (!baseDir || !fs.existsSync(baseDir)) return 0;
 
   const maxCandidates = options.maxCandidates ?? Number.POSITIVE_INFINITY;
@@ -242,11 +262,10 @@ export function cleanupOverflowCallLogFiles(
       if (paths.length === 0) break;
       let progress = 0;
       for (const relativePath of paths) {
-        if (deleteCallArtifact(relativePath, baseDir)) {
-          clearArtifactReference(relativePath, "missing");
-          deleted++;
-          progress++;
-        }
+        const changedRows = clearArtifactReference(relativePath, "missing");
+        const stillReferenced = findReferencedArtifacts([relativePath]).has(relativePath);
+        if (!stillReferenced && deleteCallArtifact(relativePath, baseDir)) deleted++;
+        if (changedRows > 0 || !stillReferenced) progress++;
       }
       if (progress === 0) break;
     }
@@ -286,19 +305,27 @@ export function trimCallLogsToMaxRows(
   }
 
   const db = getDbInstance();
+  const tenantId = currentDbTenantId();
   let deletedRows = 0;
   let deletedArtifacts = 0;
 
   while (deletedRows < maxDeletes) {
-    const currentCount = db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as {
-      cnt: number;
-    };
+    const currentCount = db
+      .prepare(
+        `SELECT COUNT(*) AS cnt FROM call_logs
+         WHERE tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')`
+      )
+      .get(tenantId, tenantId) as { cnt: number };
     if (currentCount.cnt <= maxRows) break;
 
     const toDelete = Math.min(currentCount.cnt - maxRows, 5000, maxDeletes - deletedRows);
     const ids = db
-      .prepare("SELECT id FROM call_logs ORDER BY timestamp ASC LIMIT ?")
-      .all(toDelete)
+      .prepare(
+        `SELECT id FROM call_logs
+         WHERE tenant_id = ? OR (tenant_id IS NULL AND ? = 'tenant_shiryu_admin')
+         ORDER BY timestamp ASC LIMIT ?`
+      )
+      .all(tenantId, tenantId, toDelete)
       .map((row) => String((row as { id: string }).id));
     const result = deleteCallLogRowsByIds(ids);
     deletedRows += result.deletedRows;

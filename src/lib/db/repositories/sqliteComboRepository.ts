@@ -11,6 +11,7 @@ import type {
 import { normalizeComboRecord } from "@/lib/combos/steps";
 import { validateComboInvariant } from "@/lib/combos/invariants";
 import { getDbInstance } from "../core";
+import { assertTenantScope, currentDbTenantId } from "../tenantScope";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -54,7 +55,7 @@ function getComboNameSet(
   db: ReturnType<typeof getDbInstance>,
   extraNames: string[] = []
 ): Set<string> {
-  const rows = db.prepare("SELECT name FROM combos").all();
+  const rows = db.prepare("SELECT name FROM combos WHERE tenant_id = ?").all(currentDbTenantId());
   const names = new Set<string>();
 
   for (const row of rows) {
@@ -103,7 +104,9 @@ function parseComboRow(row: unknown): JsonRecord | null {
 
 function getNextSortOrder() {
   const db = getDbInstance();
-  const row = db.prepare("SELECT COALESCE(MAX(sort_order), 0) AS sort_order FROM combos").get();
+  const row = db
+    .prepare("SELECT COALESCE(MAX(sort_order), 0) AS sort_order FROM combos WHERE tenant_id = ?")
+    .get(currentDbTenantId());
   const sortOrder = getSortOrder(row);
   return (sortOrder ?? 0) + 1;
 }
@@ -111,8 +114,8 @@ function getNextSortOrder() {
 export async function getCombos(limit?: number, offset?: number) {
   const db = getDbInstance();
   let sql =
-    "SELECT id, data, sort_order, context_cache_protection FROM combos ORDER BY sort_order ASC, name COLLATE NOCASE ASC";
-  const params: unknown[] = [];
+    "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE tenant_id = ? ORDER BY sort_order ASC, name COLLATE NOCASE ASC";
+  const params: unknown[] = [currentDbTenantId()];
   if (limit !== undefined) {
     sql += " LIMIT ? OFFSET ?";
     params.push(limit, offset ?? 0);
@@ -136,15 +139,19 @@ export async function getCombos(limit?: number, offset?: number) {
 
 export function getCombosCount(): number {
   const db = getDbInstance();
-  const row = db.prepare("SELECT count(*) as cnt FROM combos").get() as { cnt: number };
+  const row = db
+    .prepare("SELECT count(*) as cnt FROM combos WHERE tenant_id = ?")
+    .get(currentDbTenantId()) as { cnt: number };
   return row.cnt;
 }
 
 export async function getComboById(id: string) {
   const db = getDbInstance();
   const row = db
-    .prepare("SELECT id, data, sort_order, context_cache_protection FROM combos WHERE id = ?")
-    .get(id);
+    .prepare(
+      "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE id = ? AND tenant_id = ?"
+    )
+    .get(id, currentDbTenantId());
   const combo = parseComboRow(row);
   if (!combo) return null;
   return normalizeStoredCombo(combo, db, typeof combo.name === "string" ? [combo.name] : []);
@@ -153,8 +160,10 @@ export async function getComboById(id: string) {
 export async function getComboByName(name: string) {
   const db = getDbInstance();
   const row = db
-    .prepare("SELECT id, data, sort_order, context_cache_protection FROM combos WHERE name = ?")
-    .get(name);
+    .prepare(
+      "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE name = ? AND tenant_id = ?"
+    )
+    .get(name, currentDbTenantId());
   const combo = parseComboRow(row);
   if (!combo) return null;
   return normalizeStoredCombo(combo, db, [name]);
@@ -169,9 +178,9 @@ export async function getComboByNameInsensitive(name: string) {
   const db = getDbInstance();
   const row = db
     .prepare(
-      "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE name = ? COLLATE NOCASE"
+      "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE name = ? COLLATE NOCASE AND tenant_id = ?"
     )
-    .get(name);
+    .get(name, currentDbTenantId());
   const combo = parseComboRow(row);
   if (!combo) return null;
   const storedName = typeof combo.name === "string" ? combo.name : name;
@@ -179,6 +188,7 @@ export async function getComboByNameInsensitive(name: string) {
 }
 
 export async function createCombo(data: JsonRecord) {
+  const tenantId = assertTenantScope(data.tenantId);
   const db = getDbInstance();
   const now = new Date().toISOString();
   const sortOrder = typeof data.sortOrder === "number" ? data.sortOrder : getNextSortOrder();
@@ -186,6 +196,7 @@ export async function createCombo(data: JsonRecord) {
   const combo = normalizeStoredCombo(
     {
       ...data,
+      tenantId,
       id: comboId,
       name: data.name,
       models: data.models || [],
@@ -203,17 +214,20 @@ export async function createCombo(data: JsonRecord) {
   validateComboInvariant(combo);
   const contextCache = data.context_cache_protection ? 1 : 0;
   db.prepare(
-    "INSERT INTO combos (id, name, data, sort_order, created_at, updated_at, context_cache_protection) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).run(combo.id, combo.name, JSON.stringify(combo), sortOrder, now, now, contextCache);
+    "INSERT INTO combos (id, tenant_id, name, data, sort_order, created_at, updated_at, context_cache_protection) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(combo.id, tenantId, combo.name, JSON.stringify(combo), sortOrder, now, now, contextCache);
 
   return combo;
 }
 
 export async function updateCombo(id: string, data: JsonRecord): Promise<ComboUpdateResult | null> {
+  const tenantId = assertTenantScope(data.tenantId);
   const db = getDbInstance();
   const existing = db
-    .prepare("SELECT id, data, sort_order, context_cache_protection FROM combos WHERE id = ?")
-    .get(id);
+    .prepare(
+      "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE id = ? AND tenant_id = ?"
+    )
+    .get(id, tenantId);
   if (!existing) return null;
 
   const current = parseComboRow(existing);
@@ -227,6 +241,7 @@ export async function updateCombo(id: string, data: JsonRecord): Promise<ComboUp
   const merged: JsonRecord = {
     ...current,
     ...data,
+    tenantId,
     sortOrder,
     updatedAt: new Date().toISOString(),
   };
@@ -251,14 +266,15 @@ export async function updateCombo(id: string, data: JsonRecord): Promise<ComboUp
   const contextCacheProtection = normalizedMerged.context_cache_protection ? 1 : 0;
 
   db.prepare(
-    "UPDATE combos SET name = ?, data = ?, sort_order = ?, updated_at = ?, context_cache_protection = ? WHERE id = ?"
+    "UPDATE combos SET name = ?, data = ?, sort_order = ?, updated_at = ?, context_cache_protection = ? WHERE id = ? AND tenant_id = ?"
   ).run(
     nextName,
     JSON.stringify(normalizedMerged),
     sortOrder,
     normalizedMerged.updatedAt,
     contextCacheProtection,
-    id
+    id,
+    tenantId
   );
 
   return {
@@ -273,9 +289,9 @@ export async function reorderCombos(comboIds: string[]): Promise<ComboReorderRes
   const db = getDbInstance();
   const rows = db
     .prepare(
-      "SELECT id, name, data, sort_order FROM combos ORDER BY sort_order ASC, name COLLATE NOCASE ASC"
+      "SELECT id, name, data, sort_order FROM combos WHERE tenant_id = ? ORDER BY sort_order ASC, name COLLATE NOCASE ASC"
     )
-    .all();
+    .all(currentDbTenantId());
   if (rows.length === 0) return { combos: [], rowsReordered: 0 };
 
   const existingIds = new Set(
@@ -305,7 +321,7 @@ export async function reorderCombos(comboIds: string[]): Promise<ComboReorderRes
   ];
 
   const update = db.prepare(
-    "UPDATE combos SET data = ?, sort_order = ?, updated_at = ? WHERE id = ?"
+    "UPDATE combos SET data = ?, sort_order = ?, updated_at = ? WHERE id = ? AND tenant_id = ?"
   );
   const now = new Date().toISOString();
   const rowById = new Map(
@@ -331,7 +347,7 @@ export async function reorderCombos(comboIds: string[]): Promise<ComboReorderRes
         { ...combo, sortOrder, updatedAt: now },
         { allCombos: comboNames }
       );
-      update.run(JSON.stringify(updatedCombo), sortOrder, now, id);
+      update.run(JSON.stringify(updatedCombo), sortOrder, now, id, currentDbTenantId());
     });
   });
 
@@ -344,7 +360,9 @@ export async function reorderCombos(comboIds: string[]): Promise<ComboReorderRes
 
 export async function deleteCombo(id: string) {
   const db = getDbInstance();
-  const result = db.prepare("DELETE FROM combos WHERE id = ?").run(id);
+  const result = db
+    .prepare("DELETE FROM combos WHERE id = ? AND tenant_id = ?")
+    .run(id, currentDbTenantId());
   if (result.changes === 0) return false;
   return true;
 }

@@ -27,6 +27,7 @@ process.on("exit", () => {
 });
 
 const { getDbInstance, resetDbInstance } = await import("@/lib/db/core");
+const { runWithTenantContext } = await import("@/lib/tenantContext");
 const { buildCacheHealthResponse } = await import("@/lib/usage/cacheHealth");
 const { GET } = await import("@/app/api/usage/cache-health/route");
 
@@ -76,6 +77,34 @@ test("filtra por modelo quando pedido", () => {
   assert.equal(r.totalCalls, 1);
   assert.equal(r.byModel.length, 1);
   assert.equal(r.byModel[0].model, "claude-opus-4-8");
+});
+
+test("cache health reads only the current tenant's call logs", () => {
+  seed();
+  const db = getDbInstance();
+  db.prepare(
+    `INSERT INTO call_logs (id, tenant_id, timestamp, status, model, requested_model,
+       tokens_cache_read, tokens_cache_creation)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "tenant-b-cache",
+    "tenant_b",
+    new Date(NOW - 60_000).toISOString(),
+    200,
+    "private-model",
+    "private-model",
+    999999,
+    0
+  );
+
+  const platform = buildCacheHealthResponse({ range: "1h", now: NOW });
+  const tenantB = runWithTenantContext({ tenantId: "tenant_b" }, () =>
+    buildCacheHealthResponse({ range: "1h", now: NOW })
+  );
+  assert.equal(platform.totalCalls, 4);
+  assert.equal(tenantB.totalCalls, 1);
+  assert.equal(tenantB.cacheReadTotal, 999999);
+  assert.equal(JSON.stringify(platform).includes("private-model"), false);
 });
 
 test("GET responde 200 com o resumo", async () => {

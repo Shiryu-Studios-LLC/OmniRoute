@@ -13,10 +13,10 @@ const providersDb = await import("../../src/lib/db/providers.ts");
 const proxiesDb = await import("../../src/lib/db/proxies.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
 const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
+const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 const proxiesRoute = await import("../../src/app/api/settings/proxies/route.ts");
-const { createProxyRegistrySchema, updateProxyRegistrySchema } = await import(
-  "../../src/shared/validation/schemas.ts"
-);
+const { createProxyRegistrySchema, updateProxyRegistrySchema } =
+  await import("../../src/shared/validation/schemas.ts");
 
 async function resetStorage() {
   delete process.env.INITIAL_PASSWORD;
@@ -342,6 +342,17 @@ test("resolveProxyForConnection uses apiKey proxy before account-level proxy", a
   assert.equal((resolved as any).level, "apiKey");
   assert.equal((resolved as any).proxy.host, "apikey.local");
   assert.equal((resolved as any).proxy.port, 8443);
+
+  const foreignTenantResult = await runWithTenantContext(
+    { tenantId: "tenant_proxy_foreign", role: "owner" },
+    () => settingsDb.resolveProxyForConnection(connId, key.id)
+  );
+  assert.notEqual(foreignTenantResult.level, "apiKey");
+  assert.notEqual(foreignTenantResult.proxy?.host, "apikey.local");
+
+  const platformResult = await settingsDb.resolveProxyForConnection(connId, key.id);
+  assert.equal(platformResult.level, "apiKey");
+  assert.equal(platformResult.proxy?.host, "apikey.local");
 });
 
 test("resolveProxyForConnection falls through when apiKey has no proxy_id", async () => {
