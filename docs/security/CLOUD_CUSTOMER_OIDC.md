@@ -38,13 +38,26 @@ Tenant OIDC configuration cannot set a callback or post-login redirect URI.
 - `GET /__cloud/auth/session` returns the tenant, membership, and issuer for a valid
   customer portal session cookie. It does not return provider credentials or the external
   subject identifier.
+- `POST /__cloud/auth/members/invitations` accepts `{ "role": "admin" | "member" | "viewer" }`
+  from a same-origin owner/admin portal session and returns a random invitation code once.
+  Owner role cannot be granted by invitation. The code expires after 15 minutes and only
+  its SHA-256 digest is stored.
+- `POST /__cloud/auth/oidc/invitations/redeem` accepts `{ "code": "…" }` in a same-origin
+  JSON request. It returns `{ "authorizationUrl": "…" }` and sets the one-use OIDC state
+  cookie, allowing the portal to perform a top-level navigation without placing the
+  invitation code in a URL. The authorization request uses the invitation tenant's
+  currently enabled issuer.
+- On callback, the Worker verifies the ID token before atomically consuming the invitation,
+  creating the tenant membership, linking that exact issuer/subject, and writing the audit
+  event. Issuer changes, expired/reused codes, existing identity conflicts, and inactive
+  tenants fail closed. Email/domain claims do not select or create membership.
 
 The session cookie is `HttpOnly`, `SameSite=Lax`, scoped to `/__cloud/auth`, and expires
 within eight hours. The database stores a hash of the opaque cookie token. Session
 introspection checks tenant, membership, identity-link, and enabled-issuer state on every
-request, so deactivating any of them immediately makes the session unusable. Browser writes
-and additional portal APIs are not part of this slice; add them only after a CSRF and
-portal authorization contract is defined.
+request, so deactivating any of them immediately makes the session unusable. Invitation
+creation requires an exact same-origin POST and the active owner/admin session; the cookie
+does not authorize existing API routes.
 
 ## Issuer endpoint handling
 
@@ -57,5 +70,8 @@ identity link.
 
 Tenant issuer/client configuration and issuer/subject membership links are stored in
 Cloudflare D1 by migration `0015_cloud_tenant_oidc.sql`; authorization state and portal
-sessions are stored by `0016_cloud_tenant_oidc_sessions.sql`. OIDC client secrets and PKCE
-verifiers are encrypted using the Worker credential encryption key.
+sessions are stored by `0016_cloud_tenant_oidc_sessions.sql`; digest-only membership invites
+and their OIDC callback binding are stored by `0018_cloud_tenant_membership_invitations.sql`.
+OIDC client secrets and PKCE verifiers are encrypted using the Worker credential encryption
+key. Customer OIDC issuer configuration remains platform-admin managed; tenant owners/admins
+can invite members but cannot change the issuer or auto-link identities by email/domain.

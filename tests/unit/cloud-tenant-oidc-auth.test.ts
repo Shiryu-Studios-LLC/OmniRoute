@@ -14,6 +14,8 @@ import {
   CLOUD_TENANT_OIDC_LOGIN_PATH,
   CLOUD_TENANT_OIDC_SESSION_COOKIE,
   CLOUD_TENANT_OIDC_SESSION_PATH,
+  CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
+  CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
 } from "../../src/cloud/tenantOidcAuth";
 import { createCloudRuntime } from "../../src/cloud/runtime";
@@ -100,6 +102,7 @@ async function setup() {
     "0005_cloud_customer_identity.sql",
     "0015_cloud_tenant_oidc.sql",
     "0016_cloud_tenant_oidc_sessions.sql",
+    "0018_cloud_tenant_membership_invitations.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -470,4 +473,197 @@ test("OIDC callback requires trusted issuer, audience, signature and an active e
     assert.equal(result.status, 401, `${scenario.name}: invalid identity must not create session`);
     assert.equal(result.headers.get("location"), null);
   }
+});
+
+test("owner can issue a digest-only OIDC invitation that creates membership only after verified callback", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+
+  const loginState: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const loginApp = runtime(db, await makeProvider(loginState));
+  const login = await loginApp.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGIN_PATH}?tenant=${tenant.slug}`)
+  );
+  const authorization = new URL(login.headers.get("location")!);
+  loginState.nonce = authorization.searchParams.get("nonce") ?? undefined;
+  const state = authorization.searchParams.get("state")!;
+  const callback = await loginApp.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=admin-code&state=${state}`, {
+      headers: { Cookie: `omni_oidc_state=${getCookieValue(login, "omni_oidc_state")}` },
+    })
+  );
+  const ownerCookie = getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE);
+
+  const create = await loginApp.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH}`, {
+      method: "POST",
+      headers: {
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${ownerCookie}`,
+      },
+      body: JSON.stringify({ role: "admin" }),
+    })
+  );
+  assert.equal(create.status, 201);
+  const issued = (await create.json()) as { code: string; role: string; expiresAt: string };
+  assert.equal(issued.role, "admin");
+  assert.equal(Date.parse(issued.expiresAt), NOW + 15 * 60 * 1000);
+  const inviteHash = createHash("sha256").update(issued.code).digest("hex");
+  assert.equal(
+    db.raw.prepare("SELECT code_hash FROM cloud_tenant_membership_invitations WHERE id != ''").get()
+      ?.code_hash,
+    inviteHash,
+    "only the invitation digest is persisted"
+  );
+  assert.equal(
+    db.raw
+      .prepare("SELECT 1 FROM cloud_tenant_membership_invitations WHERE code_hash = ?")
+      .get(issued.code),
+    undefined,
+    "raw code must not be stored"
+  );
+
+  const newMemberState: { nonce?: string; tokenRequests: URLSearchParams[] } = {
+    tokenRequests: [],
+  };
+  const newMemberApp = runtime(db, await makeProvider(newMemberState, { subject: "new-person" }));
+  const redeem = await newMemberApp.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: issued.code }),
+    })
+  );
+  assert.equal(redeem.status, 200);
+  assert.equal(
+    redeem.headers.get("location"),
+    null,
+    "redeem returns JSON for top-level navigation"
+  );
+  const redeemBody = (await redeem.json()) as { authorizationUrl: string };
+  const inviteAuthorization = new URL(redeemBody.authorizationUrl);
+  assert.equal(inviteAuthorization.origin, ISSUER);
+  assert.equal(inviteAuthorization.searchParams.has("code"), false);
+  assert.equal(redeemBody.authorizationUrl.includes(issued.code), false);
+  newMemberState.nonce = inviteAuthorization.searchParams.get("nonce") ?? undefined;
+  const inviteState = inviteAuthorization.searchParams.get("state")!;
+  const inviteStateCookie = getCookieValue(redeem, "omni_oidc_state");
+  assert.equal(inviteStateCookie, inviteState);
+
+  const accepted = await newMemberApp.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=invitee-code&state=${encodeURIComponent(inviteState)}`,
+      { headers: { Cookie: `omni_oidc_state=${inviteStateCookie}`, Origin: ORIGIN } }
+    )
+  );
+  assert.equal(accepted.status, 303);
+  const createdMembership = db.raw
+    .prepare(
+      `SELECT membership.id, membership.role, identity.issuer, identity.subject
+         FROM cloud_customer_memberships AS membership
+         JOIN cloud_tenant_oidc_identities AS identity
+           ON identity.tenant_id = membership.tenant_id AND identity.membership_id = membership.id
+        WHERE identity.tenant_id = ? AND identity.subject = 'new-person'`
+    )
+    .get(tenant.id) as { id: string; role: string; issuer: string; subject: string } | undefined;
+  assert.ok(createdMembership?.id);
+  assert.equal(createdMembership?.role, "admin");
+  assert.equal(createdMembership?.issuer, ISSUER);
+  assert.equal(createdMembership?.subject, "new-person");
+  assert.equal(
+    db.raw
+      .prepare("SELECT consumed_at_ms FROM cloud_tenant_membership_invitations WHERE code_hash = ?")
+      .get(inviteHash)?.consumed_at_ms,
+    NOW
+  );
+  const audit = db.raw
+    .prepare(
+      "SELECT action, metadata_json FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.membership.invitation.accepted'"
+    )
+    .get(tenant.id) as { action: string; metadata_json: string };
+  assert.equal(audit.action, "customer.membership.invitation.accepted");
+  assert.deepEqual(JSON.parse(audit.metadata_json), {
+    invitationId: db.raw
+      .prepare("SELECT id FROM cloud_tenant_membership_invitations WHERE code_hash = ?")
+      .get(inviteHash)?.id,
+    role: "admin",
+  });
+
+  const replay = await newMemberApp.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: issued.code }),
+    })
+  );
+  assert.equal(replay.status, 400, "consumed invitation cannot start another login");
+  assert.ok(await cleanupExpiredCloudTenantOidcAuthArtifacts(db, NOW + 24 * 60 * 60 * 1000 + 1));
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_tenant_membership_invitations WHERE code_hash = ?"
+      )
+      .get(inviteHash)?.count,
+    0,
+    "scheduled cleanup removes old consumed invitations"
+  );
+});
+
+test("membership invitation issue requires a same-origin owner/admin session and never permits owner role", async () => {
+  const { db, tenant, membership } = await setup();
+  const state: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const app = runtime(db, await makeProvider(state));
+  const login = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGIN_PATH}?tenant=${tenant.slug}`)
+  );
+  const authorization = new URL(login.headers.get("location")!);
+  state.nonce = authorization.searchParams.get("nonce") ?? undefined;
+  const callback = await app.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=member-code&state=${authorization.searchParams.get("state")}`,
+      { headers: { Cookie: `omni_oidc_state=${getCookieValue(login, "omni_oidc_state")}` } }
+    )
+  );
+  const memberCookie = `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE)}`;
+  const memberDenied = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json", Cookie: memberCookie },
+      body: JSON.stringify({ role: "member" }),
+    })
+  );
+  assert.equal(memberDenied.status, 403, "an authenticated member cannot invite others");
+  const crossOrigin = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH}`, {
+      method: "POST",
+      headers: {
+        Origin: "https://attacker.example",
+        "Content-Type": "application/json",
+        Cookie: memberCookie,
+      },
+      body: JSON.stringify({ role: "member" }),
+    })
+  );
+  assert.equal(crossOrigin.status, 403, "invitation creation rejects cross-origin writes");
+  const ownerRole = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json", Cookie: memberCookie },
+      body: JSON.stringify({ role: "owner" }),
+    })
+  );
+  assert.equal(ownerRole.status, 400);
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_tenant_membership_invitations WHERE tenant_id = ?"
+      )
+      .get(tenant.id)?.count,
+    0
+  );
+  assert.equal(membership.role, "member");
 });

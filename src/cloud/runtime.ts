@@ -3,7 +3,14 @@ import { handleCloudApiRequest } from "./httpApi";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
-import { handleCloudTenantOidcAuthRequest } from "./tenantOidcAuth";
+import {
+  CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
+  CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
+  CLOUD_TENANT_OIDC_CALLBACK_PATH,
+  CLOUD_TENANT_OIDC_LOGIN_PATH,
+  CLOUD_TENANT_OIDC_SESSION_PATH,
+  handleCloudTenantOidcAuthRequest,
+} from "./tenantOidcAuth";
 import type {
   GatewayCoordinatorStub,
   GatewayDurableObjectNamespace,
@@ -54,9 +61,11 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       const url = new URL(request.url);
 
       if (
-        url.pathname === "/__cloud/auth/oidc/login" ||
-        url.pathname === "/__cloud/auth/oidc/callback" ||
-        url.pathname === "/__cloud/auth/session"
+        url.pathname === CLOUD_TENANT_OIDC_LOGIN_PATH ||
+        url.pathname === CLOUD_TENANT_OIDC_CALLBACK_PATH ||
+        url.pathname === CLOUD_TENANT_OIDC_SESSION_PATH ||
+        url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH ||
+        url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH
       ) {
         try {
           const response = await handleCloudTenantOidcAuthRequest(request, {

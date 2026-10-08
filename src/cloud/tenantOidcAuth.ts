@@ -1,13 +1,23 @@
 import { createLocalJWKSet, jwtVerify } from "jose";
 import type { CloudDb } from "./db";
 import { encryptCloudCredential, decryptCloudCredential } from "./credentialEncryption";
-import { CLOUD_PLATFORM_TENANT_ID, getCloudTenantBySlug } from "./tenants";
+import { CLOUD_PLATFORM_TENANT_ID, getCloudTenantById, getCloudTenantBySlug } from "./tenants";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { getActiveCloudTenantOidcIdentity, getCloudTenantOidcCredentials } from "./tenantOidc";
+import {
+  acceptCloudTenantMembershipInvitation,
+  cleanupExpiredCloudTenantMembershipInvitations,
+  createCloudTenantMembershipInvitation,
+  getPendingCloudTenantMembershipInvitation,
+  CLOUD_TENANT_MEMBERSHIP_INVITATION_TTL_MS,
+} from "./tenantMembershipInvitations";
 
 export const CLOUD_TENANT_OIDC_LOGIN_PATH = "/__cloud/auth/oidc/login";
 export const CLOUD_TENANT_OIDC_CALLBACK_PATH = "/__cloud/auth/oidc/callback";
 export const CLOUD_TENANT_OIDC_SESSION_PATH = "/__cloud/auth/session";
+export const CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH = "/__cloud/auth/members/invitations";
+export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
+  "/__cloud/auth/oidc/invitations/redeem";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -34,6 +44,7 @@ interface OidcLoginStateRow {
   created_at_ms: number;
   expires_at_ms: number;
   consumed_at_ms: number | null;
+  invitation_hash: string | null;
 }
 
 interface OidcSessionRow {
@@ -302,14 +313,30 @@ async function startLogin(
   origin: URL,
   nowMs: number
 ): Promise<Response> {
-  const db = options.db;
-  if (!db || !options.credentialEncryptionKey)
-    return json({ error: "OIDC login unavailable" }, 503);
   const url = new URL(request.url);
   const tenantSelector = url.searchParams.get("tenant");
   if (!tenantSelector || tenantSelector.length > 128)
     return json({ error: "Tenant required" }, 400);
-  const tenant = await getCloudTenantBySlug(db, tenantSelector);
+  const tenant = options.db ? await getCloudTenantBySlug(options.db, tenantSelector) : null;
+  if (!tenant || tenant.kind !== "customer" || !tenant.isActive) {
+    return json({ error: "OIDC login unavailable" }, 404);
+  }
+  return startLoginForTenant(request, options, origin, nowMs, tenant.id, null, false);
+}
+
+async function startLoginForTenant(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number,
+  tenantId: string,
+  invitationHash: string | null,
+  returnAuthorizationUrl: boolean
+): Promise<Response> {
+  const db = options.db;
+  if (!db || !options.credentialEncryptionKey)
+    return json({ error: "OIDC login unavailable" }, 503);
+  const tenant = await getCloudTenantById(db, tenantId);
   if (!tenant || tenant.kind !== "customer" || !tenant.isActive) {
     return json({ error: "OIDC login unavailable" }, 404);
   }
@@ -343,8 +370,8 @@ async function startLogin(
         `INSERT INTO cloud_tenant_oidc_login_states
            (state_hash, tenant_id, issuer, client_id, redirect_uri, authorization_endpoint,
             token_endpoint, jwks_uri, signing_algorithms_json, nonce_hash,
-            code_verifier_encrypted, created_at_ms, expires_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            code_verifier_encrypted, created_at_ms, expires_at_ms, invitation_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         stateHash,
@@ -359,7 +386,8 @@ async function startLogin(
         nonceHash,
         verifierEnvelope,
         nowMs,
-        nowMs + CLOUD_TENANT_OIDC_STATE_TTL_MS
+        nowMs + CLOUD_TENANT_OIDC_STATE_TTL_MS,
+        invitationHash
       )
       .run();
     const authorizationUrl = new URL(metadata.authorizationEndpoint);
@@ -381,10 +409,12 @@ async function startLogin(
       )
     );
     authorizationUrl.searchParams.set("code_challenge_method", "S256");
-    const response = new Response(null, {
-      status: 302,
-      headers: { Location: authorizationUrl.toString(), "Cache-Control": "no-store" },
-    });
+    const response = returnAuthorizationUrl
+      ? json({ authorizationUrl: authorizationUrl.toString() })
+      : new Response(null, {
+          status: 302,
+          headers: { Location: authorizationUrl.toString(), "Cache-Control": "no-store" },
+        });
     return withSetCookie(
       response,
       cookie(STATE_COOKIE, state, {
@@ -566,11 +596,45 @@ async function callback(
     ) {
       throw new Error("ID token claims invalid");
     }
-    const identity = await getActiveCloudTenantOidcIdentity(db, {
-      tenantId: consumed.tenant_id,
-      issuer: consumed.issuer,
-      subject: payload.sub,
-    });
+    let identity: Awaited<ReturnType<typeof getActiveCloudTenantOidcIdentity>>;
+    if (consumed.invitation_hash) {
+      const invitation = await getPendingCloudTenantMembershipInvitation(
+        db,
+        consumed.invitation_hash,
+        nowMs
+      );
+      if (
+        !invitation ||
+        invitation.tenantId !== consumed.tenant_id ||
+        invitation.issuer !== consumed.issuer
+      ) {
+        throw new Error("Invitation is unavailable");
+      }
+      const accepted = await acceptCloudTenantMembershipInvitation(db, {
+        codeHash: consumed.invitation_hash,
+        invitation,
+        issuer: consumed.issuer,
+        subject: payload.sub,
+        nowMs,
+      });
+      if (!accepted) throw new Error("Invitation is unavailable");
+      identity = {
+        id: accepted.identityId,
+        tenantId: invitation.tenantId,
+        issuer: invitation.issuer,
+        subject: payload.sub,
+        membershipId: accepted.membershipId,
+        principalId: accepted.principalId,
+        role: invitation.role,
+        createdAt: new Date(nowMs).toISOString(),
+      };
+    } else {
+      identity = await getActiveCloudTenantOidcIdentity(db, {
+        tenantId: consumed.tenant_id,
+        issuer: consumed.issuer,
+        subject: payload.sub,
+      });
+    }
     if (!identity) throw new Error("Identity is not linked to an active membership");
 
     const sessionToken = randomToken();
@@ -660,6 +724,149 @@ async function introspectSession(
   );
 }
 
+async function resolveSession(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  nowMs: number
+): Promise<OidcSessionRow | null> {
+  if (!options.db) return null;
+  const token = getCookie(request, CLOUD_TENANT_OIDC_SESSION_COOKIE);
+  if (!token || !TOKEN_PATTERN.test(token)) return null;
+  const tokenHash = await sha256(token);
+  return options.db
+    .prepare<OidcSessionRow>(
+      `SELECT session.tenant_id, tenant.name AS tenant_name, tenant.slug AS tenant_slug,
+              membership.id AS membership_id, membership.principal_id, membership.role,
+              identity.id AS identity_id, identity.issuer, identity.subject,
+              session.expires_at_ms
+         FROM cloud_tenant_oidc_sessions AS session
+         JOIN tenants AS tenant ON tenant.id = session.tenant_id
+           AND tenant.kind = 'customer' AND tenant.is_active = 1
+         JOIN cloud_customer_memberships AS membership
+           ON membership.tenant_id = session.tenant_id AND membership.id = session.membership_id
+          AND membership.is_active = 1
+         JOIN cloud_tenant_oidc_identities AS identity
+           ON identity.tenant_id = session.tenant_id AND identity.id = session.identity_id
+          AND identity.membership_id = session.membership_id
+         JOIN cloud_tenant_oidc_configs AS config
+           ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
+          AND config.is_enabled = 1
+        WHERE session.token_hash = ? AND session.revoked_at_ms IS NULL
+          AND session.expires_at_ms > ?
+        LIMIT 1`
+    )
+    .bind(tokenHash, nowMs)
+    .first();
+}
+
+async function createMembershipInvitation(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "Invitation service unavailable" }, 503);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBounded(new Response(request.body), 2048);
+  } catch {
+    return json({ error: "Invalid request body" }, 400);
+  }
+  if (
+    !isRecord(body) ||
+    Object.keys(body).length !== 1 ||
+    (body.role !== "admin" && body.role !== "member" && body.role !== "viewer")
+  ) {
+    return json({ error: "Invalid membership role" }, 400);
+  }
+  const session = await resolveSession(request, options, nowMs);
+  if (!session || (session.role !== "owner" && session.role !== "admin")) {
+    return json({ error: "Owner or admin session required" }, 403);
+  }
+  const limit = await consumeCloudRateLimit(db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-membership-invite:${session.tenant_id}:${session.membership_id}`,
+    limit: 20,
+    windowMs: 60 * 60 * 1000,
+    nowMs,
+  });
+  if (!limit.allowed) return json({ error: "Invitation rate limit exceeded" }, 429);
+
+  const code = randomToken();
+  const codeHash = await sha256(code);
+  const invitationId = crypto.randomUUID();
+  const expiresAtMs = nowMs + CLOUD_TENANT_MEMBERSHIP_INVITATION_TTL_MS;
+  const created = await createCloudTenantMembershipInvitation(db, {
+    id: invitationId,
+    codeHash,
+    tenantId: session.tenant_id,
+    issuer: session.issuer,
+    issuerMembershipId: session.membership_id,
+    role: body.role,
+    nowMs,
+    expiresAtMs,
+  });
+  if (!created) return json({ error: "Invitation could not be created" }, 409);
+  return json(
+    {
+      code,
+      role: body.role,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+      redeemPath: CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
+    },
+    201
+  );
+}
+
+async function redeemMembershipInvitation(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "Invitation service unavailable" }, 503);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBounded(new Response(request.body), 2048);
+  } catch {
+    return json({ error: "Invalid request body" }, 400);
+  }
+  if (
+    !isRecord(body) ||
+    Object.keys(body).length !== 1 ||
+    typeof body.code !== "string" ||
+    !TOKEN_PATTERN.test(body.code)
+  ) {
+    return json({ error: "Invalid invitation code" }, 400);
+  }
+  const limit = await consumeCloudRateLimit(db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-oidc-invite-redeem:${cloudflareClientIpBucket(request) ?? "unknown"}`,
+    limit: 20,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!limit.allowed) return json({ error: "Invitation redemption rate limit exceeded" }, 429);
+  const codeHash = await sha256(body.code);
+  const invitation = await getPendingCloudTenantMembershipInvitation(db, codeHash, nowMs);
+  if (!invitation) return json({ error: "Invitation is invalid or expired" }, 400);
+  return startLoginForTenant(request, options, origin, nowMs, invitation.tenantId, codeHash, true);
+}
+
 /** Called only by the Cloud runtime for the isolated OIDC auth paths. */
 export async function handleCloudTenantOidcAuthRequest(
   request: Request,
@@ -669,8 +876,14 @@ export async function handleCloudTenantOidcAuthRequest(
   const isLogin = pathname === CLOUD_TENANT_OIDC_LOGIN_PATH;
   const isCallback = pathname === CLOUD_TENANT_OIDC_CALLBACK_PATH;
   const isSession = pathname === CLOUD_TENANT_OIDC_SESSION_PATH;
-  if (!isLogin && !isCallback && !isSession) return null;
-  if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
+  const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
+  if (!isLogin && !isCallback && !isSession && !isCreateInvitation && !isRedeemInvitation)
+    return null;
+  const requiresPost = isCreateInvitation || isRedeemInvitation;
+  if (request.method !== (requiresPost ? "POST" : "GET")) {
+    return json({ error: "Method not allowed" }, 405, { Allow: requiresPost ? "POST" : "GET" });
+  }
   const origin = expectedOrigin(request, options);
   if (!origin)
     return json({ error: "OIDC origin is unavailable" }, options.publicOrigin ? 403 : 503);
@@ -684,6 +897,8 @@ export async function handleCloudTenantOidcAuthRequest(
     return startLogin(request, options, origin, nowMs);
   }
   if (isCallback) return callback(request, options, origin, nowMs);
+  if (isCreateInvitation) return createMembershipInvitation(request, options, origin, nowMs);
+  if (isRedeemInvitation) return redeemMembershipInvitation(request, options, origin, nowMs);
   return introspectSession(request, options, origin, nowMs);
 }
 
@@ -694,7 +909,7 @@ export async function cleanupExpiredCloudTenantOidcAuthArtifacts(
   batchSize = 500
 ): Promise<number> {
   const limit = Math.max(1, Math.min(1000, Math.floor(batchSize)));
-  const [states, sessions] = await Promise.all([
+  const [states, sessions, invitations] = await Promise.all([
     db
       .prepare(
         `DELETE FROM cloud_tenant_oidc_login_states WHERE rowid IN (
@@ -715,6 +930,7 @@ export async function cleanupExpiredCloudTenantOidcAuthArtifacts(
       )
       .bind(nowMs - 24 * 60 * 60 * 1000, nowMs - 24 * 60 * 60 * 1000, limit)
       .run(),
+    cleanupExpiredCloudTenantMembershipInvitations(db, nowMs, limit),
   ]);
-  return Number(states.meta?.changes ?? 0) + Number(sessions.meta?.changes ?? 0);
+  return Number(states.meta?.changes ?? 0) + Number(sessions.meta?.changes ?? 0) + invitations;
 }
