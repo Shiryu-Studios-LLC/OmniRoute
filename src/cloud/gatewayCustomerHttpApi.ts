@@ -9,6 +9,7 @@ import type { CloudDb } from "./db";
 import { D1GatewayDeviceDirectory } from "./gatewayDevices";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import { consumeCloudRateLimit } from "./rateLimit";
+import { appendCloudUsageRecord } from "./usage";
 
 const PATH = "/__gateway/v1/customer/invoke";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -90,6 +91,16 @@ function resultSize(value: unknown): number | null {
   } catch {
     return null;
   }
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function tokenCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Customer-authenticated local capability invocation. Tenant scope comes only from the D1 key. */
@@ -206,6 +217,7 @@ export async function handleGatewayCustomerRequest(
     now: options.now,
     wait: options.wait,
   });
+  const invocationStartedAt = performance.now();
   let result: Awaited<ReturnType<typeof gateway.requestCapability>>;
   try {
     result = await gateway.requestCapability({
@@ -250,6 +262,33 @@ export async function handleGatewayCustomerRequest(
   if (result.ok) {
     if (responseBytes === null || responseBytes > MAX_RESULT_BYTES) {
       return json({ error: "Invocation result exceeds the size limit" }, 502);
+    }
+    const chatModelPrefix = "ollama:chat:";
+    if (body.capability.startsWith(chatModelPrefix)) {
+      const envelope = record(result.result);
+      const outcome = record(envelope?.outcome);
+      const localResult = outcome?.ok === true ? record(outcome.value) : null;
+      if (localResult) {
+        try {
+          await appendCloudUsageRecord(db, {
+            id: result.requestId,
+            tenantId: identity.tenantId,
+            provider: "ollama",
+            model: body.capability.slice(chatModelPrefix.length),
+            apiKeyId: identity.apiKeyId,
+            tokensInput: tokenCount(localResult.prompt_eval_count),
+            tokensOutput: tokenCount(localResult.eval_count),
+            serviceTier: "customer-managed",
+            status: "success",
+            success: true,
+            latencyMs: Math.max(0, Math.round(performance.now() - invocationStartedAt)),
+            endpoint: PATH,
+            timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+          });
+        } catch {
+          return json({ error: "Invocation usage accounting is unavailable" }, 503);
+        }
+      }
     }
     return json({ requestId: result.requestId, result: result.result });
   }

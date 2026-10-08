@@ -528,7 +528,7 @@ test("customer invocation derives tenant from its API key, completes through the
     const ownerA = await customerKey(fixture, "tenant-a", "owner");
     const ownerB = await customerKey(fixture, "tenant-b", "owner");
     const deviceA = await registerOnlineDevice(fixture, "tenant-a", "device-customer-a");
-    await registerOnlineDevice(fixture, "tenant-b", "device-customer-b");
+    const deviceB = await registerOnlineDevice(fixture, "tenant-b", "device-customer-b");
 
     const body = {
       deviceId: "device-customer-a",
@@ -549,7 +549,14 @@ test("customer invocation derives tenant from its API key, completes through the
       await deviceA.transport.submitResult(deviceA.session, {
         version: 1,
         requestId: requests![0].requestId,
-        outcome: { ok: true, value: { answer: "local result" } },
+        outcome: {
+          ok: true,
+          value: {
+            message: { role: "assistant", content: "local result" },
+            prompt_eval_count: 42,
+            eval_count: 16,
+          },
+        },
       }),
       true
     );
@@ -557,8 +564,71 @@ test("customer invocation derives tenant from its API key, completes through the
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), {
       requestId: requests![0].requestId,
-      result: { version: 1, outcome: { ok: true, value: { answer: "local result" } } },
+      result: {
+        version: 1,
+        outcome: {
+          ok: true,
+          value: {
+            message: { role: "assistant", content: "local result" },
+            prompt_eval_count: 42,
+            eval_count: 16,
+          },
+        },
+      },
     });
+
+    const usage = fixture.d1.db
+      .prepare(
+        `SELECT tenant_id, provider, model, api_key_id, tokens_input, tokens_output, endpoint
+           FROM cloud_usage_history WHERE tenant_id = 'tenant-a'`
+      )
+      .all() as Array<{
+      tenant_id: string;
+      provider: string;
+      model: string;
+      api_key_id: string;
+      tokens_input: number;
+      tokens_output: number;
+      endpoint: string;
+    }>;
+    assert.deepEqual(JSON.parse(JSON.stringify(usage)), [
+      {
+        tenant_id: "tenant-a",
+        provider: "ollama",
+        model: "qwen-local",
+        api_key_id: ownerA.id,
+        tokens_input: 42,
+        tokens_output: 16,
+        endpoint: "/__gateway/v1/customer/invoke",
+      },
+    ]);
+
+    const failedCapabilityInvocation = fixture.fetch(
+      invokeRequest(ownerB.token, {
+        ...body,
+        deviceId: "device-customer-b",
+        payload: { messages: [{ role: "user", content: "failed local execution" }] },
+      })
+    );
+    let requestsB: Awaited<ReturnType<typeof deviceB.transport.poll>> = null;
+    for (let attempt = 0; attempt < 50 && !requestsB?.length; attempt += 1) {
+      requestsB = await deviceB.transport.poll(deviceB.session);
+      if (!requestsB?.length) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(requestsB?.length, 1);
+    assert.equal(
+      await deviceB.transport.submitResult(deviceB.session, {
+        version: 1,
+        requestId: requestsB![0].requestId,
+        outcome: { ok: false, error: { code: "capability_execution_failed" } },
+      }),
+      true
+    );
+    assert.equal((await failedCapabilityInvocation).status, 200);
+    const usageB = fixture.d1.db
+      .prepare("SELECT COUNT(*) AS count FROM cloud_usage_history WHERE tenant_id = 'tenant-b'")
+      .get() as { count: number };
+    assert.equal(usageB.count, 0, "failed local capability execution must not create usage");
 
     const crossTenant = await fixture.fetch(
       invokeRequest(ownerA.token, { ...body, deviceId: "device-customer-b" })
@@ -590,7 +660,7 @@ test("customer invocation derives tenant from its API key, completes through the
       status: string;
       metadata_json: string;
     }>;
-    assert.equal(audit.length, 8);
+    assert.equal(audit.length, 10);
     assert.ok(audit.filter((entry) => entry.tenant_id === "tenant-a").length === 6);
     assert.ok(audit.every((entry) => !entry.metadata_json.includes("sensitive request content")));
     assert.ok(
