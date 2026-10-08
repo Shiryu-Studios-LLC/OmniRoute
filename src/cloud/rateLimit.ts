@@ -29,6 +29,8 @@ interface RateLimitRow extends Record<string, unknown> {
 const MAX_LIMIT = 1_000_000;
 const MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BUCKET_KEY_LENGTH = 512;
+export const CLOUD_RATE_LIMIT_RETENTION_GRACE_MS = 24 * 60 * 60 * 1000;
+const MAX_RATE_LIMIT_CLEANUP_BATCH_SIZE = 1_000;
 
 /** Read the visitor address only on Workers requests carrying edge `cf` metadata. */
 export function cloudflareClientIpBucket(request: Request): string | null {
@@ -134,4 +136,56 @@ export async function consumeCloudRateLimit(
     windowStartedAtMs,
     resetAtMs: windowStartedAtMs + windowMs,
   };
+}
+
+/**
+ * Delete a bounded batch of rate-limit buckets whose windows ended at least
+ * one grace period ago. Ordering and filtering use the indexed window end,
+ * so short windows can be reclaimed after the grace period without scanning
+ * every long-window bucket.
+ */
+export async function cleanupExpiredCloudRateLimits(
+  db: CloudDb,
+  options: { nowMs?: number; batchSize?: number; retentionMs?: number } = {}
+): Promise<number> {
+  const nowMs = options.nowMs ?? Date.now();
+  const batchSize = options.batchSize ?? 500;
+  const retentionMs = options.retentionMs ?? CLOUD_RATE_LIMIT_RETENTION_GRACE_MS;
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > 8_640_000_000_000_000) {
+    throw new RangeError(
+      "nowMs must be a non-negative millisecond timestamp within the date range"
+    );
+  }
+  if (
+    !Number.isInteger(batchSize) ||
+    batchSize < 1 ||
+    batchSize > MAX_RATE_LIMIT_CLEANUP_BATCH_SIZE
+  ) {
+    throw new RangeError(
+      `batchSize must be an integer between 1 and ${MAX_RATE_LIMIT_CLEANUP_BATCH_SIZE}`
+    );
+  }
+  if (!Number.isSafeInteger(retentionMs) || retentionMs < 0 || retentionMs > MAX_WINDOW_MS) {
+    throw new RangeError(`retentionMs must be an integer between 0 and ${MAX_WINDOW_MS}`);
+  }
+  const staleBeforeMs = nowMs - retentionMs;
+  if (staleBeforeMs <= 0) return 0;
+
+  const result = await db
+    .prepare(
+      `DELETE FROM cloud_rate_limits
+        WHERE rowid IN (
+          SELECT rowid FROM cloud_rate_limits
+           WHERE window_started_at_ms + window_ms <= ?
+           ORDER BY window_started_at_ms + window_ms, tenant_id, bucket_hash
+           LIMIT ?
+        )`
+    )
+    .bind(staleBeforeMs, batchSize)
+    .run();
+  const changes = Number(result.meta?.changes ?? 0);
+  if (!result.success || !Number.isSafeInteger(changes) || changes < 0 || changes > batchSize) {
+    throw new Error("D1 rate-limit cleanup returned invalid state");
+  }
+  return changes;
 }

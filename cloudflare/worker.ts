@@ -3,6 +3,7 @@ import {
   GatewaySessionDurableObject,
   type GatewayCoordinatorStub,
 } from "../src/cloud/connectorGatewayDurableObject";
+import { cleanupExpiredCloudRateLimits } from "../src/cloud/rateLimit";
 import { createCloudRuntime } from "../src/cloud/runtime";
 
 type CloudflareEnv = Env & {
@@ -74,6 +75,9 @@ const worker = {
         GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,
       },
     }).fetch(request);
+  },
+  scheduled(_controller: ScheduledController, env: CloudflareEnv, context: ExecutionContext): void {
+    context.waitUntil(cleanupExpiredCloudRateLimits(env.DB));
   },
 };
 
