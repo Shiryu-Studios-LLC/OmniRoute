@@ -26,7 +26,9 @@ export async function provisionCloudCustomer(
       )
       .bind(input.id, input.name, input.slug, input.now, input.now)
       .run();
-    tenantInserted = Number(insertResult.meta?.changes ?? 0) > 0;
+    tenantInserted =
+      insertResult.success &&
+      (insertResult.meta?.changes === undefined || Number(insertResult.meta.changes) > 0);
     if (!insertResult.success || !tenantInserted) {
       throw new Error("Customer tenant could not be created");
     }
@@ -54,7 +56,10 @@ export async function provisionCloudCustomer(
           .prepare("DELETE FROM tenants WHERE id = ? AND kind = 'customer'")
           .bind(input.id)
           .run();
-        if (!rollback.success || Number(rollback.meta?.changes ?? 0) !== 1) {
+        if (
+          !rollback.success ||
+          (rollback.meta?.changes !== undefined && Number(rollback.meta.changes) !== 1)
+        ) {
           throw new Error("Customer provisioning rollback did not delete the tenant");
         }
       } catch {
@@ -74,7 +79,10 @@ export async function rollbackCloudCustomerProvisioning(
     .prepare("DELETE FROM tenants WHERE id = ? AND kind = 'customer'")
     .bind(tenantId)
     .run();
-  if (!result.success || Number(result.meta?.changes ?? 0) !== 1) {
+  if (
+    !result.success ||
+    (result.meta?.changes !== undefined && Number(result.meta.changes) !== 1)
+  ) {
     throw new Error("Customer provisioning rollback failed");
   }
 }

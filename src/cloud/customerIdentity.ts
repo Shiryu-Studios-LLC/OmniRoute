@@ -78,7 +78,10 @@ export async function createCloudCustomerMembership(
     )
     .bind(id, input.tenantId, input.principalId, role, now, now)
     .run();
-  if (!result.success || Number(result.meta?.changes ?? 0) !== 1) {
+  if (
+    !result.success ||
+    (result.meta?.changes !== undefined && Number(result.meta.changes) !== 1)
+  ) {
     throw new Error("Customer membership could not be created");
   }
   return { id, tenantId: input.tenantId, principalId: input.principalId, role };
@@ -122,7 +125,10 @@ export async function issueCloudCustomerApiKey(
     )
     .bind(id, input.tenantId, input.membershipId, await hashToken(token), now, expiresAt)
     .run();
-  if (!result.success || Number(result.meta?.changes ?? 0) !== 1) {
+  if (
+    !result.success ||
+    (result.meta?.changes !== undefined && Number(result.meta.changes) !== 1)
+  ) {
     throw new Error("Customer API key could not be issued");
   }
   return {
