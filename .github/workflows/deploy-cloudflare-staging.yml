@@ -209,8 +209,20 @@ jobs:
         shell: bash
         env:
           STAGING_URL: ${{ steps.deploy.outputs.url }}
+          EXPECTED_BUILD_SHA: ${{ github.sha }}
+          OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
+          denied="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/status")"
+          [[ "$denied" == "401" ]] || {
+            echo "Staging Worker did not reject an unauthenticated admin request."
+            exit 1
+          }
+          authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/status")"
+          [[ "$authorized" == "404" ]] || {
+            echo "Staging Worker admin authorization smoke check returned an unexpected status."
+            exit 1
+          }
           health="$(curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused "$STAGING_URL/__cloud/health")"
           printf '%s' "$health" | node -e '
             let body = "";
@@ -229,7 +241,34 @@ jobs:
               if (value.status !== "ok" || value.runtime !== "cloudflare" || value.database !== "d1") process.exit(1);
             });
           '
-          echo "Staging Worker health and D1 binding are healthy."
+          readiness="$(curl --fail --silent --show-error "$STAGING_URL/__cloud/readiness")"
+          printf '%s' "$readiness" | node -e '
+            let body = "";
+            process.stdin.on("data", (chunk) => { body += chunk; });
+            process.stdin.on("end", () => {
+              const value = JSON.parse(body);
+              if (
+                value.status !== "ready" ||
+                value.runtime !== "cloudflare" ||
+                value.checks?.database !== "ok" ||
+                value.checks?.gateway !== "ok"
+              ) process.exit(1);
+            });
+          '
+          runtime="$(curl --fail --silent --show-error "$STAGING_URL/__cloud/runtime")"
+          printf '%s' "$runtime" | EXPECTED_BUILD_SHA="$EXPECTED_BUILD_SHA" node -e '
+            let body = "";
+            process.stdin.on("data", (chunk) => { body += chunk; });
+            process.stdin.on("end", () => {
+              const value = JSON.parse(body);
+              if (
+                value.runtime !== "cloudflare" ||
+                value.environment !== "staging" ||
+                value.buildSha !== process.env.EXPECTED_BUILD_SHA
+              ) process.exit(1);
+            });
+          '
+          echo "Staging Worker health, D1, Durable Object, environment, and build SHA are healthy."
 
       - name: Remove temporary Wrangler configuration and deployment log
         if: always()

@@ -20,7 +20,9 @@ test("discovers installed Ollama IDs and only reports verified model capabilitie
         }
         const modelName = String(init?.body ?? "");
         return jsonResponse({
-          capabilities: modelName.includes("llava") ? ["completion", "vision"] : ["completion"],
+          capabilities: modelName.includes("llava")
+            ? ["completion", "vision", "embedding"]
+            : ["completion"],
         });
       },
     }
@@ -36,15 +38,18 @@ test("discovers installed Ollama IDs and only reports verified model capabilitie
       "ollama:model:llava:7b",
       "ollama:chat:llama3.2:3b",
       "ollama:chat:llava:7b",
-      "ollama:vision:llava:7b",
     ],
   });
+  assert.equal(
+    result.heartbeat.capabilities.some((capability) => /:(vision|embedding):/.test(capability)),
+    false
+  );
   assert.equal(requested.length, 3);
   assert.match(requested[0], /^GET http:\/\/localhost:11434\/api\/tags$/);
   assert.match(requested[1], /^POST http:\/\/localhost:11434\/api\/show$/);
 });
 
-test("discovers ComfyUI checkpoint IDs and registered image/video node capability", async () => {
+test("discovers ComfyUI checkpoint IDs and only executable image capability", async () => {
   const result = await discoverLocalCapabilities(
     { comfyUiUrl: "http://192.168.1.20:8188" },
     {
@@ -64,7 +69,7 @@ test("discovers ComfyUI checkpoint IDs and registered image/video node capabilit
   ]);
   assert.deepEqual(result.heartbeat, {
     status: "online",
-    capabilities: ["comfyui:image", "comfyui:video"],
+    capabilities: ["comfyui:image"],
   });
 });
 

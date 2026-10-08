@@ -212,8 +212,6 @@ async function discoverOllama(
       if (!Array.isArray(modelCapabilities)) continue;
       for (const capability of modelCapabilities) {
         if (capability === "completion") capabilities.push(`ollama:chat:${name}`);
-        if (capability === "vision") capabilities.push(`ollama:vision:${name}`);
-        if (capability === "embedding") capabilities.push(`ollama:embedding:${name}`);
       }
     } catch {
       // /api/show is optional metadata; installed model IDs remain useful on older Ollama versions.
@@ -248,9 +246,6 @@ async function discoverComfyUi(
     models.length > 0
   ) {
     capabilities.push("comfyui:image");
-  }
-  if (nodeTypes.has("VHS_VideoCombine") || nodeTypes.has("CreateVideo")) {
-    capabilities.push("comfyui:video");
   }
   return { models, capabilities };
 }

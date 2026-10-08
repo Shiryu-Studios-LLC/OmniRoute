@@ -29,6 +29,7 @@ export interface GatewayDurableObjectNamespace<Stub> {
 }
 
 export interface GatewayCoordinatorStub {
+  checkReadiness(): Promise<void>;
   putSession(deviceId: string, session: GatewaySessionRecord): Promise<void>;
   getSession(deviceId: string): Promise<GatewaySessionRecord | null>;
   touchSession(
@@ -132,6 +133,12 @@ function assertDeviceId(deviceId: string): void {
  */
 export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
   constructor(private readonly state: GatewayDurableObjectState) {}
+
+  async checkReadiness(): Promise<void> {
+    // A read-only storage operation confirms that the binding can reach this
+    // Durable Object without creating or changing gateway session state.
+    await this.state.storage.get(IDENTITY_KEY);
+  }
 
   async putSession(deviceId: string, session: GatewaySessionRecord): Promise<void> {
     assertDeviceId(deviceId);

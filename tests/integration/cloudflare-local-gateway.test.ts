@@ -241,99 +241,183 @@ test(
     const database = await requestJson(`${baseUrl}/__cloud/db`);
     assert.equal(database.response.status, 200);
     assert.equal(database.body.database, "d1");
-
-    const tenantId = `local-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
-    const tenantResult = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
-      token: adminToken,
-      body: { id: tenantId, name: "Local Integration Tenant", slug: tenantId },
-    });
-    assert.equal(
-      tenantResult.response.status,
-      201,
-      `tenant provisioning failed: ${JSON.stringify(tenantResult.body)}\n${output}`
+    const readiness = await requestJson(`${baseUrl}/__cloud/readiness`);
+    assert.equal(readiness.response.status, 200);
+    assert.deepEqual(readiness.body.checks, { database: "ok", gateway: "ok" });
+    const unauthorizedAdminRequest = await requestJson(
+      `${baseUrl}/__cloud/v1/tenants/__smoke_missing__/status`
     );
-    const membershipResult = await requestJson(
-      `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships`,
-      { token: adminToken, body: { principalId: `principal-${tenantId}`, role: "owner" } }
+    assert.equal(unauthorizedAdminRequest.response.status, 401);
+    const authorizedAdminRequest = await requestJson(
+      `${baseUrl}/__cloud/v1/tenants/__smoke_missing__/status`,
+      { token: adminToken }
     );
-    assert.equal(membershipResult.response.status, 201);
-    const membershipId = String(membershipResult.body.id);
-    const keyResult = await requestJson(
-      `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships/${membershipId}/api-keys`,
-      { token: adminToken, body: {} }
-    );
-    assert.equal(keyResult.response.status, 201);
-    const customerKey = String(keyResult.body.token);
-    assert.match(customerKey, /^orc_live_/);
-
-    const deviceId = `device-${randomUUID().replaceAll("-", "").slice(0, 20)}`;
-    const credential = `local-device-${randomUUID().replaceAll("-", "")}`.padEnd(43, "x");
-    const credentialHash = createHash("sha256").update(credential).digest("hex");
-    const deviceResult = await requestJson(
-      `${baseUrl}/__cloud/v1/tenants/${tenantId}/gateway-devices`,
-      {
-        token: adminToken,
-        body: { id: deviceId, credentialHash, capabilities: [capability] },
-      }
-    );
-    assert.equal(deviceResult.response.status, 201);
+    assert.equal(authorizedAdminRequest.response.status, 404);
 
     const deviceTransport = createHttpLocalAgentGatewayTransport(baseUrl, {
       fetch,
       requestTimeoutMs: 5_000,
     });
-    const session = await deviceTransport.connect(deviceId, credential);
-    assert.ok(session, "device credential should authenticate through the Worker and D1");
-    assert.equal(await deviceTransport.heartbeat(session, [capability]), true);
 
-    const invocationBody = {
-      deviceId,
-      capability,
-      payload: { prompt: "local Worker integration payload" },
-      timeoutMs: 10_000,
+    const provisionCustomer = async (label: string, connectDevice = true) => {
+      const tenantId = `local-${label}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+      const tenantResult = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
+        token: adminToken,
+        body: { id: tenantId, name: `Local Integration ${label}`, slug: tenantId },
+      });
+      assert.equal(
+        tenantResult.response.status,
+        201,
+        `${label} tenant provisioning failed: ${JSON.stringify(tenantResult.body)}\n${output}`
+      );
+      const membershipResult = await requestJson(
+        `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships`,
+        { token: adminToken, body: { principalId: `principal-${tenantId}`, role: "owner" } }
+      );
+      assert.equal(membershipResult.response.status, 201);
+      const membershipId = String(membershipResult.body.id);
+      const keyResult = await requestJson(
+        `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships/${membershipId}/api-keys`,
+        { token: adminToken, body: {} }
+      );
+      assert.equal(keyResult.response.status, 201);
+      const customerKey = String(keyResult.body.token);
+      assert.match(customerKey, /^orc_live_/);
+
+      const deviceId = `device-${randomUUID().replaceAll("-", "").slice(0, 20)}`;
+      const credential = `local-device-${randomUUID().replaceAll("-", "")}`.padEnd(43, "x");
+      const credentialHash = createHash("sha256").update(credential).digest("hex");
+      const deviceResult = await requestJson(
+        `${baseUrl}/__cloud/v1/tenants/${tenantId}/gateway-devices`,
+        {
+          token: adminToken,
+          body: { id: deviceId, credentialHash, capabilities: [capability] },
+        }
+      );
+      assert.equal(deviceResult.response.status, 201);
+
+      const session = connectDevice ? await deviceTransport.connect(deviceId, credential) : null;
+      if (connectDevice) {
+        assert.ok(session, `${label} device credential should authenticate through Worker and D1`);
+        assert.equal(await deviceTransport.heartbeat(session!, [capability]), true);
+      }
+      return { tenantId, customerKey, deviceId, credential, session };
     };
-    const idempotencyKey = `local-replay-${randomUUID()}`;
-    const invoke = () =>
+
+    const customerA = await provisionCustomer("a");
+    const customerB = await provisionCustomer("b");
+    assert.notEqual(customerA.tenantId, customerB.tenantId);
+    assert.notEqual(customerA.customerKey, customerB.customerKey);
+    assert.notEqual(customerA.deviceId, customerB.deviceId);
+    assert.notEqual(customerA.credential, customerB.credential);
+
+    const invoke = (customerKey: string, deviceId: string, idempotencyKey: string) =>
       requestJson(`${baseUrl}/__gateway/v1/customer/invoke`, {
         token: customerKey,
         headers: { "Idempotency-Key": idempotencyKey },
-        body: invocationBody,
+        body: {
+          deviceId,
+          capability,
+          payload: { prompt: "local Worker integration payload" },
+          timeoutMs: 10_000,
+        },
       });
-    const firstInvocation = invoke();
 
-    let deviceRequests: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
-    const pollDeadline = Date.now() + 5_000;
-    while (!deviceRequests?.length && Date.now() < pollDeadline) {
-      deviceRequests = await deviceTransport.poll(session);
-      if (!deviceRequests?.length) await delay(25);
-    }
-    assert.equal(
-      deviceRequests?.length,
-      1,
-      "invocation should be enqueued in the real Durable Object"
-    );
-    const requestId = deviceRequests![0]!.requestId;
-    assert.equal(
-      await deviceTransport.submitResult(session, {
+    const invokeAndComplete = async (customer: typeof customerA, expectedAnswer: string) => {
+      const idempotencyKey = `local-replay-${randomUUID()}`;
+      const invocation = invoke(customer.customerKey, customer.deviceId, idempotencyKey);
+      let deviceRequests: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
+      const pollDeadline = Date.now() + 5_000;
+      while (!deviceRequests?.length && Date.now() < pollDeadline) {
+        deviceRequests = await deviceTransport.poll(customer.session!);
+        if (!deviceRequests?.length) await delay(25);
+      }
+      assert.equal(
+        deviceRequests?.length,
+        1,
+        "invocation should be enqueued in the real Durable Object"
+      );
+      const requestId = deviceRequests![0]!.requestId;
+      assert.equal(
+        await deviceTransport.submitResult(customer.session!, {
+          version: 1,
+          requestId,
+          outcome: { ok: true, value: { answer: expectedAnswer } },
+        }),
+        true
+      );
+
+      const firstResult = await invocation;
+      assert.equal(firstResult.response.status, 200);
+      assert.equal(firstResult.body.requestId, requestId);
+      assert.deepEqual(firstResult.body.result, {
         version: 1,
-        requestId,
-        outcome: { ok: true, value: { answer: "handled by local device fixture" } },
-      }),
-      true
+        outcome: { ok: true, value: { answer: expectedAnswer } },
+      });
+
+      const replayResult = await invoke(customer.customerKey, customer.deviceId, idempotencyKey);
+      assert.equal(replayResult.response.status, 200);
+      assert.deepEqual(replayResult.body, firstResult.body);
+      assert.equal(
+        (await deviceTransport.poll(customer.session!))?.length,
+        0,
+        "replay must not enqueue again"
+      );
+      return firstResult.body;
+    };
+
+    const resultA = await invokeAndComplete(customerA, "handled by customer A device");
+    const resultB = await invokeAndComplete(customerB, "handled by customer B device");
+    assert.notEqual(resultA.requestId, resultB.requestId);
+
+    assert.equal(
+      (await invoke(customerA.customerKey, customerB.deviceId, `cross-tenant-${randomUUID()}`))
+        .response.status,
+      404,
+      "tenant A key must not invoke tenant B device"
+    );
+    assert.equal(
+      (await invoke(customerB.customerKey, customerA.deviceId, `cross-tenant-${randomUUID()}`))
+        .response.status,
+      404,
+      "tenant B key must not invoke tenant A device"
     );
 
-    const firstResult = await firstInvocation;
-    assert.equal(firstResult.response.status, 200);
-    assert.equal(firstResult.body.requestId, requestId);
-    assert.deepEqual(firstResult.body.result, {
-      version: 1,
-      outcome: { ok: true, value: { answer: "handled by local device fixture" } },
-    });
+    const revokedDevice = await provisionCustomer("revoked");
+    const revokeResult = await requestJson(
+      `${baseUrl}/__cloud/v1/tenants/${revokedDevice.tenantId}/gateway-devices/${revokedDevice.deviceId}`,
+      { token: adminToken, method: "DELETE" }
+    );
+    assert.equal(revokeResult.response.status, 200);
+    assert.equal(
+      await deviceTransport.heartbeat(revokedDevice.session!, [capability]),
+      false,
+      "revocation should invalidate the existing Durable Object session"
+    );
+    assert.equal(
+      (
+        await invoke(
+          revokedDevice.customerKey,
+          revokedDevice.deviceId,
+          `revoked-device-${randomUUID()}`
+        )
+      ).response.status,
+      503,
+      "revoked device must not accept a customer invocation"
+    );
 
-    const replayResult = await invoke();
-    assert.equal(replayResult.response.status, 200);
-    assert.deepEqual(replayResult.body, firstResult.body);
-    assert.equal((await deviceTransport.poll(session))?.length, 0, "replay must not enqueue again");
+    const offlineDevice = await provisionCustomer("offline", false);
+    assert.equal(
+      (
+        await invoke(
+          offlineDevice.customerKey,
+          offlineDevice.deviceId,
+          `offline-device-${randomUUID()}`
+        )
+      ).response.status,
+      503,
+      "registered but offline device must not accept a customer invocation"
+    );
 
     // The local worker config and environment were generated under tempDir, not
     // the repository; assert this invariant to guard against future test changes.

@@ -239,7 +239,11 @@ Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 `OMNIROUTE_CLOUD_ADMIN_TOKEN`. The D1 ID must resolve through the Cloudflare API
 to a database named exactly `omniroute-cloud-runtime-staging`. The workflow binds
 the admin token through `wrangler secret put` using stdin. It applies pending D1
-migrations and checks `/__cloud/health` and `/__cloud/db` after deployment.
+migrations and checks `/__cloud/health`, `/__cloud/db`, `/__cloud/readiness`, and
+`/__cloud/runtime` after deployment. It also checks that the cloud admin API rejects
+an unauthenticated request and accepts the configured token without creating a
+resource. Readiness performs a D1 query and read-only Durable Object storage
+access; the runtime check verifies the staging name and deployed commit SHA.
 
 After the repository is cloud-ready:
 
@@ -251,6 +255,25 @@ After the repository is cloud-ready:
 6. Run cloud integration tests.
 7. Cut traffic over only after validation.
 8. Keep local OmniRoute available as a rollback/development target until production is proven.
+
+#### Rollback and D1 recovery
+
+The staging workflow does not automate rollback. Before each deployment, record the
+last known-good Worker version ID and the D1 migration state. If a Worker version
+fails its smoke checks, stop further promotion and roll the Worker back to the
+recorded version using the Cloudflare dashboard or `wrangler rollback`. Worker
+versions capture bindings and code, but do not restore D1 or Durable Object state;
+see [Cloudflare Worker rollbacks](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
+
+Treat schema and data recovery separately. Prefer a forward-only corrective
+migration when the deployed schema remains compatible. For damaged D1 data or an
+irreversible migration, first stop writes and preserve the current database state,
+then select a known-good point-in-time and restore it with D1 Time Travel. A restore
+overwrites the database in place and can discard writes made after the selected
+point; rehearse the procedure against staging first. See
+[Cloudflare D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
+These recovery procedures are documented but have not been exercised against a
+staging database.
 
 ### 15. End-to-end production validation
 

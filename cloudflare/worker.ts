@@ -22,6 +22,10 @@ export class GatewaySessionObject extends DurableObject<CloudflareEnv> {
     });
   }
 
+  checkReadiness() {
+    return this.coordinator.checkReadiness();
+  }
+
   putSession(...args: Parameters<GatewayCoordinatorStub["putSession"]>) {
     return this.coordinator.putSession(...args);
   }

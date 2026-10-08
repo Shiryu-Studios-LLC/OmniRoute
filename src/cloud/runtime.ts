@@ -42,6 +42,48 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         );
       }
 
+      if (request.method === "GET" && url.pathname === "/__cloud/readiness") {
+        const checks: {
+          database: "ok" | "unconfigured" | "error";
+          gateway: "ok" | "unconfigured" | "error";
+        } = {
+          database: "unconfigured",
+          gateway: "unconfigured",
+        };
+
+        if (options.env?.DB) {
+          try {
+            await options.env.DB.prepare("SELECT 1 AS ok").first();
+            checks.database = "ok";
+          } catch {
+            checks.database = "error";
+          }
+        }
+
+        if (options.env?.GATEWAY_SESSIONS) {
+          try {
+            const probe = options.env.GATEWAY_SESSIONS.idFromName("__healthcheck__");
+            await options.env.GATEWAY_SESSIONS.get(probe).checkReadiness();
+            checks.gateway = "ok";
+          } catch {
+            checks.gateway = "error";
+          }
+        }
+
+        const ready = checks.database === "ok" && checks.gateway === "ok";
+        return Response.json(
+          {
+            status: ready ? "ready" : "not_ready",
+            runtime: "cloudflare",
+            checks,
+          },
+          {
+            status: ready ? 200 : 503,
+            headers: { "Cache-Control": "no-store" },
+          }
+        );
+      }
+
       if (request.method === "GET" && url.pathname === "/__cloud/db") {
         if (!options.env?.DB) {
           return Response.json(
