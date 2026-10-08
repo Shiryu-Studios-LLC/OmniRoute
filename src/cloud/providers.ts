@@ -109,6 +109,12 @@ function parseJson(value: unknown): unknown {
   }
 }
 
+function serializeProviderSpecificData(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === "string" && /^enc:v[12]:/.test(value)) return value;
+  return JSON.stringify(value);
+}
+
 function connectionFromRow(row: Record<string, unknown>): CloudProviderConnection {
   return {
     id: String(row.id),
@@ -244,7 +250,7 @@ export async function createCloudProviderConnection(
       input.lastErrorAt ?? null,
       input.apiKey ?? null,
       input.idToken ?? null,
-      input.providerSpecificData == null ? null : JSON.stringify(input.providerSpecificData),
+      serializeProviderSpecificData(input.providerSpecificData),
       input.expiresIn ?? null,
       input.displayName ?? null,
       input.globalPriority ?? null,
@@ -307,7 +313,7 @@ export async function updateCloudProviderConnection(
       merged.lastErrorAt ?? null,
       merged.apiKey ?? null,
       merged.idToken ?? null,
-      merged.providerSpecificData == null ? null : JSON.stringify(merged.providerSpecificData),
+      serializeProviderSpecificData(merged.providerSpecificData),
       merged.expiresIn ?? null,
       merged.displayName ?? null,
       merged.globalPriority ?? null,

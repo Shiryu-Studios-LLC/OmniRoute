@@ -41,6 +41,7 @@ jobs:
         env:
           CONFIRM_STAGING: ${{ inputs.confirm_staging }}
           OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
           if [[ "$CONFIRM_STAGING" != "deploy-staging" ]]; then
@@ -51,6 +52,7 @@ jobs:
           [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_ACCOUNT_ID must be a 32-character Cloudflare account ID."; exit 1; }
           [[ "$CLOUDFLARE_STAGING_D1_DATABASE_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_STAGING_D1_DATABASE_ID must be a 32-character staging D1 ID."; exit 1; }
           [[ "$OMNIROUTE_CLOUD_ADMIN_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "OMNIROUTE_CLOUD_ADMIN_TOKEN must be 32–512 URL-safe characters with no whitespace or control characters."; exit 1; }
+          [[ "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY must be a base64-encoded 32-byte key."; exit 1; }
           if [[ ! -d cloudflare/migrations ]] || ! find cloudflare/migrations -maxdepth 1 -type f -name '*.sql' -print -quit | grep -q .; then
             echo "No Cloudflare D1 SQL migrations found."
             exit 1
@@ -204,6 +206,15 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$OMNIROUTE_CLOUD_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+
+      - name: Bind staging cloud credential encryption key
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY" | npx wrangler secret put OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY --config "$WRANGLER_CONFIG"
 
       - name: Verify staging health and D1 binding
         shell: bash

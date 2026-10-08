@@ -10,6 +10,7 @@ type CloudflareEnv = Env & {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
 };
 
 export class GatewaySessionObject extends DurableObject<CloudflareEnv> {
@@ -71,6 +72,7 @@ const worker = {
         OMNIROUTE_ENV: env.OMNIROUTE_ENV,
         OMNIROUTE_BUILD_SHA: env.OMNIROUTE_BUILD_SHA,
         OMNIROUTE_CLOUD_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+        OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
         DB: env.DB,
         GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,
       },

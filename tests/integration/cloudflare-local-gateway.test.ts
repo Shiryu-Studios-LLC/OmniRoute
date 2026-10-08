@@ -309,37 +309,39 @@ test(
       `local D1 migrations failed:\n${migrationResult.stdout}\n${migrationResult.stderr}`
     );
 
-    const child = spawn(
-      process.execPath,
-      [
-        wranglerBin,
-        "dev",
-        "--local",
-        "--ip",
-        "127.0.0.1",
-        "--port",
-        new URL(baseUrl).port,
-        "--persist-to",
-        persistDir,
-        "--config",
-        wranglerConfigPath,
-        "--env-file",
-        safeEnvPath,
-        "--show-interactive-dev-session=false",
-      ],
-      {
-        cwd: tempDir,
-        env: {
-          PATH: process.env.PATH ?? "",
-          HOME: homeDir,
-          TMPDIR: tempDir,
-          NODE_ENV: "test",
-          NO_COLOR: "1",
-          CI: "1",
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      }
-    );
+    const startWorker = () =>
+      spawn(
+        process.execPath,
+        [
+          wranglerBin,
+          "dev",
+          "--local",
+          "--ip",
+          "127.0.0.1",
+          "--port",
+          new URL(baseUrl).port,
+          "--persist-to",
+          persistDir,
+          "--config",
+          wranglerConfigPath,
+          "--env-file",
+          safeEnvPath,
+          "--show-interactive-dev-session=false",
+        ],
+        {
+          cwd: tempDir,
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: homeDir,
+            TMPDIR: tempDir,
+            NODE_ENV: "test",
+            NO_COLOR: "1",
+            CI: "1",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        }
+      );
+    let child = startWorker();
     let output = "";
     const appendOutput = (chunk: Buffer) => {
       output = `${output}${chunk.toString("utf8")}`.slice(-30_000);
@@ -432,6 +434,33 @@ test(
     assert.notEqual(customerA.customerKey, customerB.customerKey);
     assert.notEqual(customerA.deviceId, customerB.deviceId);
     assert.notEqual(customerA.credential, customerB.credential);
+
+    await t.test("device session and D1 state survive a local Worker restart", async () => {
+      await stopWorker(child);
+      child = startWorker();
+      child.stdout?.on("data", appendOutput);
+      child.stderr?.on("data", appendOutput);
+      await waitForWorker(baseUrl, child, () => output);
+
+      const restartedHealth = await requestJson(`${baseUrl}/__cloud/health`);
+      assert.equal(restartedHealth.response.status, 200);
+      const restartedDevice = await requestJson(
+        `${baseUrl}/__cloud/v1/tenants/${customerA.tenantId}/gateway-devices/${customerA.deviceId}`,
+        { token: adminToken }
+      );
+      assert.equal(restartedDevice.response.status, 200);
+      assert.equal(restartedDevice.body.id, customerA.deviceId);
+      assert.equal(
+        await deviceTransport.heartbeat(customerA.session!, [capability]),
+        true,
+        "the pre-restart session should remain valid in persistent Durable Object storage"
+      );
+      assert.deepEqual(
+        await deviceTransport.poll(customerA.session!),
+        [],
+        "the reconnected session should poll successfully without stale queued work"
+      );
+    });
 
     await t.test(
       "Front Desk routes a host-scoped chat through the local Worker gateway to tenant A's device",

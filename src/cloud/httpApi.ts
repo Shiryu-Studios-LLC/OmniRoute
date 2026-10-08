@@ -46,15 +46,16 @@ import type {
   GatewayCoordinatorStub,
   GatewayDurableObjectNamespace,
 } from "./connectorGatewayDurableObject";
+import { CloudCredentialEncryptionError, encryptCloudCredential } from "./credentialEncryption";
 
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
-const ENCRYPTED_VALUE = /^enc:v1:[0-9a-f]{32}:[0-9a-f]*:[0-9a-f]{32}$/i;
-
 export interface CloudApiOptions {
   db?: CloudDb;
   /** Privileged server-to-server token. Never expose this value to browser clients. */
   adminToken?: string;
+  /** Base64-encoded 32-byte secret used only by the Worker credential envelope. */
+  credentialEncryptionKey?: string;
   sessions?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
   now?: () => Date;
   /** Test override; production defaults are intentionally conservative. */
@@ -210,11 +211,15 @@ function nullableString(value: unknown, field: string): string | null {
   return value;
 }
 
-function connectionInput(
+async function connectionInput(
   value: unknown,
   tenantId: string,
+  encryptionKey: string | undefined,
+  connectionId?: string,
   isPatch = false
-): CloudProviderConnectionInput | Partial<Omit<CloudProviderConnectionInput, "id" | "tenantId">> {
+): Promise<
+  CloudProviderConnectionInput | Partial<Omit<CloudProviderConnectionInput, "id" | "tenantId">>
+> {
   const allowed = isPatch ? CONNECTION_FIELDS : ["id", ...CONNECTION_FIELDS];
   const body = validateFields(value, allowed, isPatch ? [] : ["id", "provider"]);
   const result: Record<string, unknown> = {};
@@ -223,6 +228,7 @@ function connectionInput(
     if (typeof body.id !== "string" || !validId(body.id)) throw new ApiError(400, "Invalid id");
     result.id = body.id;
     result.tenantId = tenantId;
+    connectionId = body.id;
   }
 
   for (const field of CONNECTION_FIELDS) {
@@ -245,15 +251,39 @@ function connectionInput(
       if (current !== null && typeof current !== "object" && typeof current !== "string") {
         throw new ApiError(400, "providerSpecificData must be an object, string, or null");
       }
-      result[field] = current;
+      if (current === null) {
+        result[field] = null;
+      } else {
+        if (typeof current === "string" && isSubmittedCiphertext(current)) {
+          throw new ApiError(400, `${field} must be submitted as plaintext`);
+        }
+        const plaintext = typeof current === "string" ? current : JSON.stringify(current);
+        result[field] = await encryptCredentialField(
+          plaintext,
+          encryptionKey,
+          tenantId,
+          connectionId,
+          field
+        );
+      }
     } else {
       const normalized = nullableString(current, field);
       if (field === "provider" && (!normalized || !normalized.trim())) {
         throw new ApiError(400, "provider cannot be empty");
       }
       if (["accessToken", "refreshToken", "apiKey", "idToken"].includes(field)) {
-        if (normalized !== null && !ENCRYPTED_VALUE.test(normalized)) {
-          throw new ApiError(400, `${field} must be encrypted before storage`);
+        if (normalized !== null) {
+          if (isSubmittedCiphertext(normalized)) {
+            throw new ApiError(400, `${field} must be submitted as plaintext`);
+          }
+          result[field] = await encryptCredentialField(
+            normalized,
+            encryptionKey,
+            tenantId,
+            connectionId,
+            field
+          );
+          continue;
         }
       }
       result[field] = normalized;
@@ -264,11 +294,39 @@ function connectionInput(
   return result as unknown as CloudProviderConnectionInput;
 }
 
-function nodeInput(
+function isSubmittedCiphertext(value: string): boolean {
+  return value.startsWith("enc:v1:") || value.startsWith("enc:v2:");
+}
+
+async function encryptCredentialField(
+  plaintext: string,
+  encryptionKey: string | undefined,
+  tenantId: string,
+  connectionId: string | undefined,
+  field: string
+): Promise<string> {
+  if (!connectionId) throw new ApiError(400, "Invalid provider connection context");
+  try {
+    return await encryptCloudCredential(plaintext, encryptionKey, {
+      tenantId,
+      connectionId,
+      field,
+    });
+  } catch (error) {
+    if (error instanceof CloudCredentialEncryptionError) {
+      throw new ApiError(503, "Cloud credential encryption is unavailable");
+    }
+    throw new ApiError(503, "Cloud credential encryption is unavailable");
+  }
+}
+
+async function nodeInput(
   value: unknown,
   tenantId: string,
+  encryptionKey: string | undefined,
+  nodeId?: string,
   isPatch = false
-): CloudProviderNodeInput | Partial<Omit<CloudProviderNodeInput, "id" | "tenantId">> {
+): Promise<CloudProviderNodeInput | Partial<Omit<CloudProviderNodeInput, "id" | "tenantId">>> {
   const allowed = isPatch ? NODE_FIELDS : ["id", ...NODE_FIELDS];
   const body = validateFields(value, allowed, isPatch ? [] : ["id", "type", "name"]);
   const result: Record<string, unknown> = {};
@@ -277,6 +335,7 @@ function nodeInput(
     if (typeof body.id !== "string" || !validId(body.id)) throw new ApiError(400, "Invalid id");
     result.id = body.id;
     result.tenantId = tenantId;
+    nodeId = body.id;
   }
 
   for (const field of NODE_FIELDS) {
@@ -285,7 +344,20 @@ function nodeInput(
     if ((field === "type" || field === "name") && (!fieldValue || !fieldValue.trim())) {
       throw new ApiError(400, `${field} cannot be empty`);
     }
-    result[field] = fieldValue;
+    if (field === "customHeadersJson" && fieldValue !== null) {
+      if (isSubmittedCiphertext(fieldValue)) {
+        throw new ApiError(400, `${field} must be submitted as plaintext`);
+      }
+      result[field] = await encryptCredentialField(
+        fieldValue,
+        encryptionKey,
+        tenantId,
+        nodeId,
+        field
+      );
+    } else {
+      result[field] = fieldValue;
+    }
   }
   if (isPatch && Object.keys(result).length === 0) throw new ApiError(400, "Patch is empty");
   return result as unknown as CloudProviderNodeInput;
@@ -828,10 +900,11 @@ export async function handleCloudApiRequest(
         return json(connections.map(safeConnection));
       }
       if (!resourceId && request.method === "POST") {
-        const input = connectionInput(
+        const input = (await connectionInput(
           await readBody(request),
-          tenantId
-        ) as CloudProviderConnectionInput;
+          tenantId,
+          options.credentialEncryptionKey
+        )) as CloudProviderConnectionInput;
         const connection = await createCloudProviderConnection(db, {
           ...input,
           updatedAt: now().toISOString(),
@@ -844,9 +917,13 @@ export async function handleCloudApiRequest(
         return connection ? json(safeConnection(connection)) : json({ error: "Not found" }, 404);
       }
       if (resourceId && request.method === "PATCH") {
-        const patch = connectionInput(await readBody(request), tenantId, true) as Partial<
-          Omit<CloudProviderConnectionInput, "id" | "tenantId">
-        >;
+        const patch = (await connectionInput(
+          await readBody(request),
+          tenantId,
+          options.credentialEncryptionKey,
+          resourceId,
+          true
+        )) as Partial<Omit<CloudProviderConnectionInput, "id" | "tenantId">>;
         const connection = await updateCloudProviderConnection(db, tenantId, resourceId, patch);
         return connection ? json(safeConnection(connection)) : json({ error: "Not found" }, 404);
       }
@@ -860,7 +937,11 @@ export async function handleCloudApiRequest(
       if (!resourceId && request.method === "GET")
         return json((await getCloudProviderNodes(db, tenantId)).map(safeNode));
       if (!resourceId && request.method === "POST") {
-        const input = nodeInput(await readBody(request), tenantId) as CloudProviderNodeInput;
+        const input = (await nodeInput(
+          await readBody(request),
+          tenantId,
+          options.credentialEncryptionKey
+        )) as CloudProviderNodeInput;
         const node = await createCloudProviderNode(db, {
           ...input,
           updatedAt: now().toISOString(),
@@ -873,9 +954,13 @@ export async function handleCloudApiRequest(
         return node ? json(safeNode(node)) : json({ error: "Not found" }, 404);
       }
       if (resourceId && request.method === "PATCH") {
-        const patch = nodeInput(await readBody(request), tenantId, true) as Partial<
-          Omit<CloudProviderNodeInput, "id" | "tenantId">
-        >;
+        const patch = (await nodeInput(
+          await readBody(request),
+          tenantId,
+          options.credentialEncryptionKey,
+          resourceId,
+          true
+        )) as Partial<Omit<CloudProviderNodeInput, "id" | "tenantId">>;
         const node = await updateCloudProviderNode(db, tenantId, resourceId, patch);
         return node ? json(safeNode(node)) : json({ error: "Not found" }, 404);
       }

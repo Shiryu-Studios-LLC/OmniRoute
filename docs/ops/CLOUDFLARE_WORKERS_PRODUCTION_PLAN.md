@@ -235,10 +235,15 @@ The repository includes a manual-only GitHub Actions workflow at
 `omniroute-cloud-runtime-staging` Worker to its `workers.dev` address; it does not
 configure production routes or custom domains. Configure a protected GitHub
 Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
-`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`, and
-`OMNIROUTE_CLOUD_ADMIN_TOKEN`. The D1 ID must resolve through the Cloudflare API
+`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`,
+`OMNIROUTE_CLOUD_ADMIN_TOKEN`, and `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`.
+The credential key must be a base64-encoded 32-byte key used only for Cloud
+credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The Worker
+fails provider credential writes with a sanitized 503 if this key is missing or
+invalid. The D1 ID must resolve through the Cloudflare API
 to a database named exactly `omniroute-cloud-runtime-staging`. The workflow binds
-the admin token through `wrangler secret put` using stdin. It applies pending D1
+the admin and credential-encryption secrets through `wrangler secret put` using
+stdin. It applies pending D1
 migrations and checks `/__cloud/health`, `/__cloud/db`, `/__cloud/readiness`, and
 `/__cloud/runtime` after deployment. It also checks that the cloud admin API rejects
 an unauthenticated request and accepts the configured token without creating a
