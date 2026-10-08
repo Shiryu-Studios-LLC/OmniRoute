@@ -63,7 +63,7 @@ export function getRecentEgressIpForConnection(
       `SELECT egress_ip, timestamp FROM proxy_logs
        WHERE connection_id = ? AND egress_ip IS NOT NULL AND timestamp >= ?
          AND tenant_id = ?
-       ORDER BY timestamp DESC LIMIT 1`
+       ORDER BY timestamp DESC, rowid DESC LIMIT 1`
     )
     .get(connectionId, since, currentDbTenantId()) as
     { egress_ip: string; timestamp: string } | undefined;
