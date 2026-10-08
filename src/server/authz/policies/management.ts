@@ -3,12 +3,13 @@ import { isModelSyncInternalRequest } from "../../../shared/services/modelSyncSc
 import { isAuthRequired, isDashboardSessionAuthenticated } from "../../../shared/utils/apiAuth";
 import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow, reject } from "../context";
-import { extractApiKey, isValidApiKey } from "../../../sse/services/auth";
+import { extractApiKey } from "../../../sse/services/apiKeyRequest";
+import { isValidApiKey } from "../../../sse/services/apiKeyValidation";
 import { getApiKeyMetadata } from "../../../lib/db/apiKeys";
 import { getTenantById, getTenantMemberRole } from "../../../lib/db/tenants";
-import { hasManageScope } from "../../../lib/api/requireManagementAuth";
 import {
   hasMcpConnectOrManageScope,
+  hasManageScope,
   MCP_CONNECT_SCOPE,
 } from "../../../shared/constants/managementScopes";
 import { evaluateAccessTokenAuth } from "../accessTokenAuth";

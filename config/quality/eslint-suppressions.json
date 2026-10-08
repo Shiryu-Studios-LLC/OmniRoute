@@ -2891,11 +2891,6 @@
       "count": 1
     }
   },
-  "src/shared/utils/apiAuth.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
   "src/shared/utils/apiKey.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
@@ -3019,11 +3014,6 @@
       "count": 3
     },
     "no-restricted-imports": {
-      "count": 1
-    }
-  },
-  "src/sse/services/auth.ts": {
-    "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
   },

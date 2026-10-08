@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { extractApiKey } = await import("../../src/sse/services/auth.ts");
+const { extractApiKey } = await import("../../src/sse/services/apiKeyRequest.ts");
 
 function makeRequest(headers: Record<string, string>): Request {
   return new Request("https://omniroute.test/v1/messages", { headers });
