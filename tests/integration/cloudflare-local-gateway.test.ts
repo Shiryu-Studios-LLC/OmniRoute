@@ -8,7 +8,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import type { LocalAgentGatewaySession } from "../../src/lib/localAgent/gatewayProtocol.js";
 import { createHttpLocalAgentGatewayTransport } from "../../src/lib/localAgent/httpGatewayTransport.js";
+import { discoverLocalCapabilities } from "../../src/lib/localAgent/localDiscovery.js";
+import { runLocalAgentGatewayCycle } from "../../src/lib/localAgent/runner.js";
 
 const enabled = process.env.RUN_CLOUDFLARE_LOCAL_INT === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -111,6 +114,71 @@ async function requestHostJson(
     if (serializedBody) request.write(serializedBody);
     request.end();
   });
+}
+
+async function startComfyUiFixture(): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const server = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = Buffer.concat(chunks).toString("utf8");
+    if (request.url === "/object_info") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          KSampler: {},
+          CheckpointLoaderSimple: { input: { required: { ckpt_name: [["fixture.safetensors"]] } } },
+          SaveImage: {},
+        })
+      );
+      return;
+    }
+    if (request.url === "/prompt" && request.method === "POST") {
+      const submitted = JSON.parse(body) as { prompt?: unknown };
+      if (!submitted.prompt || typeof submitted.prompt !== "object") {
+        response.writeHead(400).end();
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ prompt_id: "fixture_job_1" }));
+      return;
+    }
+    if (request.url === "/history/fixture_job_1") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          fixture_job_1: {
+            outputs: {
+              "9": { images: [{ filename: "result.png", subfolder: "", type: "output" }] },
+            },
+          },
+        })
+      );
+      return;
+    }
+    if (
+      request.url?.startsWith("/view?") &&
+      new URL(request.url, "http://127.0.0.1").searchParams.get("filename") === "result.png"
+    ) {
+      response.writeHead(200, { "content-type": "image/png" });
+      response.end(Buffer.from([137, 80, 78, 71]));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    },
+  };
 }
 
 async function discoverInstalledOllamaModel(): Promise<string> {
@@ -483,30 +551,47 @@ test(
         const frontDeskPort = await getUnusedPort();
         const frontDeskKeyEnv = "FRONT_DESK_LOCAL_GATEWAY_KEY";
         const frontDeskDashboardEnv = "FRONT_DESK_LOCAL_GATEWAY_DASHBOARD";
-        const frontDeskTenants = [
-          {
-            host: frontDeskHost,
-            tenantId: customerA.tenantId,
-            dashboardTokenEnv: frontDeskDashboardEnv,
-            gateway: {
-              baseUrl,
-              customerApiKeyEnv: frontDeskKeyEnv,
-              deviceId: customerA.deviceId,
-              ollamaModel: "integration-test",
-            },
-            business: {
-              name: "Local Gateway Integration",
-              description: "Isolated test business",
-              hours: "Always",
-              services: [],
-              assistant: {
-                name: "Integration assistant",
-                tone: "helpful",
-                handoff: "Offer a follow-up.",
-              },
+        const frontDeskBHost = "tenant-b.frontdesk.test";
+        const frontDeskBKeyEnv = "FRONT_DESK_LOCAL_GATEWAY_B_KEY";
+        const frontDeskBDashboardEnv = "FRONT_DESK_LOCAL_GATEWAY_B_DASHBOARD";
+        const frontDeskTenantA = {
+          host: frontDeskHost,
+          tenantId: customerA.tenantId,
+          dashboardTokenEnv: frontDeskDashboardEnv,
+          gateway: {
+            baseUrl,
+            customerApiKeyEnv: frontDeskKeyEnv,
+            deviceId: customerA.deviceId,
+            ollamaModel: "integration-test",
+          },
+          business: {
+            name: "Local Gateway Integration A",
+            description: "Isolated test business A",
+            hours: "Always",
+            services: [],
+            assistant: {
+              name: "Integration assistant",
+              tone: "helpful",
+              handoff: "Offer a follow-up.",
             },
           },
-        ];
+        };
+        const frontDeskTenantB = {
+          ...frontDeskTenantA,
+          host: frontDeskBHost,
+          tenantId: customerB.tenantId,
+          dashboardTokenEnv: frontDeskBDashboardEnv,
+          gateway: {
+            ...frontDeskTenantA.gateway,
+            customerApiKeyEnv: frontDeskBKeyEnv,
+            deviceId: customerB.deviceId,
+          },
+          business: {
+            ...frontDeskTenantA.business,
+            name: "Local Gateway Integration B",
+          },
+        };
+        const frontDeskTenants = [frontDeskTenantA, frontDeskTenantB];
         const frontDeskChild = spawn(process.execPath, ["server.js"], {
           cwd: frontDeskTempDir,
           env: {
@@ -518,6 +603,8 @@ test(
             FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
             [frontDeskKeyEnv]: customerA.customerKey,
             [frontDeskDashboardEnv]: "local-frontdesk-dashboard-token",
+            [frontDeskBKeyEnv]: customerB.customerKey,
+            [frontDeskBDashboardEnv]: "local-frontdesk-dashboard-token-b",
           },
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -615,6 +702,56 @@ test(
           JSON.stringify(frontDeskResponse.body).includes(customerA.customerKey),
           false,
           "Front Desk chat response must not expose the tenant API key"
+        );
+
+        const chatB = requestHostJson(frontDeskPort, frontDeskBHost, "/api/chat", {
+          messages: [{ role: "user", content: "Please handle tenant B's gateway test." }],
+        });
+        let gatewayRequestsB: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
+        const gatewayPollDeadlineB = Date.now() + 10_000;
+        while (!gatewayRequestsB?.length && Date.now() < gatewayPollDeadlineB) {
+          gatewayRequestsB = await deviceTransport.poll(customerB.session!);
+          if (!gatewayRequestsB?.length) await delay(25);
+        }
+        assert.equal(
+          gatewayRequestsB?.length,
+          1,
+          `Front Desk host B should reach tenant B's device. Front Desk logs:\n${frontDeskOutput}`
+        );
+        const gatewayRequestB = gatewayRequestsB![0]!;
+        assert.equal(gatewayRequestB.capability, capability);
+        assert.deepEqual(gatewayRequestB.payload, {
+          messages: [{ role: "user", content: "Please handle tenant B's gateway test." }],
+          options: { temperature: 0.2 },
+        });
+        assert.equal(
+          await deviceTransport.submitResult(customerB.session!, {
+            version: 1,
+            requestId: gatewayRequestB.requestId,
+            outcome: {
+              ok: true,
+              value: { message: { role: "assistant", content: "Completed for tenant B." } },
+            },
+          }),
+          true
+        );
+        const frontDeskResponseB = await chatB;
+        assert.equal(
+          frontDeskResponseB.status,
+          200,
+          `Front Desk should route host B to tenant B's Worker identity: ${JSON.stringify(frontDeskResponseB.body)}`
+        );
+        assert.deepEqual(frontDeskResponseB.body.choices, [
+          {
+            index: 0,
+            message: { role: "assistant", content: "Completed for tenant B." },
+            finish_reason: "stop",
+          },
+        ]);
+        assert.equal(
+          JSON.stringify(frontDeskResponseB.body).includes(customerB.customerKey),
+          false,
+          "Front Desk tenant B response must not expose its API key"
         );
       }
     );
@@ -880,6 +1017,87 @@ test(
       );
       return firstResult.body;
     };
+
+    await t.test(
+      "a ComfyUI capability completes through the local agent executor, Worker, D1, and Durable Object",
+      async (comfyTest) => {
+        const comfy = await startComfyUiFixture();
+        comfyTest.after(comfy.close);
+        const comfyCustomer = await provisionCustomer("comfy", true, ["comfyui:image"]);
+        const runnerConfig = {
+          gatewayUrl: baseUrl,
+          deviceId: comfyCustomer.deviceId,
+          credential: comfyCustomer.credential,
+          comfyUiUrl: comfy.baseUrl,
+          requestTimeoutMs: 5_000,
+        };
+        const discovery = await discoverLocalCapabilities(runnerConfig, {
+          fetch,
+          resolveHost: async () => ["127.0.0.1"],
+        });
+        assert.ok(
+          discovery.heartbeat.capabilities.includes("comfyui:image"),
+          `mock ComfyUI should advertise image generation: ${JSON.stringify(discovery)}`
+        );
+        const runnerDependencies = {
+          fetch,
+          resolveHost: async () => ["127.0.0.1"],
+          gateway: deviceTransport,
+        };
+        let session: LocalAgentGatewaySession | undefined;
+        const initialCycle = await runLocalAgentGatewayCycle(
+          runnerConfig,
+          runnerDependencies,
+          session
+        );
+        session = initialCycle.session;
+        assert.equal(initialCycle.processed, 0, "the initial agent cycle should only connect");
+
+        const idempotencyKey = `local-comfy-${randomUUID()}`;
+        const workflow = {
+          "1": {
+            class_type: "CheckpointLoaderSimple",
+            inputs: { ckpt_name: "fixture.safetensors" },
+          },
+        };
+        const invocation = requestJson(`${baseUrl}/__gateway/v1/customer/invoke`, {
+          token: comfyCustomer.customerKey,
+          headers: { "Idempotency-Key": idempotencyKey },
+          body: {
+            deviceId: comfyCustomer.deviceId,
+            capability: "comfyui:image",
+            payload: { workflow },
+            timeoutMs: 10_000,
+          },
+        });
+
+        let processed = 0;
+        const deadline = Date.now() + 5_000;
+        while (processed === 0 && Date.now() < deadline) {
+          const cycle = await runLocalAgentGatewayCycle(runnerConfig, runnerDependencies, session);
+          session = cycle.session;
+          processed = cycle.processed;
+          if (processed === 0) await delay(25);
+        }
+        const result = await invocation;
+        assert.equal(
+          result.response.status,
+          200,
+          `ComfyUI invocation failed before the local agent could complete it: ${JSON.stringify(result.body)}`
+        );
+        assert.equal(processed, 1, "the local agent should execute the queued ComfyUI request");
+        assert.deepEqual(result.body.result, {
+          version: 1,
+          outcome: {
+            ok: true,
+            value: {
+              promptId: "fixture_job_1",
+              images: [{ filename: "result.png", contentType: "image/png", data: "iVBORw==" }],
+            },
+          },
+        });
+      }
+    );
 
     const resultA = await invokeAndComplete(customerA, "handled by customer A device");
     const resultB = await invokeAndComplete(customerB, "handled by customer B device");
