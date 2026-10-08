@@ -14,7 +14,14 @@ const apiKeys = await import("../../src/lib/db/apiKeys.ts");
 const tenants = await import("../../src/lib/db/tenants.ts");
 const { runWithTenantContext } = await import("../../src/lib/tenantContext.ts");
 const cacheRoute = await import("../../src/app/api/cache/entries/route.ts");
+const globalCacheRoute = await import("../../src/app/api/cache/route.ts");
+const cacheStatsRoute = await import("../../src/app/api/cache/stats/route.ts");
+const cacheConfigRoute = await import("../../src/app/api/settings/cache-config/route.ts");
+const exportRoute = await import("../../src/app/api/settings/export-json/route.ts");
 const fallbackRoute = await import("../../src/app/api/fallback/chains/route.ts");
+const rateLimitsRoute = await import("../../src/app/api/rate-limits/route.ts");
+const rateLimitAliasRoute = await import("../../src/app/api/rate-limit/route.ts");
+const searchStatsRoute = await import("../../src/app/api/search/stats/route.ts");
 
 async function reset() {
   core.resetDbInstance();
@@ -118,6 +125,100 @@ test("shared semantic-cache administration rejects customer management keys", as
   );
 });
 
+test("shared cache controls and memory-cache clearing require platform administration", async () => {
+  const customer = await createManageKey("policy-customer-a", "Customer cache key");
+  const platform = await createManageKey(tenants.SHIRYU_ADMIN_TENANT_ID, "Platform cache key");
+
+  for (const response of [
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      globalCacheRoute.GET(request("/api/cache", "GET", customer.key) as never)
+    ),
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      globalCacheRoute.DELETE(request("/api/cache", "DELETE", customer.key) as never)
+    ),
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      cacheStatsRoute.GET(request("/api/cache/stats", "GET", customer.key) as never)
+    ),
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      cacheStatsRoute.DELETE(request("/api/cache/stats", "DELETE", customer.key) as never)
+    ),
+  ]) {
+    assert.equal(response.status, 403);
+  }
+
+  const platformRead = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => globalCacheRoute.GET(request("/api/cache", "GET", platform.key) as never)
+  );
+  assert.equal(platformRead.status, 200);
+
+  const platformClear = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => cacheStatsRoute.DELETE(request("/api/cache/stats", "DELETE", platform.key) as never)
+  );
+  assert.equal(platformClear.status, 200);
+});
+
+test("JSON settings export is restricted to the platform admin tenant", async () => {
+  const customer = await createManageKey("policy-customer-b", "Customer backup key");
+  const platform = await createManageKey(tenants.SHIRYU_ADMIN_TENANT_ID, "Platform backup key");
+
+  const customerExport = await runWithTenantContext({ tenantId: "policy-customer-b" }, () =>
+    exportRoute.GET(request("/api/settings/export-json", "GET", customer.key))
+  );
+  assert.equal(customerExport.status, 403);
+
+  const platformExport = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => exportRoute.GET(request("/api/settings/export-json", "GET", platform.key))
+  );
+  assert.equal(platformExport.status, 200);
+});
+
+test("global cache configuration requires platform administration", async () => {
+  const customer = await createManageKey("policy-customer-a", "Customer cache config key");
+  const platform = await createManageKey(
+    tenants.SHIRYU_ADMIN_TENANT_ID,
+    "Platform cache config key"
+  );
+
+  const customerRead = await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+    cacheConfigRoute.GET(request("/api/settings/cache-config", "GET", customer.key) as never)
+  );
+  assert.equal(customerRead.status, 403);
+  const customerWrite = await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+    cacheConfigRoute.PUT(
+      request("/api/settings/cache-config", "PUT", customer.key, {
+        semanticCacheEnabled: false,
+      }) as never
+    )
+  );
+  assert.equal(customerWrite.status, 403);
+
+  const platformWrite = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () =>
+      cacheConfigRoute.PUT(
+        request("/api/settings/cache-config", "PUT", platform.key, {
+          semanticCacheEnabled: false,
+          modelCatalogCacheTtlMs: 4242,
+          idempotencyWindowMs: 9000,
+        }) as never
+      )
+  );
+  assert.equal(platformWrite.status, 200);
+
+  const platformRead = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => cacheConfigRoute.GET(request("/api/settings/cache-config", "GET", platform.key) as never)
+  );
+  assert.equal(platformRead.status, 200);
+  const cacheConfig = await platformRead.json();
+  assert.equal(cacheConfig.semanticCacheEnabled, false);
+  assert.equal(cacheConfig.modelCatalogCacheTtlMs, 4242);
+  assert.equal(cacheConfig.idempotencyWindowMs, 9000);
+});
+
 test("global fallback policy requires the platform admin tenant", async () => {
   const customer = await createManageKey("policy-customer-b", "Customer manage key");
   const platform = await createManageKey(tenants.SHIRYU_ADMIN_TENANT_ID, "Platform manage key");
@@ -162,4 +263,48 @@ test("global fallback policy requires the platform admin tenant", async () => {
   );
   assert.equal(platformReadAfterDelete.status, 200);
   assert.deepEqual(await platformReadAfterDelete.json(), {});
+});
+
+test("shared rate-limit controls and search stats require platform administration", async () => {
+  const customer = await createManageKey("policy-customer-a", "Customer shared-state key");
+  const platform = await createManageKey(
+    tenants.SHIRYU_ADMIN_TENANT_ID,
+    "Platform shared-state key"
+  );
+
+  const customerResponses = [
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      rateLimitsRoute.GET(request("/api/rate-limits", "GET", customer.key))
+    ),
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      rateLimitsRoute.POST(
+        request("/api/rate-limits", "POST", customer.key, {
+          connectionId: "policy-connection",
+          enabled: true,
+        })
+      )
+    ),
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      rateLimitAliasRoute.GET(request("/api/rate-limit", "GET", customer.key))
+    ),
+    await runWithTenantContext({ tenantId: "policy-customer-a" }, () =>
+      searchStatsRoute.GET(request("/api/search/stats", "GET", customer.key))
+    ),
+  ];
+  assert.deepEqual(
+    customerResponses.map((response) => response.status),
+    [403, 403, 403, 403]
+  );
+
+  const platformRead = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => rateLimitsRoute.GET(request("/api/rate-limits", "GET", platform.key))
+  );
+  assert.equal(platformRead.status, 200);
+
+  const platformSearchStats = await runWithTenantContext(
+    { tenantId: tenants.SHIRYU_ADMIN_TENANT_ID, role: "owner" },
+    () => searchStatsRoute.GET(request("/api/search/stats", "GET", platform.key))
+  );
+  assert.equal(platformSearchStats.status, 200);
 });

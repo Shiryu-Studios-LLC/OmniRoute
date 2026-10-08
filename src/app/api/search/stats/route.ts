@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import { getCacheStats } from "@omniroute/open-sse/services/searchCache.ts";
 import { SEARCH_PROVIDERS } from "@omniroute/open-sse/config/searchRegistry.ts";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requirePlatformAdminManagement } from "@/lib/api/platformAdminAuth";
 import { getSearchProviderStats, getRecentSearchLogs } from "@/lib/db/callLogStats";
 
 export async function GET(request: Request) {
-  if (!(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(request);
+  if (authError) return authError;
+
   try {
     const cache = getCacheStats();
 
@@ -49,7 +49,7 @@ export async function GET(request: Request) {
     });
 
     return NextResponse.json({ cache, providers, recent_searches });
-  } catch (error) {
+  } catch (_error) {
     return NextResponse.json({ error: "Failed to get stats" }, { status: 500 });
   }
 }

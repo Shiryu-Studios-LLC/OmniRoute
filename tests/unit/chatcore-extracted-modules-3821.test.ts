@@ -38,7 +38,11 @@ test("sanitizeChatRequestBody: Responses target maps max_tokens → max_output_t
   // #9161: token-field selection keys on the OUTBOUND (target) protocol only — a
   // Responses-shaped SOURCE no longer forces max_output_tokens (see
   // codex-responses-to-chat-9161.test.ts for that direction).
-  const out = sanitizeChatRequestBody({ max_tokens: 128 }, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES);
+  const out = sanitizeChatRequestBody(
+    { max_tokens: 128 },
+    FORMATS.OPENAI,
+    FORMATS.OPENAI_RESPONSES
+  );
   assert.equal(out.max_output_tokens, 128);
   assert.equal(out.max_tokens, undefined);
 });
@@ -88,6 +92,8 @@ test("checkIdempotencyCache returns { hit:null, idempotencyKey } on a miss", asy
     result.idempotencyKey,
     composeIdempotencyKey({
       rawKey: "idem-miss-3821",
+      tenantId: "tenant_shiryu_admin",
+      principalId: "anonymous",
       provider: "openai",
       model: "gpt-4.1",
       messages: undefined,
@@ -101,6 +107,8 @@ test("checkIdempotencyCache returns a hit Response reusing the same key after a 
   // same derivation checkIdempotencyCache returns — reproduce that here.
   const key = composeIdempotencyKey({
     rawKey,
+    tenantId: "tenant_shiryu_admin",
+    principalId: "anonymous",
     provider: "openai",
     model: "gpt-4.1",
     messages: undefined,
@@ -117,7 +125,11 @@ test("checkIdempotencyCache returns a hit Response reusing the same key after a 
     log: undefined,
   });
 
-  assert.equal(result.idempotencyKey, key, "the resolved key is returned for the save site to reuse");
+  assert.equal(
+    result.idempotencyKey,
+    key,
+    "the resolved key is returned for the save site to reuse"
+  );
   assert.ok(result.hit, "a cached entry produces a hit");
   assert.equal(result.hit!.response.headers.get("X-OmniRoute-Idempotent"), "true");
 });

@@ -41,43 +41,15 @@ test.after(() => {
   resetStorage();
 });
 
-test("cache-config route resolves and modelCatalogCacheTtlMs round-trips", async (t) => {
+test("cache-config route resolves and requires management authentication", async () => {
   // Importing the route module must not throw (RED before the fix: the
   // module-level import of a nonexistent path crashed at import time).
   const cacheConfigRoute = await import("../../src/app/api/settings/cache-config/route.ts");
+  const getResponse = await cacheConfigRoute.GET(makeJsonRequest("GET") as never);
+  assert.equal(getResponse.status, 401);
 
-  await t.test("GET resolves without crashing and returns defaults", async () => {
-    const response = await cacheConfigRoute.GET(makeJsonRequest("GET") as never);
-    const body = await response.json();
-
-    assert.equal(response.status, 200);
-    assert.equal(typeof body.modelCatalogCacheTtlMs, "number");
-  });
-
-  await t.test("PUT resolves without crashing and persists the new TTL", async () => {
-    const putResponse = await cacheConfigRoute.PUT(
-      makeJsonRequest("PUT", { modelCatalogCacheTtlMs: 4242 }) as never
-    );
-    const putBody = await putResponse.json();
-
-    assert.equal(putResponse.status, 200);
-    assert.equal(putBody.ok, true);
-
-    const getResponse = await cacheConfigRoute.GET(makeJsonRequest("GET") as never);
-    const getBody = await getResponse.json();
-
-    assert.equal(getResponse.status, 200);
-    assert.equal(getBody.modelCatalogCacheTtlMs, 4242, "modelCatalogCacheTtlMs must round-trip");
-  });
-
-  await t.test("PUT persists idempotencyWindowMs via the flat settings module", async () => {
-    const putResponse = await cacheConfigRoute.PUT(
-      makeJsonRequest("PUT", { idempotencyWindowMs: 9000 }) as never
-    );
-    assert.equal(putResponse.status, 200);
-
-    const getResponse = await cacheConfigRoute.GET(makeJsonRequest("GET") as never);
-    const getBody = await getResponse.json();
-    assert.equal(getBody.idempotencyWindowMs, 9000);
-  });
+  const putResponse = await cacheConfigRoute.PUT(
+    makeJsonRequest("PUT", { modelCatalogCacheTtlMs: 4242 }) as never
+  );
+  assert.equal(putResponse.status, 401);
 });

@@ -9,8 +9,8 @@ import {
 } from "@/lib/semanticCache";
 import { getIdempotencyStats } from "@/lib/idempotencyLayer";
 import { getCacheMetrics, getCacheTrend } from "@/lib/db/settings";
-import { getCachedSettings } from "@/lib/localDb";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { getCachedSettings } from "@/lib/db/settings";
+import { requirePlatformAdminManagement } from "@/lib/api/platformAdminAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 function errorMessage(error: unknown): string {
@@ -18,9 +18,8 @@ function errorMessage(error: unknown): string {
 }
 
 export async function GET(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(req);
+  if (authError) return authError;
 
   try {
     const { searchParams } = new URL(req.url);
@@ -48,9 +47,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(req);
+  if (authError) return authError;
 
   try {
     const { searchParams } = new URL(req.url);

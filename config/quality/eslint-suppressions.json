@@ -1270,11 +1270,6 @@
       "count": 1
     }
   },
-  "src/app/api/cache/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
   "src/app/api/cli-tools/claude-settings/route.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -1608,11 +1603,6 @@
       "count": 1
     }
   },
-  "src/app/api/rate-limits/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
   "src/app/api/relay/tokens/[id]/route.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
@@ -1620,11 +1610,6 @@
   },
   "src/app/api/resilience/route.ts": {
     "no-restricted-imports": {
-      "count": 1
-    }
-  },
-  "src/app/api/search/stats/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
   },

@@ -2,7 +2,7 @@ import type {
   GatewayCoordinator,
   GatewayDeviceRequest,
   GatewaySessionRecord,
-} from "./connectorGateway.js";
+} from "./connectorGateway.ts";
 
 /** Minimal subset of Durable Object storage used by the adapter. */
 export interface GatewayDurableStorageTransaction {

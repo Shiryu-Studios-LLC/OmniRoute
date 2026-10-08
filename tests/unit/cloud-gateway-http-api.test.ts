@@ -807,6 +807,115 @@ test("an invocation retry after timeout resumes the same retained device request
   }
 });
 
+test("a result-audit failure retries from the completed device request without invoking twice", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const device = await registerOnlineDevice(fixture, "tenant-a", "device-audit-retry");
+    const key = "gateway-audit-retry-0001";
+    const body = {
+      deviceId: "device-audit-retry",
+      capability: "ollama:chat:qwen-local",
+      payload: { prompt: "return once even when result auditing fails" },
+      timeoutMs: 2_000,
+    };
+    let failSuccessfulResultAudit = true;
+    const failingDb: CloudDb = {
+      prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+        const statement = fixture.d1.prepare<T>(sql);
+        let values: unknown[] = [];
+        return {
+          bind(...nextValues: unknown[]) {
+            values = nextValues;
+            statement.bind(...nextValues);
+            return this;
+          },
+          first<U = T>(column?: string) {
+            return statement.first<U>(column);
+          },
+          all<U = T>() {
+            return statement.all<U>();
+          },
+          async run() {
+            if (
+              failSuccessfulResultAudit &&
+              sql.includes("INSERT INTO cloud_compliance_audit") &&
+              values[9] === "success"
+            ) {
+              throw new Error("Injected terminal audit failure");
+            }
+            return statement.run();
+          },
+        };
+      },
+      batch(statements: CloudDbStatement[]) {
+        return fixture.d1.batch(statements);
+      },
+      exec(sql: string) {
+        return fixture.d1.exec(sql);
+      },
+    };
+    const retryRuntime = createCloudRuntime({
+      env: { DB: failingDb, GATEWAY_SESSIONS: fixture.sessions },
+      now: () => new Date(fixture.now),
+    });
+    const invoke = () => retryRuntime.fetch(invokeRequest(owner.token, body, key));
+
+    const firstInvocation = invoke();
+    let delivered: Awaited<ReturnType<typeof device.transport.poll>> = null;
+    for (let attempt = 0; attempt < 50 && !delivered?.length; attempt += 1) {
+      delivered = await device.transport.poll(device.session);
+      if (!delivered?.length) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(delivered?.length, 1);
+    const requestId = delivered![0].requestId;
+    assert.equal(
+      await device.transport.submitResult(device.session, {
+        version: 1,
+        requestId,
+        outcome: { ok: true, value: { recovered: "same durable request" } },
+      }),
+      true
+    );
+
+    const firstResponse = await firstInvocation;
+    assert.equal(firstResponse.status, 503);
+    assert.deepEqual(await firstResponse.json(), { error: "Invocation result is unavailable" });
+
+    failSuccessfulResultAudit = false;
+    const retriedResponse = await invoke();
+    assert.equal(retriedResponse.status, 200);
+    assert.deepEqual(await retriedResponse.json(), {
+      requestId,
+      result: {
+        version: 1,
+        outcome: { ok: true, value: { recovered: "same durable request" } },
+      },
+    });
+    assert.equal((await device.transport.poll(device.session))?.length, 0);
+
+    const idempotency = fixture.d1.db
+      .prepare("SELECT request_id, state FROM cloud_gateway_idempotency")
+      .get() as { request_id: string; state: string };
+    assert.equal(idempotency.request_id, requestId);
+    assert.equal(idempotency.state, "completed");
+    const audits = fixture.d1.db
+      .prepare(
+        "SELECT status, COUNT(*) AS count FROM cloud_compliance_audit WHERE action = 'gateway.customer.invoke' GROUP BY status ORDER BY status"
+      )
+      .all() as Array<{ status: string; count: number }>;
+    assert.deepEqual(
+      audits.map((row) => ({ status: row.status, count: Number(row.count) })),
+      [
+        { status: "attempted", count: 1 },
+        { status: "success", count: 1 },
+      ]
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
 test("device revocation makes an idempotent operation terminal and replayable", async () => {
   const fixture = createRuntimeFixture();
   try {

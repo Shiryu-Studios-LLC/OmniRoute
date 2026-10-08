@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { getIdempotencyKey, checkIdempotency } from "@/lib/idempotencyLayer";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
+import { getTenantContext } from "@/lib/tenantContext";
+import { currentDbTenantId } from "@/lib/db/tenantScope";
 import type { EffectiveServiceTier } from "./serviceTier.ts";
 
 type HeadersLike = Headers | Record<string, unknown> | null | undefined;
@@ -23,11 +25,15 @@ type LoggerLike = { debug?: (...args: unknown[]) => void } | null | undefined;
  */
 export function composeIdempotencyKey({
   rawKey,
+  tenantId,
+  principalId,
   provider,
   model,
   messages,
 }: {
   rawKey: string | null | undefined;
+  tenantId: string;
+  principalId: string;
   provider: string;
   model: string;
   messages: unknown;
@@ -42,7 +48,11 @@ export function composeIdempotencyKey({
   } catch {
     digest = "nodigest";
   }
-  return `${rawKey}|${provider}|${model}|${digest}`;
+  const scopeDigest = createHash("sha256")
+    .update(`${tenantId}|${principalId}`)
+    .digest("hex")
+    .slice(0, 16);
+  return `${rawKey}|${scopeDigest}|${provider}|${model}|${digest}`;
 }
 
 /**
@@ -70,8 +80,11 @@ export async function checkIdempotencyCache({
 }): Promise<{ hit: { success: true; response: Response } | null; idempotencyKey: string | null }> {
   // NEXA fusion-idempotency fix: namespace the raw header key (see composeIdempotencyKey).
   const rawIdempotencyKey = getIdempotencyKey(clientRawRequest?.headers);
+  const tenantContext = getTenantContext();
   const idempotencyKey = composeIdempotencyKey({
     rawKey: rawIdempotencyKey,
+    tenantId: tenantContext?.tenantId ?? currentDbTenantId(),
+    principalId: tenantContext?.principalId ?? "anonymous",
     provider,
     model,
     messages: (body as { messages?: unknown } | undefined)?.messages,

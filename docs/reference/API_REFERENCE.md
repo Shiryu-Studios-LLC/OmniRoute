@@ -661,11 +661,21 @@ refusal. On success:
 {
   "allowed": true,
   // present only when the key opted into per-key usage limits (daily/weekly USD):
-  "personal": { "dailySpentUsd": 1.25, "dailyLimitUsd": 5, "dailyResetAtIso": "…", "weeklySpentUsd": 8, "weeklyLimitUsd": 20, "weeklyResetAtIso": "…" /* … */ },
+  "personal": {
+    "dailySpentUsd": 1.25,
+    "dailyLimitUsd": 5,
+    "dailyResetAtIso": "…",
+    "weeklySpentUsd": 8,
+    "weeklyLimitUsd": 20,
+    "weeklyResetAtIso": "…" /* … */,
+  },
   // the selected provider quota snapshot, or null when nothing is cached yet:
-  "provider": { "connectionId": "…", "provider": "claude", "plan": "…", "quotas": { /* … */ } },
+  "provider": { "connectionId": "…", "provider": "claude", "plan": "…", "quotas": {/* … */} },
   // every connection's snapshot, so a UI can render several providers side by side:
-  "providers": [ { "connectionId": "…", "provider": "claude", /* … */ }, { "provider": "codex", /* … */ } ]
+  "providers": [
+    { "connectionId": "…", "provider": "claude" /* … */ },
+    { "provider": "codex" /* … */ },
+  ],
 }
 ```
 
@@ -674,7 +684,7 @@ On refusal (`401` bad key / `403` not allowed) the same route returns
 (key allowed, nothing learned yet) is a different state from a refusal, and only the JSON form
 distinguishes them.
 
-**Auth:** the caller's own Bearer API key, validated with `isValidApiKey` — this is *not* the
+**Auth:** the caller's own Bearer API key, validated with `isValidApiKey` — this is _not_ the
 management surface (`/api/keys/…`), which stays behind `requireManagementAuth`.
 
 ---
@@ -835,7 +845,8 @@ ordinary inference API keys. Credential families, scopes, and curl examples:
 | Endpoint                             | Method     | Description                                                                                                                                                                                       |
 | ------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/api/sessions`                      | GET        | Active session tracking                                                                                                                                                                           |
-| `/api/rate-limits`                   | GET        | Per-account rate limits                                                                                                                                                                           |
+| `/api/rate-limits`                   | GET/POST   | Platform-admin per-account rate-limit status and protection toggle                                                                                                                                |
+| `/api/search/stats`                  | GET        | Platform-admin search-provider, cache, and recent-search statistics                                                                                                                               |
 | `/api/monitoring/health`             | GET        | Health check + provider summary (`catalogCount`, `configuredCount`, `activeCount`, `monitoredCount`)                                                                                              |
 | `/api/cache/stats`                   | GET/DELETE | Cache stats / clear                                                                                                                                                                               |
 | `/api/modality-bridge/stats`         | GET        | In-memory `attempts`, successes/`bridged`, failures, cache hits, `totalLatencyMs`, `latencySamples`, sample-denominated `averageLatencyMs`, and last-use time (reset on restart; management auth) |
@@ -900,8 +911,8 @@ GET response includes `agents[]` (id, name, binary, version, installed, protocol
 | `/api/resilience/reset`           | POST      | Reset provider circuit breakers                                                      |
 | `/api/resilience/model-cooldowns` | GET       | List active per-(provider, connection, model) lockouts, sorted by remaining time     |
 | `/api/resilience/model-cooldowns` | DELETE    | Clear a model lockout — body `{provider, model}` or `{all: true}` to wipe everything |
-| `/api/rate-limits`                | GET       | Per-account rate limit status                                                        |
-| `/api/rate-limit`                 | GET       | Global rate limit configuration                                                      |
+| `/api/rate-limits`                | GET/POST  | Platform-admin per-account rate-limit status and protection toggle                   |
+| `/api/rate-limit`                 | GET/POST  | Deprecated redirect to the platform-admin rate-limit endpoint                        |
 
 > All four `/api/resilience/*` routes require **management auth** (`requireManagementAuth`). See [Resilience (extended)](#resilience-extended) for a full breakdown of provider breaker vs connection cooldown vs model lockout.
 
@@ -1598,16 +1609,18 @@ Manage AI agent skills (similar to OpenAI's custom GPTs but for agents).
 
 Manage the semantic cache and reasoning cache.
 
-| Method | Path                   | Description                                                                                             |
-| ------ | ---------------------- | ------------------------------------------------------------------------------------------------------- |
-| GET    | `/api/cache`           | Cache overview: total entries, hit rate, size on disk                                                   |
-| GET    | `/api/cache/entries`   | List cached entries (with pagination)                                                                   |
-| DELETE | `/api/cache/entries`   | Delete cache entries (filter by query parameters)                                                       |
-| GET    | `/api/cache/stats`     | Detailed cache statistics (per-provider, per-model)                                                     |
-| GET    | `/api/cache/reasoning` | Reasoning cache status (for reasoning replay)                                                           |
-| DELETE | `/api/cache/reasoning` | Clear reasoning cache — query params: `?toolCallId=<id>` (single) or `?provider=<p>` or no params (all) |
+| Method | Path                         | Description                                                                                             |
+| ------ | ---------------------------- | ------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/cache`                 | Cache overview: total entries, hit rate, size on disk                                                   |
+| GET    | `/api/cache/entries`         | List cached entries (with pagination)                                                                   |
+| DELETE | `/api/cache/entries`         | Delete cache entries (filter by query parameters)                                                       |
+| GET    | `/api/cache/stats`           | Detailed cache statistics (per-provider, per-model)                                                     |
+| GET    | `/api/cache/reasoning`       | Reasoning cache status (for reasoning replay)                                                           |
+| DELETE | `/api/cache/reasoning`       | Clear reasoning cache — query params: `?toolCallId=<id>` (single) or `?provider=<p>` or no params (all) |
+| GET    | `/api/settings/cache-config` | Read platform-wide cache settings                                                                       |
+| PUT    | `/api/settings/cache-config` | Update platform-wide cache settings                                                                     |
 
-**Auth:** Requires management session.
+**Auth:** `/api/cache`, `/api/cache/entries`, `/api/cache/stats`, `/api/settings/cache-config`, `/api/rate-limits`, `/api/rate-limit`, and `/api/search/stats` require platform-admin management authentication. Reasoning-cache routes require management authentication and operate within the authenticated tenant.
 
 ---
 

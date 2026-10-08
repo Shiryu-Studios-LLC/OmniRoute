@@ -2170,6 +2170,51 @@ paths:
         "200":
           description: Updated settings
 
+  /api/settings/cache-config:
+    get:
+      tags: [Settings]
+      summary: Get platform-wide cache configuration
+      description: Requires management authentication for the platform-admin tenant.
+      security:
+        - ManagementSessionAuth: []
+      responses:
+        "200":
+          description: Current cache configuration
+        "401":
+          description: Unauthorized
+        "403":
+          description: Platform administrator required
+    put:
+      tags: [Settings]
+      summary: Update platform-wide cache configuration
+      description: Requires management authentication for the platform-admin tenant.
+      security:
+        - ManagementSessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                semanticCacheEnabled: { type: boolean }
+                semanticCacheMaxSize: { type: number, exclusiveMinimum: 0 }
+                semanticCacheTTL: { type: number, exclusiveMinimum: 0 }
+                promptCacheEnabled: { type: boolean }
+                promptCacheStrategy: { type: string, enum: [auto, system-only, manual] }
+                alwaysPreserveClientCache: { type: string, enum: [auto, always, never] }
+                idempotencyWindowMs: { type: number, exclusiveMinimum: 0 }
+                modelCatalogCacheTtlMs: { type: number, exclusiveMinimum: 0 }
+      responses:
+        "200":
+          description: Cache configuration updated
+        "400":
+          description: Invalid cache configuration
+        "401":
+          description: Unauthorized
+        "403":
+          description: Platform administrator required
+
   /api/settings/purge-request-history:
     post:
       tags: [Settings]
@@ -2705,12 +2750,20 @@ paths:
     get:
       tags: [Settings]
       summary: Get rate limit configuration
+      description: Deprecated redirect; requires platform-admin management authentication.
+      security:
+        - ManagementSessionAuth: []
       responses:
-        "200":
-          description: Rate limit settings
+        "308":
+          description: Redirect to the protected rate-limit status endpoint
+        "401": { description: Unauthorized }
+        "403": { description: Platform administrator required }
     post:
       tags: [Settings]
       summary: Update rate limit configuration
+      description: Deprecated redirect; requires platform-admin management authentication.
+      security:
+        - ManagementSessionAuth: []
       requestBody:
         required: true
         content:
@@ -2718,8 +2771,10 @@ paths:
             schema:
               type: object
       responses:
-        "200":
-          description: Updated rate limit settings
+        "308":
+          description: Redirect to the protected rate-limit update endpoint
+        "401": { description: Unauthorized }
+        "403": { description: Platform administrator required }
 
   /api/tags:
     get:
@@ -5616,9 +5671,47 @@ paths:
     get:
       tags: [System]
       summary: Get per-account rate limit status
+      description: Platform-admin only; returns connection status, model lockouts, and shared cache statistics.
+      security:
+        - ManagementSessionAuth: []
       responses:
         "200":
           description: Rate limit status by account
+        "401": { description: Unauthorized }
+        "403": { description: Platform administrator required }
+    post:
+      tags: [System]
+      summary: Toggle per-connection rate-limit protection
+      description: Platform-admin only.
+      security:
+        - ManagementSessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connectionId, enabled]
+              properties:
+                connectionId: { type: string }
+                enabled: { type: boolean }
+      responses:
+        "200": { description: Rate-limit protection updated }
+        "400": { description: Invalid request }
+        "401": { description: Unauthorized }
+        "403": { description: Platform administrator required }
+
+  /api/search/stats:
+    get:
+      tags: [System]
+      summary: Get search provider and recent-query statistics
+      description: Platform-admin only; includes global cache statistics and recent search query/filter text.
+      security:
+        - ManagementSessionAuth: []
+      responses:
+        "200": { description: Search statistics }
+        "401": { description: Unauthorized }
+        "403": { description: Platform administrator required }
 
   /api/sessions:
     get:
@@ -5632,15 +5725,29 @@ paths:
     get:
       tags: [System]
       summary: Get cache statistics
+      description: Platform-admin only; returns shared semantic-cache and idempotency statistics.
+      security:
+        - ManagementSessionAuth: []
       responses:
         "200":
           description: Semantic cache and idempotency stats
+        "401":
+          description: Unauthorized
+        "403":
+          description: Platform administrator required
     delete:
       tags: [System]
       summary: Clear all caches
+      description: Platform-admin only; clears shared cache state.
+      security:
+        - ManagementSessionAuth: []
       responses:
         "200":
           description: Caches cleared
+        "401":
+          description: Unauthorized
+        "403":
+          description: Platform administrator required
 
   /api/modality-bridge/stats:
     get:
@@ -5881,16 +5988,29 @@ paths:
     get:
       tags: [System]
       summary: Get detailed cache statistics
-      description: Returns detailed statistics for all cache layers.
+      description: Platform-admin only; returns detailed statistics for all shared cache layers.
+      security:
+        - ManagementSessionAuth: []
       responses:
         "200":
           description: Detailed cache stats
+        "401":
+          description: Unauthorized
+        "403":
+          description: Platform administrator required
     delete:
       tags: [System]
       summary: Clear cache statistics
+      description: Platform-admin only; clears the shared in-memory semantic cache.
+      security:
+        - ManagementSessionAuth: []
       responses:
         "200":
           description: Cache stats cleared
+        "401":
+          description: Unauthorized
+        "403":
+          description: Platform administrator required
 
   # ─── Telemetry & Token Health ───────────────────────────────────
 

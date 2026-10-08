@@ -5,7 +5,8 @@ import {
   type UserDatabaseSettings,
 } from "@/lib/db/databaseSettings";
 import { getSettings, updateSettings } from "@/lib/db/settings";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requirePlatformAdminManagement } from "@/lib/api/platformAdminAuth";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { z } from "zod";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -45,9 +46,8 @@ const DEFAULTS = {
 };
 
 export async function GET(request: NextRequest) {
-  if (!(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(request);
+  if (authError) return authError;
 
   try {
     const dbSettings = getDatabaseSettings();
@@ -66,14 +66,13 @@ export async function GET(request: NextRequest) {
     }
     return NextResponse.json(config);
   } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }
 
 export async function PUT(request: NextRequest) {
-  if (!(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(request);
+  if (authError) return authError;
 
   try {
     let rawBody: unknown;
@@ -126,6 +125,6 @@ export async function PUT(request: NextRequest) {
 
     return NextResponse.json({ ok: true });
   } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }

@@ -1,13 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { clearMemoryCache, getMemoryCacheStats } from "@/lib/semanticCache";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { requirePlatformAdminManagement } from "@/lib/api/platformAdminAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
 export async function GET(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(req);
+  if (authError) return authError;
 
   try {
     return NextResponse.json(getMemoryCacheStats());
@@ -17,9 +16,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  if (!(await isAuthenticated(req))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const authError = await requirePlatformAdminManagement(req);
+  if (authError) return authError;
 
   try {
     clearMemoryCache();
