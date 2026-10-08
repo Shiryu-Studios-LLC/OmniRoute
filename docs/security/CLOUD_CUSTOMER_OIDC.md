@@ -38,6 +38,9 @@ Tenant OIDC configuration cannot set a callback or post-login redirect URI.
 - `GET /__cloud/auth/session` returns the tenant, membership, and issuer for a valid
   customer portal session cookie. It does not return provider credentials or the external
   subject identifier.
+- `POST /__cloud/auth/logout` requires an exact same-origin `Origin`, revokes only the
+  caller's hashed session token in D1, and expires the matching scoped HttpOnly cookie.
+  Missing or malformed cookies are safe to clear without revoking another session.
 - `GET /__cloud/auth/members?limit=<1–100>&cursor=<opaque>` lists tenant memberships for
   active owner/admin sessions. Pages contain membership ID, role, active state, and
   timestamps; they omit principal IDs and OIDC details.
@@ -65,8 +68,9 @@ Tenant OIDC configuration cannot set a callback or post-login redirect URI.
 
 The session cookie is `HttpOnly`, `SameSite=Lax`, scoped to `/__cloud/auth`, and expires
 within eight hours. The database stores a hash of the opaque cookie token. Session
-introspection checks tenant, membership, identity-link, and enabled-issuer state on every
-request, so deactivating any of them immediately makes the session unusable. Invitation
+introspection checks tenant, membership, identity-link, enabled-issuer, and revocation state
+on every request, so explicit logout or deactivating any of them immediately makes the
+session unusable. Invitation
 creation requires an exact same-origin POST and the active owner/admin session; the cookie
 does not authorize existing API routes.
 

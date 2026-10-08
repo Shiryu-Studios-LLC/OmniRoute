@@ -13,10 +13,19 @@ import { Agent, buildConnector, fetch as undiciFetch, type Dispatcher } from "un
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { isConnectionUnavailableToAuxiliaryActivity } from "@/lib/exclusiveLeaseIsolation";
 import { getRuntimePorts } from "@/lib/runtime/ports";
+import {
+  getModelSyncInternalAuthHeaderName,
+  getModelSyncInternalAuthToken,
+  setModelSyncInternalAuthToken,
+} from "./modelSyncInternalAuth";
+
+export {
+  getModelSyncInternalAuthHeaderName,
+  isModelSyncInternalRequest,
+} from "./modelSyncInternalAuth";
 
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MODEL_SYNC_SETTING_KEY = "model_sync_last_run";
-const MODEL_SYNC_INTERNAL_AUTH_HEADER = "x-model-sync-internal-auth";
 
 function normalizeInternalBasePath(value: string | undefined): string {
   const trimmed = value?.trim();
@@ -112,36 +121,20 @@ export const fetchModelSyncInternal: typeof fetch = async (input, init = {}) => 
   return globalThis.fetch(inputUrl.href, requestInit);
 };
 
-const globalState = globalThis as typeof globalThis & {
-  __omnirouteModelSyncInternalAuthToken?: string;
-};
-
 let schedulerTimer: NodeJS.Timeout | null = null;
 let isRunning = false;
 let internalAuthToken: string | null = null;
 
 function getInternalAuthToken(): string {
   if (!internalAuthToken) {
-    internalAuthToken = globalState.__omnirouteModelSyncInternalAuthToken || randomUUID();
-    globalState.__omnirouteModelSyncInternalAuthToken = internalAuthToken;
+    internalAuthToken = getModelSyncInternalAuthToken() || randomUUID();
+    setModelSyncInternalAuthToken(internalAuthToken);
   }
   return internalAuthToken;
 }
 
-export function getModelSyncInternalAuthHeaderName(): string {
-  return MODEL_SYNC_INTERNAL_AUTH_HEADER;
-}
-
 export function buildModelSyncInternalHeaders(): Record<string, string> {
-  return { [MODEL_SYNC_INTERNAL_AUTH_HEADER]: getInternalAuthToken() };
-}
-
-export function isModelSyncInternalRequest(request: { headers: Headers }): boolean {
-  if (!internalAuthToken && globalState.__omnirouteModelSyncInternalAuthToken) {
-    internalAuthToken = globalState.__omnirouteModelSyncInternalAuthToken;
-  }
-  const headerToken = request.headers.get(MODEL_SYNC_INTERNAL_AUTH_HEADER);
-  return Boolean(headerToken && internalAuthToken && headerToken === internalAuthToken);
+  return { [getModelSyncInternalAuthHeaderName()]: getInternalAuthToken() };
 }
 
 /**

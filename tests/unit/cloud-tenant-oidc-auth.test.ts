@@ -18,6 +18,7 @@ import { addCloudTenantOidcIdentity, setCloudTenantOidcConfig } from "../../src/
 import {
   CLOUD_TENANT_OIDC_CALLBACK_PATH,
   CLOUD_TENANT_OIDC_LOGIN_PATH,
+  CLOUD_TENANT_OIDC_LOGOUT_PATH,
   CLOUD_TENANT_OIDC_SESSION_COOKIE,
   CLOUD_TENANT_OIDC_SESSION_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
@@ -395,6 +396,124 @@ test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an
     })
   );
   assert.equal(revoked.status, 401);
+});
+
+test("tenant OIDC logout revokes only the caller session, expires its cookie, and blocks introspection", async () => {
+  const { db, tenant } = await setup();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const otherPortal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const before = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(before.status, 200);
+
+  const logout = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGOUT_PATH}`, {
+      method: "POST",
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(logout.status, 200);
+  assert.deepEqual(await logout.json(), { loggedOut: true });
+  const clearedCookie = logout.headers
+    .getSetCookie()
+    .find((value) => value.startsWith(`${CLOUD_TENANT_OIDC_SESSION_COOKIE}=`));
+  assert.ok(clearedCookie);
+  assert.match(clearedCookie, /Path=\/__cloud\/auth(?:;|$)/);
+  assert.match(clearedCookie, /Max-Age=0(?:;|$)/);
+  assert.match(clearedCookie, /HttpOnly/);
+  assert.match(clearedCookie, /SameSite=Lax/);
+
+  const after = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(after.status, 401);
+
+  const otherSession = await otherPortal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${otherPortal.cookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(otherSession.status, 200, "logout must leave a separate session active");
+
+  const activeSessions = await db
+    .prepare(
+      "SELECT count(*) AS count FROM cloud_tenant_oidc_sessions WHERE tenant_id = ? AND revoked_at_ms IS NULL"
+    )
+    .bind(tenant.id)
+    .first<{ count: number }>();
+  assert.equal(activeSessions?.count, 1);
+});
+
+test("tenant OIDC logout requires exact same origin and safely handles absent or invalid cookies", async () => {
+  const { db, tenant } = await setup();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const crossOrigin = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGOUT_PATH}`, {
+      method: "POST",
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        Origin: "https://attacker.example",
+      },
+    })
+  );
+  assert.equal(crossOrigin.status, 403);
+  assert.equal(crossOrigin.headers.getSetCookie().length, 0);
+  const missingOrigin = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGOUT_PATH}`, {
+      method: "POST",
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}` },
+    })
+  );
+  assert.equal(missingOrigin.status, 403);
+
+  for (const cookieHeader of [undefined, `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=invalid`]) {
+    const headers = new Headers({ Origin: ORIGIN });
+    if (cookieHeader) headers.set("Cookie", cookieHeader);
+    const logout = await portal.app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGOUT_PATH}`, {
+        method: "POST",
+        headers,
+      })
+    );
+    assert.equal(logout.status, 200);
+    assert.deepEqual(await logout.json(), { loggedOut: true });
+    assert.ok(
+      logout.headers
+        .getSetCookie()
+        .some(
+          (value) =>
+            value.startsWith(`${CLOUD_TENANT_OIDC_SESSION_COOKIE}=`) && /Max-Age=0/.test(value)
+        )
+    );
+  }
+
+  const session = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}` },
+    })
+  );
+  assert.equal(
+    session.status,
+    200,
+    "missing and malformed logout cookies must not revoke another session"
+  );
 });
 
 test("tenant OIDC login and introspection fail closed for missing or mismatched public origin", async () => {

@@ -130,6 +130,27 @@ test("modelSyncScheduler: internal auth headers validate only for scheduler requ
   assert.equal(isModelSyncInternalRequest(externalRequest), false);
 });
 
+test("modelSyncInternalAuth: a separate module instance accepts the shared scheduler token", async () => {
+  const scheduler = await loadScheduler("shared-auth-token-source");
+  const internalHeaders = scheduler.buildModelSyncInternalHeaders();
+  const helperPath = path.join(process.cwd(), "src/shared/services/modelSyncInternalAuth.ts");
+  const separateHelperInstance = await import(
+    `${pathToFileURL(helperPath).href}?case=shared-auth-token-consumer-${Date.now()}`
+  );
+
+  const internalRequest = new Request("http://localhost/api/providers/test/sync-models", {
+    method: "POST",
+    headers: internalHeaders,
+  });
+  assert.equal(separateHelperInstance.isModelSyncInternalRequest(internalRequest), true);
+
+  const externalRequest = new Request("http://localhost/api/providers/test/sync-models", {
+    method: "POST",
+    headers: { [scheduler.getModelSyncInternalAuthHeaderName()]: "invalid-token" },
+  });
+  assert.equal(separateHelperInstance.isModelSyncInternalRequest(externalRequest), false);
+});
+
 test("modelSyncScheduler resolves only loopback origins and uses the dashboard port", async () => {
   const previous = {
     OMNIROUTE_PORT: process.env.OMNIROUTE_PORT,

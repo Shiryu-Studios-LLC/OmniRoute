@@ -23,6 +23,7 @@ import { listCloudTenantPortalMembers } from "./tenantMembershipManagement";
 export const CLOUD_TENANT_OIDC_LOGIN_PATH = "/__cloud/auth/oidc/login";
 export const CLOUD_TENANT_OIDC_CALLBACK_PATH = "/__cloud/auth/oidc/callback";
 export const CLOUD_TENANT_OIDC_SESSION_PATH = "/__cloud/auth/session";
+export const CLOUD_TENANT_OIDC_LOGOUT_PATH = "/__cloud/auth/logout";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH = "/__cloud/auth/members/invitations";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
   "/__cloud/auth/oidc/invitations/redeem";
@@ -733,6 +734,43 @@ async function introspectSession(
   );
 }
 
+async function logoutSession(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+
+  const expiredCookie = cookie(CLOUD_TENANT_OIDC_SESSION_COOKIE, "", {
+    path: SESSION_COOKIE_PATH,
+    maxAge: 0,
+    secure: secureCookie(origin),
+    sameSite: "Lax",
+  });
+  const response = (result: Response) => withSetCookie(result, expiredCookie);
+  if (!options.db) return response(json({ error: "Session service unavailable" }, 503));
+
+  const token = getCookie(request, CLOUD_TENANT_OIDC_SESSION_COOKIE);
+  if (token && TOKEN_PATTERN.test(token)) {
+    try {
+      const result = await options.db
+        .prepare(
+          `UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ?
+            WHERE token_hash = ? AND revoked_at_ms IS NULL`
+        )
+        .bind(nowMs, await sha256(token))
+        .run();
+      if (!result.success) return response(json({ error: "Session service unavailable" }, 503));
+    } catch {
+      return response(json({ error: "Session service unavailable" }, 503));
+    }
+  }
+  return response(json({ loggedOut: true }));
+}
+
 async function resolveSession(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1059,6 +1097,7 @@ export async function handleCloudTenantOidcAuthRequest(
   const isLogin = pathname === CLOUD_TENANT_OIDC_LOGIN_PATH;
   const isCallback = pathname === CLOUD_TENANT_OIDC_CALLBACK_PATH;
   const isSession = pathname === CLOUD_TENANT_OIDC_SESSION_PATH;
+  const isLogout = pathname === CLOUD_TENANT_OIDC_LOGOUT_PATH;
   const isMembers = pathname === CLOUD_TENANT_MEMBERS_PATH;
   const isMemberItem = pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`);
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
@@ -1067,6 +1106,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isLogin &&
     !isCallback &&
     !isSession &&
+    !isLogout &&
     !isMembers &&
     !isMemberItem &&
     !isCreateInvitation &&
@@ -1075,7 +1115,7 @@ export async function handleCloudTenantOidcAuthRequest(
     return null;
   }
   const expectedMethod =
-    isCreateInvitation || isRedeemInvitation ? "POST" : isMemberItem ? "PATCH" : "GET";
+    isCreateInvitation || isRedeemInvitation || isLogout ? "POST" : isMemberItem ? "PATCH" : "GET";
   if (request.method !== expectedMethod) {
     return json({ error: "Method not allowed" }, 405, { Allow: expectedMethod });
   }
@@ -1094,6 +1134,7 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isCallback) return callback(request, options, origin, nowMs);
   if (isCreateInvitation) return createMembershipInvitation(request, options, origin, nowMs);
   if (isRedeemInvitation) return redeemMembershipInvitation(request, options, origin, nowMs);
+  if (isLogout) return logoutSession(request, options, origin, nowMs);
   if (isMembers) return listMemberships(request, options, nowMs);
   if (isMemberItem) {
     return updateMembership(

@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { isModelSyncInternalRequest } from "../../../shared/services/modelSyncScheduler";
+import { isModelSyncInternalRequest } from "../../../shared/services/modelSyncInternalAuth";
 import { isAuthRequired, isDashboardSessionAuthenticated } from "../../../shared/utils/apiAuth";
 import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow, reject } from "../context";
