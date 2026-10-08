@@ -1,4 +1,5 @@
 import { installLocalAgentSystemd, uninstallLocalAgentSystemd } from "../localAgentSystemd.mjs";
+import { installLocalAgentLaunchd, uninstallLocalAgentLaunchd } from "../localAgentLaunchd.mjs";
 
 const DEFAULT_CREDENTIAL_ENV = "SHIRYU_LOCAL_AGENT_CREDENTIAL";
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -156,10 +157,10 @@ export function registerLocalAgent(program) {
 
   const service = localAgent
     .command("service")
-    .description("Install or remove the Linux user service");
+    .description("Install or remove the per-user Local Agent service");
   const install = service
     .command("install")
-    .description("Install and start a protected systemd user service on Linux")
+    .description("Install and start a protected Linux systemd or macOS launchd user service")
     .option("--gateway-url <url>", "HTTPS gateway base URL (or SHIRYU_LOCAL_AGENT_GATEWAY_URL)")
     .option("--device-id <id>", "Registered device ID (or SHIRYU_LOCAL_AGENT_DEVICE_ID)")
     .option(
@@ -176,11 +177,14 @@ export function registerLocalAgent(program) {
   install.action(async (options) => {
     try {
       const config = resolveLocalAgentConfig(options);
-      const installed = installLocalAgentSystemd(config);
+      const installed =
+        process.platform === "darwin"
+          ? installLocalAgentLaunchd(config)
+          : installLocalAgentSystemd(config);
       process.stdout.write(`Local Agent service installed: ${installed.serviceName}\n`);
     } catch {
       process.stderr.write(
-        "Local Agent service install failed; check Linux systemd and configuration.\n"
+        "Local Agent service install failed; check systemd or launchd and configuration.\n"
       );
       process.exitCode = 1;
     }
@@ -188,10 +192,13 @@ export function registerLocalAgent(program) {
 
   service
     .command("uninstall")
-    .description("Stop and remove the installed Local Agent systemd user service")
+    .description("Stop and remove the installed Local Agent user service")
     .action(() => {
       try {
-        const removed = uninstallLocalAgentSystemd();
+        const removed =
+          process.platform === "darwin"
+            ? uninstallLocalAgentLaunchd()
+            : uninstallLocalAgentSystemd();
         process.stdout.write(
           removed ? "Local Agent service removed.\n" : "Local Agent service is not installed.\n"
         );

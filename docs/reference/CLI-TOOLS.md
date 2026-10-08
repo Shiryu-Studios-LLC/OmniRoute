@@ -118,13 +118,15 @@ omniroute local-agent run \
 The gateway URL and device ID can instead come from
 `SHIRYU_LOCAL_AGENT_GATEWAY_URL` and `SHIRYU_LOCAL_AGENT_DEVICE_ID`. Optional local
 service URLs use `SHIRYU_LOCAL_AGENT_OLLAMA_URL` and
-`SHIRYU_LOCAL_AGENT_COMFYUI_URL`. To install the Linux user service, export the
+`SHIRYU_LOCAL_AGENT_COMFYUI_URL`. To install the per-user service, export the
 one-time credential and the required configuration variables, then run
-`omniroute local-agent service install`. The installer stores the credential in
-`~/.config/omniroute/local-agent.env` with owner-only permissions and manages
-`omniroute-local-agent.service` under the current user's systemd session. Re-running
-install updates the service configuration. Remove the service and stored credential
-with `omniroute local-agent service uninstall`.
+`omniroute local-agent service install`. Linux uses the current user's systemd
+session and stores the credential in `~/.config/omniroute/local-agent.env` with
+owner-only permissions. macOS uses the current user's launchd session and stores
+the credential in `~/Library/LaunchAgents/com.omniroute.local-agent.plist`, also
+with owner-only permissions. Re-running install updates and restarts the service.
+Remove the service and stored credential with
+`omniroute local-agent service uninstall`.
 
 For local development, the gateway URL may use plain HTTP only when its host is
 `localhost`, `127.0.0.1`, or `[::1]`. Remote gateway URLs must use HTTPS.
