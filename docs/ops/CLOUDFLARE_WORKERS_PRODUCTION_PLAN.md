@@ -137,6 +137,7 @@ Complete the existing `multi-tenant` foundation:
 - Create customer tenant.
 - Create owner/admin membership.
 - Generate tenant-scoped credentials.
+- The platform-admin tenant-create request can include an owner principal ID from an external verified identity flow; it then creates the tenant, owner membership, and one-time API key with compensating rollback and an audit record.
 - Configure provider defaults.
 - Configure MCP defaults.
 - Register devices.

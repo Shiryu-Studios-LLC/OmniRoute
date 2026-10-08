@@ -53,7 +53,12 @@ class MockD1Statement<T = unknown> implements CloudDbStatement<T> {
 }
 
 class MockD1 implements CloudDb {
-  readonly db = new DatabaseSync(":memory:");
+  readonly db: DatabaseSync;
+
+  constructor() {
+    this.db = new DatabaseSync(":memory:");
+    this.db.exec("PRAGMA foreign_keys = ON");
+  }
 
   prepare<T = unknown>(sql: string): CloudDbStatement<T> {
     return new MockD1Statement<T>(this.db, sql);
@@ -108,6 +113,185 @@ test("D1 customer identity migration is idempotent", async () => {
     "cloud_customer_memberships",
   ]);
   d1.db.close();
+});
+
+test("platform admin can provision a tenant, owner membership, and one-time key in one request", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const request = new Request("https://omniroute.test/__cloud/v1/tenants", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer platform-secret",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "tenant-new-customer",
+        name: "New Customer",
+        slug: "new-customer",
+        ownerPrincipalId: "verified-owner-subject",
+      }),
+    });
+    const response = await handleCloudApiRequest(request, {
+      db: d1,
+      adminToken: "platform-secret",
+      now: () => new Date(now),
+    });
+    assert.equal(response.status, 201);
+    const provisioned = (await response.json()) as {
+      tenant: { id: string; kind: string };
+      ownerMembership: { tenantId: string; principalId: string; role: string };
+      ownerApiKey: { id: string; token: string };
+    };
+    assert.deepEqual(
+      {
+        tenant: provisioned.tenant,
+        ownerMembership: provisioned.ownerMembership,
+      },
+      {
+        tenant: {
+          id: "tenant-new-customer",
+          name: "New Customer",
+          slug: "new-customer",
+          kind: "customer",
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+        },
+        ownerMembership: {
+          id: provisioned.ownerMembership.id,
+          tenantId: "tenant-new-customer",
+          principalId: "verified-owner-subject",
+          role: "owner",
+        },
+      }
+    );
+    assert.match(provisioned.ownerApiKey.token, /^orc_live_[A-Za-z0-9_-]{43}$/);
+    assert.equal(
+      (await authenticateCloudCustomerApiKey(d1, provisioned.ownerApiKey.token, now))?.tenantId,
+      "tenant-new-customer"
+    );
+    const storedKey = await d1
+      .prepare<{ key_hash: string }>("SELECT key_hash FROM cloud_customer_api_keys WHERE id = ?")
+      .bind(provisioned.ownerApiKey.id)
+      .first();
+    assert.notEqual(storedKey?.key_hash, provisioned.ownerApiKey.token);
+    const provisionAudit = await d1
+      .prepare<{ metadata_json: string | null }>(
+        "SELECT metadata_json FROM cloud_compliance_audit WHERE action = 'customer.provision'"
+      )
+      .all();
+    assert.ok(provisionAudit.results.length === 1);
+    assert.ok(!provisionAudit.results[0].metadata_json?.includes(provisioned.ownerApiKey.token));
+
+    const collision = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer platform-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-uncreated",
+          name: "Collision",
+          slug: "new-customer",
+          ownerPrincipalId: "verified-owner-subject-2",
+        }),
+      }),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+    assert.equal(collision.status, 409);
+    assert.equal(
+      await d1.prepare("SELECT id FROM tenants WHERE id = 'tenant-uncreated'").first(),
+      null
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("customer provisioning compensates tenant and owner writes when key issuance fails", async () => {
+  const { d1, now } = await fixture();
+  try {
+    await d1.exec(`
+      CREATE TRIGGER fail_customer_key BEFORE INSERT ON cloud_customer_api_keys
+      BEGIN SELECT RAISE(ABORT, 'injected key storage failure'); END;
+    `);
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer platform-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-rollback",
+          name: "Rollback Customer",
+          slug: "rollback-customer",
+          ownerPrincipalId: "verified-owner-rollback",
+        }),
+      }),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+    assert.equal(response.status, 500);
+    assert.equal(
+      await d1.prepare("SELECT id FROM tenants WHERE id = 'tenant-rollback'").first(),
+      null
+    );
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM cloud_customer_memberships WHERE tenant_id = 'tenant-rollback'")
+        .first(),
+      null
+    );
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM cloud_customer_api_keys WHERE tenant_id = 'tenant-rollback'")
+        .first(),
+      null
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("customer provisioning removes the tenant if its success audit cannot be written", async () => {
+  const { d1, now } = await fixture();
+  try {
+    await d1.exec(`
+      CREATE TRIGGER fail_provision_audit BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action = 'customer.provision'
+      BEGIN SELECT RAISE(ABORT, 'injected audit storage failure'); END;
+    `);
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer platform-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-audit-rollback",
+          name: "Audit Rollback Customer",
+          slug: "audit-rollback-customer",
+          ownerPrincipalId: "verified-owner-audit-rollback",
+        }),
+      }),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+    assert.equal(response.status, 503);
+    assert.equal(
+      await d1.prepare("SELECT id FROM tenants WHERE id = 'tenant-audit-rollback'").first(),
+      null
+    );
+    const attemptAudit = await d1
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE action = 'cloud.api.post'"
+      )
+      .first<{ count: number }>();
+    assert.equal(attemptAudit?.count, 1);
+  } finally {
+    d1.db.close();
+  }
 });
 
 test("customer key resolves tenant and role only through active D1 membership", async () => {

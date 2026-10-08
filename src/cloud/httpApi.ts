@@ -22,6 +22,7 @@ import {
   setCloudCustomerTenantActive,
 } from "./tenants";
 import { appendCloudComplianceAudit } from "./complianceAudit";
+import { provisionCloudCustomer, rollbackCloudCustomerProvisioning } from "./provisioning";
 import { consumeCloudRateLimit } from "./rateLimit";
 import { appendCloudUsageRecord, listCloudUsageRecords } from "./usage";
 import {
@@ -639,7 +640,7 @@ export async function handleCloudApiRequest(
 
       const body = validateFields(
         await readBody(request),
-        ["id", "name", "slug"],
+        ["id", "name", "slug", "ownerPrincipalId"],
         ["id", "name", "slug"]
       );
       if (typeof body.id !== "string" || !validId(body.id)) throw new ApiError(400, "Invalid id");
@@ -648,6 +649,47 @@ export async function handleCloudApiRequest(
       }
       if (typeof body.slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(body.slug)) {
         throw new ApiError(400, "Invalid slug");
+      }
+      if (
+        body.ownerPrincipalId !== undefined &&
+        (typeof body.ownerPrincipalId !== "string" || !validId(body.ownerPrincipalId))
+      ) {
+        throw new ApiError(400, "Invalid ownerPrincipalId");
+      }
+      if (typeof body.ownerPrincipalId === "string") {
+        const provisioned = await provisionCloudCustomer(db, {
+          id: body.id,
+          name: body.name.trim(),
+          slug: body.slug,
+          ownerPrincipalId: body.ownerPrincipalId,
+          now: now().toISOString(),
+        });
+        try {
+          await appendCloudComplianceAudit(db, {
+            id: crypto.randomUUID(),
+            tenantId: CLOUD_PLATFORM_TENANT_ID,
+            timestamp: now().toISOString(),
+            action: "customer.provision",
+            actor: "cloud-admin",
+            target: provisioned.tenant.id,
+            resourceType: "customer-tenant",
+            status: "success",
+            requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+            metadata: {
+              slug: provisioned.tenant.slug,
+              membershipId: provisioned.ownerMembership.id,
+              apiKeyId: provisioned.ownerApiKey.id,
+            },
+          });
+        } catch {
+          try {
+            await rollbackCloudCustomerProvisioning(db, provisioned.tenant.id);
+          } catch {
+            return json({ error: "Customer provisioning rollback could not be confirmed" }, 503);
+          }
+          return json({ error: "Customer provisioning audit could not be completed" }, 503);
+        }
+        return json(provisioned, 201);
       }
       const tenant = await createCloudCustomerTenant(db, {
         id: body.id,
