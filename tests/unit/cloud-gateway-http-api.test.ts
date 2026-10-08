@@ -749,7 +749,7 @@ test("customer invocation derives tenant from its API key, completes through the
   }
 });
 
-test("customer invocation atomically claims an Idempotency-Key and replays the completed response", async () => {
+test("customer invocation replays completed results only while its device remains active", async () => {
   const fixture = createRuntimeFixture();
   try {
     const owner = await customerKey(fixture, "tenant-a", "owner");
@@ -809,6 +809,7 @@ test("customer invocation atomically claims an Idempotency-Key and replays the c
       rateBefore.request_count + 1,
       "retries must not consume another invocation slot"
     );
+
     const stored = fixture.d1.db
       .prepare("SELECT state, key_hash, request_id FROM cloud_gateway_idempotency")
       .get() as { state: string; key_hash: string; request_id: string };
@@ -829,6 +830,14 @@ test("customer invocation atomically claims an Idempotency-Key and replays the c
       404,
       "the tenant-scoped key does not reveal or block tenant A's idempotency record"
     );
+
+    const revoked = await fixture.fetch(
+      adminRequest("/__cloud/v1/tenants/tenant-a/gateway-devices/device-idempotent", "DELETE")
+    );
+    assert.equal(revoked.status, 200);
+    const replayAfterRevocation = await fixture.fetch(invokeRequest(owner.token, body, key));
+    assert.equal(replayAfterRevocation.status, 503);
+    assert.deepEqual(await replayAfterRevocation.json(), { error: "Device is unavailable" });
   } finally {
     fixture.d1.db.close();
   }

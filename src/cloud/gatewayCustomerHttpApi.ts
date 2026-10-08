@@ -226,7 +226,16 @@ export async function handleGatewayCustomerRequest(
   if (idempotency.kind === "capacity") {
     return json({ error: "Invocation idempotency storage is full or invalid" }, 503);
   }
-  if (idempotency.kind === "replay") return json(idempotency.response, idempotency.status);
+  if (idempotency.kind === "replay") {
+    // A completed response can contain local device output. Re-check the
+    // authoritative device record before returning it so revocation also
+    // stops access through a previously completed idempotency key.
+    const device = await new D1GatewayDeviceDirectory(db).getDevice(body.deviceId);
+    if (!device || device.tenantId !== identity.tenantId)
+      return json({ error: "Device not found" }, 404);
+    if (device.revokedAt) return json({ error: "Device is unavailable" }, 503);
+    return json(idempotency.response, idempotency.status);
+  }
   if (idempotency.kind === "in_progress") {
     return json({ error: "Invocation with this Idempotency-Key is in progress" }, 409);
   }

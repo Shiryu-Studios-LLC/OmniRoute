@@ -14,6 +14,7 @@ const enabled = process.env.RUN_CLOUDFLARE_LOCAL_INT === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const adminToken = "local-integration-admin-token-only";
 const capability = "ollama:chat:integration-test";
+const localOllamaBaseUrl = "http://127.0.0.1:11434";
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -110,6 +111,75 @@ async function requestHostJson(
     if (serializedBody) request.write(serializedBody);
     request.end();
   });
+}
+
+async function discoverInstalledOllamaModel(): Promise<string> {
+  const response = await fetch(`${localOllamaBaseUrl}/api/tags`, {
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(response.ok, true, "local Ollama /api/tags should respond successfully");
+  const bodyText = await response.text();
+  assert.ok(Buffer.byteLength(bodyText) <= 64 * 1024, "Ollama model list exceeds 64 KiB");
+  const body: unknown = JSON.parse(bodyText);
+  assert.ok(body !== null && typeof body === "object" && !Array.isArray(body));
+  const models = (body as { models?: unknown }).models;
+  assert.ok(Array.isArray(models) && models.length > 0, "Ollama must have an installed model");
+  const installedModels = models.flatMap((entry) => {
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      typeof (entry as { name?: unknown }).name !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test((entry as { name: string }).name) ||
+      !Number.isSafeInteger((entry as { size?: unknown }).size) ||
+      (entry as { size: number }).size < 1
+    ) {
+      return [];
+    }
+    return [{ name: (entry as { name: string }).name, size: (entry as { size: number }).size }];
+  });
+  assert.ok(installedModels.length > 0, "Ollama returned no valid installed model entries");
+  installedModels.sort((left, right) => left.size - right.size);
+  return installedModels[0]!.name;
+}
+
+async function runLocalOllamaChat(
+  model: string,
+  messages: unknown,
+  options: unknown
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${localOllamaBaseUrl}/api/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      model,
+      messages,
+      stream: false,
+      keep_alive: 0,
+      options: {
+        ...(options && typeof options === "object" ? options : {}),
+        num_predict: 64,
+      },
+    }),
+    signal: AbortSignal.timeout(12_000),
+  });
+  const responseText = await response.text();
+  assert.ok(Buffer.byteLength(responseText) <= 128 * 1024, "Ollama chat response exceeds 128 KiB");
+  assert.equal(response.ok, true, `local Ollama chat failed: HTTP ${response.status}`);
+  const body: unknown = JSON.parse(responseText);
+  assert.ok(body !== null && typeof body === "object" && !Array.isArray(body));
+  const result = body as Record<string, unknown>;
+  assert.ok(
+    result.message !== null && typeof result.message === "object" && !Array.isArray(result.message),
+    "Ollama chat result must include a message object"
+  );
+  const message = result.message as Record<string, unknown>;
+  assert.equal(message.role, "assistant");
+  assert.equal(typeof message.content, "string");
+  assert.ok(
+    (message.content as string).trim().length > 0,
+    "Ollama returned empty assistant content"
+  );
+  return result;
 }
 
 async function waitForWorker(
@@ -306,7 +376,11 @@ test(
       requestTimeoutMs: 5_000,
     });
 
-    const provisionCustomer = async (label: string, connectDevice = true) => {
+    const provisionCustomer = async (
+      label: string,
+      connectDevice = true,
+      capabilities: string[] = [capability]
+    ) => {
       const tenantId = `local-${label}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       const tenantResult = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
         token: adminToken,
@@ -338,7 +412,7 @@ test(
         `${baseUrl}/__cloud/v1/tenants/${tenantId}/gateway-devices`,
         {
           token: adminToken,
-          body: { id: deviceId, credentialHash, capabilities: [capability] },
+          body: { id: deviceId, credentialHash, capabilities },
         }
       );
       assert.equal(deviceResult.response.status, 201);
@@ -346,7 +420,7 @@ test(
       const session = connectDevice ? await deviceTransport.connect(deviceId, credential) : null;
       if (connectDevice) {
         assert.ok(session, `${label} device credential should authenticate through Worker and D1`);
-        assert.equal(await deviceTransport.heartbeat(session!, [capability]), true);
+        assert.equal(await deviceTransport.heartbeat(session!, capabilities), true);
       }
       return { tenantId, customerKey, deviceId, credential, session };
     };
@@ -511,6 +585,167 @@ test(
           JSON.stringify(frontDeskResponse.body).includes(customerA.customerKey),
           false,
           "Front Desk chat response must not expose the tenant API key"
+        );
+      }
+    );
+
+    await t.test(
+      "Front Desk completes a local Ollama model chat through the Worker and Durable Object",
+      {
+        timeout: 90_000,
+        skip:
+          process.env.RUN_CLOUDFLARE_LOCAL_OLLAMA_INT !== "1"
+            ? "Set RUN_CLOUDFLARE_LOCAL_OLLAMA_INT=1 to run the loopback-only Ollama integration."
+            : !process.env.FRONT_DESK_REPO
+              ? "Set FRONT_DESK_REPO to run the Front Desk plus local Ollama integration."
+              : false,
+      },
+      async (ollamaTest) => {
+        const model = await discoverInstalledOllamaModel();
+        const modelCapability = `ollama:chat:${model}`;
+        const ollamaCustomer = await provisionCustomer("ollama", true, [modelCapability]);
+        const frontDeskRepo = path.resolve(process.env.FRONT_DESK_REPO!);
+        const frontDeskTempDir = await mkdtemp(path.join(tempDir, "front-desk-ollama-"));
+        const frontDeskHome = path.join(frontDeskTempDir, "home");
+        await mkdir(frontDeskHome, { recursive: true });
+        for (const filename of ["server.js", "omnirouteConfig.js", "leadStore.js"]) {
+          await copyFile(path.join(frontDeskRepo, filename), path.join(frontDeskTempDir, filename));
+        }
+        await writeFile(path.join(frontDeskTempDir, "leads.json"), "[]\n", { mode: 0o600 });
+
+        const frontDeskHost = "tenant-ollama.frontdesk.test";
+        const frontDeskPort = await getUnusedPort();
+        const frontDeskKeyEnv = "FRONT_DESK_LOCAL_OLLAMA_KEY";
+        const frontDeskDashboardEnv = "FRONT_DESK_LOCAL_OLLAMA_DASHBOARD";
+        const frontDeskTenants = [
+          {
+            host: frontDeskHost,
+            tenantId: ollamaCustomer.tenantId,
+            dashboardTokenEnv: frontDeskDashboardEnv,
+            gateway: {
+              baseUrl,
+              customerApiKeyEnv: frontDeskKeyEnv,
+              deviceId: ollamaCustomer.deviceId,
+              ollamaModel: model,
+            },
+            business: {
+              name: "Loopback Ollama Integration",
+              description: "Isolated local model test",
+              hours: "Always",
+              services: [],
+              assistant: {
+                name: "Local model assistant",
+                tone: "helpful",
+                handoff: "Offer a follow-up.",
+              },
+            },
+          },
+        ];
+        const frontDeskChild = spawn(process.execPath, ["server.js"], {
+          cwd: frontDeskTempDir,
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: frontDeskHome,
+            NODE_ENV: "test",
+            NO_COLOR: "1",
+            PORT: String(frontDeskPort),
+            FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
+            [frontDeskKeyEnv]: ollamaCustomer.customerKey,
+            [frontDeskDashboardEnv]: "local-ollama-dashboard-token",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let frontDeskOutput = "";
+        const appendFrontDeskOutput = (chunk: Buffer) => {
+          frontDeskOutput = `${frontDeskOutput}${chunk.toString("utf8")}`.slice(-10_000);
+        };
+        frontDeskChild.stdout?.on("data", appendFrontDeskOutput);
+        frontDeskChild.stderr?.on("data", appendFrontDeskOutput);
+        ollamaTest.after(async () => {
+          await stopWorker(frontDeskChild);
+          await rm(frontDeskTempDir, { recursive: true, force: true });
+        });
+
+        let frontDeskReady = false;
+        const frontDeskDeadline = Date.now() + 10_000;
+        while (Date.now() < frontDeskDeadline) {
+          if (frontDeskChild.exitCode !== null) {
+            assert.fail(
+              `Front Desk exited before becoming ready (code ${frontDeskChild.exitCode}):\n${frontDeskOutput}`
+            );
+          }
+          try {
+            const response = await requestHostJson(frontDeskPort, frontDeskHost, "/api/health");
+            if (response.status === 200) {
+              frontDeskReady = true;
+              break;
+            }
+          } catch {
+            // The temporary Front Desk process may still be starting.
+          }
+          await delay(50);
+        }
+        assert.equal(frontDeskReady, true, `Front Desk did not become ready:\n${frontDeskOutput}`);
+
+        const chatRequest = requestHostJson(frontDeskPort, frontDeskHost, "/api/chat", {
+          messages: [
+            {
+              role: "user",
+              content: "Reply with the exact token LOCAL_OLLAMA_GATEWAY_OK and nothing else.",
+            },
+          ],
+        });
+        let gatewayRequests: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
+        const gatewayPollDeadline = Date.now() + 8_000;
+        while (!gatewayRequests?.length && Date.now() < gatewayPollDeadline) {
+          gatewayRequests = await deviceTransport.poll(ollamaCustomer.session!);
+          if (!gatewayRequests?.length) await delay(25);
+        }
+        assert.equal(
+          gatewayRequests?.length,
+          1,
+          `Front Desk chat should reach the Ollama device session. Front Desk logs:\n${frontDeskOutput}`
+        );
+        const gatewayRequest = gatewayRequests![0]!;
+        assert.equal(gatewayRequest.capability, modelCapability);
+        const localResult = await runLocalOllamaChat(
+          model,
+          (gatewayRequest.payload as { messages?: unknown }).messages,
+          (gatewayRequest.payload as { options?: unknown }).options
+        );
+        assert.equal(
+          await deviceTransport.submitResult(ollamaCustomer.session!, {
+            version: 1,
+            requestId: gatewayRequest.requestId,
+            outcome: { ok: true, value: localResult },
+          }),
+          true,
+          "the Worker should accept the real Ollama result from the device session"
+        );
+
+        const frontDeskResponse = await chatRequest;
+        assert.equal(
+          frontDeskResponse.status,
+          200,
+          `Front Desk should return the local model completion: ${JSON.stringify(frontDeskResponse.body)}`
+        );
+        assert.equal(frontDeskResponse.body.object, "chat.completion");
+        assert.equal(frontDeskResponse.body.model, model);
+        const choices = frontDeskResponse.body.choices;
+        assert.ok(Array.isArray(choices) && choices.length === 1);
+        const firstChoice = choices[0] as {
+          message?: { role?: unknown; content?: unknown };
+          finish_reason?: unknown;
+        };
+        assert.equal(firstChoice.message?.role, "assistant");
+        assert.equal(
+          firstChoice.message?.content,
+          (localResult.message as { content: string }).content
+        );
+        assert.equal(
+          JSON.stringify(frontDeskResponse.body).includes(ollamaCustomer.customerKey),
+          false,
+          "Front Desk chat response must not expose the local tenant API key"
         );
       }
     );
