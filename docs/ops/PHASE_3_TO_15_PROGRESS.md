@@ -10,7 +10,7 @@ Last updated: 2026-10-08
 
 - Active worktree: `/home/okashi/.devspace/worktrees/OmniRoute-e1d58cf1`
 - Branch: `feat/cloudflare-runtime-readiness`
-- Latest pushed implementation checkpoint: `43018c585` (`feat: provision cloud customer identity in one request`); Ollama usage telemetry is in `ed214e68b`, and the separate Front Desk integration is pushed as `e56cbeb`. Phase acceptance remains partial as the table describes.
+- Latest pushed implementation checkpoint: `662779653` (`feat: manage cloud customer membership lifecycle`); tenant provisioning is in `43018c585`, Ollama usage telemetry is in `ed214e68b`, and the separate Front Desk integration is pushed as `e56cbeb`. Phase acceptance remains partial as the table describes.
 - Current phase: integrated validation and Cloudflare runtime readiness
 - Pushed implementation slices touch Phases 3–14; the phase table below is the status source of truth.
 - Latest implementation slice adds tenant-derived usage telemetry for successful local Ollama chat invocations. It is not a trusted billing source.
