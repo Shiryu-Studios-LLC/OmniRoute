@@ -1246,6 +1246,8 @@ Métricas canônicas em 2026-08-24: **1.029 vídeos únicos** · **11.132.922 vi
   <tr><td nowrap><b><a href="contrib/podman/README.md">Podman Guide</a></b></td><td>Quadlet systemd integration, podman-compose, SELinux</td></tr>
   <tr><td nowrap><b><a href="docs/ops/VM_DEPLOYMENT_GUIDE.md">VM Deployment</a></b></td><td>Complete guide: VM + nginx + Cloudflare setup</td></tr>
   <tr><td nowrap><b><a href="docs/ops/FLY_IO_DEPLOYMENT_GUIDE.md">Fly.io Deployment</a></b></td><td>Deploy to Fly.io with persistent storage</td></tr>
+  <tr><td nowrap><b><a href="docs/ops/CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md">Cloudflare Workers Production Plan</a></b></td><td>Cloud-native production architecture, D1, Durable Objects, tenant isolation, and Local Agent rollout</td></tr>
+  <tr><td nowrap><b><a href="docs/ops/CLOUDFLARE_WORKERS_COMPATIBILITY_AUDIT.md">Cloudflare Compatibility Audit</a></b></td><td>Worker-runtime blockers, compatibility matrix, and cloud-build exit criteria</td></tr>
   <tr><td nowrap><b><a href="docs/guides/TERMUX_GUIDE.md">Termux Guide</a></b></td><td>Run OmniRoute on Android via Termux</td></tr>
   <tr><td nowrap><b><a href="docs/guides/PWA_GUIDE.md">PWA Guide</a></b></td><td>Progressive Web App install, caching, architecture</td></tr>
   <tr><td nowrap><b><a href="docs/guides/UNINSTALL.md">Uninstall Guide</a></b></td><td>Clean removal for all install methods</td></tr>

@@ -1,0 +1,114 @@
+# Cloudflare Workers Compatibility Audit
+
+## Scope
+
+This audit covers the current OmniRoute repository at the start of the Cloudflare production-readiness work. It is intentionally focused on the **Shiryu cloud control plane**, not on preserving every local/desktop feature inside a Worker.
+
+## Initial findings
+
+### Cloud-compatible target
+
+The main API/routing architecture is a good candidate for Workers because the core request flow is HTTP/fetch/stream oriented:
+
+```
+HTTP request
+  -> authentication
+  -> tenant/policy checks
+  -> routing/combo selection
+  -> provider translation
+  -> fetch upstream
+  -> streaming/JSON response
+```
+
+The existing architecture already separates API routes, handlers, executors, translators, domain policy, and database domain modules. That gives us useful boundaries for a cloud runtime.
+
+### Known blockers
+
+The current application is **not Worker-ready as one bundle**.
+
+1. **Database**
+   - Current persistence is centered on local SQLite adapters and filesystem-backed state.
+   - Production cloud runtime needs an asynchronous Cloudflare D1 adapter.
+   - In-memory SQLite must not be treated as cloud production persistence.
+
+2. **Filesystem**
+   - Numerous modules use `fs`, `fs/promises`, `path`, and local data directories.
+   - These must be excluded from the cloud request graph or replaced with cloud storage abstractions.
+
+3. **Child processes / OS APIs**
+   - Local tooling uses `child_process`, OS inspection, installers, process supervisors, and system configuration.
+   - These are local-runtime features and must not enter the Worker bundle.
+
+4. **Native modules**
+   - The repository includes `better-sqlite3`, `sharp`, `tls-client-node`, Playwright, and other native/browser-oriented dependencies.
+   - They must be isolated from the cloud request bundle unless a specific dependency is proven compatible and actually needed.
+
+5. **Node server/network APIs**
+   - Local MITM, live-server, browser-login, and some provider/session implementations use Node HTTP/TCP/TLS server APIs.
+   - Cloud request paths must use Worker-supported Web APIs or an explicitly supported compatibility layer.
+
+6. **Bundle size**
+   - OmniRoute contains hundreds of provider executors plus local-only features.
+   - We must measure the actual Worker bundle and avoid shipping the entire local application graph.
+
+7. **Next.js build**
+   - The current Next configuration is optimized for a standalone Node deployment.
+   - A Cloudflare deployment target must be added without breaking the existing local/standalone build.
+
+## Runtime classification
+
+| Area | Target | Status |
+| --- | --- | --- |
+| OpenAI-compatible HTTP API | Worker | Ready conceptually; needs cloud build |
+| Authentication | Worker | Adaptable |
+| Tenant context | Worker | Adaptable; verify request isolation |
+| Provider routing | Worker | Adaptable |
+| HTTP provider executors | Worker | Candidate; audit each executor |
+| Streaming | Worker | Candidate |
+| API-key policy | Worker | Adaptable |
+| Provider CRUD | Worker + D1 | Blocked on D1 adapter |
+| Tenant/provider state | Worker + D1 | Blocked on D1 adapter |
+| Cache | KV/DO/D1 as appropriate | Needs classification |
+| Rate limiting | DO/KV/Cloudflare service | Needs design |
+| Circuit breakers | D1/DO/KV | Needs design |
+| MCP cloud transport | Worker/DO | Needs classification |
+| Local MCP | Local Agent | Do not move into Worker |
+| Ollama | Customer machine | Local |
+| ComfyUI | Customer machine | Local |
+| Local Agent | Customer machine | Future |
+| Device connections | Durable Objects | Future |
+| `connect.shiryu.org` | Cloudflare | Future |
+| MITM proxy | Local-only | Exclude |
+| OS/process management | Local-only | Exclude |
+| Desktop/Electron | Local-only | Exclude |
+| Local SQLite file | Local-only | Replace for cloud |
+| Cloudflare tunnel management | Local Agent/operator tooling | Exclude from cloud Worker |
+
+## Immediate engineering sequence
+
+1. Create the cloud runtime boundary.
+2. Build a minimal Worker-compatible health/API entry point.
+3. Introduce the D1-capable asynchronous persistence boundary.
+4. Make tenant/provider APIs use that boundary.
+5. Audit provider executors transitively imported by the cloud route.
+6. Add bundle-size and forbidden-import checks for the cloud build.
+7. Produce a staging Worker.
+8. Only then build the Local Agent connector against the verified cloud API.
+
+## Cloud deployment principle
+
+The GitHub repository should remain the source of truth. Cloudflare should build/deploy the verified cloud target from GitHub after the local compatibility work is complete.
+
+The developer Linux machine remains useful for local development and customer-compute simulation, but the production cloud control plane must not depend on it.
+
+## Exit criteria for the audit phase
+
+The audit phase is complete when:
+
+- A Worker-compatible entry point exists.
+- The selected API path builds without local-only modules.
+- A D1 integration boundary exists.
+- Forbidden local-runtime imports are mechanically detected.
+- Bundle size is measured.
+- A staging deployment can answer a health request.
+- The cloud build does not alter the existing local deployment path.

@@ -12,8 +12,9 @@ _Last updated: 2026-06-28_
 
 ## Executive Summary
 
-OmniRoute is a local AI routing gateway and dashboard built on Next.js.
-It provides a single OpenAI-compatible endpoint (`/v1/*`) and routes traffic across multiple upstream providers with translation, fallback, token refresh, and usage tracking.
+OmniRoute is an AI routing gateway and dashboard built on Next.js. Its production Shiryu architecture targets a Cloudflare-hosted control plane, while local OS/process capabilities remain on the developer or customer machine. It provides a single OpenAI-compatible endpoint (`/v1/*`) and routes traffic across multiple upstream providers with translation, fallback, token refresh, and usage tracking.
+
+For the production cloud target, the request/routing layer must be Worker-compatible, persistent platform state must use a Cloudflare-supported storage adapter such as D1, and long-lived customer-device connections may use Durable Objects. Local-only capabilities such as Ollama, ComfyUI, child-process execution, filesystem management, and OS-level tooling remain outside the Worker runtime. See [Cloudflare Workers Production Plan](../ops/CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md).
 
 Core capabilities:
 
