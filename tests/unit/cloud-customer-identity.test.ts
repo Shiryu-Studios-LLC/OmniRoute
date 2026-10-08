@@ -459,6 +459,52 @@ test("membership and key creation reject non-customer, suspended, and cross-tena
   }
 });
 
+test("maintenance identity attributes tenant provision attempt and success audits correctly", async () => {
+  const { d1, now } = await fixture();
+  const adminToken = "platform-admin-secret";
+  const maintenanceToken = "platform-maintenance-secret";
+  try {
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${maintenanceToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-maintenance-audit",
+          name: "Maintenance Audit",
+          slug: "maintenance-audit",
+          ownerPrincipalId: "verified-maintenance-owner",
+        }),
+      }),
+      {
+        db: d1,
+        adminToken,
+        maintenanceToken,
+        now: () => new Date(now),
+      }
+    );
+    assert.equal(response.status, 201);
+    const auditRows = await d1
+      .prepare<{ action: string; actor: string; status: string }>(
+        `SELECT action, actor, status FROM cloud_compliance_audit
+          WHERE action IN ('cloud.api.post', 'customer.provision')
+          ORDER BY rowid`
+      )
+      .all();
+    assert.deepEqual(
+      auditRows.results.map(({ action, actor, status }) => ({ action, actor, status })),
+      [
+        { action: "cloud.api.post", actor: "cloud-maintenance", status: "attempted" },
+        { action: "customer.provision", actor: "cloud-maintenance", status: "success" },
+      ]
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
 test("platform admin API issues a one-time key and revokes it by tenant and key ID", async () => {
   const { d1, now } = await fixture();
   const adminToken = "platform-admin-secret";

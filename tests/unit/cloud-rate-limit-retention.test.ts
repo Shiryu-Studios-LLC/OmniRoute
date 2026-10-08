@@ -4,6 +4,13 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "@/cloud/db";
+import {
+  cleanupStaleCloudInferenceReservations,
+  getCloudInferenceBudgetStatus,
+  reserveCloudInferenceTokens,
+  setCloudInferenceEntitlement,
+  setCloudInferenceMonthlyBudget,
+} from "@/cloud/inferencePolicy";
 import { cleanupExpiredCloudRateLimits } from "@/cloud/rateLimit";
 
 class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
@@ -54,6 +61,7 @@ class SqliteD1 implements CloudDb {
       "0002_cloud_usage_audit_rate_limits.sql",
       "0003_cloud_platform_tenant.sql",
       "0009_cloud_rate_limit_retention.sql",
+      "0010_cloud_inference_policy.sql",
     ]) {
       this.db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
     }
@@ -150,6 +158,177 @@ test("rate-limit retention deletes no more than one configured batch per run", a
       remaining.map((row) => row.bucket_hash),
       ["active"]
     );
+  } finally {
+    fixture.db.close();
+  }
+});
+
+test("stale inference cleanup charges abandoned claims at their reserved caps and preserves recent calls", async () => {
+  const fixture = new SqliteD1();
+  try {
+    await setCloudInferenceMonthlyBudget(fixture, {
+      tenantId: "tenant-a",
+      monthlyTokenLimit: 1000,
+      now: new Date(NOW_MS - 6 * 60_000),
+    });
+    await setCloudInferenceEntitlement(fixture, {
+      tenantId: "tenant-a",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 100,
+      now: new Date(NOW_MS - 6 * 60_000),
+    });
+    const makeReservation = (reservationId: string, createdMs: number) =>
+      reserveCloudInferenceTokens(fixture, {
+        tenantId: "tenant-a",
+        reservationId,
+        provider: "openai",
+        model: "gpt-4o-mini",
+        inputTokens: 10,
+        maxOutputTokens: 10,
+        now: new Date(createdMs),
+      });
+
+    assert.equal(
+      (await makeReservation("stale-reservation", NOW_MS - 6 * 60_000)).kind,
+      "reserved"
+    );
+    assert.equal(
+      (await makeReservation("recent-reservation", NOW_MS - 4 * 60_000)).kind,
+      "reserved"
+    );
+    assert.equal((await makeReservation("active-reservation", NOW_MS)).kind, "reserved");
+
+    assert.equal(
+      await cleanupStaleCloudInferenceReservations(fixture, { now: new Date(NOW_MS) }),
+      1
+    );
+    const rows = fixture.db
+      .prepare(
+        "SELECT reservation_id, status FROM cloud_inference_reservations ORDER BY reservation_id"
+      )
+      .all() as Array<{ reservation_id: string; status: string }>;
+    assert.deepEqual(
+      rows.map((row) => ({ reservation_id: row.reservation_id, status: row.status })),
+      [
+        { reservation_id: "active-reservation", status: "reserved" },
+        { reservation_id: "recent-reservation", status: "reserved" },
+        { reservation_id: "stale-reservation", status: "settled" },
+      ]
+    );
+    const stale = fixture.db
+      .prepare(
+        `SELECT actual_input_tokens, actual_output_tokens, actual_tokens
+           FROM cloud_inference_reservations WHERE tenant_id = 'tenant-a'
+             AND reservation_id = 'stale-reservation'`
+      )
+      .get() as {
+      actual_input_tokens: number;
+      actual_output_tokens: number;
+      actual_tokens: number;
+    };
+    assert.deepEqual(
+      { ...stale },
+      {
+        actual_input_tokens: 10,
+        actual_output_tokens: 10,
+        actual_tokens: 20,
+      }
+    );
+    assert.deepEqual(await getCloudInferenceBudgetStatus(fixture, "tenant-a", new Date(NOW_MS)), {
+      tenantId: "tenant-a",
+      monthUtc: "2026-10",
+      monthlyTokenLimit: 1000,
+      reservedTokens: 40,
+      settledTokens: 20,
+      consumedTokens: 60,
+      remainingTokens: 940,
+    });
+    assert.equal(
+      (await makeReservation("stale-reservation", NOW_MS)).kind,
+      "replay",
+      "cleanup preserves the idempotency row and cannot retry an uncertain provider operation"
+    );
+    const replay = await reserveCloudInferenceTokens(fixture, {
+      tenantId: "tenant-a",
+      reservationId: "stale-reservation",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      inputTokens: 10,
+      maxOutputTokens: 10,
+      now: new Date(NOW_MS),
+    });
+    assert.equal(replay.kind, "replay");
+    if (replay.kind === "replay") assert.equal(replay.reservation.status, "settled");
+  } finally {
+    fixture.db.close();
+  }
+});
+
+test("stale inference cleanup settles no more than the configured batch", async () => {
+  const fixture = new SqliteD1();
+  try {
+    await setCloudInferenceMonthlyBudget(fixture, {
+      tenantId: "tenant-a",
+      monthlyTokenLimit: 1000,
+      now: new Date(NOW_MS - 10 * 60_000),
+    });
+    await setCloudInferenceEntitlement(fixture, {
+      tenantId: "tenant-a",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 100,
+      now: new Date(NOW_MS - 10 * 60_000),
+    });
+    for (let index = 0; index < 5; index += 1) {
+      await reserveCloudInferenceTokens(fixture, {
+        tenantId: "tenant-a",
+        reservationId: `abandoned-${index}`,
+        provider: "openai",
+        model: "gpt-4o-mini",
+        inputTokens: 10,
+        maxOutputTokens: 10,
+        now: new Date(NOW_MS - 10 * 60_000),
+      });
+    }
+    assert.equal(
+      await cleanupStaleCloudInferenceReservations(fixture, {
+        now: new Date(NOW_MS),
+        batchSize: 2,
+      }),
+      2
+    );
+    assert.equal(
+      await cleanupStaleCloudInferenceReservations(fixture, {
+        now: new Date(NOW_MS),
+        batchSize: 2,
+      }),
+      2
+    );
+    assert.equal(
+      await cleanupStaleCloudInferenceReservations(fixture, {
+        now: new Date(NOW_MS),
+        batchSize: 2,
+      }),
+      1
+    );
+    assert.equal(
+      await cleanupStaleCloudInferenceReservations(fixture, {
+        now: new Date(NOW_MS),
+        batchSize: 2,
+      }),
+      0
+    );
+    const settled = fixture.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_inference_reservations WHERE status = 'settled'"
+      )
+      .get() as { count: number };
+    assert.equal(settled.count, 5);
   } finally {
     fixture.db.close();
   }

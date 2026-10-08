@@ -47,6 +47,13 @@ import type {
   GatewayDurableObjectNamespace,
 } from "./connectorGatewayDurableObject";
 import { CloudCredentialEncryptionError, encryptCloudCredential } from "./credentialEncryption";
+import {
+  getCloudInferenceBudgetStatus,
+  listCloudInferenceEntitlements,
+  setCloudInferenceEntitlement,
+  setCloudInferenceMonthlyBudget,
+  type CloudInferenceEntitlement,
+} from "./inferencePolicy";
 
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
@@ -54,6 +61,8 @@ export interface CloudApiOptions {
   db?: CloudDb;
   /** Privileged server-to-server token. Never expose this value to browser clients. */
   adminToken?: string;
+  /** Optional token limited to tenant provisioning and lifecycle operations. */
+  maintenanceToken?: string;
   /** Base64-encoded 32-byte secret used only by the Worker credential envelope. */
   credentialEncryptionKey?: string;
   sessions?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
@@ -425,13 +434,30 @@ export async function handleCloudApiRequest(
   request: Request,
   options: CloudApiOptions
 ): Promise<Response> {
-  if (!options.adminToken) return json({ error: "Cloud API is not configured" }, 503);
-  if (!authorized(request, options.adminToken)) return json({ error: "Unauthorized" }, 401);
-  if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
-  if (request.method === "OPTIONS") return json({ error: "Method not allowed" }, 405);
-
+  if (
+    options.adminToken &&
+    options.maintenanceToken &&
+    options.adminToken === options.maintenanceToken
+  ) {
+    return json({ error: "Cloud API is not configured" }, 503);
+  }
   const segments = decodeSegments(new URL(request.url).pathname);
   if (!segments) return json({ error: "Malformed path" }, 400);
+  const maintenanceRoute =
+    (segments.length === 0 && request.method === "POST") ||
+    (segments.length === 2 &&
+      segments[1] === "status" &&
+      (request.method === "GET" || request.method === "POST"));
+  const isMaintenanceToken =
+    maintenanceRoute && !!options.maintenanceToken && authorized(request, options.maintenanceToken);
+  const isAdminToken = !!options.adminToken && authorized(request, options.adminToken);
+  if (!options.adminToken && !(maintenanceRoute && options.maintenanceToken)) {
+    return json({ error: "Cloud API is not configured" }, 503);
+  }
+  if (!isAdminToken && !isMaintenanceToken) return json({ error: "Unauthorized" }, 401);
+  const auditActor = isMaintenanceToken && !isAdminToken ? "cloud-maintenance" : "cloud-admin";
+  if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
+  if (request.method === "OPTIONS") return json({ error: "Method not allowed" }, 405);
   const db = options.db;
   const now = options.now ?? (() => new Date());
 
@@ -488,7 +514,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp,
           action: "customer.membership.create",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: tenantId,
           resourceType: "customer-membership",
           status: "attempted",
@@ -506,7 +532,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp: now().toISOString(),
           action: "customer.membership.create",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: membership.id,
           resourceType: "customer-membership",
           status: "success",
@@ -543,7 +569,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp,
           action: "customer.membership.update",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: resourceId,
           resourceType: "customer-membership",
           status: "attempted",
@@ -569,7 +595,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp: now().toISOString(),
           action: "customer.membership.update",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: membership.id,
           resourceType: "customer-membership",
           status: "success",
@@ -596,7 +622,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp,
           action: "customer.api-key.issue",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: tenantId,
           resourceType: "customer-api-key",
           status: "attempted",
@@ -614,7 +640,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp: now().toISOString(),
           action: "customer.api-key.issue",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: key.id,
           resourceType: "customer-api-key",
           status: "success",
@@ -633,7 +659,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp,
           action: "customer.api-key.revoke",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: resourceId,
           resourceType: "customer-api-key",
           status: "attempted",
@@ -651,7 +677,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp: now().toISOString(),
           action: "customer.api-key.revoke",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: resourceId,
           resourceType: "customer-api-key",
           status: "success",
@@ -698,7 +724,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp,
           action: "tenant.lifecycle.status",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: target.id,
           resourceType: "tenant",
           status: "attempted",
@@ -732,7 +758,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp: now().toISOString(),
           action: "tenant.lifecycle.status",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: target.id,
           resourceType: "tenant",
           status: "success",
@@ -767,7 +793,7 @@ export async function handleCloudApiRequest(
           tenantId: CLOUD_PLATFORM_TENANT_ID,
           timestamp: now().toISOString(),
           action: "cloud.api.post",
-          actor: "cloud-admin",
+          actor: auditActor,
           target: "tenants",
           resourceType: "cloud-api",
           status: "attempted",
@@ -810,7 +836,7 @@ export async function handleCloudApiRequest(
             tenantId: CLOUD_PLATFORM_TENANT_ID,
             timestamp: now().toISOString(),
             action: "customer.provision",
-            actor: "cloud-admin",
+            actor: auditActor,
             target: provisioned.tenant.id,
             resourceType: "customer-tenant",
             status: "success",
@@ -866,7 +892,7 @@ export async function handleCloudApiRequest(
     // The route's tenant is a requested resource, not an authenticated identity.
     // This API is currently only available to the configured server-side admin
     // token; resolve the target against D1 before using it as a tenant partition.
-    if (["POST", "PATCH", "DELETE"].includes(request.method)) {
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
       try {
         await appendCloudComplianceAudit(db, {
           id: crypto.randomUUID(),
@@ -883,6 +909,136 @@ export async function handleCloudApiRequest(
       } catch {
         return json({ error: "Cloud API audit storage is unavailable" }, 503);
       }
+    }
+
+    if (
+      (collection === "inference-entitlements" || collection === "inference-budget") &&
+      segments.length === 2
+    ) {
+      const targetTenant = await getCloudTenantById(db, tenantId);
+      if (!targetTenant || targetTenant.kind !== "customer") {
+        return json({ error: "Tenant not found" }, 404);
+      }
+
+      if (collection === "inference-entitlements") {
+        if (request.method === "GET") {
+          return json(await listCloudInferenceEntitlements(db, tenantId));
+        }
+        if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
+
+        const body = validateFields(
+          await readBody(request),
+          ["provider", "model", "enabled", "maxInputTokens", "maxOutputTokens"],
+          ["provider", "model", "enabled", "maxInputTokens", "maxOutputTokens"]
+        );
+        if (typeof body.provider !== "string") throw new ApiError(400, "Invalid provider");
+        if (typeof body.model !== "string") throw new ApiError(400, "Invalid model");
+        if (typeof body.enabled !== "boolean") {
+          throw new ApiError(400, "enabled must be a boolean");
+        }
+        if (
+          typeof body.maxInputTokens !== "number" ||
+          !Number.isSafeInteger(body.maxInputTokens) ||
+          body.maxInputTokens < 0
+        ) {
+          throw new ApiError(400, "maxInputTokens must be a non-negative safe integer");
+        }
+        if (
+          typeof body.maxOutputTokens !== "number" ||
+          !Number.isSafeInteger(body.maxOutputTokens) ||
+          body.maxOutputTokens < 0
+        ) {
+          throw new ApiError(400, "maxOutputTokens must be a non-negative safe integer");
+        }
+
+        let entitlement: CloudInferenceEntitlement;
+        try {
+          entitlement = await setCloudInferenceEntitlement(db, {
+            tenantId,
+            provider: body.provider,
+            model: body.model,
+            enabled: body.enabled,
+            maxInputTokens: body.maxInputTokens,
+            maxOutputTokens: body.maxOutputTokens,
+            now: now(),
+          });
+        } catch (error) {
+          if (error instanceof TypeError || error instanceof RangeError) {
+            throw new ApiError(400, error.message);
+          }
+          throw error;
+        }
+        try {
+          await appendCloudComplianceAudit(db, {
+            id: crypto.randomUUID(),
+            tenantId,
+            timestamp: now().toISOString(),
+            action: "cloud.inference.entitlement.configure",
+            actor: auditActor,
+            target: `${entitlement.provider}/${entitlement.model}`,
+            resourceType: "cloud-inference-entitlement",
+            status: "success",
+            requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+            metadata: {
+              enabled: entitlement.enabled,
+              maxInputTokens: entitlement.maxInputTokens,
+              maxOutputTokens: entitlement.maxOutputTokens,
+            },
+          });
+        } catch {
+          return json(
+            { error: "Inference entitlement changed but audit confirmation failed" },
+            503
+          );
+        }
+        return json(entitlement);
+      }
+
+      if (request.method === "GET") {
+        return json(await getCloudInferenceBudgetStatus(db, tenantId, now()));
+      }
+      if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
+      const body = validateFields(
+        await readBody(request),
+        ["monthlyTokenLimit"],
+        ["monthlyTokenLimit"]
+      );
+      if (
+        typeof body.monthlyTokenLimit !== "number" ||
+        !Number.isSafeInteger(body.monthlyTokenLimit) ||
+        body.monthlyTokenLimit < 0
+      ) {
+        throw new ApiError(400, "monthlyTokenLimit must be a non-negative safe integer");
+      }
+      try {
+        await setCloudInferenceMonthlyBudget(db, {
+          tenantId,
+          monthlyTokenLimit: body.monthlyTokenLimit,
+          now: now(),
+        });
+      } catch (error) {
+        if (error instanceof TypeError || error instanceof RangeError) {
+          throw new ApiError(400, error.message);
+        }
+        throw error;
+      }
+      try {
+        await appendCloudComplianceAudit(db, {
+          id: crypto.randomUUID(),
+          tenantId,
+          timestamp: now().toISOString(),
+          action: "cloud.inference.budget.configure",
+          actor: auditActor,
+          target: "monthly-token-budget",
+          resourceType: "cloud-inference-budget",
+          status: "success",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: { monthlyTokenLimit: body.monthlyTokenLimit },
+        });
+      } catch {
+        return json({ error: "Inference budget changed but audit confirmation failed" }, 503);
+      }
+      return json(await getCloudInferenceBudgetStatus(db, tenantId, now()));
     }
 
     if (collection === "provider-connections") {

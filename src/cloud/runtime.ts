@@ -12,6 +12,7 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_BUILD_SHA?: string;
   DB?: CloudDb;
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
   GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
 }
@@ -170,6 +171,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         return handleCloudApiRequest(request, {
           db: options.env?.DB,
           adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+          maintenanceToken: options.env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN,
           credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
           sessions: options.env?.GATEWAY_SESSIONS,
           now,

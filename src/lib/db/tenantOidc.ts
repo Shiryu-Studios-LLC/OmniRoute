@@ -156,9 +156,10 @@ export function setTenantOidcConfig(input: {
   const db = getDbInstance();
   const existing = db
     .prepare(
-      "SELECT created_at, client_secret_encrypted FROM tenant_oidc_configs WHERE tenant_id = ?"
+      "SELECT issuer, created_at, client_secret_encrypted FROM tenant_oidc_configs WHERE tenant_id = ?"
     )
-    .get(tenantId) as { created_at: string; client_secret_encrypted: string } | undefined;
+    .get(tenantId) as
+    { issuer: string; created_at: string; client_secret_encrypted: string } | undefined;
   const encryptedSecret = data.clientSecret
     ? encryptClientSecret(data.clientSecret)
     : existing?.client_secret_encrypted;
@@ -166,8 +167,12 @@ export function setTenantOidcConfig(input: {
     throw new Error("OIDC client secret is required when creating tenant OIDC configuration");
   }
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO tenant_oidc_configs
+  const saveConfig = db.transaction(() => {
+    if (existing && existing.issuer !== data.issuer) {
+      db.prepare("DELETE FROM tenant_oidc_identities WHERE tenant_id = ?").run(tenantId);
+    }
+    db.prepare(
+      `INSERT INTO tenant_oidc_configs
        (tenant_id, issuer, client_id, client_secret_encrypted, scopes_json, is_enabled, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(tenant_id) DO UPDATE SET
@@ -177,16 +182,18 @@ export function setTenantOidcConfig(input: {
        scopes_json = excluded.scopes_json,
        is_enabled = excluded.is_enabled,
        updated_at = excluded.updated_at`
-  ).run(
-    tenantId,
-    data.issuer,
-    data.clientId,
-    encryptedSecret,
-    JSON.stringify(data.scopes ?? ["openid", "profile", "email"]),
-    data.isEnabled === true ? 1 : 0,
-    existing?.created_at ?? now,
-    now
-  );
+    ).run(
+      tenantId,
+      data.issuer,
+      data.clientId,
+      encryptedSecret,
+      JSON.stringify(data.scopes ?? ["openid", "profile", "email"]),
+      data.isEnabled === true ? 1 : 0,
+      existing?.created_at ?? now,
+      now
+    );
+  });
+  saveConfig();
   const config = getTenantOidcConfig();
   if (!config) throw new Error("Failed to store tenant OIDC configuration");
   return config;
@@ -226,11 +233,13 @@ export function disableTenantOidcConfig(): TenantOidcConfig | null {
 /** Delete the current tenant's OIDC configuration. */
 export function deleteTenantOidcConfig(tenantId?: string): boolean {
   const scopedTenantId = assertTenantScope(tenantId);
-  return (
-    getDbInstance()
-      .prepare("DELETE FROM tenant_oidc_configs WHERE tenant_id = ?")
-      .run(scopedTenantId).changes > 0
-  );
+  const db = getDbInstance();
+  const removeConfig = db.transaction(() => {
+    db.prepare("DELETE FROM tenant_oidc_identities WHERE tenant_id = ?").run(scopedTenantId);
+    return db.prepare("DELETE FROM tenant_oidc_configs WHERE tenant_id = ?").run(scopedTenantId)
+      .changes;
+  });
+  return removeConfig() > 0;
 }
 
 /** Add an externally verified identity mapping for the current tenant. */
@@ -271,9 +280,14 @@ export function getTenantOidcIdentityByIssuerSubject(
   const parsedSubject = z.string().min(1).max(512).parse(subject);
   const row = getDbInstance()
     .prepare(
-      `SELECT id, tenant_id, issuer, subject, principal_id, created_at
-       FROM tenant_oidc_identities
-       WHERE tenant_id = ? AND issuer = ? AND subject = ? LIMIT 1`
+      `SELECT identity.id, identity.tenant_id, identity.issuer, identity.subject,
+              identity.principal_id, identity.created_at
+       FROM tenant_oidc_identities AS identity
+       INNER JOIN tenant_oidc_configs AS config
+         ON config.tenant_id = identity.tenant_id
+        AND config.issuer = identity.issuer
+        AND config.is_enabled = 1
+       WHERE identity.tenant_id = ? AND identity.issuer = ? AND identity.subject = ? LIMIT 1`
     )
     .get(currentDbTenantId(), parsedIssuer, parsedSubject) as IdentityRow | undefined;
   return row ? toIdentity(row) : null;

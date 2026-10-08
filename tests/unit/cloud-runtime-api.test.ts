@@ -190,6 +190,18 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
   }
 
   async run() {
+    if (this.sql.startsWith("INSERT INTO tenants")) {
+      const [id, name, slug, createdAt, updatedAt] = this.values;
+      this.database.tenants.push({
+        id: String(id),
+        name: String(name),
+        slug: String(slug),
+        kind: "customer",
+        is_active: 1,
+        created_at: String(createdAt),
+        updated_at: String(updatedAt),
+      });
+    }
     if (this.sql.startsWith("INSERT INTO provider_connections")) {
       const fields = [
         "id",
@@ -323,12 +335,14 @@ const cloudCredentialKey = Buffer.alloc(32, 7).toString("base64");
 function runtime(
   db = new TestD1(),
   adminRateLimit?: { limit: number; windowMs: number },
-  credentialEncryptionKey?: string
+  credentialEncryptionKey?: string,
+  maintenanceToken?: string
 ) {
   return createCloudRuntime({
     env: {
       DB: db,
       OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: credentialEncryptionKey,
     },
     adminRateLimit,
@@ -343,6 +357,62 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
     request("/__cloud/v1/tenants/tenant-a", "wrong-token")
   );
   assert.equal(response.status, 401);
+});
+
+test("maintenance identity can provision and inspect tenant lifecycle but cannot access cloud CRUD", async () => {
+  const db = new TestD1();
+  const app = runtime(db, undefined, undefined, "test-cloud-maintenance-secret");
+  const provision = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-cloud-maintenance-secret",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ id: "tenant-maintained", name: "Maintained", slug: "maintained" }),
+    })
+  );
+  assert.equal(provision.status, 201);
+  assert.equal(db.auditRows[0][4], "cloud-maintenance");
+
+  const lifecycle = await app.fetch(
+    request("/__cloud/v1/tenants/tenant-a/status", "test-cloud-maintenance-secret")
+  );
+  assert.equal(lifecycle.status, 200);
+
+  const providerRead = await app.fetch(
+    request(
+      "/__cloud/v1/tenants/tenant-a/provider-connections/alpha-openai",
+      "test-cloud-maintenance-secret"
+    )
+  );
+  assert.equal(providerRead.status, 401);
+
+  const membershipMutation = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants/tenant-a/memberships", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-cloud-maintenance-secret",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ principalId: "principal-a", role: "owner" }),
+    })
+  );
+  assert.equal(membershipMutation.status, 401);
+});
+
+test("cloud admin API fails closed when admin and maintenance tokens are identical", async () => {
+  const app = createCloudRuntime({
+    env: {
+      DB: new TestD1(),
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: "shared-cloud-token",
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: "shared-cloud-token",
+    },
+  });
+  const providerRead = await app.fetch(
+    request("/__cloud/v1/tenants/tenant-a/provider-connections/alpha-openai", "shared-cloud-token")
+  );
+  assert.equal(providerRead.status, 503);
 });
 
 test("provider connection reads remain tenant-scoped and redact credentials", async () => {

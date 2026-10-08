@@ -152,7 +152,43 @@ test("tenant identity mappings use exact issuer/subject and remain isolated", ()
     null,
     "issuer comparison must remain exact"
   );
-  assert.equal(asTenant("tenant_oidc_b", () => oidc.listTenantOidcIdentities()).length, 0);
+  assert.equal(
+    asTenant("tenant_oidc_b", () =>
+      oidc.getTenantOidcIdentityByIssuerSubject("https://idp.example.com/realms/acme", "user-123")
+    ),
+    null,
+    "lookup must be limited to the active tenant"
+  );
+  asTenant("tenant_oidc_b", () =>
+    oidc.setTenantOidcConfig({
+      issuer: "https://idp.example.com/realms/acme",
+      clientId: "acme-client-b",
+      clientSecret: "tenant-b-oidc-secret",
+      isEnabled: true,
+    })
+  );
+  const identityB = asTenant("tenant_oidc_b", () =>
+    oidc.addTenantOidcIdentity({
+      issuer: "https://idp.example.com/realms/acme",
+      subject: "user-123",
+      principalId: "principal-acme-b-123",
+    })
+  );
+  assert.equal(identityB.tenantId, "tenant_oidc_b");
+  assert.equal(identityB.principalId, "principal-acme-b-123");
+  assert.equal(asTenant("tenant_oidc_b", () => oidc.listTenantOidcIdentities()).length, 1);
+  assert.throws(
+    () =>
+      asTenant("tenant_oidc_a", () =>
+        oidc.addTenantOidcIdentity({
+          issuer: "https://idp.example.com/realms/acme",
+          subject: "user-123",
+          email: "user@example.com",
+        } as Parameters<typeof oidc.addTenantOidcIdentity>[0])
+      ),
+    /Unrecognized key/i,
+    "email is not a linking key or supported auto-join attribute"
+  );
   assert.throws(
     () =>
       asTenant("tenant_oidc_a", () =>
@@ -196,6 +232,55 @@ test("tenant OIDC identity links reject unconfigured, disabled, and mismatched i
   );
   assert.throws(() => add("https://idp.example.com/realms/other"), /enabled OIDC configuration/i);
   assert.equal(asTenant("tenant_oidc_a", () => oidc.listTenantOidcIdentities()).length, 0);
+});
+
+test("changing or disabling an issuer cannot leave stale identity links usable", () => {
+  createTenants();
+  asTenant("tenant_oidc_a", () =>
+    oidc.setTenantOidcConfig({
+      issuer: "https://idp.example.com/realms/acme",
+      clientId: "acme-client",
+      clientSecret: "tenant-a-oidc-secret",
+      isEnabled: true,
+    })
+  );
+  asTenant("tenant_oidc_a", () =>
+    oidc.addTenantOidcIdentity({
+      issuer: "https://idp.example.com/realms/acme",
+      subject: "user-123",
+    })
+  );
+
+  asTenant("tenant_oidc_a", () => oidc.disableTenantOidcConfig());
+  assert.equal(
+    asTenant("tenant_oidc_a", () =>
+      oidc.getTenantOidcIdentityByIssuerSubject("https://idp.example.com/realms/acme", "user-123")
+    ),
+    null
+  );
+
+  asTenant("tenant_oidc_a", () =>
+    oidc.setTenantOidcConfig({
+      issuer: "https://idp.example.com/realms/other",
+      clientId: "other-client",
+      isEnabled: true,
+    })
+  );
+  assert.equal(asTenant("tenant_oidc_a", () => oidc.listTenantOidcIdentities()).length, 0);
+  asTenant("tenant_oidc_a", () =>
+    oidc.setTenantOidcConfig({
+      issuer: "https://idp.example.com/realms/acme",
+      clientId: "acme-client",
+      isEnabled: true,
+    })
+  );
+  assert.equal(
+    asTenant("tenant_oidc_a", () =>
+      oidc.getTenantOidcIdentityByIssuerSubject("https://idp.example.com/realms/acme", "user-123")
+    ),
+    null,
+    "changing issuers must remove the previous issuer's identity links"
+  );
 });
 
 test("tenant OIDC config refuses storage without configured encryption", () => {

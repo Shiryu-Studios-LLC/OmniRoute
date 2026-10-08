@@ -4,12 +4,14 @@ import {
   type GatewayCoordinatorStub,
 } from "../src/cloud/connectorGatewayDurableObject";
 import { cleanupExpiredCloudRateLimits } from "../src/cloud/rateLimit";
+import { cleanupStaleCloudInferenceReservations } from "../src/cloud/inferencePolicy";
 import { createCloudRuntime } from "../src/cloud/runtime";
 
 type CloudflareEnv = Env & {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
 };
 
@@ -72,6 +74,7 @@ const worker = {
         OMNIROUTE_ENV: env.OMNIROUTE_ENV,
         OMNIROUTE_BUILD_SHA: env.OMNIROUTE_BUILD_SHA,
         OMNIROUTE_CLOUD_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+        OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: env.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN,
         OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
         DB: env.DB,
         GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,
@@ -79,7 +82,12 @@ const worker = {
     }).fetch(request);
   },
   scheduled(_controller: ScheduledController, env: CloudflareEnv, context: ExecutionContext): void {
-    context.waitUntil(cleanupExpiredCloudRateLimits(env.DB));
+    context.waitUntil(
+      Promise.all([
+        cleanupExpiredCloudRateLimits(env.DB),
+        cleanupStaleCloudInferenceReservations(env.DB),
+      ]).then(() => undefined)
+    );
   },
 };
 

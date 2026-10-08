@@ -236,14 +236,25 @@ The repository includes a manual-only GitHub Actions workflow at
 configure production routes or custom domains. Configure a protected GitHub
 Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`,
-`OMNIROUTE_CLOUD_ADMIN_TOKEN`, and `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`.
+`OMNIROUTE_CLOUD_ADMIN_TOKEN`, `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN`, and
+`OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`. Both cloud tokens must be distinct,
+32–512 URL-safe characters, and are required by the manual staging workflow. The
+admin token retains the full server-side cloud API scope. The maintenance token
+is limited to customer tenant provisioning and tenant lifecycle inspection or
+suspension/resumption; it cannot access provider, gateway, customer membership,
+or API-key management routes. Tenant lifecycle mutation events, provisioning
+request attempts, and successful owner-provisioning events are attributed to
+`cloud-maintenance`. The workflow validates that the tokens differ, binds both
+through `wrangler secret put` using stdin, and checks that the maintenance token
+works on a lifecycle route while being rejected on provider CRUD.
+
 The credential key must be a base64-encoded 32-byte key used only for Cloud
 credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The Worker
 fails provider credential writes with a sanitized 503 if this key is missing or
 invalid. The D1 ID must resolve through the Cloudflare API
 to a database named exactly `omniroute-cloud-runtime-staging`. The workflow binds
-the admin and credential-encryption secrets through `wrangler secret put` using
-stdin. It applies pending D1
+the admin, maintenance, and credential-encryption secrets through `wrangler
+secret put` using stdin. It applies pending D1
 migrations and checks `/__cloud/health`, `/__cloud/db`, `/__cloud/readiness`, and
 `/__cloud/runtime` after deployment. It also checks that the cloud admin API rejects
 an unauthenticated request and accepts the configured token without creating a
