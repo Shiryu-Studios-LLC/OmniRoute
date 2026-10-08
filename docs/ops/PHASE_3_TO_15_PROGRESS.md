@@ -10,7 +10,7 @@ Last updated: 2026-10-08
 
 - Active worktree: `/home/okashi/.devspace/worktrees/OmniRoute-e1d58cf1`
 - Branch: `feat/cloudflare-runtime-readiness`
-- Latest pushed OmniRoute implementation slice is `d4d352edc` (`feat: discover local models from loopback defaults`), following `b4cb3da4c` (`feat: verify cloud readiness and tenant gateway isolation`) and `5ab79f7fb` (`fix: protect shared cache and gateway state`). Earlier slices include tenant cache/quota/reasoning isolation and gateway request replay (`9ad3b2410`), tenant provisioning (`43018c585`), and Ollama usage telemetry (`ed214e68b`). The separate Front Desk contract and stable idempotency forwarding are pushed in `9828390` and `9f086fe`. Phase acceptance remains partial as the table describes.
+- Latest pushed OmniRoute implementation commits are `2a0b84d91` (tenant defaults and local service health) and `b1dce6b80` (deterministic egress lookup ordering), with progress evidence in `d10c66a91`. Earlier slices include local discovery defaults (`d4d352edc`), Cloud readiness and tenant gateway isolation (`b4cb3da4c`), shared cache and gateway state (`5ab79f7fb`), tenant cache/quota/reasoning isolation and gateway request replay (`9ad3b2410`), tenant provisioning (`43018c585`), and Ollama usage telemetry (`ed214e68b`). The separate Front Desk contract and stable idempotency forwarding are pushed in `9828390` and `9f086fe`. Phase acceptance remains partial as the table describes.
 - Current phase: integrated validation and Cloudflare runtime readiness
 - Pushed implementation slices touch Phases 3–14; the phase table below is the status source of truth.
 - Tenant-derived usage telemetry for successful local Ollama chat invocations is device-reported and is not a trusted billing source.
