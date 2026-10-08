@@ -1,4 +1,8 @@
-# OmniRoute Cloudflare Workers Production Plan
+---
+title: "OmniRoute Cloudflare Workers Production Plan"
+version: 3.8.50
+lastUpdated: 2026-10-07
+---
 
 ## Objective
 
@@ -46,7 +50,7 @@ so customer GPUs can later be replaced by Shiryu-hosted infrastructure without c
 
 ## Workstreams
 
-### 0. Cloudflare compatibility audit — NEXT
+### 0. Cloudflare compatibility audit — COMPLETE
 
 - Inventory all imports and runtime APIs used by the production request path.
 - Classify code as Worker-safe, Worker-adaptable, or local-only.
@@ -58,7 +62,7 @@ so customer GPUs can later be replaced by Shiryu-hosted infrastructure without c
 
 **Exit:** a documented list of blockers with tests proving the selected production request path is Worker-compatible.
 
-### 1. Cloud runtime boundary
+### 1. Cloud runtime boundary — COMPLETE (isolated boundary)
 
 - Create a cloud-safe application/runtime entry point.
 - Keep Next.js/OpenNext as the initial deployment target for the existing application.

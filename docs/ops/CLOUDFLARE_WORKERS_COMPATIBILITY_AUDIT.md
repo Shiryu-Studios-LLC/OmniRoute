@@ -1,4 +1,8 @@
-# Cloudflare Workers Compatibility Audit
+---
+title: "Cloudflare Workers Compatibility Audit"
+version: 3.8.50
+lastUpdated: 2026-10-07
+---
 
 ## Scope
 
@@ -57,32 +61,32 @@ The current application is **not Worker-ready as one bundle**.
 
 ## Runtime classification
 
-| Area | Target | Status |
-| --- | --- | --- |
-| OpenAI-compatible HTTP API | Worker | Ready conceptually; needs cloud build |
-| Authentication | Worker | Adaptable |
-| Tenant context | Worker | Adaptable; verify request isolation |
-| Provider routing | Worker | Adaptable |
-| HTTP provider executors | Worker | Candidate; audit each executor |
-| Streaming | Worker | Candidate |
-| API-key policy | Worker | Adaptable |
-| Provider CRUD | Worker + D1 | Blocked on D1 adapter |
-| Tenant/provider state | Worker + D1 | Blocked on D1 adapter |
-| Cache | KV/DO/D1 as appropriate | Needs classification |
-| Rate limiting | DO/KV/Cloudflare service | Needs design |
-| Circuit breakers | D1/DO/KV | Needs design |
-| MCP cloud transport | Worker/DO | Needs classification |
-| Local MCP | Local Agent | Do not move into Worker |
-| Ollama | Customer machine | Local |
-| ComfyUI | Customer machine | Local |
-| Local Agent | Customer machine | Future |
-| Device connections | Durable Objects | Future |
-| `connect.shiryu.org` | Cloudflare | Future |
-| MITM proxy | Local-only | Exclude |
-| OS/process management | Local-only | Exclude |
-| Desktop/Electron | Local-only | Exclude |
-| Local SQLite file | Local-only | Replace for cloud |
-| Cloudflare tunnel management | Local Agent/operator tooling | Exclude from cloud Worker |
+| Area                         | Target                       | Status                                |
+| ---------------------------- | ---------------------------- | ------------------------------------- |
+| OpenAI-compatible HTTP API   | Worker                       | Ready conceptually; needs cloud build |
+| Authentication               | Worker                       | Adaptable                             |
+| Tenant context               | Worker                       | Adaptable; verify request isolation   |
+| Provider routing             | Worker                       | Adaptable                             |
+| HTTP provider executors      | Worker                       | Candidate; audit each executor        |
+| Streaming                    | Worker                       | Candidate                             |
+| API-key policy               | Worker                       | Adaptable                             |
+| Provider CRUD                | Worker + D1                  | Blocked on D1 adapter                 |
+| Tenant/provider state        | Worker + D1                  | Blocked on D1 adapter                 |
+| Cache                        | KV/DO/D1 as appropriate      | Needs classification                  |
+| Rate limiting                | DO/KV/Cloudflare service     | Needs design                          |
+| Circuit breakers             | D1/DO/KV                     | Needs design                          |
+| MCP cloud transport          | Worker/DO                    | Needs classification                  |
+| Local MCP                    | Local Agent                  | Do not move into Worker               |
+| Ollama                       | Customer machine             | Local                                 |
+| ComfyUI                      | Customer machine             | Local                                 |
+| Local Agent                  | Customer machine             | Future                                |
+| Device connections           | Durable Objects              | Future                                |
+| `connect.shiryu.org`         | Cloudflare                   | Future                                |
+| MITM proxy                   | Local-only                   | Exclude                               |
+| OS/process management        | Local-only                   | Exclude                               |
+| Desktop/Electron             | Local-only                   | Exclude                               |
+| Local SQLite file            | Local-only                   | Replace for cloud                     |
+| Cloudflare tunnel management | Local Agent/operator tooling | Exclude from cloud Worker             |
 
 ## Immediate engineering sequence
 
@@ -101,14 +105,30 @@ The GitHub repository should remain the source of truth. Cloudflare should build
 
 The developer Linux machine remains useful for local development and customer-compute simulation, but the production cloud control plane must not depend on it.
 
-## Exit criteria for the audit phase
+## Phase 0/1 completion status
 
-The audit phase is complete when:
+Phase 0 (compatibility audit) and Phase 1 (cloud runtime boundary) are complete for the **isolated cloud runtime boundary**.
+
+Implemented in this cycle:
+
+- `cloudflare/worker.ts` is the explicit Worker entry point.
+- `src/cloud/runtime.ts` contains the first cloud-only runtime surface and imports no Node-only modules.
+- `scripts/check/check-cloudflare-boundary.mjs` recursively checks the Worker entry graph for forbidden Node built-ins.
+- `tests/unit/cloudflare-boundary.test.ts` verifies the Worker-safe health and runtime metadata endpoints.
+- `wrangler.jsonc` provides a reproducible Worker build target.
+- `open-next.config.ts` establishes the OpenNext deployment adapter for the eventual Next.js integration.
+- Wrangler dry-run measured the isolated boundary at **1.38 KiB upload / 0.60 KiB gzip**.
+
+The full Next.js/OpenNext application build was also exercised. It currently demonstrates the expected Phase 2+ blockers: the existing app graph imports SQLite, filesystem, child-process, MITM, tunnel, and other local-runtime modules. Those are not hidden or polyfilled into the Worker; they remain outside the cloud boundary and must be removed from the production request graph during the next cloud-runtime workstreams.
+
+## Exit criteria for Phase 0/1
 
 - A Worker-compatible entry point exists.
-- The selected API path builds without local-only modules.
-- A D1 integration boundary exists.
+- The isolated cloud request path builds with Wrangler without local-only imports.
 - Forbidden local-runtime imports are mechanically detected.
-- Bundle size is measured.
-- A staging deployment can answer a health request.
-- The cloud build does not alter the existing local deployment path.
+- The isolated Worker bundle size is measured.
+- A cloud health endpoint is executable in the Worker runtime.
+- OpenNext is configured as the initial Next.js integration target without replacing the existing local build.
+- The full Next.js graph remains explicitly tracked as **not yet cloud-compatible** rather than being incorrectly treated as Worker-ready.
+
+The next blocker is the cloud runtime/database boundary: move persistence behind an asynchronous D1-capable interface and progressively detach the request path from local SQLite and OS-only modules.
