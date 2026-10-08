@@ -91,6 +91,7 @@ next-env.d.ts
 # data and logs
 /data/
 .data/
+.wrangler/
 logs/*
 test_output.log
 
