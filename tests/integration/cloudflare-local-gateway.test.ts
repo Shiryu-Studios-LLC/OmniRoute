@@ -10,7 +10,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import type { LocalAgentGatewaySession } from "../../src/lib/localAgent/gatewayProtocol.js";
 import { createHttpLocalAgentGatewayTransport } from "../../src/lib/localAgent/httpGatewayTransport.js";
-import { discoverLocalCapabilities } from "../../src/lib/localAgent/localDiscovery.js";
+import {
+  discoverLocalCapabilities,
+  type LocalDiscoveryResult,
+} from "../../src/lib/localAgent/localDiscovery.js";
 import { runLocalAgentGatewayCycle } from "../../src/lib/localAgent/runner.js";
 
 const enabled = process.env.RUN_CLOUDFLARE_LOCAL_INT === "1";
@@ -528,6 +531,39 @@ test(
         [],
         "the reconnected session should poll successfully without stale queued work"
       );
+
+      const staleSession = customerA.session!;
+      assert.ok(await deviceTransport.connect(customerA.deviceId, customerA.credential));
+      const recovered = await runLocalAgentGatewayCycle(
+        {
+          gatewayUrl: baseUrl,
+          deviceId: customerA.deviceId,
+          credential: customerA.credential,
+        },
+        {
+          fetch,
+          gateway: deviceTransport,
+          discover: async (): Promise<LocalDiscoveryResult> => ({
+            heartbeat: {
+              status: "online",
+              capabilities: [capability],
+              serviceHealth: { ollama: false, comfyui: false },
+            },
+            services: [
+              { service: "ollama", reachable: false, models: [] },
+              { service: "comfyui", reachable: false, models: [] },
+            ],
+          }),
+        },
+        staleSession
+      );
+      assert.equal(recovered.processed, 0);
+      assert.equal(
+        await deviceTransport.heartbeat(staleSession, [capability]),
+        false,
+        "the session replaced during recovery must remain invalid"
+      );
+      customerA.session = recovered.session;
     });
 
     await t.test(
