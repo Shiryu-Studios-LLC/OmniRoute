@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
+import { cleanupExpiredCloudInferenceResponses } from "../../src/cloud/inferenceIdempotency";
 import {
+  cleanupSettledCloudInferenceReservations,
   getCloudInferenceBudgetStatus,
   getCloudInferenceEntitlement,
   releaseCloudInferenceReservation,
@@ -86,7 +88,14 @@ const NOW = "2026-10-08T12:00:00.000Z";
 
 async function makeDb(): Promise<SqliteCloudDb> {
   const db = new SqliteCloudDb();
-  for (const migration of ["0001_cloud_runtime.sql", "0010_cloud_inference_policy.sql"]) {
+  for (const migration of [
+    "0001_cloud_runtime.sql",
+    "0010_cloud_inference_policy.sql",
+    "0011_cloud_inference_idempotency.sql",
+    "0012_cloud_inference_idempotency_capacity.sql",
+    "0013_cloud_inference_idempotency_tombstone_retention.sql",
+    "0014_cloud_inference_reservation_retention.sql",
+  ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
   for (const [id, name, slug] of [
@@ -365,6 +374,171 @@ test("budgets, entitlements, reservations, and monthly totals are tenant and UTC
     assert.equal(
       (await getCloudInferenceBudgetStatus(db, "tenant-a", november)).reservedTokens,
       50
+    );
+  } finally {
+    db.db.close();
+  }
+});
+
+test("reservation retention honors month, age, active state, tombstone, and batch bounds", async () => {
+  const db = await makeDb();
+  try {
+    await configure(db, "tenant-a", 1000);
+    const september = "2026-09-01T12:00:00.000Z";
+    const september2 = "2026-09-02T12:00:00.000Z";
+    const september3 = "2026-09-03T12:00:00.000Z";
+    const october = "2026-10-20T12:00:00.000Z";
+    const november = "2026-11-05T12:00:00.000Z";
+    const terminal = async (reservationId: string, at: string) => {
+      assert.equal((await reserve(db, { reservationId, now: at })).kind, "reserved");
+      assert.equal(
+        (
+          await settleCloudInferenceReservation(db, {
+            tenantId: "tenant-a",
+            reservationId,
+            actualInputTokens: 8,
+            actualOutputTokens: 3,
+            now: at,
+          })
+        ).kind,
+        "updated"
+      );
+    };
+    await terminal("old-linked", september);
+    await terminal("old-unlinked-a", september2);
+    await terminal("old-unlinked-b", september3);
+    await terminal("recent-old-month", october);
+    assert.equal(
+      (await reserve(db, { reservationId: "old-released", now: september3 })).kind,
+      "reserved"
+    );
+    assert.equal(
+      (
+        await releaseCloudInferenceReservation(db, {
+          tenantId: "tenant-a",
+          reservationId: "old-released",
+          now: september3,
+        })
+      ).kind,
+      "updated"
+    );
+    assert.equal(
+      (await reserve(db, { reservationId: "old-active", now: september })).kind,
+      "reserved"
+    );
+    assert.equal(
+      (await reserve(db, { reservationId: "current-month", now: november })).kind,
+      "reserved"
+    );
+    assert.equal(
+      (
+        await settleCloudInferenceReservation(db, {
+          tenantId: "tenant-a",
+          reservationId: "current-month",
+          actualInputTokens: 5,
+          actualOutputTokens: 2,
+          now: november,
+        })
+      ).kind,
+      "updated"
+    );
+
+    const tombstoneCreated = Date.parse(september);
+    await db
+      .prepare(
+        `INSERT INTO cloud_inference_idempotency (
+      tenant_id, principal_id, api_key_id, idempotency_key_hash, request_hash, request_id,
+      claim_token, state, claimed_at_ms, claim_expires_at_ms, response_expires_at_ms,
+      response_status, response_body, created_at_ms, updated_at_ms, tombstone_expires_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'outcome_unavailable', ?, NULL, ?, NULL, NULL, ?, ?, ?)`
+      )
+      .bind(
+        "tenant-a",
+        "principal-a",
+        "api-key-a",
+        "a".repeat(64),
+        "b".repeat(64),
+        "old-linked",
+        tombstoneCreated,
+        tombstoneCreated,
+        tombstoneCreated,
+        tombstoneCreated,
+        tombstoneCreated + 30 * 24 * 60 * 60 * 1000
+      )
+      .run();
+
+    assert.equal(
+      await cleanupSettledCloudInferenceReservations(db, { now: november, batchSize: 1 }),
+      1
+    );
+    assert.ok(
+      await db
+        .prepare("SELECT 1 FROM cloud_inference_reservations WHERE reservation_id='old-linked'")
+        .first()
+    );
+    assert.ok(
+      await db
+        .prepare(
+          "SELECT 1 FROM cloud_inference_reservations WHERE reservation_id='recent-old-month'"
+        )
+        .first()
+    );
+    assert.ok(
+      await db
+        .prepare("SELECT 1 FROM cloud_inference_reservations WHERE reservation_id='current-month'")
+        .first()
+    );
+    assert.ok(
+      await db
+        .prepare("SELECT 1 FROM cloud_inference_reservations WHERE reservation_id='old-active'")
+        .first()
+    );
+
+    assert.equal(
+      await cleanupExpiredCloudInferenceResponses(db, {
+        nowMs: Date.parse(november),
+        batchSize: 10,
+      }),
+      1,
+      "the expired tombstone is removed first"
+    );
+    assert.equal(
+      await cleanupSettledCloudInferenceReservations(db, { now: november, batchSize: 1 }),
+      1
+    );
+    assert.equal(
+      await cleanupSettledCloudInferenceReservations(db, { now: november, batchSize: 1 }),
+      1
+    );
+    assert.equal(
+      await cleanupSettledCloudInferenceReservations(db, { now: november, batchSize: 1 }),
+      1
+    );
+    assert.equal(
+      await cleanupSettledCloudInferenceReservations(db, { now: november, batchSize: 1 }),
+      0
+    );
+
+    const retained = await db
+      .prepare<{ reservation_id: string; status: string }>(
+        "SELECT reservation_id,status FROM cloud_inference_reservations ORDER BY reservation_id"
+      )
+      .all();
+    assert.deepEqual(
+      retained.results.map((row) => [row.reservation_id, row.status]),
+      [
+        ["current-month", "settled"],
+        ["old-active", "reserved"],
+        ["recent-old-month", "settled"],
+      ]
+    );
+    const budget = await getCloudInferenceBudgetStatus(db, "tenant-a", november);
+    assert.equal(budget.reservedTokens, 0);
+    assert.equal(budget.settledTokens, 7);
+    assert.equal(
+      (await reserve(db, { reservationId: "current-month", now: november })).kind,
+      "replay",
+      "current-month reservation IDs remain replayable after retention cleanup"
     );
   } finally {
     db.db.close();

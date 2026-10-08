@@ -2,6 +2,7 @@ import type { CloudDb } from "./db";
 import { handleCloudApiRequest } from "./httpApi";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
+import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
 import type {
   GatewayCoordinatorStub,
   GatewayDurableObjectNamespace,
@@ -14,6 +15,7 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
+  OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
   GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
 }
 
@@ -24,6 +26,12 @@ export interface CloudRuntimeOptions {
   customerInvokeRateLimit?: { limit: number; windowMs: number };
   customerAuthFailureRateLimit?: { limit: number; windowMs: number };
   customerAuthFailureFallbackRateLimit?: { limit: number; windowMs: number };
+  cloudInferenceRateLimit?: { limit: number; windowMs: number };
+  cloudInferenceAuthFailureRateLimit?: { limit: number; windowMs: number };
+  cloudInferenceRequestBodyTimeoutMs?: number;
+  cloudInferenceCountTimeoutMs?: number;
+  cloudInferenceGenerationTimeoutMs?: number;
+  fetcher?: typeof fetch;
   gatewayConnectRateLimit?: { limit: number; windowMs: number };
   gatewayConnectFallbackRateLimit?: { limit: number; windowMs: number };
   gatewayDeviceRateLimits?: {
@@ -129,6 +137,28 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             headers: { "Cache-Control": "no-store" },
           }
         );
+      }
+
+      if (url.pathname === "/v1/chat/completions") {
+        try {
+          return await handleCloudInferenceCustomerRequest(request, {
+            db: options.env?.DB,
+            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            requestHashSecret: options.env?.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY,
+            now: () => now().getTime(),
+            fetcher: options.fetcher,
+            rateLimit: options.cloudInferenceRateLimit,
+            failedKeyRateLimit: options.cloudInferenceAuthFailureRateLimit,
+            requestBodyTimeoutMs: options.cloudInferenceRequestBodyTimeoutMs,
+            countTimeoutMs: options.cloudInferenceCountTimeoutMs,
+            generationTimeoutMs: options.cloudInferenceGenerationTimeoutMs,
+          });
+        } catch {
+          return Response.json(
+            { error: { message: "Cloud inference is unavailable", type: "cloud_inference_error" } },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
       }
 
       if (url.pathname.startsWith("/__gateway/v1/device/")) {

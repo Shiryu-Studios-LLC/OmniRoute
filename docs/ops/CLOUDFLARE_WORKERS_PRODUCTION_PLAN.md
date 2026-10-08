@@ -237,29 +237,54 @@ configure production routes or custom domains. Configure a protected GitHub
 Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`,
 `OMNIROUTE_CLOUD_ADMIN_TOKEN`, `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN`, and
-`OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`. Both cloud tokens must be distinct,
-32–512 URL-safe characters, and are required by the manual staging workflow. The
+`OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`, and
+`OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY`. Both cloud tokens must be distinct and
+32–512 URL-safe characters. Both key secrets must be distinct base64-encoded
+32-byte values. All four secrets are required by the manual staging workflow. The
 admin token retains the full server-side cloud API scope. The maintenance token
 is limited to customer tenant provisioning and tenant lifecycle inspection or
 suspension/resumption; it cannot access provider, gateway, customer membership,
 or API-key management routes. Tenant lifecycle mutation events, provisioning
 request attempts, and successful owner-provisioning events are attributed to
-`cloud-maintenance`. The workflow validates that the tokens differ, binds both
+`cloud-maintenance`. The workflow validates that tokens and key secrets differ, binds all four
 through `wrangler secret put` using stdin, and checks that the maintenance token
 works on a lifecycle route while being rejected on provider CRUD.
 
 The credential key must be a base64-encoded 32-byte key used only for Cloud
-credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The Worker
-fails provider credential writes with a sanitized 503 if this key is missing or
-invalid. The D1 ID must resolve through the Cloudflare API
+credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The idempotency HMAC key must be a different base64-encoded 32-byte secret.
+Inference requests fail closed if this key is missing or invalid; provider
+credential writes also fail closed if their encryption key is unavailable. The D1 ID must resolve through the Cloudflare API
 to a database named exactly `omniroute-cloud-runtime-staging`. The workflow binds
-the admin, maintenance, and credential-encryption secrets through `wrangler
-secret put` using stdin. It applies pending D1
+the admin, maintenance, credential-encryption, and idempotency-HMAC secrets
+through `wrangler secret put` using stdin. It applies pending D1
 migrations and checks `/__cloud/health`, `/__cloud/db`, `/__cloud/readiness`, and
 `/__cloud/runtime` after deployment. It also checks that the cloud admin API rejects
 an unauthenticated request and accepts the configured token without creating a
 resource. Readiness performs a D1 query and read-only Durable Object storage
 access; the runtime check verifies the staging name and deployed commit SHA.
+
+### Worker customer inference subset
+
+The Cloud Worker exposes a deliberately narrow `POST /v1/chat/completions`
+subset in `src/cloud/inferenceCustomerHttpApi.ts`. It accepts one plain-text
+`user` message for the pinned `gpt-4o-mini-2024-07-18` model, is non-streaming,
+and rejects tools, other roles, extra fields, and customer-selected endpoints.
+The Worker calls only OpenAI's fixed Responses input-token count endpoint and
+Responses generation endpoint. The count preflight sends the message to OpenAI
+and may be billable; it is required before reserving the tenant's exact input
+count plus the requested output cap. Input/output caps and the monthly budget
+are token accounting only; they do not cap monetary cost. The route replays
+completed responses for 24 hours and retains compact idempotency keys for 30
+days, after which keys may be reused.
+
+The dedicated `OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY` must be distinct from the
+credential-encryption key and remain stable for replay continuity across the
+30-day retention window. Client idempotency-key identity is a stable SHA-256
+digest, so rotating the HMAC secret cannot create a second claim or dispatch;
+a request using the same key after rotation can instead conflict because its
+request fingerprint changed. The Cloud Worker route is not the Next application
+route documented in `docs/openapi.yaml`, and this bounded subset does not imply
+full OpenAI Chat Completions compatibility.
 
 After the repository is cloud-ready:
 

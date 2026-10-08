@@ -4,7 +4,11 @@ import {
   type GatewayCoordinatorStub,
 } from "../src/cloud/connectorGatewayDurableObject";
 import { cleanupExpiredCloudRateLimits } from "../src/cloud/rateLimit";
-import { cleanupStaleCloudInferenceReservations } from "../src/cloud/inferencePolicy";
+import {
+  cleanupSettledCloudInferenceReservations,
+  cleanupStaleCloudInferenceReservations,
+} from "../src/cloud/inferencePolicy";
+import { cleanupExpiredCloudInferenceResponses } from "../src/cloud/inferenceIdempotency";
 import { createCloudRuntime } from "../src/cloud/runtime";
 
 type CloudflareEnv = Env & {
@@ -13,6 +17,7 @@ type CloudflareEnv = Env & {
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
+  OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
 };
 
 export class GatewaySessionObject extends DurableObject<CloudflareEnv> {
@@ -76,6 +81,7 @@ const worker = {
         OMNIROUTE_CLOUD_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_ADMIN_TOKEN,
         OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: env.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN,
         OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+        OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: env.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY,
         DB: env.DB,
         GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,
       },
@@ -86,6 +92,8 @@ const worker = {
       Promise.all([
         cleanupExpiredCloudRateLimits(env.DB),
         cleanupStaleCloudInferenceReservations(env.DB),
+        cleanupSettledCloudInferenceReservations(env.DB),
+        cleanupExpiredCloudInferenceResponses(env.DB),
       ]).then(() => undefined)
     );
   },

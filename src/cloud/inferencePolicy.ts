@@ -550,6 +550,57 @@ export async function cleanupStaleCloudInferenceReservations(
   return changes;
 }
 
+/**
+ * Delete terminal reservation rows from prior UTC months after a 30-day grace in bounded batches.
+ * The current UTC month's budget ledger, every still-reserved operation, and rows referenced by idempotency tombstones are retained.
+ * Long-term successful usage remains in cloud_usage_history.
+ */
+export async function cleanupSettledCloudInferenceReservations(
+  db: CloudDb,
+  options: { now?: string | Date; batchSize?: number } = {}
+): Promise<number> {
+  const now = validTimestamp(options.now);
+  const batchSize = options.batchSize ?? MAX_CLOUD_INFERENCE_RESERVATION_CLEANUP_BATCH_SIZE;
+  if (
+    !Number.isSafeInteger(batchSize) ||
+    batchSize < 1 ||
+    batchSize > MAX_CLOUD_INFERENCE_RESERVATION_CLEANUP_BATCH_SIZE
+  ) {
+    throw new RangeError(
+      `batchSize must be between 1 and ${MAX_CLOUD_INFERENCE_RESERVATION_CLEANUP_BATCH_SIZE}`
+    );
+  }
+  const currentMonth = monthUtc(now);
+  const olderThan = new Date(Date.parse(now) - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const result = await db
+    .prepare(
+      `DELETE FROM cloud_inference_reservations
+        WHERE rowid IN (
+          SELECT r.rowid FROM cloud_inference_reservations r
+           WHERE r.month_utc < ? AND r.created_at <= ? AND r.status IN ('settled', 'released')
+             AND NOT EXISTS (
+               SELECT 1 FROM cloud_inference_idempotency i
+                WHERE i.tenant_id = r.tenant_id AND i.request_id = r.reservation_id
+             )
+           ORDER BY r.month_utc, r.created_at, r.tenant_id, r.reservation_id
+           LIMIT ?
+        )
+          AND month_utc < ? AND created_at <= ? AND status IN ('settled', 'released')
+          AND NOT EXISTS (
+            SELECT 1 FROM cloud_inference_idempotency i
+             WHERE i.tenant_id = cloud_inference_reservations.tenant_id
+               AND i.request_id = cloud_inference_reservations.reservation_id
+          )`
+    )
+    .bind(currentMonth, olderThan, batchSize, currentMonth, olderThan)
+    .run();
+  const changes = Number(result.meta?.changes ?? 0);
+  if (!result.success || !Number.isSafeInteger(changes) || changes < 0 || changes > batchSize) {
+    throw new Error("D1 inference reservation retention returned invalid state");
+  }
+  return changes;
+}
+
 async function readReservation(
   db: CloudDb,
   tenantId: string,
