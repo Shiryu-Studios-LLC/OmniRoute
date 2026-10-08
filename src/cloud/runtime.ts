@@ -3,6 +3,7 @@ import { handleCloudApiRequest } from "./httpApi";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
+import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
@@ -61,6 +62,11 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
   return {
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
+
+      if (url.pathname === CLOUD_CUSTOMER_PORTAL_PATH) {
+        const response = handleCloudCustomerPortalRequest(request);
+        if (response) return response;
+      }
 
       if (
         url.pathname === CLOUD_TENANT_OIDC_LOGIN_PATH ||

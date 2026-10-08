@@ -27,6 +27,7 @@ import {
   cleanupExpiredCloudTenantOidcAuthArtifacts,
 } from "../../src/cloud/tenantOidcAuth";
 import { createCloudRuntime } from "../../src/cloud/runtime";
+import { CLOUD_CUSTOMER_PORTAL_PATH } from "../../src/cloud/customerPortal";
 
 const ISSUER = "https://identity.example.test";
 const ORIGIN = "https://cloud.example.test";
@@ -314,7 +315,7 @@ test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an
     )
   );
   assert.equal(callback.status, 303);
-  assert.equal(callback.headers.get("location"), `${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`);
+  assert.equal(callback.headers.get("location"), `${ORIGIN}${CLOUD_CUSTOMER_PORTAL_PATH}`);
   assert.equal(fetchState.tokenRequests.length, 1);
   assert.equal(fetchState.tokenRequests[0]?.get("code_verifier")?.length, 43);
   assert.equal(fetchState.tokenRequests[0]?.get("client_secret"), "client-secret-test");

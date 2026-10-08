@@ -19,6 +19,7 @@ import {
   CLOUD_TENANT_MEMBERSHIP_INVITATION_TTL_MS,
 } from "./tenantMembershipInvitations";
 import { listCloudTenantPortalMembers } from "./tenantMembershipManagement";
+import { CLOUD_CUSTOMER_PORTAL_PATH } from "./customerPortal";
 
 export const CLOUD_TENANT_OIDC_LOGIN_PATH = "/__cloud/auth/oidc/login";
 export const CLOUD_TENANT_OIDC_CALLBACK_PATH = "/__cloud/auth/oidc/callback";
@@ -661,7 +662,7 @@ async function callback(
     const response = new Response(null, {
       status: 303,
       headers: {
-        Location: new URL(CLOUD_TENANT_OIDC_SESSION_PATH, origin).toString(),
+        Location: new URL(CLOUD_CUSTOMER_PORTAL_PATH, origin).toString(),
         "Cache-Control": "no-store",
       },
     });

@@ -22,13 +22,17 @@ Environment variable of the same name and requires it to match the isolated
 
 The setting is used to construct the fixed callback URI
 `/__cloud/auth/oidc/callback` and the fixed successful-login redirect
-`/__cloud/auth/session`. The login, callback, and session endpoints reject requests whose
+`/__cloud/portal`. The login, callback, and session endpoints reject requests whose
 URL origin differs from this configured origin. The session endpoint also rejects a
 supplied `Origin` header unless it matches exactly.
 Tenant OIDC configuration cannot set a callback or post-login redirect URI.
 
 ## Available routes
 
+- `GET /__cloud/portal` serves the Worker-hosted customer portal. It uses the session and
+  membership APIs below; those APIs remain the authorization authority. The page uses a
+  per-response nonce Content Security Policy and does not display OIDC subjects or
+  principal IDs.
 - `GET /__cloud/auth/oidc/login?tenant=<tenant-slug>` begins authorization for an active
   customer tenant with enabled OIDC configuration. The Worker discovers provider metadata,
   uses a short-lived one-time state and nonce, and requires PKCE with `S256`.
@@ -38,9 +42,9 @@ Tenant OIDC configuration cannot set a callback or post-login redirect URI.
 - `GET /__cloud/auth/session` returns the tenant, membership, and issuer for a valid
   customer portal session cookie. It does not return provider credentials or the external
   subject identifier.
-- `POST /__cloud/auth/logout` requires an exact same-origin `Origin`, revokes only the
-  caller's hashed session token in D1, and expires the matching scoped HttpOnly cookie.
-  Missing or malformed cookies are safe to clear without revoking another session.
+- `POST /__cloud/auth/logout` requires the exact configured `Origin`, revokes only the
+  session whose cookie hash matches the caller, and expires the scoped HttpOnly session
+  cookie. Missing or malformed cookies are handled idempotently without revoking a session.
 - `GET /__cloud/auth/members?limit=<1–100>&cursor=<opaque>` lists tenant memberships for
   active owner/admin sessions. Pages contain membership ID, role, active state, and
   timestamps; they omit principal IDs and OIDC details.
