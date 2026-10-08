@@ -292,3 +292,152 @@ test("completed idempotent results do not consume the pending queue capacity", a
     true
   );
 });
+
+test("revocation and session replacement clear undeliverable work", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const request: GatewayDeviceRequest = {
+    requestId: "revoked_work",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:10:00.000Z",
+    status: "pending",
+  };
+  assert.equal(await coordinator.enqueueRequest("device_A", request), true);
+  await coordinator.revokeSession("device_A", "2026-10-08T12:00:01.000Z");
+  assert.equal(
+    await coordinator.getRequest("device_A", request.requestId, "2026-10-08T12:00:02.000Z"),
+    null
+  );
+
+  await coordinator.putSession(session("device_A", "session_B"));
+  assert.equal(
+    await coordinator.enqueueRequest("device_A", {
+      ...request,
+      requestId: "new_session_work",
+      sessionId: "session_B",
+      createdAt: "2026-10-08T12:00:03.000Z",
+    }),
+    true
+  );
+});
+
+test("completed request retention is bounded by row count and serialized bytes", async () => {
+  const storage = new MemoryStorage();
+  const durableObject = new GatewaySessionDurableObject({
+    id: { name: "device_A" },
+    storage,
+  });
+  await durableObject.putSession("device_A", session());
+  const createdAt = "2026-10-08T12:00:00.000Z";
+  const expiresAt = "2026-10-08T12:10:00.000Z";
+
+  for (let index = 0; index < 64; index += 1) {
+    const row: GatewayDeviceRequest = {
+      requestId: `retained_${index}`,
+      tenantId: "tenant_A",
+      sessionId: "session_A",
+      capability: "ollama.chat",
+      payload: "{}",
+      createdAt,
+      expiresAt,
+      status: "pending",
+    };
+    assert.equal(await durableObject.enqueueRequest("device_A", row), true);
+    assert.equal((await durableObject.takeRequests("device_A", "session_A", createdAt)).length, 1);
+    assert.equal(
+      await durableObject.submitRequestResult(
+        "device_A",
+        "session_A",
+        row.requestId,
+        "{}",
+        createdAt
+      ),
+      true
+    );
+  }
+  assert.equal(
+    await durableObject.enqueueRequest("device_A", {
+      requestId: "retained_overflow",
+      tenantId: "tenant_A",
+      sessionId: "session_A",
+      capability: "ollama.chat",
+      payload: "{}",
+      createdAt,
+      expiresAt,
+      status: "pending",
+    }),
+    false
+  );
+
+  // Large completed requests are bounded by the serialized queue budget even
+  // before the separate retained-row ceiling is reached.
+  const byteStorage = new MemoryStorage();
+  const byteLimited = new GatewaySessionDurableObject({
+    id: { name: "device_A" },
+    storage: byteStorage,
+  });
+  await byteLimited.putSession("device_A", session());
+  let completedLargeRows = 0;
+  for (let index = 0; index < 20; index += 1) {
+    const row: GatewayDeviceRequest = {
+      requestId: `large_${index}`,
+      tenantId: "tenant_A",
+      sessionId: "session_A",
+      capability: "ollama.chat",
+      payload: "x".repeat(64 * 1024),
+      createdAt,
+      expiresAt,
+      status: "pending",
+    };
+    if (!(await byteLimited.enqueueRequest("device_A", row))) break;
+    await byteLimited.takeRequests("device_A", "session_A", createdAt);
+    if (
+      !(await byteLimited.submitRequestResult(
+        "device_A",
+        "session_A",
+        row.requestId,
+        "x".repeat(64 * 1024),
+        createdAt
+      ))
+    ) {
+      break;
+    }
+    completedLargeRows += 1;
+  }
+  const persisted = (await byteStorage.get<GatewayDeviceRequest[]>("gateway:requests")) ?? [];
+  assert.ok(completedLargeRows > 0);
+  assert.ok(new TextEncoder().encode(JSON.stringify(persisted)).byteLength <= 1_500_000);
+
+  const legacyStorage = new MemoryStorage();
+  const recoveringObject = new GatewaySessionDurableObject({
+    id: { name: "device_A" },
+    storage: legacyStorage,
+  });
+  await recoveringObject.putSession("device_A", session());
+  const legacyRows: GatewayDeviceRequest[] = Array.from({ length: 70 }, (_, index) => ({
+    requestId: `legacy_${index}`,
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt: new Date(Date.parse(createdAt) + index).toISOString(),
+    expiresAt,
+    status: "complete",
+    result: "{}",
+  }));
+  await legacyStorage.transaction(async (transaction) => {
+    await transaction.put("gateway:requests", legacyRows);
+  });
+  assert.equal(
+    (await recoveringObject.getRequest("device_A", "legacy_69", createdAt))?.requestId,
+    "legacy_69"
+  );
+  const recoveredRows = (await legacyStorage.get<GatewayDeviceRequest[]>("gateway:requests")) ?? [];
+  assert.ok(recoveredRows.length <= 64);
+  assert.ok(new TextEncoder().encode(JSON.stringify(recoveredRows)).byteLength <= 1_500_000);
+});

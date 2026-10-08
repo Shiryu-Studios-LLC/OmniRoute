@@ -59,6 +59,58 @@ function parsePositiveInteger(value, label) {
   return parsed;
 }
 
+function parseMcpServers(value) {
+  if (value === undefined || value === null || value === "") return [];
+  if (typeof value !== "string" || value.length > 16_384) {
+    throw new Error("Local MCP configuration exceeds the size limit");
+  }
+  let rows;
+  try {
+    rows = JSON.parse(value);
+  } catch {
+    throw new Error("Local MCP configuration must be valid JSON");
+  }
+  if (!Array.isArray(rows) || rows.length > 8) {
+    throw new Error("Local MCP configuration must contain at most 8 servers");
+  }
+  const ids = new Set();
+  return rows.map((row) => {
+    if (
+      !row ||
+      typeof row !== "object" ||
+      Array.isArray(row) ||
+      Object.keys(row).some((key) => key !== "id" && key !== "endpoint") ||
+      typeof row.id !== "string" ||
+      !/^[A-Za-z0-9_-]{1,32}$/.test(row.id) ||
+      ids.has(row.id) ||
+      typeof row.endpoint !== "string"
+    ) {
+      throw new Error("Local MCP server configuration is invalid");
+    }
+    let endpoint;
+    try {
+      endpoint = new URL(row.endpoint);
+    } catch {
+      throw new Error("Local MCP endpoint must be a valid URL");
+    }
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname.toLowerCase());
+    if (
+      (endpoint.protocol !== "https:" && !(loopback && endpoint.protocol === "http:")) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.hash ||
+      endpoint.search ||
+      (!loopback && endpoint.port && endpoint.port !== "443")
+    ) {
+      throw new Error(
+        "Local MCP endpoints must be loopback HTTP(S) or public HTTPS without credentials or query data"
+      );
+    }
+    ids.add(row.id);
+    return { id: row.id, endpoint: endpoint.toString() };
+  });
+}
+
 /** Resolve process configuration without persisting or displaying the credential. */
 export function resolveLocalAgentConfig(options = {}, env = process.env) {
   const gatewayUrl = parseGatewayUrl(
@@ -90,6 +142,7 @@ export function resolveLocalAgentConfig(options = {}, env = process.env) {
       env.SHIRYU_LOCAL_AGENT_COMFYUI_URL,
       "ComfyUI URL"
     ),
+    mcpServers: parseMcpServers(env.SHIRYU_LOCAL_AGENT_MCP_SERVERS),
     ...(heartbeatIntervalMs === undefined ? {} : { heartbeatIntervalMs }),
   };
 }

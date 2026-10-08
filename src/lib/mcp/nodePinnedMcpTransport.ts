@@ -61,7 +61,7 @@ function isPublicAddress(address: string): boolean {
   return false;
 }
 
-function normalizeEndpoint(input: string): URL {
+function normalizeEndpoint(input: string, allowLoopback = false): URL {
   let url: URL;
   try {
     url = new URL(input);
@@ -72,6 +72,19 @@ function normalizeEndpoint(input: string): URL {
     .replace(/^\[|\]$/g, "")
     .replace(/\.$/, "")
     .toLowerCase();
+  const localLiteral = host === "127.0.0.1" || host === "::1";
+  const localHost = localLiteral || host === "localhost";
+  if (
+    allowLoopback &&
+    localHost &&
+    (url.protocol === "http:" || url.protocol === "https:") &&
+    !url.username &&
+    !url.password &&
+    !url.hash &&
+    !url.search
+  ) {
+    return url;
+  }
   if (
     url.protocol !== "https:" ||
     !host ||
@@ -114,12 +127,18 @@ function systemLookupAll(hostname: string): Promise<LookupRecord[]> {
 }
 
 export function createPinnedMcpLookup(
-  records: readonly McpPinnedAddress[]
+  records: readonly McpPinnedAddress[],
+  allowLoopback = false
 ): NonNullable<TcpNetConnectOpts["lookup"]> {
   if (
     records.length === 0 ||
     records.some(
-      (record) => !isPublicAddress(record.address) || record.family !== isIP(record.address)
+      (record) =>
+        record.family !== isIP(record.address) ||
+        !(allowLoopback
+          ? (record.family === 4 && record.address === "127.0.0.1") ||
+            (record.family === 6 && record.address === "::1")
+          : isPublicAddress(record.address))
     )
   ) {
     throw new McpOutboundEgressError("MCP_OUTBOUND_DNS_REJECTED");
@@ -184,23 +203,54 @@ function copyHeaders(headers: {
  * proxy or leave outbound MCP discovery disabled.
  */
 export function createNodePinnedMcpTransport(
-  options: { lookupAll?: LookupAll } = {}
+  options: { lookupAll?: LookupAll; allowLoopback?: boolean } = {}
 ): McpOutboundTransport {
   const lookupAll = options.lookupAll ?? systemLookupAll;
   return {
     async fetch(input, init) {
-      const url = normalizeEndpoint(input);
+      const url = normalizeEndpoint(input, options.allowLoopback === true);
       const literal = isIP(url.hostname.replace(/^\[|\]$/g, ""));
-      const records = literal
+      const loopbackMode =
+        options.allowLoopback === true &&
+        (url.hostname.toLowerCase() === "localhost" ||
+          url.hostname === "127.0.0.1" ||
+          url.hostname === "[::1]");
+      let records = literal
         ? [{ address: url.hostname.replace(/^\[|\]$/g, ""), family: literal }]
-        : await lookupAllPublic(url.hostname.replace(/\.$/, ""), lookupAll);
-      if (records.some((record) => !isPublicAddress(record.address))) {
+        : loopbackMode
+          ? []
+          : await lookupAllPublic(url.hostname.replace(/\.$/, ""), lookupAll);
+      if (loopbackMode && url.hostname.toLowerCase() === "localhost") {
+        records = await lookupAll(url.hostname);
+        if (
+          records.length === 0 ||
+          records.some(
+            (record) =>
+              !(
+                (record.family === 4 && record.address === "127.0.0.1") ||
+                (record.family === 6 && record.address === "::1")
+              )
+          )
+        ) {
+          throw new McpOutboundEgressError("MCP_OUTBOUND_DNS_REJECTED");
+        }
+      }
+      if (
+        records.some((record) =>
+          loopbackMode
+            ? !(
+                (record.family === 4 && record.address === "127.0.0.1") ||
+                (record.family === 6 && record.address === "::1")
+              )
+            : !isPublicAddress(record.address)
+        )
+      ) {
         throw new McpOutboundEgressError("MCP_OUTBOUND_DNS_REJECTED");
       }
 
       const agent = new Agent({
         connect: {
-          lookup: createPinnedMcpLookup(records),
+          lookup: createPinnedMcpLookup(records, loopbackMode),
         },
         connections: 1,
         pipelining: 0,

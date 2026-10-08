@@ -66,6 +66,10 @@ const SESSION_KEY = "gateway:session";
 const REQUESTS_KEY = "gateway:requests";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_PENDING_REQUESTS = 16;
+// Keep the single serialized queue value below the SQLite-backed Durable
+// Object value limit, including JSON keys and per-row metadata.
+const MAX_STORED_REQUESTS = 64;
+const MAX_REQUEST_QUEUE_BYTES = 1_500_000;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
@@ -122,6 +126,11 @@ function isRequestRecord(value: unknown): value is GatewayDeviceRequest {
   );
 }
 
+function requestQueueFits(requests: GatewayDeviceRequest[]): boolean {
+  if (requests.length > MAX_STORED_REQUESTS) return false;
+  return new TextEncoder().encode(JSON.stringify(requests)).byteLength <= MAX_REQUEST_QUEUE_BYTES;
+}
+
 function assertDeviceId(deviceId: string): void {
   if (!DEVICE_ID_PATTERN.test(deviceId)) throw new Error("Invalid gateway device identity");
 }
@@ -147,6 +156,13 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     }
     await this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
+      const current = await transaction.get<unknown>(SESSION_KEY);
+      if (!isSessionRecord(current) || current.sessionId !== session.sessionId) {
+        // Requests are bound to the session that authorized them. Replacing a
+        // session makes its pending work undeliverable, so release those
+        // queue slots when the device reconnects.
+        await transaction.delete(REQUESTS_KEY);
+      }
       await transaction.put(SESSION_KEY, session);
     });
   }
@@ -196,9 +212,12 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     await this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
       const value = await transaction.get<unknown>(SESSION_KEY);
-      if (!isSessionRecord(value) || value.deviceId !== deviceId || value.revokedAt !== null)
-        return;
-      await transaction.put(SESSION_KEY, { ...value, revokedAt });
+      if (isSessionRecord(value) && value.deviceId === deviceId && value.revokedAt === null) {
+        await transaction.put(SESSION_KEY, { ...value, revokedAt });
+      }
+      // Revoked session requests and their retained idempotency results must
+      // not occupy queue capacity or be observable after revocation.
+      await transaction.delete(REQUESTS_KEY);
     });
   }
 
@@ -224,7 +243,8 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
       const pending = active.filter((row) => row.status !== "complete");
       if (
         pending.length >= MAX_PENDING_REQUESTS ||
-        active.some((row) => row.requestId === request.requestId)
+        active.some((row) => row.requestId === request.requestId) ||
+        !requestQueueFits([...active, request])
       ) {
         return false;
       }
@@ -310,6 +330,7 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
       }
       const updated = [...rows];
       updated[index] = { ...updated[index], status: "complete", result };
+      if (!requestQueueFits(updated)) return false;
       await transaction.put(REQUESTS_KEY, updated);
       return true;
     });
@@ -347,7 +368,24 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
   ): Promise<GatewayDeviceRequest[]> {
     const value = await transaction.get<unknown>(REQUESTS_KEY);
     if (!Array.isArray(value)) return [];
-    return value.filter(isRequestRecord);
+    const valid = value.filter(isRequestRecord);
+    if (requestQueueFits(valid)) return valid;
+
+    // Compact state written by earlier versions that did not bound completed
+    // idempotency records. Keep in-flight work first, then the newest completed
+    // results that fit the current storage budget.
+    const inFlight = valid
+      .filter((request) => request.status !== "complete")
+      .slice(0, MAX_PENDING_REQUESTS);
+    const completed = valid
+      .filter((request) => request.status === "complete")
+      .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+    const retained = [...inFlight];
+    for (const request of completed) {
+      if (requestQueueFits([...retained, request])) retained.push(request);
+    }
+    const retainedSet = new Set(retained);
+    return valid.filter((request) => retainedSet.has(request));
   }
 
   private async assertBound(

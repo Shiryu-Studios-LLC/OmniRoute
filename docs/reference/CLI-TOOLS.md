@@ -131,6 +131,23 @@ Remove the service and stored credential with
 For local development, the gateway URL may use plain HTTP only when its host is
 `localhost`, `127.0.0.1`, or `[::1]`. Remote gateway URLs must use HTTPS.
 
+Optional MCP tools can be exposed from up to eight operator-configured
+Streamable HTTP servers using `SHIRYU_LOCAL_AGENT_MCP_SERVERS`. Set it to a JSON
+array of `{ "id", "endpoint" }` objects. Endpoints must use loopback HTTP(S) or
+public HTTPS on port 443; public DNS answers are pinned for each request. The
+agent advertises up to eight tools per server and only invokes a tool that was
+advertised during discovery. The gateway request supplies the server ID, tool
+name, and arguments, never an endpoint or credential. The current Local Agent
+does not launch MCP stdio commands or configure MCP credentials.
+
+```json
+[{ "id": "docs", "endpoint": "http://127.0.0.1:9911/mcp" }]
+```
+
+The value is stored with the other Local Agent service environment settings
+when the per-user service is installed. Treat access to that service
+configuration as machine-operator access.
+
 ## Source of Truth
 
 The unified catalog lives in `src/shared/constants/cliTools.ts` as `CLI_TOOLS: Record<string, CliCatalogEntry>`.

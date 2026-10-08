@@ -1,6 +1,13 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import type { LocalAgentHeartbeatPayload } from "./protocol";
+import {
+  discoverLocalMcpServers,
+  localMcpCapability,
+  type LocalMcpDependencies,
+  type LocalMcpServerConfig,
+  type LocalMcpServerDiscovery,
+} from "./localMcp";
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_BINARY_RESPONSE_BYTES = 40 * 1024;
@@ -14,11 +21,13 @@ const DEFAULT_LOCAL_ENDPOINTS = {
 export interface LocalDiscoveryConfig {
   ollamaUrl?: string;
   comfyUiUrl?: string;
+  mcpServers?: LocalMcpServerConfig[];
 }
 
 export interface LocalDiscoveryDependencies {
   fetch: typeof fetch;
   resolveHost?: (hostname: string) => Promise<string[]>;
+  mcp?: LocalMcpDependencies;
 }
 
 export interface LocalDiscoveryResult {
@@ -28,6 +37,7 @@ export interface LocalDiscoveryResult {
     reachable: boolean;
     models: string[];
   }>;
+  mcpServers?: LocalMcpServerDiscovery[];
 }
 
 const defaultResolveHost = async (hostname: string): Promise<string[]> => {
@@ -283,6 +293,20 @@ export async function discoverLocalCapabilities(
     }
   }
 
+  let mcpServers: LocalMcpServerDiscovery[] = [];
+  if (config.mcpServers?.length) {
+    mcpServers = await discoverLocalMcpServers(config.mcpServers, dependencies.mcp);
+    for (const server of mcpServers) {
+      for (const tool of server.tools) {
+        try {
+          capabilities.push(localMcpCapability(server.id, tool.name));
+        } catch {
+          // Malformed tool names are never advertised.
+        }
+      }
+    }
+  }
+
   return {
     heartbeat: {
       status: "online",
@@ -293,5 +317,6 @@ export async function discoverLocalCapabilities(
       },
     },
     services,
+    ...(mcpServers.length ? { mcpServers } : {}),
   };
 }

@@ -50,6 +50,7 @@ test("configuration accepts HTTPS cloud URL and reads credential only from its n
     heartbeatIntervalMs: 30000,
     ollamaUrl: "http://127.0.0.1:11434/",
     comfyUiUrl: undefined,
+    mcpServers: [],
   });
 });
 
@@ -86,6 +87,9 @@ test("configuration supports the documented Local Agent environment variables", 
       SHIRYU_LOCAL_AGENT_OLLAMA_URL: "http://localhost:11434",
       SHIRYU_LOCAL_AGENT_COMFYUI_URL: "http://192.168.1.20:8188",
       SHIRYU_LOCAL_AGENT_HEARTBEAT_INTERVAL_MS: "45000",
+      SHIRYU_LOCAL_AGENT_MCP_SERVERS: JSON.stringify([
+        { id: "docs", endpoint: "http://localhost:9911/mcp" },
+      ]),
     }
   );
 
@@ -95,6 +99,7 @@ test("configuration supports the documented Local Agent environment variables", 
   assert.equal(config.ollamaUrl, "http://localhost:11434/");
   assert.equal(config.comfyUiUrl, "http://192.168.1.20:8188/");
   assert.equal(config.heartbeatIntervalMs, 45000);
+  assert.deepEqual(config.mcpServers, [{ id: "docs", endpoint: "http://localhost:9911/mcp" }]);
 });
 
 test("configuration rejects insecure gateway URLs, invalid credentials, and invalid local URLs", () => {
@@ -115,6 +120,19 @@ test("configuration rejects insecure gateway URLs, invalid credentials, and inva
         { SHIRYU_LOCAL_AGENT_CREDENTIAL: credential }
       ),
     /Ollama URL must be HTTP/
+  );
+  assert.throws(
+    () =>
+      resolveLocalAgentConfig(
+        { ...baseOptions },
+        {
+          SHIRYU_LOCAL_AGENT_CREDENTIAL: credential,
+          SHIRYU_LOCAL_AGENT_MCP_SERVERS: JSON.stringify([
+            { id: "bad", endpoint: "http://192.168.1.5:9911/mcp" },
+          ]),
+        }
+      ),
+    /loopback HTTP\(S\) or public HTTPS/
   );
 });
 

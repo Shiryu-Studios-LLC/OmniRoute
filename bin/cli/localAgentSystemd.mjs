@@ -21,6 +21,7 @@ const MANAGED_ENV_KEYS = [
   "SHIRYU_LOCAL_AGENT_CREDENTIAL",
   "SHIRYU_LOCAL_AGENT_OLLAMA_URL",
   "SHIRYU_LOCAL_AGENT_COMFYUI_URL",
+  "SHIRYU_LOCAL_AGENT_MCP_SERVERS",
   "SHIRYU_LOCAL_AGENT_HEARTBEAT_INTERVAL_MS",
 ];
 
@@ -122,6 +123,7 @@ export function installLocalAgentSystemd(
     SHIRYU_LOCAL_AGENT_CREDENTIAL: config.credential,
     SHIRYU_LOCAL_AGENT_OLLAMA_URL: config.ollamaUrl ?? "",
     SHIRYU_LOCAL_AGENT_COMFYUI_URL: config.comfyUiUrl ?? "",
+    SHIRYU_LOCAL_AGENT_MCP_SERVERS: JSON.stringify(config.mcpServers ?? []),
     SHIRYU_LOCAL_AGENT_HEARTBEAT_INTERVAL_MS: config.heartbeatIntervalMs?.toString() ?? "",
   };
   const envContent =

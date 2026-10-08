@@ -6,6 +6,7 @@ import {
 } from "./localDiscovery";
 import { LOCAL_AGENT_HEARTBEAT_PATH, signLocalAgentHeartbeat } from "./protocol";
 import { executeLocalCapability } from "./capabilityExecutor";
+import type { LocalMcpDependencies } from "./localMcp";
 import {
   LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
   type LocalAgentGatewayRequest,
@@ -36,6 +37,7 @@ export interface LocalAgentRunnerDependencies {
   createNonce?: () => string;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   discover?: typeof discoverLocalCapabilities;
+  mcp?: LocalMcpDependencies;
 }
 
 export interface LocalAgentGatewayRunnerDependencies extends LocalAgentRunnerDependencies {
@@ -103,8 +105,12 @@ export async function runLocalAgentCycle(
   const gateway = validateConfig(config);
   const discover = dependencies.discover ?? discoverLocalCapabilities;
   const discovered = await discover(
-    { ollamaUrl: config.ollamaUrl, comfyUiUrl: config.comfyUiUrl },
-    { fetch: dependencies.fetch }
+    {
+      ollamaUrl: config.ollamaUrl,
+      comfyUiUrl: config.comfyUiUrl,
+      mcpServers: config.mcpServers,
+    },
+    { fetch: dependencies.fetch, mcp: dependencies.mcp }
   );
   await sendHeartbeat(config, gateway, dependencies, discovered);
   return { accepted: true };
@@ -155,8 +161,12 @@ export async function runLocalAgentGatewayCycle(
   validateConfig(config);
   const discover = dependencies.discover ?? discoverLocalCapabilities;
   const discovery = await discover(
-    { ollamaUrl: config.ollamaUrl, comfyUiUrl: config.comfyUiUrl },
-    { fetch: dependencies.fetch }
+    {
+      ollamaUrl: config.ollamaUrl,
+      comfyUiUrl: config.comfyUiUrl,
+      mcpServers: config.mcpServers,
+    },
+    { fetch: dependencies.fetch, mcp: dependencies.mcp }
   );
 
   let session = previousSession;
@@ -208,10 +218,14 @@ export async function runLocalAgentGatewayCycle(
       const value = dependencies.execute
         ? await dependencies.execute(request, discovery)
         : await executeLocalCapability(
-            { ollamaUrl: config.ollamaUrl, comfyUiUrl: config.comfyUiUrl },
+            {
+              ollamaUrl: config.ollamaUrl,
+              comfyUiUrl: config.comfyUiUrl,
+              mcpServers: config.mcpServers,
+            },
             discovery,
             request,
-            { fetch: dependencies.fetch }
+            { fetch: dependencies.fetch, mcp: dependencies.mcp }
           );
       outcome = { ok: true, value };
     } catch {

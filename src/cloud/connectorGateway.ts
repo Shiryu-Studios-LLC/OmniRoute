@@ -454,6 +454,7 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
       if (!authorization.ok) return authorization;
       const target = authorization.target;
       const timestamp = now();
+      const deadline = timestamp + timeoutMs;
       const createdAt = input.requestCreatedAt ?? new Date(timestamp).toISOString();
       const expiresAt = input.requestExpiresAt ?? new Date(timestamp + timeoutMs).toISOString();
       if (
@@ -492,6 +493,12 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
           return { ok: false, reason: "queue_full" };
         }
         if (storedRequest?.status === "complete" && storedRequest.result !== undefined) {
+          if (now() >= deadline) return { ok: false, reason: "timeout" };
+          const active = await this.authorizeCapability(input);
+          if (!active.ok || active.target.sessionId !== target.sessionId) {
+            return active.ok ? { ok: false, reason: "offline" } : active;
+          }
+          if (now() >= deadline) return { ok: false, reason: "timeout" };
           try {
             return {
               ok: true,
@@ -503,11 +510,11 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
           }
         }
       }
+      if (now() >= deadline) return { ok: false, reason: "timeout" };
       if (!storedRequest && !(await options.coordinator.enqueueRequest(input.deviceId, request))) {
         return { ok: false, reason: "queue_full" };
       }
 
-      const deadline = timestamp + timeoutMs;
       while (now() < deadline) {
         const active = await this.authorizeCapability(input);
         if (!active.ok || active.target.sessionId !== target.sessionId) {
@@ -521,9 +528,29 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
           request.requestId,
           new Date(now()).toISOString()
         );
-        if (stored?.status === "complete" && stored.result !== undefined) {
+        if (now() >= deadline) {
           if (!input.requestId) {
             await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+          }
+          return { ok: false, reason: "timeout" };
+        }
+        if (stored?.status === "complete" && stored.result !== undefined) {
+          const completedFor = await this.authorizeCapability(input);
+          if (!completedFor.ok || completedFor.target.sessionId !== target.sessionId) {
+            if (!input.requestId) {
+              await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+            }
+            return completedFor.ok ? { ok: false, reason: "offline" } : completedFor;
+          }
+          if (now() >= deadline) {
+            if (!input.requestId) {
+              await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+            }
+            return { ok: false, reason: "timeout" };
+          }
+          if (!input.requestId) {
+            await options.coordinator.deleteRequest(input.deviceId, request.requestId);
+            if (now() >= deadline) return { ok: false, reason: "timeout" };
           }
           try {
             return {

@@ -133,6 +133,12 @@ Phase 8 update: macOS service management now has a per-user launchd installer/un
 
 Phase 4 update: Cloud D1 migration `0015_cloud_tenant_oidc.sql` adds per-tenant OIDC configuration and exact issuer/subject links to active memberships. Platform-admin routes encrypt client secrets and redact them from responses and audits; membership keys and maintenance tokens cannot manage the records. The links are storage only: customer login, issuer discovery, account verification, and customer sessions are not connected. Focused OIDC and Cloud runtime/identity tests pass 28/28; the migration passes foreign-key checks in the SQLite-backed D1 fixture and all 15 migrations applied in the latest local Wrangler D1/Durable Object integration.
 
+Phase 5 update: the customer Local Agent now supports operator-configured MCP Streamable HTTP servers through `SHIRYU_LOCAL_AGENT_MCP_SERVERS`. It uses protocol-version negotiation, session headers, JSON/SSE replies, bounded discovery and invocation, and per-request pinned public DNS; loopback endpoints are limited to explicit local configuration. The gateway still cannot invoke arbitrary remote MCP endpoints because Worker egress lacks safe destination pinning. MCP, CLI, launchd, systemd, gateway, and Durable Object focused tests pass 43/43.
+
+Phase 9 update: the Durable Object request queue is bounded by row count and serialized size, clears stale requests/results on device session replacement and revocation, and checks request deadlines after result reads and deletion. Gateway and Durable Object regression suites pass within the combined 43/43 run. Front Desk now validates the complete `ollama:chat:<model>` capability syntax and length; its focused tests pass 11/11, pushed in `737a598` on the separate Front Desk branch.
+
+Latest slice verification: `npm run typecheck:core`, `npm run cloudflare:check`, `npm run cloudflare:build` (dry run only), `npm run lint` (0 errors; one existing warning in `open-next.config.ts`), `npm run check:docs-all` (91 existing soft drift notices), `npm run check:cycles`, `npm run check:tracked-artifacts`, and `git diff --check` pass. Wrangler dry run packaged 22 inputs at 244,033 bytes (44,195 gzip), SHA-256 `9f93b55881532a07d6173879506efd6296595675badf36fc1bd1dbbc07fce725`; no deployment occurred.
+
 ## Next actions
 
 1. Isolate the Next middleware dependency graph behind a cloud-specific D1 authorization path; verify a complete OpenNext build before treating the full application as Worker-ready. The 21-input control-plane Worker dry run is green.

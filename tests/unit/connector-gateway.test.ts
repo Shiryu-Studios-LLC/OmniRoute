@@ -418,3 +418,167 @@ test("cross-tenant calls, revoked sessions, and expired calls cannot receive res
     false
   );
 });
+
+test("request deadline remains authoritative when result storage is slow", async () => {
+  const credential = "slow-result-credential";
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_slow",
+      tenantId: "tenant_slow",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama.chat"],
+      revokedAt: null,
+    },
+  ]);
+  const getRequest = adapters.coordinator.getRequest.bind(adapters.coordinator);
+  adapters.coordinator.getRequest = async (deviceId, requestId, timestamp) => {
+    await new Promise((resolve) => setTimeout(resolve, 130));
+    const row = await getRequest(deviceId, requestId, timestamp);
+    return row ? { ...row, status: "complete", result: JSON.stringify({ text: "late" }) } : null;
+  };
+  const gateway = createConnectorGateway({
+    ...adapters,
+    createId: () => "session_slow",
+    createToken: () => "session-token-slow",
+    createRequestId: () => "request_slow",
+  });
+  assert.ok(await gateway.connect("device_slow", credential));
+  assert.deepEqual(
+    await gateway.requestCapability({
+      tenantId: "tenant_slow",
+      deviceId: "device_slow",
+      capability: "ollama.chat",
+      payload: {},
+      timeoutMs: 100,
+    }),
+    { ok: false, reason: "timeout" }
+  );
+});
+
+test("request deadline remains authoritative when completed-request deletion is slow", async () => {
+  const credential = "slow-delete-credential";
+  const baseTime = 1_800_000_000_000;
+  let currentTime = baseTime;
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_slow_delete",
+      tenantId: "tenant_slow_delete",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama.chat"],
+      revokedAt: null,
+    },
+  ]);
+  const deleteRequest = adapters.coordinator.deleteRequest.bind(adapters.coordinator);
+  adapters.coordinator.deleteRequest = async (deviceId, requestId) => {
+    await deleteRequest(deviceId, requestId);
+    currentTime = baseTime + 101;
+  };
+  const gateway = createConnectorGateway({
+    ...adapters,
+    now: () => currentTime,
+    createId: () => "session_slow_delete",
+    createToken: () => "session-token-slow-delete",
+    createRequestId: () => "request_slow_delete",
+    wait: async () => new Promise((resolve) => setTimeout(resolve, 0)),
+  });
+  const session = await gateway.connect("device_slow_delete", credential);
+  assert.ok(session);
+  const pending = gateway.requestCapability({
+    tenantId: "tenant_slow_delete",
+    deviceId: "device_slow_delete",
+    capability: "ollama.chat",
+    payload: {},
+    timeoutMs: 100,
+  });
+  for (
+    let attempt = 0;
+    attempt < 10 && !adapters.requests.get("device_slow_delete")?.length;
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const deliveries = await gateway.pollDeviceRequests({
+    deviceId: "device_slow_delete",
+    sessionToken: session.sessionToken,
+  });
+  assert.equal(deliveries.length, 1);
+  assert.equal(
+    await gateway.submitDeviceResult({
+      deviceId: "device_slow_delete",
+      sessionToken: session.sessionToken,
+      requestId: "request_slow_delete",
+      result: { text: "completed" },
+    }),
+    true
+  );
+  assert.deepEqual(await pending, { ok: false, reason: "timeout" });
+});
+
+test("a result found during a concurrent device revocation is not returned", async () => {
+  const credential = "revocation-race-credential";
+  const now = Date.now();
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_race",
+      tenantId: "tenant_race",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama.chat"],
+      revokedAt: null,
+    },
+  ]);
+  let revokeOnCompletedRead = false;
+  const getRequest = adapters.coordinator.getRequest.bind(adapters.coordinator);
+  adapters.coordinator.getRequest = async (deviceId, requestId, timestamp) => {
+    const row = await getRequest(deviceId, requestId, timestamp);
+    if (revokeOnCompletedRead && row?.status === "complete") {
+      revokeOnCompletedRead = false;
+      const device = adapters.devices.get(deviceId);
+      if (device) device.revokedAt = new Date(now).toISOString();
+    }
+    return row;
+  };
+  const gateway = createConnectorGateway({
+    ...adapters,
+    now: () => now,
+    createId: () => "session_race",
+    createToken: () => "session-token-race",
+    createRequestId: () => "request_race",
+    wait: async () => new Promise((resolve) => setTimeout(resolve, 0)),
+  });
+  const session = await gateway.connect("device_race", credential);
+  assert.ok(session);
+  const input = {
+    tenantId: "tenant_race",
+    deviceId: "device_race",
+    capability: "ollama.chat",
+    payload: { prompt: "hello" },
+    timeoutMs: 2_000,
+    requestId: "stable_request_race",
+  };
+  const firstRequest = gateway.requestCapability(input);
+  for (
+    let attempt = 0;
+    attempt < 20 && !adapters.requests.get("device_race")?.length;
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const delivery = await gateway.pollDeviceRequests({
+    deviceId: "device_race",
+    sessionToken: session.sessionToken,
+  });
+  assert.equal(delivery?.length, 1);
+  assert.equal(
+    await gateway.submitDeviceResult({
+      deviceId: "device_race",
+      sessionToken: session.sessionToken,
+      requestId: "stable_request_race",
+      result: { text: "completed" },
+    }),
+    true
+  );
+  assert.equal((await firstRequest).ok, true);
+
+  revokeOnCompletedRead = true;
+  assert.deepEqual(await gateway.requestCapability(input), { ok: false, reason: "revoked" });
+});

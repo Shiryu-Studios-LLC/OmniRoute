@@ -4,6 +4,12 @@ import {
   type LocalDiscoveryConfig,
   type LocalDiscoveryResult,
 } from "./localDiscovery";
+import {
+  invokeLocalMcpTool,
+  parseLocalMcpCapability,
+  type LocalMcpDependencies,
+  validateLocalMcpServers,
+} from "./localMcp";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_GATEWAY_RESULT_BYTES = 56 * 1024;
@@ -20,6 +26,7 @@ export interface LocalCapabilityRequest {
 export interface LocalCapabilityExecutorDependencies {
   fetch: typeof fetch;
   resolveHost?: (hostname: string) => Promise<string[]>;
+  mcp?: LocalMcpDependencies;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -314,6 +321,23 @@ export async function executeLocalCapability(
       throw new Error("ComfyUI image payload must contain a workflow object");
     }
     return runComfyUiImageWorkflow(config.comfyUiUrl, workflow, dependencies);
+  }
+
+  const mcpCapability = parseLocalMcpCapability(request.capability);
+  if (mcpCapability) {
+    const configured = validateLocalMcpServers(config.mcpServers ?? []).find(
+      (server) => server.id === mcpCapability.serverId
+    );
+    const discovered = discovery.mcpServers?.find(
+      (server) => server.id === mcpCapability.serverId && server.endpoint === configured?.endpoint
+    );
+    if (!configured || !discovered) throw new Error("Local MCP server is unavailable");
+    return invokeLocalMcpTool(
+      discovered,
+      mcpCapability.toolName,
+      request.payload,
+      dependencies.mcp
+    );
   }
 
   throw new Error("Local capability is unsupported");
