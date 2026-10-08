@@ -72,7 +72,7 @@ so customer GPUs can later be replaced by Shiryu-hosted infrastructure without c
 
 **Exit:** cloud build can compile without importing local-only runtime modules.
 
-### 2. Cloud database adapter
+### 2. Cloud database adapter — IN PROGRESS (boundary established)
 
 - Introduce an asynchronous database boundary capable of targeting Cloudflare D1.
 - Preserve the existing SQLite domain/migration model where practical.
@@ -80,6 +80,8 @@ so customer GPUs can later be replaced by Shiryu-hosted infrastructure without c
 - Define transaction/batch semantics explicitly.
 - Keep local SQLite as the development/self-hosted adapter.
 - Do not use in-memory SQLite as a production cloud persistence fallback.
+
+**Current:** src/cloud/db.ts now defines the async cloud persistence contract and the Worker exposes /__cloud/db for a D1 connectivity check. Local SQLite remains unchanged. The next increment must move tenant/provider repositories onto this boundary and add a real D1 integration test.
 
 **Exit:** tenant and provider CRUD can execute against D1 in a cloud-runtime integration test.
 
