@@ -32,6 +32,7 @@ import { resolveQuotaKeyScope } from "@/lib/quota/quotaKey";
 import { isQuotaModelName, parseQuotaModelName } from "@/lib/quota/quotaModelNaming";
 import { buildApiKeyUsageLimitPolicyRejection } from "@/lib/usage/apiKeyUsageLimits";
 import { ALL_COMBOS_ACCESS_RULE } from "@/shared/constants/comboAccess";
+import { enterTenantContext } from "@/lib/tenantContext";
 
 // Default to no per-key request cap. API keys can still opt into explicit
 // limits via Settings/API Keys, while provider/account quota controls remain
@@ -73,6 +74,7 @@ interface AccessSchedule {
 /** Metadata stored for an API key in the local database. */
 export interface ApiKeyMetadata {
   id: string;
+  tenantId?: string;
   name?: string;
   modelAccessMode?: "all" | "restricted";
   allowedModels?: string[];
@@ -699,6 +701,10 @@ export async function enforceApiKeyPolicy(
   // Key not found in DB — skip policy (auth layer handles validation)
   if (!apiKeyInfo) {
     return { apiKey, apiKeyInfo: null, rejection: null };
+  }
+
+  if (apiKeyInfo.tenantId) {
+    enterTenantContext({ tenantId: apiKeyInfo.tenantId, principalId: apiKeyInfo.id });
   }
 
   const context = { request, apiKey, apiKeyInfo, modelStr };

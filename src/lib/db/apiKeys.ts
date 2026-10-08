@@ -82,6 +82,7 @@ export type { AccessSchedule, RateLimitRule } from "./apiKeys/types";
 
 interface ApiKeyMetadata {
   id: string;
+  tenantId: string;
   name: string;
   machineId: string | null;
   modelAccessMode: ModelAccessMode;
@@ -136,6 +137,8 @@ interface ApiKeyRow extends JsonRecord {
   allowedConnections?: unknown;
   allowed_quotas?: unknown;
   allowedQuotas?: unknown;
+  tenant_id?: unknown;
+  tenantId?: unknown;
   no_log?: unknown;
   noLog?: unknown;
   auto_resolve?: unknown;
@@ -436,10 +439,10 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
       "SELECT id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key = ? OR key_hash = ?",
     );
     _stmtGetKeyMetadata = db.prepare<ApiKeyRow>(
-      "SELECT id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?",
+      "SELECT id, tenant_id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?",
     );
     _stmtInsertKey = db.prepare(
-      "INSERT INTO api_keys (id, name, key, machine_id, allowed_models, allowed_combos, allowed_connections, no_log, created_at, key_prefix, key_hash, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO api_keys (id, tenant_id, name, key, machine_id, allowed_models, allowed_combos, allowed_connections, no_log, created_at, key_prefix, key_hash, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     _stmtDeleteKey = db.prepare("DELETE FROM api_keys WHERE id = ?");
   }
@@ -678,6 +681,7 @@ export async function createApiKey(
 
   const apiKey = {
     id: uuidv4(),
+    tenantId: "tenant_shiryu_admin",
     name: name,
     key: result.key,
     machineId: machineId,
@@ -694,6 +698,7 @@ export async function createApiKey(
   const stmt = getPreparedStatements(db);
   stmt.insertKey.run(
     apiKey.id,
+    apiKey.tenantId,
     apiKey.name,
     apiKey.key,
     apiKey.machineId,
@@ -1340,6 +1345,7 @@ export async function getApiKeyMetadata(
     // unset the env var instead.
     return {
       id: "env-key",
+      tenantId: "tenant_shiryu_admin",
       name: "Environment Key",
       machineId: "server-env",
       modelAccessMode: "all",
@@ -1403,8 +1409,14 @@ export async function getApiKeyMetadata(
   const rawMaxSessions = record.max_sessions ?? record.maxSessions;
 
   const rawAllowedModels = record.allowed_models ?? record.allowedModels;
+  const metadataTenantIdRaw = record.tenant_id ?? record.tenantId;
+  const metadataTenantId =
+    typeof metadataTenantIdRaw === "string" && metadataTenantIdRaw.trim()
+      ? metadataTenantIdRaw
+      : "tenant_shiryu_admin";
   const metadata: ApiKeyMetadata = {
     id: metadataId,
+    tenantId: metadataTenantId,
     name: metadataName,
     machineId: metadataMachineId,
     modelAccessMode: parseModelAccessMode(

@@ -6,6 +6,8 @@ import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
 import { evaluateAccessTokenAuth } from "@/server/authz/accessTokenAuth";
 import { isTrustedLoopbackInternalServiceRequest } from "@/lib/api/internalServiceAuth";
 import { AUTHZ_HEADER_AUTH_KIND, AUTHZ_HEADER_AUTH_LABEL } from "@/server/authz/headers";
+import { enterTenantContext } from "@/lib/tenantContext";
+import { SHIRYU_ADMIN_TENANT_ID } from "@/lib/db/tenants";
 import {
   MANAGE_SCOPE,
   MCP_CONNECT_SCOPE,
@@ -55,6 +57,7 @@ export async function requireManagementAuth(
   }
 
   if (await isDashboardSessionAuthenticated(request)) {
+    enterTenantContext({ tenantId: SHIRYU_ADMIN_TENANT_ID, principalId: "dashboard", role: "owner" });
     return null;
   }
 
@@ -132,6 +135,10 @@ export async function requireManagementAuth(
     // meta (valid key, metadata unavailable — deleted mid-request) falls
     // through to the same 403 as the default path for every caller, keeping
     // the error contract uniform.
+    if (meta?.tenantId) {
+      enterTenantContext({ tenantId: meta.tenantId, principalId: meta.id });
+    }
+
     if (
       meta &&
       (options.acceptMcpConnectScope

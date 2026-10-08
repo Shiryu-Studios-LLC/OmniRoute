@@ -33,6 +33,7 @@ import {
 } from "./webSessionDedup";
 import { pickCodexConnectionForUser } from "@/lib/oauth/utils/codexConnectionSelection";
 import { reconcileCodexUsageHistory } from "./providers/usageIdentityReconciliation";
+import { getCurrentTenantId } from "../tenantContext";
 
 /**
  * normalizeProviderSpecificData + the Codex fingerprint-seed invariant: Codex
@@ -221,10 +222,14 @@ export async function getProviderConnections(
   offset?: number,
   columns?: string[]
 ) {
+  const tenantId = getCurrentTenantId();
+  const scopedFilter = tenantId && filter.tenantId === undefined
+    ? { ...filter, tenantId }
+    : filter;
   const useCache = !columns?.length && limit === undefined && offset === undefined;
   const raw = useCache
-    ? await getCachedRawProviderConnections(filter)
-    : await getRawProviderConnections(filter, limit, offset, columns);
+    ? await getCachedRawProviderConnections(scopedFilter)
+    : await getRawProviderConnections(scopedFilter, limit, offset, columns);
   return raw.map(createLazyRowProxy);
 }
 
@@ -264,6 +269,10 @@ export async function getRawProviderConnections(
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
 
+  if (filter.tenantId) {
+    conditions.push("tenant_id = @tenantId");
+    params.tenantId = filter.tenantId;
+  }
   if (filter.provider) {
     conditions.push("provider = @provider");
     params.provider = filter.provider;
