@@ -10,7 +10,7 @@ Last updated: 2026-10-08
 
 - Active worktree: `/home/okashi/.devspace/worktrees/OmniRoute-e1d58cf1`
 - Branch: `feat/cloudflare-runtime-readiness`
-- Latest pushed implementation checkpoint: `ed214e68b` (`feat: account for customer Ollama gateway usage`); the separate Front Desk integration is pushed as `e56cbeb`. Phase acceptance remains partial as the table describes.
+- Latest pushed implementation checkpoint: `43018c585` (`feat: provision cloud customer identity in one request`); Ollama usage telemetry is in `ed214e68b`, and the separate Front Desk integration is pushed as `e56cbeb`. Phase acceptance remains partial as the table describes.
 - Current phase: integrated validation and Cloudflare runtime readiness
 - Pushed implementation slices touch Phases 3–14; the phase table below is the status source of truth.
 - Latest implementation slice adds tenant-derived usage telemetry for successful local Ollama chat invocations. It is not a trusted billing source.
@@ -96,7 +96,7 @@ Last updated: 2026-10-08
 - Latest Front Desk server run passed 7/7, including multiline `.env` loading and rejection of remote HTTP OmniRoute endpoints; syntax checks and `git diff --check` passed in the separate checkout.
 - Phase 4 tenant permission regression passed 4/4: customer API keys without an explicit valid tenant membership or tenant context are denied access to scoped management routes.
 - Cloud customer identity D1/membership/key lifecycle tests passed 5/5 (combined rerun with the tenant permission suite passed 9/9); core typecheck, ESLint, migration idempotency, and Worker graph checks passed. The global admin remains the trusted identity provisioning boundary.
-- The platform-admin tenant-create API can now optionally bind a trusted owner principal, issue its one-time tenant API key, audit the completed operation, and delete the new tenant on key/audit failure. Cloud identity, runtime API, and compensation tests passed 17/17; core typecheck, targeted ESLint, and 15-input Cloudflare dry run passed. Owner identity verification still belongs to an external trusted identity flow.
+- The platform-admin tenant-create API can now optionally bind a trusted owner principal, issue its one-time tenant API key, audit the completed operation, and delete the new tenant on key/audit failure; pushed in `43018c585`. Cloud identity, runtime API, and compensation tests passed 17/17; core typecheck, targeted ESLint, and 15-input Cloudflare dry run passed. Owner identity verification still belongs to an external trusted identity flow.
 - Phase 7 lifecycle HTTP, rate-limit, and Durable Object regression run passed 14/14, including suspend/resume session invalidation and device credential rotate/revoke. This uses the existing platform admin token; cloud owner identity remains unimplemented.
 - Local Agent CLI and CLI program runs passed 19/19 and 21/21, respectively. The credential is read from the explicitly named environment variable and never accepted in argv.
 - Phase 10 Local Agent executor, discovery, and gateway tests passed 16/16 for bounded ComfyUI output retrieval, metadata validation, and oversized-response rejection; typecheck and docs checks passed.
