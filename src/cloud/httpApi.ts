@@ -34,8 +34,11 @@ import {
 } from "./gatewayDevices";
 import {
   createCloudCustomerMembership,
+  CloudLastActiveOwnerError,
+  getCloudCustomerMembership,
   issueCloudCustomerApiKey,
   revokeCloudCustomerApiKey,
+  updateCloudCustomerMembership,
   type CloudCustomerRole,
 } from "./customerIdentity";
 import type {
@@ -365,6 +368,7 @@ export async function handleCloudApiRequest(
     // accepted or mapped as a customer API key identity.
     const isCustomerIdentityPath =
       (segments.length === 2 && segments[1] === "memberships" && request.method === "POST") ||
+      (segments.length === 3 && segments[1] === "memberships" && request.method === "PATCH") ||
       (segments.length === 4 &&
         segments[1] === "memberships" &&
         segments[3] === "api-keys" &&
@@ -437,6 +441,69 @@ export async function handleCloudApiRequest(
           metadata: { tenantId, role: membership.role },
         });
         return json(membership, 201);
+      }
+
+      if (collection === "memberships" && resourceId !== undefined && request.method === "PATCH") {
+        const target = await getCloudTenantById(db, tenantId);
+        if (!target || target.kind !== "customer") return json({ error: "Tenant not found" }, 404);
+        const currentMembership = await getCloudCustomerMembership(db, tenantId, resourceId);
+        if (!currentMembership) return json({ error: "Membership not found" }, 404);
+        const body = validateFields(await readBody(request), ["role", "isActive"]);
+        if (body.role === undefined && body.isActive === undefined) {
+          throw new ApiError(400, "At least one of role or isActive is required");
+        }
+        if (
+          body.role !== undefined &&
+          (typeof body.role !== "string" ||
+            !["owner", "admin", "member", "viewer"].includes(body.role))
+        ) {
+          throw new ApiError(400, "Invalid customer role");
+        }
+        if (body.isActive !== undefined && typeof body.isActive !== "boolean") {
+          throw new ApiError(400, "isActive must be a boolean");
+        }
+        const nextRole = (body.role as CloudCustomerRole | undefined) ?? currentMembership.role;
+        const nextActive = (body.isActive as boolean | undefined) ?? currentMembership.isActive;
+        const timestamp = now().toISOString();
+        await appendCloudComplianceAudit(db, {
+          id: crypto.randomUUID(),
+          tenantId: CLOUD_PLATFORM_TENANT_ID,
+          timestamp,
+          action: "customer.membership.update",
+          actor: "cloud-admin",
+          target: resourceId,
+          resourceType: "customer-membership",
+          status: "attempted",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: { tenantId, role: nextRole, isActive: nextActive },
+        });
+        let membership;
+        try {
+          membership = await updateCloudCustomerMembership(db, {
+            tenantId,
+            membershipId: resourceId,
+            role: nextRole,
+            isActive: nextActive,
+            now: timestamp,
+          });
+        } catch (error) {
+          if (error instanceof CloudLastActiveOwnerError) throw new ApiError(409, error.message);
+          throw error;
+        }
+        if (!membership) return json({ error: "Membership not found" }, 404);
+        await appendCloudComplianceAudit(db, {
+          id: crypto.randomUUID(),
+          tenantId: CLOUD_PLATFORM_TENANT_ID,
+          timestamp: now().toISOString(),
+          action: "customer.membership.update",
+          actor: "cloud-admin",
+          target: membership.id,
+          resourceType: "customer-membership",
+          status: "success",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: { tenantId, role: membership.role, isActive: membership.isActive },
+        });
+        return json(membership);
       }
 
       if (collection === "memberships" && resourceId !== undefined) {

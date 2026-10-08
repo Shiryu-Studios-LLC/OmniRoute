@@ -20,6 +20,23 @@ export interface IssuedCloudCustomerApiKey {
   expiresAt: string | null;
 }
 
+export interface CloudCustomerMembership {
+  id: string;
+  tenantId: string;
+  principalId: string;
+  role: CloudCustomerRole;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export class CloudLastActiveOwnerError extends Error {
+  constructor() {
+    super("A customer tenant must keep at least one active owner");
+    this.name = "CloudLastActiveOwnerError";
+  }
+}
+
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const ROLE_SET = new Set<CloudCustomerRole>(["owner", "admin", "member", "viewer"]);
 const TOKEN_PREFIX = "orc_live_";
@@ -85,6 +102,116 @@ export async function createCloudCustomerMembership(
     throw new Error("Customer membership could not be created");
   }
   return { id, tenantId: input.tenantId, principalId: input.principalId, role };
+}
+
+/** Read one membership within its tenant partition. */
+export async function getCloudCustomerMembership(
+  db: CloudDb,
+  tenantId: string,
+  membershipId: string
+): Promise<CloudCustomerMembership | null> {
+  const row = await db
+    .prepare<{
+      id: string;
+      tenant_id: string;
+      principal_id: string;
+      role: CloudCustomerRole;
+      is_active: number;
+      created_at: string;
+      updated_at: string;
+    }>(
+      `SELECT id, tenant_id, principal_id, role, is_active, created_at, updated_at
+         FROM cloud_customer_memberships
+        WHERE tenant_id = ? AND id = ? LIMIT 1`
+    )
+    .bind(tenantId, membershipId)
+    .first();
+  if (!row) return null;
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    principalId: row.principal_id,
+    role: row.role,
+    isActive: row.is_active !== 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Update a tenant membership and permanently revoke its API keys when deactivated. */
+export async function updateCloudCustomerMembership(
+  db: CloudDb,
+  input: {
+    tenantId: string;
+    membershipId: string;
+    role: CloudCustomerRole;
+    isActive: boolean;
+    now?: string;
+  }
+): Promise<CloudCustomerMembership | null> {
+  requireId(input.tenantId, "tenantId");
+  requireId(input.membershipId, "membershipId");
+  const role = requireRole(input.role);
+  const now = input.now ?? new Date().toISOString();
+  const updateMembership = db
+    .prepare(
+      `UPDATE cloud_customer_memberships
+          SET role = ?, is_active = ?, updated_at = ?
+        WHERE tenant_id = ? AND id = ?
+          AND (
+            role <> 'owner' OR is_active = 0 OR (? = 'owner' AND ? = 1)
+            OR EXISTS (
+              SELECT 1 FROM cloud_customer_memberships other
+               WHERE other.tenant_id = ? AND other.id <> ?
+                 AND other.role = 'owner' AND other.is_active = 1
+            )
+          )`
+    )
+    .bind(
+      role,
+      input.isActive ? 1 : 0,
+      now,
+      input.tenantId,
+      input.membershipId,
+      role,
+      input.isActive ? 1 : 0,
+      input.tenantId,
+      input.membershipId
+    );
+  const statements = [updateMembership];
+  if (!input.isActive) {
+    statements.push(
+      db
+        .prepare(
+          `UPDATE cloud_customer_api_keys SET revoked_at = ?
+            WHERE tenant_id = ? AND membership_id = ? AND revoked_at IS NULL
+              AND EXISTS (
+                SELECT 1 FROM cloud_customer_memberships
+                 WHERE tenant_id = ? AND id = ? AND is_active = 0 AND updated_at = ?
+              )`
+        )
+        .bind(now, input.tenantId, input.membershipId, input.tenantId, input.membershipId, now)
+    );
+  }
+  const results = await db.batch(statements);
+  if (
+    results.some(
+      (result) =>
+        typeof result === "object" &&
+        result !== null &&
+        "success" in result &&
+        result.success === false
+    )
+  ) {
+    throw new Error("Customer membership could not be updated");
+  }
+  const updated = await getCloudCustomerMembership(db, input.tenantId, input.membershipId);
+  if (!updated) return null;
+  if (updated.role !== role || updated.isActive !== input.isActive) {
+    if (updated.role === "owner" && updated.isActive) throw new CloudLastActiveOwnerError();
+    throw new Error("Customer membership could not be updated");
+  }
+  return updated;
 }
 
 /** Issue a random tenant-bound key. The raw token is returned once and is never stored. */

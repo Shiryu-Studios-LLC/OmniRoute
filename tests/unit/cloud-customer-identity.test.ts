@@ -9,6 +9,7 @@ import { handleCloudApiRequest } from "../../src/cloud/httpApi";
 import {
   authenticateCloudCustomerApiKey,
   createCloudCustomerMembership,
+  getCloudCustomerMembership,
   issueCloudCustomerApiKey,
   revokeCloudCustomerApiKey,
 } from "../../src/cloud/customerIdentity";
@@ -65,7 +66,16 @@ class MockD1 implements CloudDb {
   }
 
   async batch(statements: CloudDbStatement[]): Promise<unknown[]> {
-    return Promise.all(statements.map((statement) => statement.run()));
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const results: unknown[] = [];
+      for (const statement of statements) results.push(await statement.run());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async exec(sql: string): Promise<unknown> {
@@ -461,6 +471,22 @@ test("platform admin API issues a one-time key and revokes it by tenant and key 
     assert.equal(membershipResponse.status, 201);
     const membership = (await membershipResponse.json()) as { id: string };
 
+    const secondOwnerResponse = await call(
+      "/__cloud/v1/tenants/tenant-customer/memberships",
+      "POST",
+      { principalId: "customer-user-second-owner", role: "owner" }
+    );
+    assert.equal(secondOwnerResponse.status, 201);
+    const secondOwner = (await secondOwnerResponse.json()) as { id: string };
+
+    const secondOwnerKeyResponse = await call(
+      `/__cloud/v1/tenants/tenant-customer/memberships/${secondOwner.id}/api-keys`,
+      "POST",
+      {}
+    );
+    assert.equal(secondOwnerKeyResponse.status, 201);
+    const secondOwnerKey = (await secondOwnerKeyResponse.json()) as { token: string };
+
     const issueResponse = await call(
       `/__cloud/v1/tenants/tenant-customer/memberships/${membership.id}/api-keys`,
       "POST",
@@ -478,6 +504,39 @@ test("platform admin API issues a one-time key and revokes it by tenant and key 
     });
     assert.equal(await authenticateCloudCustomerApiKey(d1, adminToken, now), null);
 
+    const deactivateResponse = await call(
+      `/__cloud/v1/tenants/tenant-customer/memberships/${membership.id}`,
+      "PATCH",
+      { isActive: false }
+    );
+    assert.equal(deactivateResponse.status, 200);
+    assert.equal(await authenticateCloudCustomerApiKey(d1, issued.token, now), null);
+    const secondOwnerDemotion = await call(
+      `/__cloud/v1/tenants/tenant-customer/memberships/${secondOwner.id}`,
+      "PATCH",
+      { role: "member" }
+    );
+    assert.equal(secondOwnerDemotion.status, 409);
+    assert.equal(
+      (await authenticateCloudCustomerApiKey(d1, secondOwnerKey.token, now))?.role,
+      "owner",
+      "a rejected last-owner change must not revoke the active owner's API key"
+    );
+
+    const reactivateResponse = await call(
+      `/__cloud/v1/tenants/tenant-customer/memberships/${membership.id}`,
+      "PATCH",
+      { isActive: true }
+    );
+    assert.equal(reactivateResponse.status, 200);
+    assert.equal(await authenticateCloudCustomerApiKey(d1, issued.token, now), null);
+    const demoteResponse = await call(
+      `/__cloud/v1/tenants/tenant-customer/memberships/${secondOwner.id}`,
+      "PATCH",
+      { role: "member" }
+    );
+    assert.equal(demoteResponse.status, 200);
+
     const overrideAttempt = await call("/__cloud/v1/tenants/tenant-customer/memberships", "POST", {
       principalId: "attacker",
       role: "owner",
@@ -485,12 +544,71 @@ test("platform admin API issues a one-time key and revokes it by tenant and key 
     });
     assert.equal(overrideAttempt.status, 400);
 
+    const secondIssueResponse = await call(
+      `/__cloud/v1/tenants/tenant-customer/memberships/${membership.id}/api-keys`,
+      "POST",
+      {}
+    );
+    assert.equal(secondIssueResponse.status, 201);
+    const secondIssued = (await secondIssueResponse.json()) as { id: string; token: string };
     const revokeResponse = await call(
-      `/__cloud/v1/tenants/tenant-customer/api-keys/${issued.id}`,
+      `/__cloud/v1/tenants/tenant-customer/api-keys/${secondIssued.id}`,
       "DELETE"
     );
     assert.equal(revokeResponse.status, 200);
-    assert.equal(await authenticateCloudCustomerApiKey(d1, issued.token, now), null);
+    assert.equal(await authenticateCloudCustomerApiKey(d1, secondIssued.token, now), null);
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("membership deactivation and key revocation roll back together on D1 failure", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const membership = await createCloudCustomerMembership(d1, {
+      tenantId: "tenant-customer",
+      principalId: "customer-user-atomic",
+      role: "owner",
+      now,
+    });
+    await createCloudCustomerMembership(d1, {
+      tenantId: "tenant-customer",
+      principalId: "customer-user-atomic-backup-owner",
+      role: "owner",
+      now,
+    });
+    const issued = await issueCloudCustomerApiKey(d1, {
+      tenantId: "tenant-customer",
+      membershipId: membership.id,
+      now,
+    });
+    await d1.exec(`
+      CREATE TRIGGER fail_key_revocation BEFORE UPDATE OF revoked_at ON cloud_customer_api_keys
+      BEGIN SELECT RAISE(ABORT, 'injected key revocation failure'); END;
+    `);
+    const response = await handleCloudApiRequest(
+      new Request(
+        `https://cloud.example.test/__cloud/v1/tenants/tenant-customer/memberships/${membership.id}`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: "Bearer platform-secret",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ isActive: false }),
+        }
+      ),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+    assert.equal(response.status, 500);
+    assert.equal(
+      (await getCloudCustomerMembership(d1, "tenant-customer", membership.id))?.isActive,
+      true
+    );
+    assert.equal(
+      (await authenticateCloudCustomerApiKey(d1, issued.token, now))?.principalId,
+      "customer-user-atomic"
+    );
   } finally {
     d1.db.close();
   }
