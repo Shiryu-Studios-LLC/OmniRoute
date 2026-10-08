@@ -9,7 +9,7 @@ function jsonResponse(body: unknown): Response {
 test("discovers installed Ollama IDs and only reports verified model capabilities", async () => {
   const requested: string[] = [];
   const result = await discoverLocalCapabilities(
-    { ollamaUrl: "http://localhost:11434" },
+    { ollamaUrl: "http://localhost:11434", comfyUiUrl: "http://comfy.internal:8188" },
     {
       resolveHost: async (host) => (host === "localhost" ? ["127.0.0.1", "::1"] : []),
       fetch: async (input, init) => {
@@ -30,6 +30,7 @@ test("discovers installed Ollama IDs and only reports verified model capabilitie
 
   assert.deepEqual(result.services, [
     { service: "ollama", reachable: true, models: ["llama3.2:3b", "llava:7b"] },
+    { service: "comfyui", reachable: false, models: [] },
   ]);
   assert.deepEqual(result.heartbeat, {
     status: "online",
@@ -51,7 +52,7 @@ test("discovers installed Ollama IDs and only reports verified model capabilitie
 
 test("discovers ComfyUI checkpoint IDs and only executable image capability", async () => {
   const result = await discoverLocalCapabilities(
-    { comfyUiUrl: "http://192.168.1.20:8188" },
+    { ollamaUrl: "http://ollama.internal:11434", comfyUiUrl: "http://192.168.1.20:8188" },
     {
       resolveHost: async () => ["192.168.1.20"],
       fetch: async () =>
@@ -65,6 +66,7 @@ test("discovers ComfyUI checkpoint IDs and only executable image capability", as
   );
 
   assert.deepEqual(result.services, [
+    { service: "ollama", reachable: false, models: [] },
     { service: "comfyui", reachable: true, models: ["comfyui:checkpoint:sdxl.safetensors"] },
   ]);
   assert.deepEqual(result.heartbeat, {
@@ -73,10 +75,71 @@ test("discovers ComfyUI checkpoint IDs and only executable image capability", as
   });
 });
 
+test("probes only the default loopback endpoints when service URLs are omitted", async () => {
+  const requested: string[] = [];
+  const result = await discoverLocalCapabilities(
+    {},
+    {
+      fetch: async (input, init) => {
+        const url = String(input);
+        requested.push(`${init?.method ?? "GET"} ${url}`);
+        if (url.endsWith("/api/tags")) return jsonResponse({ models: [{ name: "qwen3" }] });
+        if (url.endsWith("/api/show")) return jsonResponse({ capabilities: ["completion"] });
+        if (url.endsWith("/object_info")) {
+          return jsonResponse({
+            CheckpointLoaderSimple: { input: { required: { ckpt_name: [["sdxl.safetensors"]] } } },
+            KSampler: {},
+            SaveImage: {},
+          });
+        }
+        throw new Error(`Unexpected local service request: ${url}`);
+      },
+    }
+  );
+
+  assert.deepEqual(requested, [
+    "GET http://127.0.0.1:11434/api/tags",
+    "POST http://127.0.0.1:11434/api/show",
+    "GET http://127.0.0.1:8188/object_info",
+  ]);
+  assert.deepEqual(result.services, [
+    { service: "ollama", reachable: true, models: ["qwen3"] },
+    { service: "comfyui", reachable: true, models: ["comfyui:checkpoint:sdxl.safetensors"] },
+  ]);
+  assert.deepEqual(result.heartbeat.capabilities, [
+    "ollama:model:qwen3",
+    "ollama:chat:qwen3",
+    "comfyui:image",
+  ]);
+});
+
+test("reports omitted default loopback services as unavailable when probes fail", async () => {
+  const requested: string[] = [];
+  const result = await discoverLocalCapabilities(
+    {},
+    {
+      fetch: async (input) => {
+        requested.push(String(input));
+        throw new Error("service offline");
+      },
+    }
+  );
+
+  assert.deepEqual(requested, [
+    "http://127.0.0.1:11434/api/tags",
+    "http://127.0.0.1:8188/object_info",
+  ]);
+  assert.deepEqual(result.services, [
+    { service: "ollama", reachable: false, models: [] },
+    { service: "comfyui", reachable: false, models: [] },
+  ]);
+  assert.deepEqual(result.heartbeat.capabilities, []);
+});
+
 test("does not make a request to arbitrary DNS hostnames, even if they resolve privately", async () => {
   let calls = 0;
   const result = await discoverLocalCapabilities(
-    { ollamaUrl: "http://ollama.internal:11434" },
+    { ollamaUrl: "http://ollama.internal:11434", comfyUiUrl: "http://comfy.internal:8188" },
     {
       resolveHost: async () => ["10.0.0.4"],
       fetch: async () => {
@@ -86,13 +149,19 @@ test("does not make a request to arbitrary DNS hostnames, even if they resolve p
     }
   );
   assert.equal(calls, 0);
-  assert.deepEqual(result.services, [{ service: "ollama", reachable: false, models: [] }]);
+  assert.deepEqual(result.services, [
+    { service: "ollama", reachable: false, models: [] },
+    { service: "comfyui", reachable: false, models: [] },
+  ]);
 });
 
 test("rejects link-local metadata addresses before sending a request", async () => {
   let calls = 0;
   const result = await discoverLocalCapabilities(
-    { ollamaUrl: "http://169.254.169.254/latest/meta-data" },
+    {
+      ollamaUrl: "http://169.254.169.254/latest/meta-data",
+      comfyUiUrl: "http://169.254.169.254/latest/meta-data",
+    },
     {
       fetch: async () => {
         calls += 1;
@@ -107,7 +176,10 @@ test("rejects link-local metadata addresses before sending a request", async () 
 test("rejects URL credentials and caps Ollama model enumeration", async () => {
   let calls = 0;
   const rejected = await discoverLocalCapabilities(
-    { ollamaUrl: "http://user:password@127.0.0.1:11434" },
+    {
+      ollamaUrl: "http://user:password@127.0.0.1:11434",
+      comfyUiUrl: "http://user:password@127.0.0.1:8188",
+    },
     {
       fetch: async () => {
         calls += 1;
@@ -120,7 +192,10 @@ test("rejects URL credentials and caps Ollama model enumeration", async () => {
 
   const models = Array.from({ length: 40 }, (_, index) => ({ name: `model-${index}` }));
   const bounded = await discoverLocalCapabilities(
-    { ollamaUrl: "http://127.0.0.1:11434" },
+    {
+      ollamaUrl: "http://127.0.0.1:11434",
+      comfyUiUrl: "http://user:password@127.0.0.1:8188",
+    },
     {
       fetch: async (_input, init) => {
         calls += 1;
@@ -135,7 +210,7 @@ test("rejects URL credentials and caps Ollama model enumeration", async () => {
 
 test("never infers ComfyUI image generation without required nodes and checkpoints", async () => {
   const result = await discoverLocalCapabilities(
-    { comfyUiUrl: "http://127.0.0.1:8188" },
+    { ollamaUrl: "http://user:password@127.0.0.1:11434", comfyUiUrl: "http://127.0.0.1:8188" },
     {
       fetch: async () => jsonResponse({ KSampler: {}, SaveImage: {} }),
     }

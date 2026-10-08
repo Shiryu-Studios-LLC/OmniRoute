@@ -6,6 +6,10 @@ const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_BINARY_RESPONSE_BYTES = 40 * 1024;
 const MAX_OLLAMA_MODELS = 32;
 const REQUEST_TIMEOUT_MS = 4_000;
+const DEFAULT_LOCAL_ENDPOINTS = {
+  ollama: "http://127.0.0.1:11434",
+  comfyui: "http://127.0.0.1:8188",
+} as const;
 
 export interface LocalDiscoveryConfig {
   ollamaUrl?: string;
@@ -264,10 +268,9 @@ export async function discoverLocalCapabilities(
   const services: LocalDiscoveryResult["services"] = [];
 
   for (const [service, endpoint] of [
-    ["ollama", config.ollamaUrl],
-    ["comfyui", config.comfyUiUrl],
+    ["ollama", config.ollamaUrl ?? DEFAULT_LOCAL_ENDPOINTS.ollama],
+    ["comfyui", config.comfyUiUrl ?? DEFAULT_LOCAL_ENDPOINTS.comfyui],
   ] as const) {
-    if (!endpoint) continue;
     try {
       const result =
         service === "ollama"
