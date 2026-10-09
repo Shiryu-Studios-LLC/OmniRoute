@@ -4,6 +4,9 @@
   "main": "cloudflare/worker.ts",
   "compatibility_date": "2026-10-08",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "OMNIROUTE_ENV": "production",
+  },
   "triggers": {
     "crons": ["*/15 * * * *"],
   },

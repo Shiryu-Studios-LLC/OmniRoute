@@ -97,6 +97,7 @@ jobs:
             "compatibility_date",
             "compatibility_flags",
             "observability",
+            "vars",
             "d1_databases",
             "durable_objects",
             "migrations",

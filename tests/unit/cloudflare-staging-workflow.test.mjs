@@ -7,6 +7,9 @@ const workflow = readFileSync(
   join(process.cwd(), ".github/workflows/deploy-cloudflare-staging.yml"),
   "utf8"
 );
+const wranglerConfig = JSON.parse(
+  readFileSync(join(process.cwd(), "wrangler.jsonc"), "utf8").replace(/,\s*([}\]])/g, "$1")
+);
 
 test("Cloudflare staging deployment is manual and requires an explicit staging confirmation", () => {
   assert.match(workflow, /^  workflow_dispatch:/m);
@@ -18,6 +21,9 @@ test("Cloudflare staging deployment is manual and requires an explicit staging c
 });
 
 test("staging deploy constructs a staging-only Worker config without production routes", () => {
+  assert.equal(wranglerConfig.vars?.OMNIROUTE_ENV, "production");
+  assert.match(workflow, /"vars"/);
+  assert.match(workflow, /OMNIROUTE_ENV: "staging"/);
   assert.match(workflow, /config\.name = "omniroute-cloud-runtime-staging"/);
   assert.match(workflow, /config\.workers_dev = true/);
   assert.match(workflow, /config\.routes = \[\]/);
