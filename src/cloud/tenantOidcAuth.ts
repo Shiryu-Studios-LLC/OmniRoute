@@ -28,6 +28,10 @@ import {
 } from "./customerBusinessProfile";
 import { validateCloudCustomerBusinessProfile } from "./customerBusinessProfileHttpApi";
 import {
+  CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH,
+  handleCloudCustomerProviderPortalRequest,
+} from "./customerProviderHttpApi";
+import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaimByHash,
@@ -45,6 +49,8 @@ export const CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH = "/__cloud/auth/oidc/own
 export const CLOUD_TENANT_MEMBERS_PATH = "/__cloud/auth/members";
 export const CLOUD_TENANT_API_KEYS_PATH = "/__cloud/auth/api-keys";
 export const CLOUD_TENANT_BUSINESS_PROFILE_PATH = "/__cloud/auth/business-profile";
+export const CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH =
+  CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH;
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -945,6 +951,33 @@ async function customerBusinessProfilePortal(
   return result ? json(result) : json({ error: "Owner or admin session required" }, 403);
 }
 
+async function customerProviderConnectionsPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (request.method !== "GET" && request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const response = await handleCloudCustomerProviderPortalRequest(
+    request,
+    {
+      db: options.db,
+      credentialEncryptionKey: options.credentialEncryptionKey,
+      now: () => new Date(nowMs),
+    },
+    {
+      tenantId: session.tenant_id,
+      principalId: session.principal_id,
+      role: session.role,
+    }
+  );
+  return response ?? json({ error: "Not found" }, 404);
+}
+
 async function listMemberships(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1429,6 +1462,9 @@ export async function handleCloudTenantOidcAuthRequest(
   const isApiKeyCollection = pathname === CLOUD_TENANT_API_KEYS_PATH;
   const isApiKeyItem = pathname.startsWith(`${CLOUD_TENANT_API_KEYS_PATH}/`);
   const isBusinessProfile = pathname === CLOUD_TENANT_BUSINESS_PROFILE_PATH;
+  const isProviderConnections =
+    pathname === CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH ||
+    pathname.startsWith(`${CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH}/`);
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1442,6 +1478,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isApiKeyCollection &&
     !isApiKeyItem &&
     !isBusinessProfile &&
+    !isProviderConnections &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1449,7 +1486,7 @@ export async function handleCloudTenantOidcAuthRequest(
     return null;
   }
   const expectedMethod =
-    isApiKeyCollection || isApiKeyItem || isBusinessProfile
+    isApiKeyCollection || isApiKeyItem || isBusinessProfile || isProviderConnections
       ? ""
       : isCreateInvitation || isRedeemInvitation || isRedeemOwnerClaim || isLogout
         ? "POST"
@@ -1462,7 +1499,9 @@ export async function handleCloudTenantOidcAuthRequest(
       ? ["DELETE"]
       : isBusinessProfile
         ? ["GET", "PUT"]
-        : [expectedMethod];
+        : isProviderConnections
+          ? ["GET", "POST", "PATCH", "DELETE"]
+          : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1476,6 +1515,8 @@ export async function handleCloudTenantOidcAuthRequest(
   const nowMs = options.now?.() ?? Date.now();
   if (!Number.isSafeInteger(nowMs) || nowMs < 0) return json({ error: "Service unavailable" }, 503);
   if (isBusinessProfile) return customerBusinessProfilePortal(request, options, origin, nowMs);
+  if (isProviderConnections)
+    return customerProviderConnectionsPortal(request, options, origin, nowMs);
   if (isLogin) {
     return startLogin(request, options, origin, nowMs);
   }

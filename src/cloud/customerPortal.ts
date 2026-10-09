@@ -38,6 +38,7 @@ const PORTAL_SCRIPT = `
   const apiKeyList = byId("api-keys");
   const apiKeyResult = byId("api-key-result");
   const serviceList = byId("business-services");
+  const providerList = byId("provider-connections");
   let newlyIssuedToken = null;
   let nextCursor = null;
 
@@ -115,6 +116,106 @@ const PORTAL_SCRIPT = `
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Business profile could not be saved.", true);
     } finally { button.disabled = false; }
+  });
+
+  const loadProviderConnections = async () => {
+    const data = await api("/__cloud/auth/provider-connections");
+    if (!Array.isArray(data.connections)) throw new Error("Invalid provider connection response");
+    providerList.replaceChildren();
+    for (const connection of data.connections) {
+      if (!connection || typeof connection.id !== "string" || connection.provider !== "openai" ||
+          typeof connection.isActive !== "boolean" || typeof connection.hasCredentials !== "boolean") continue;
+      const row = node("li");
+      row.className = "provider-row";
+      row.append(node("h3", connection.name || "OpenAI"));
+      row.append(node("p", (connection.isActive ? "Active" : "Inactive") + " · " +
+        (connection.hasCredentials ? "Credential stored" : "No credential")));
+      const form = node("form");
+      form.className = "provider-form";
+      const nameLabel = node("label", "Connection name");
+      const name = node("input");
+      name.maxLength = 200;
+      name.value = typeof connection.name === "string" ? connection.name : "";
+      nameLabel.append(name);
+      const priorityLabel = node("label", "Priority");
+      const priority = node("input");
+      priority.type = "number";
+      priority.min = "0";
+      priority.max = "100000";
+      priority.step = "1";
+      priority.value = String(Number.isInteger(connection.priority) ? connection.priority : 0);
+      priorityLabel.append(priority);
+      const activeLabel = node("label", "Connection active");
+      const active = node("input");
+      active.type = "checkbox";
+      active.checked = connection.isActive;
+      activeLabel.append(active);
+      const keyLabel = node("label", "Replace credential (leave blank to keep current)");
+      const key = node("input");
+      key.type = "password";
+      key.autocomplete = "new-password";
+      key.maxLength = 8192;
+      keyLabel.append(key);
+      const save = node("button", "Save connection");
+      save.type = "submit";
+      form.append(nameLabel, priorityLabel, activeLabel, keyLabel, save);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        save.disabled = true;
+        const body = { name: name.value || null, priority: Number(priority.value), isActive: active.checked };
+        if (key.value) body.apiKey = key.value;
+        try {
+          await api("/__cloud/auth/provider-connections/" + encodeURIComponent(connection.id), {
+            method: "PATCH",
+            body: JSON.stringify(body),
+          });
+          setStatus("Provider connection updated. Credential values are never displayed.");
+          await loadProviderConnections();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Provider connection could not be updated.", true);
+        } finally { key.value = ""; save.disabled = false; }
+      });
+      const remove = node("button", "Revoke connection");
+      remove.type = "button";
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try {
+          await api("/__cloud/auth/provider-connections/" + encodeURIComponent(connection.id), {
+            method: "DELETE",
+          });
+          setStatus("Provider connection revoked.");
+          await loadProviderConnections();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Provider connection could not be revoked.", true);
+          remove.disabled = false;
+        }
+      });
+      row.append(form, remove);
+      providerList.append(row);
+    }
+  };
+
+  byId("provider-connection-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("create-provider-connection");
+    const key = byId("provider-api-key");
+    button.disabled = true;
+    const body = {
+      id: "customer-openai-" + crypto.randomUUID(),
+      provider: "openai",
+      apiKey: key.value,
+      name: byId("provider-connection-name").value || null,
+      priority: Number(byId("provider-connection-priority").value || 0),
+    };
+    try {
+      await api("/__cloud/auth/provider-connections", { method: "POST", body: JSON.stringify(body) });
+      key.value = "";
+      byId("provider-connection-name").value = "";
+      setStatus("OpenAI connection created. Credential values are never displayed.");
+      await loadProviderConnections();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Provider connection could not be created.", true);
+    } finally { key.value = ""; button.disabled = false; }
   });
 
   const loadApiKeys = async () => {
@@ -355,10 +456,16 @@ const PORTAL_SCRIPT = `
         byId("api-key-panel").hidden = false;
         byId("manager-panel").hidden = false;
         byId("business-profile-panel").hidden = false;
+        byId("provider-connection-panel").hidden = false;
         try {
           await loadBusinessProfile();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "Could not load business profile.", true);
+        }
+        try {
+          await loadProviderConnections();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load provider connections.", true);
         }
         try {
           await loadApiKeys();
@@ -402,8 +509,8 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
       body { margin: 0 auto; max-width: 54rem; padding: 2rem 1rem; }
       main { display: grid; gap: 1.5rem; }
-      section, .member-row { border: 1px solid #8888; border-radius: .75rem; padding: 1rem; }
-      form, .member-form, .service-row { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
+      section, .member-row, .provider-row { border: 1px solid #8888; border-radius: .75rem; padding: 1rem; }
+      form, .member-form, .service-row, .provider-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
       textarea { font: inherit; min-width: min(28rem, 80vw); min-height: 4rem; }
       label { display: grid; gap: .25rem; }
       input, select, button { font: inherit; padding: .5rem; }
@@ -487,6 +594,21 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <label for="assistant-handoff">When to hand off to a person</label>
           <textarea id="assistant-handoff" maxlength="1000" required></textarea>
           <button id="save-business-profile" type="submit">Save business profile</button>
+        </form>
+      </section>
+      <section id="provider-connection-panel" hidden>
+        <h2>OpenAI provider connections</h2>
+        <p>Connections use the fixed OmniRoute model gpt-4o-mini-2024-07-18. Credentials are encrypted before storage and are never returned to this page.</p>
+        <ul id="provider-connections"></ul>
+        <h3>Add an OpenAI connection</h3>
+        <form id="provider-connection-form">
+          <label for="provider-connection-name">Connection name</label>
+          <input id="provider-connection-name" maxlength="200" autocomplete="off">
+          <label for="provider-connection-priority">Priority</label>
+          <input id="provider-connection-priority" type="number" min="0" max="100000" step="1" value="0" required>
+          <label for="provider-api-key">OpenAI API key</label>
+          <input id="provider-api-key" type="password" autocomplete="new-password" maxlength="8192" required>
+          <button id="create-provider-connection" type="submit">Add OpenAI connection</button>
         </form>
       </section>
     </main>

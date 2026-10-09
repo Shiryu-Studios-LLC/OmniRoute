@@ -247,8 +247,10 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Create owner/admin membership.
 - Generate tenant-scoped credentials.
 - The platform-admin tenant-create request supports either an owner principal ID from an external verified identity flow (creating the tenant, owner membership, and one-time API key) or explicit `bootstrapMode: "oidc_pending"` (creating the tenant and settings without an owner or key). The latter is followed by platform-admin OIDC configuration and first-owner claim issuance. Both paths have compensating rollback and audit records. The Cloud runtime does not verify real-world identity outside its configured OIDC callback.
-- Configure provider connections through the owner/admin customer API. Current self-service is
-  limited to a fixed OpenAI connection and does not grant inference entitlements.
+- Configure provider connections through the owner/admin customer API or Worker portal. The portal
+  uses the OIDC session to list, create, edit, deactivate, and revoke the fixed OpenAI contract;
+  credential inputs are transient, encrypted at the Worker boundary, and never returned or audited.
+  This does not grant inference entitlements, which remain default-deny until separately configured.
 - Store and update a tenant-scoped Front Desk business identity through the owner/admin API;
   Front Desk can opt into reading it from OmniRoute.
 - Owner/admins can also read and edit that profile in the Worker-served portal through their

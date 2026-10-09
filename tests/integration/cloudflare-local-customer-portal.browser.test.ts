@@ -349,6 +349,55 @@ test(
       "Consultation"
     );
 
+    const providerSecret = "sk-test-browser-provider-secret";
+    await page.locator("#provider-connection-name").fill("Browser OpenAI");
+    await page.locator("#provider-api-key").fill(providerSecret);
+    await page.getByRole("button", { name: "Add OpenAI connection" }).click();
+    await page
+      .getByText("OpenAI connection created. Credential values are never displayed.")
+      .waitFor();
+    assert.equal(await page.locator("#provider-api-key").inputValue(), "");
+    const providerRow = page.locator("#provider-connections .provider-row").first();
+    await providerRow.waitFor();
+    assert.equal((await providerRow.textContent())?.includes(providerSecret), false);
+    await providerRow.getByLabel("Connection name").fill("Browser OpenAI Edited");
+    await providerRow.getByRole("button", { name: "Save connection" }).click();
+    await page
+      .getByText("Provider connection updated. Credential values are never displayed.")
+      .waitFor();
+    assert.equal(
+      (await page.locator("#provider-connections").textContent())?.includes(providerSecret),
+      false
+    );
+    const connectionResult = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT api_key, name FROM provider_connections WHERE tenant_id = ${sqlText(tenantId)} AND provider = 'openai';`,
+    ]);
+    assert.equal(
+      connectionResult.status,
+      0,
+      `${connectionResult.stdout}\n${connectionResult.stderr}`
+    );
+    assert.doesNotMatch(connectionResult.stdout, new RegExp(providerSecret));
+    assert.match(connectionResult.stdout, /enc:v[12]:/);
+    assert.match(connectionResult.stdout, /Browser OpenAI Edited/);
+    await providerRow.getByRole("button", { name: "Revoke connection" }).click();
+    await page.getByText("Provider connection revoked.").waitFor();
+    await providerRow.waitFor({ state: "detached" });
+    assert.equal(await page.locator("#provider-connections").textContent(), "");
+
     await page.getByRole("button", { name: "Create API key" }).click();
     await page.getByText("API key created.").waitFor();
     const issuedKey = await page.locator("#api-key-result code").textContent();

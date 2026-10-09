@@ -14,6 +14,11 @@ import {
   updateCloudCustomerMembership,
 } from "../../src/cloud/customerIdentity";
 import { CLOUD_PLATFORM_TENANT_ID, createCloudCustomerTenant } from "../../src/cloud/tenants";
+import {
+  decryptCloudCredential,
+  isCloudCredentialEnvelope,
+} from "../../src/cloud/credentialEncryption";
+import { createCloudProviderConnection } from "../../src/cloud/providers";
 import { addCloudTenantOidcIdentity, setCloudTenantOidcConfig } from "../../src/cloud/tenantOidc";
 import {
   CLOUD_TENANT_OIDC_CALLBACK_PATH,
@@ -26,6 +31,7 @@ import {
   CLOUD_TENANT_MEMBERS_PATH,
   CLOUD_TENANT_API_KEYS_PATH,
   CLOUD_TENANT_BUSINESS_PROFILE_PATH,
+  CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -194,6 +200,7 @@ async function setup() {
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
+    "0022_provider_execution_contract.sql",
     "0023_cloud_tenant_business_profiles.sql",
     "0024_cloud_tenant_business_profile_configuration.sql",
   ]) {
@@ -559,6 +566,176 @@ test("business profile portal is owner/admin session scoped, origin checked, bou
     profileB?.name,
     otherTenant.name,
     "the session cannot modify another tenant profile"
+  );
+});
+
+test("provider connection portal enforces owner sessions and reuses encrypted fixed-contract API operations", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const secret = "sk-test-portal-provider-secret";
+  const path = `${ORIGIN}${CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH}`;
+  const headers = (extra: Record<string, string> = {}) => ({
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+    ...extra,
+  });
+
+  const blockedOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "POST",
+      headers: headers({ Origin: "https://attacker.example", "Content-Type": "application/json" }),
+      body: JSON.stringify({ id: "provider-a", provider: "openai", apiKey: secret }),
+    })
+  );
+  assert.equal(blockedOrigin.status, 403);
+  const missingOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ id: "provider-missing-origin", provider: "openai", apiKey: secret }),
+    })
+  );
+  assert.equal(missingOrigin.status, 403);
+  const created = await portal.app.fetch(
+    new Request(path, {
+      method: "POST",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ id: "provider-a", provider: "openai", apiKey: secret, name: "Team" }),
+    })
+  );
+  assert.equal(created.status, 201);
+  const createdText = await created.text();
+  assert.doesNotMatch(createdText, /apiKey|sk-test-portal-provider-secret/);
+  assert.match(createdText, /"hasCredentials":true/);
+  const stored = await db
+    .prepare(
+      "SELECT api_key, default_model, credential_ownership, execution_location FROM provider_connections WHERE tenant_id = ? AND id = ?"
+    )
+    .bind(tenant.id, "provider-a")
+    .first<{
+      api_key: string;
+      default_model: string;
+      credential_ownership: string;
+      execution_location: string;
+    }>();
+  assert.ok(stored && isCloudCredentialEnvelope(stored.api_key));
+  assert.equal(
+    await decryptCloudCredential(stored.api_key, ENCRYPTION_KEY, {
+      tenantId: tenant.id,
+      connectionId: "provider-a",
+      field: "apiKey",
+    }),
+    secret
+  );
+  assert.equal(stored.default_model, "gpt-4o-mini-2024-07-18");
+  assert.equal(stored.credential_ownership, "customer_managed");
+  assert.equal(stored.execution_location, "third_party");
+
+  const otherTenant = await createCloudCustomerTenant(db, {
+    id: "provider-portal-other",
+    name: "Other Provider Tenant",
+    slug: "provider-portal-other",
+  });
+  await createCloudProviderConnection(db, {
+    id: "only-other-tenant",
+    tenantId: otherTenant.id,
+    provider: "openai",
+    apiKey: "other-tenant-secret",
+    credentialOwnership: "customer_managed",
+    executionLocation: "third_party",
+  });
+  const listed = await portal.app.fetch(new Request(path, { headers: headers() }));
+  assert.equal(listed.status, 200);
+  const listText = await listed.text();
+  assert.match(listText, /provider-a/);
+  assert.doesNotMatch(
+    listText,
+    /only-other-tenant|other-tenant-secret|sk-test-portal-provider-secret/
+  );
+  assert.equal(
+    (await portal.app.fetch(new Request(`${path}/only-other-tenant`, { headers: headers() })))
+      .status,
+    404
+  );
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+
+  const edited = await portal.app.fetch(
+    new Request(`${path}/provider-a`, {
+      method: "PATCH",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ name: "Renamed", priority: 10, apiKey: "sk-rotated-portal-secret" }),
+    })
+  );
+  assert.equal(edited.status, 200);
+  const editedText = await edited.text();
+  assert.match(editedText, /Renamed/);
+  assert.doesNotMatch(editedText, /apiKey|sk-rotated-portal-secret|sk-test-portal-provider-secret/);
+
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "provider-portal-member",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "provider-portal-member-subject",
+    membershipId: member.id,
+  });
+  const memberPortal = await createPortalSession(db, tenant.slug, "provider-portal-member-subject");
+  const memberCookie = { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${memberPortal.cookie}` };
+  assert.equal(
+    (await memberPortal.app.fetch(new Request(path, { headers: memberCookie }))).status,
+    403
+  );
+  assert.equal(
+    (
+      await memberPortal.app.fetch(
+        new Request(path, {
+          method: "POST",
+          headers: { ...memberCookie, Origin: ORIGIN, "Content-Type": "application/json" },
+          body: JSON.stringify({ id: "blocked", provider: "openai", apiKey: secret }),
+        })
+      )
+    ).status,
+    403
+  );
+
+  const publicWithoutBearer = await portal.app.fetch(
+    new Request(`${ORIGIN}/__cloud/v1/customer/provider-connections`, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}` },
+    })
+  );
+  assert.equal(publicWithoutBearer.status, 401);
+  const audit = await db
+    .prepare(
+      `SELECT action, metadata_json FROM cloud_compliance_audit
+       WHERE tenant_id = ? AND action LIKE 'customer.provider_connection.%' ORDER BY timestamp`
+    )
+    .bind(tenant.id)
+    .all<{ action: string; metadata_json: string }>();
+  assert.deepEqual(audit.results.map((row) => row.action).sort(), [
+    "customer.provider_connection.create",
+    "customer.provider_connection.update",
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(audit.results),
+    /sk-test-portal-provider-secret|sk-rotated-portal-secret/
+  );
+
+  const removed = await portal.app.fetch(
+    new Request(`${path}/provider-a`, { method: "DELETE", headers: headers({ Origin: ORIGIN }) })
+  );
+  assert.equal(removed.status, 200);
+  assert.equal(
+    (await portal.app.fetch(new Request(`${path}/provider-a`, { headers: headers() }))).status,
+    404
   );
 });
 

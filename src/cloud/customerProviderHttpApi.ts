@@ -14,6 +14,7 @@ import {
 } from "./providers";
 
 export const CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH = "/__cloud/v1/customer/provider-connections";
+export const CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH = "/__cloud/auth/provider-connections";
 const MAX_BODY_BYTES = 16 * 1024;
 const BODY_READ_TIMEOUT_MS = 5_000;
 const AUTH_RATE_LIMIT = { limit: 600, windowMs: 60_000 };
@@ -30,6 +31,12 @@ export interface CloudCustomerProviderApiOptions {
   failedKeyFallbackRateLimit?: { limit: number; windowMs: number };
   tenantRateLimit?: { limit: number; windowMs: number };
   bodyReadTimeoutMs?: number;
+}
+
+export interface CloudCustomerProviderPortalIdentity {
+  tenantId: string;
+  principalId: string;
+  role: "owner" | "admin";
 }
 
 function json(body: unknown, status = 200): Response {
@@ -232,19 +239,19 @@ function mutationChanged(result: unknown): boolean {
   return Number((meta as { changes?: unknown }).changes ?? 0) > 0;
 }
 
-/** Owner/admin customer-key API for the one provider contract implemented by cloud inference. */
-export async function handleCloudCustomerProviderRequest(
+/** Shared operations core. Trusted identity is supplied only by the session portal wrapper below. */
+async function handleCloudCustomerProviderRequestCore(
   request: Request,
-  options: CloudCustomerProviderApiOptions
+  options: CloudCustomerProviderApiOptions,
+  trustedIdentity?: CloudCustomerProviderPortalIdentity
 ): Promise<Response | null> {
   const url = new URL(request.url);
-  if (
-    url.pathname !== CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH &&
-    !url.pathname.startsWith(`${CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH}/`)
-  )
-    return null;
+  const routePath = trustedIdentity
+    ? CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH
+    : CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH;
+  if (url.pathname !== routePath && !url.pathname.startsWith(`${routePath}/`)) return null;
   if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
-  const routeSuffix = url.pathname.slice(CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH.length);
+  const routeSuffix = url.pathname.slice(routePath.length);
   let connectionId: string | undefined;
   if (routeSuffix) {
     try {
@@ -281,15 +288,17 @@ export async function handleCloudCustomerProviderRequest(
   } catch {
     return json({ error: "Authentication rate limit is unavailable" }, 503);
   }
-  const match = /^Bearer (orc_live_[A-Za-z0-9_-]{32,64})$/.exec(
-    request.headers.get("authorization") ?? ""
-  );
-  if (!match) return json({ error: "Unauthorized" }, 401);
-  let identity;
-  try {
-    identity = await authenticateCloudCustomerApiKey(options.db, match[1], now().toISOString());
-  } catch {
-    return json({ error: "Customer authentication is unavailable" }, 503);
+  let identity = trustedIdentity;
+  if (!identity) {
+    const match = /^Bearer (orc_live_[A-Za-z0-9_-]{32,64})$/.exec(
+      request.headers.get("authorization") ?? ""
+    );
+    if (!match) return json({ error: "Unauthorized" }, 401);
+    try {
+      identity = await authenticateCloudCustomerApiKey(options.db, match[1], now().toISOString());
+    } catch {
+      return json({ error: "Customer authentication is unavailable" }, 503);
+    }
   }
   if (!identity) return json({ error: "Unauthorized" }, 401);
   if (identity.role !== "owner" && identity.role !== "admin") {
@@ -453,4 +462,24 @@ export async function handleCloudCustomerProviderRequest(
     }
     return json({ error: "Customer provider connection request could not be completed" }, 503);
   }
+}
+
+/** Customer public API path; identity is always derived from its bearer API key. */
+export function handleCloudCustomerProviderRequest(
+  request: Request,
+  options: CloudCustomerProviderApiOptions
+): Promise<Response | null> {
+  return handleCloudCustomerProviderRequestCore(request, options);
+}
+
+/**
+ * Internal OIDC portal path. Call only after the OIDC session and owner/admin role are validated.
+ * The public customer path never accepts this trusted identity argument.
+ */
+export function handleCloudCustomerProviderPortalRequest(
+  request: Request,
+  options: CloudCustomerProviderApiOptions,
+  identity: CloudCustomerProviderPortalIdentity
+): Promise<Response | null> {
+  return handleCloudCustomerProviderRequestCore(request, options, identity);
 }
