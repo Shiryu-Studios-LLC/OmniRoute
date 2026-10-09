@@ -640,7 +640,12 @@ test(
         const frontDeskTempDir = await mkdtemp(path.join(tempDir, "front-desk-"));
         const frontDeskHome = path.join(frontDeskTempDir, "home");
         await mkdir(frontDeskHome, { recursive: true });
-        for (const filename of ["server.js", "omnirouteConfig.js", "leadStore.js"]) {
+        for (const filename of [
+          "server.js",
+          "omnirouteConfig.js",
+          "leadStore.js",
+          "chatRateLimit.js",
+        ]) {
           await copyFile(path.join(frontDeskRepo, filename), path.join(frontDeskTempDir, filename));
         }
         await writeFile(path.join(frontDeskTempDir, "leads.json"), "[]\n", { mode: 0o600 });
@@ -879,7 +884,12 @@ test(
         const frontDeskTempDir = await mkdtemp(path.join(tempDir, "front-desk-ollama-"));
         const frontDeskHome = path.join(frontDeskTempDir, "home");
         await mkdir(frontDeskHome, { recursive: true });
-        for (const filename of ["server.js", "omnirouteConfig.js", "leadStore.js"]) {
+        for (const filename of [
+          "server.js",
+          "omnirouteConfig.js",
+          "leadStore.js",
+          "chatRateLimit.js",
+        ]) {
           await copyFile(path.join(frontDeskRepo, filename), path.join(frontDeskTempDir, filename));
         }
         await writeFile(path.join(frontDeskTempDir, "leads.json"), "[]\n", { mode: 0o600 });
