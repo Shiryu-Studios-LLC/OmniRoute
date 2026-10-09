@@ -194,6 +194,8 @@ Phase 7/8 follow-up (2026-10-08, OmniRoute commit `0503c53b1` pushed): customer 
 
 Phase 13 privileged API configuration follow-up (2026-10-08): the base Wrangler config now sets `OMNIROUTE_ENV=production`; the manual staging workflow accepts `vars` and explicitly overrides the value to `staging`. In these environments the Worker rejects admin or maintenance tokens outside the staging workflow's 32–512 character URL-safe format, returning 503 before any D1 access; the runtime also retains the existing distinct-token requirement. The focused Cloud API and staging workflow suites pass 23/23, targeted ESLint/Prettier and `git diff --check` pass, and `npm run cloudflare:build` passes as a dry run at 92 inputs / 509,914 B (96,034 B gzip), SHA-256 `b0c97a8e0e750f09e5d3d362cca21cbbfcb37c9fbec7dec2ba3440fe186d86d1`. This does not remove the global admin token's cross-tenant authority or prove deployment secret entropy; Phase 13 remains in progress and no deployment occurred.
 
+Phase 14 CI follow-up (2026-10-09): `.github/workflows/cloudflare-worker-check.yml` now runs the isolated Worker graph check/dry-run bundle and Cloudflare migration-numbering check on pushes, pull requests, and manual dispatch. It uses read-only repository permissions and no deployment credentials. This catches Worker graph and migration regressions before staging, but does not replace the manual staging deployment or live validation; no Cloudflare resources are created by this workflow.
+
 ## Next actions
 
 1. Isolate the Next middleware dependency graph behind a cloud-specific D1 authorization path; verify a complete OpenNext build before treating the full application as Worker-ready. The isolated Cloud Worker dry run is green at 81 inputs / 402,713 bytes.
