@@ -28,6 +28,11 @@ import type { CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import { CLOUD_TENANT_HOSTS_PATH, handleCloudTenantHostsRequest } from "./tenantHostsHttpApi";
 import {
+  CLOUD_FRONT_DESK_CONFIG_PATH,
+  CLOUD_FRONT_DESK_CONFIGS_PATH,
+  handleCloudFrontDeskConfigRequest,
+} from "./frontDeskConfigHttpApi";
+import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
   CLOUD_TENANT_MEMBERS_PATH,
@@ -60,6 +65,7 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
+  OMNIROUTE_FRONT_DESK_CONFIG_TOKEN?: string;
   OMNIROUTE_CLOUD_PUBLIC_ORIGIN?: string;
   GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
   GATEWAY_ARTIFACTS?: GatewayImageArtifactBucket;
@@ -111,6 +117,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
     const maintenanceToken = env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN;
     const credentialEncryptionKey = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY;
     const idempotencyKey = env?.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY;
+    const frontDeskConfigToken = env?.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN;
     if (!adminToken || !maintenanceToken || !credentialEncryptionKey || !idempotencyKey) {
       return "unconfigured";
     }
@@ -119,7 +126,15 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       !isDeploymentToken(maintenanceToken) ||
       !isCloudCredentialEncryptionKey(credentialEncryptionKey) ||
       !isCloudInferenceIdempotencySecret(idempotencyKey) ||
-      new Set([adminToken, maintenanceToken, credentialEncryptionKey, idempotencyKey]).size !== 4
+      (frontDeskConfigToken !== undefined && !isDeploymentToken(frontDeskConfigToken)) ||
+      new Set([
+        adminToken,
+        maintenanceToken,
+        credentialEncryptionKey,
+        idempotencyKey,
+        ...(frontDeskConfigToken ? [frontDeskConfigToken] : []),
+      ]).size !==
+        4 + (frontDeskConfigToken ? 1 : 0)
     ) {
       return "error";
     }
@@ -133,6 +148,28 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       if (url.pathname === CLOUD_CUSTOMER_PORTAL_PATH) {
         const response = handleCloudCustomerPortalRequest(request);
         if (response) return response;
+      }
+
+      if (
+        url.pathname === CLOUD_FRONT_DESK_CONFIG_PATH ||
+        url.pathname === CLOUD_FRONT_DESK_CONFIGS_PATH ||
+        url.pathname.startsWith(`${CLOUD_FRONT_DESK_CONFIGS_PATH}/`)
+      ) {
+        try {
+          const response = await handleCloudFrontDeskConfigRequest(request, {
+            db: options.env?.DB,
+            adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+            serviceToken: options.env?.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN,
+            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            now,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Front Desk config request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
       }
 
       if (

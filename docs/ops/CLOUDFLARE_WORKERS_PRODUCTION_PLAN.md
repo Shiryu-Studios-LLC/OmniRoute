@@ -262,7 +262,12 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
   OIDC session. Writes require the same origin and commit the profile with a content-free audit.
 - Configure MCP defaults.
 - Register devices.
-- Provision Front Desk host configuration and branding.
+- Register verified Front Desk hosts and store tenant-specific runtime configuration through the
+  Worker API; Front Desk resolves the exact host, then fetches its bounded configuration through a
+  separate service token. Customer API keys and dashboard tokens are encrypted in D1 and omitted
+  from admin listing responses. The Worker checks that the stored key and gateway device remain
+  active before releasing configuration. The static Front Desk tenant configuration remains
+  available for existing installations.
 - Support suspend/revoke/delete lifecycle.
 
 First-owner onboarding now has a platform-admin-issued, digest-only, one-use
@@ -271,8 +276,10 @@ no active owner; acceptance creates the first owner, identity link, and audit
 record atomically. Provider self-service currently supports one fixed OpenAI
 contract, and business identity storage is tenant-scoped with an opt-in Front
 Desk consumer. Automated MCP provisioning, arbitrary provider defaults, Front
-Desk host registration/branding, and end-to-end customer onboarding still
-require further work.
+Desk branding, and end-to-end customer onboarding still require further work.
+Dynamic Front Desk config retrieval requires a one-time shared service token in
+OmniRoute and Front Desk secret stores; no customer-specific server file edits
+are needed once a verified host and tenant config have been provisioned.
 
 **Exit:** a new tenant can be created without manually editing server files.
 
