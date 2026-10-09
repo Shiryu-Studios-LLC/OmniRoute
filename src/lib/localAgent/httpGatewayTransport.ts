@@ -106,6 +106,46 @@ function validSession(value: unknown): LocalAgentGatewaySession | null {
   };
 }
 
+function cancelResponseBody(response: Response): void {
+  if (!response.body || response.body.locked) return;
+  void response.body.cancel("Local Agent gateway response rejected").catch(() => undefined);
+}
+
+async function readBoundedResponseText(response: Response): Promise<string> {
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_RESPONSE_BYTES) {
+        void reader
+          .cancel("Local Agent gateway response exceeds the size limit")
+          .catch(() => undefined);
+        throw new Error("Local Agent gateway response exceeds the size limit");
+      }
+      chunks.push(value);
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(bytes);
+  } catch (error) {
+    void reader.cancel("Local Agent gateway response could not be read").catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export function createHttpLocalAgentGatewayTransport(
   rawUrl: string,
   options: HttpGatewayTransportOptions
@@ -151,12 +191,10 @@ export function createHttpLocalAgentGatewayTransport(
     });
     const advertisedLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(advertisedLength) && advertisedLength > MAX_RESPONSE_BYTES) {
+      cancelResponseBody(response);
       throw new Error("Local Agent gateway response exceeds the size limit");
     }
-    const responseText = await response.text();
-    if (new TextEncoder().encode(responseText).byteLength > MAX_RESPONSE_BYTES) {
-      throw new Error("Local Agent gateway response exceeds the size limit");
-    }
+    const responseText = await readBoundedResponseText(response);
     let parsed: unknown;
     try {
       parsed = JSON.parse(responseText) as unknown;

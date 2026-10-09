@@ -1390,6 +1390,63 @@ test("HTTP Local Agent transport rejects non-HTTPS remote gateway URLs and overs
   );
 });
 
+test("HTTP Local Agent transport cancels oversized gateway responses while reading", async () => {
+  const oversizedChunk = new Uint8Array(512 * 1024 + 1);
+  const scenarios = [
+    { name: "without Content-Length", headers: {} },
+    { name: "with an understated Content-Length", headers: { "content-length": "1" } },
+  ];
+
+  for (const scenario of scenarios) {
+    let cancelled = false;
+    const transport = createHttpLocalAgentGatewayTransport("https://gateway.example.test", {
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(oversizedChunk);
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: scenario.headers }
+        ),
+    });
+
+    await assert.rejects(
+      transport.connect("device", "c".repeat(43)),
+      /response exceeds the size limit/,
+      scenario.name
+    );
+    assert.equal(cancelled, true, `${scenario.name} response stream should be cancelled`);
+  }
+});
+
+test("HTTP Local Agent transport cancels a response rejected by Content-Length", async () => {
+  let cancelled = false;
+  const transport = createHttpLocalAgentGatewayTransport("https://gateway.example.test", {
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([123]));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "content-length": String(512 * 1024 + 1) } }
+      ),
+  });
+
+  await assert.rejects(
+    transport.connect("device", "c".repeat(43)),
+    /response exceeds the size limit/
+  );
+  assert.equal(cancelled, true, "advertised oversized response stream should be cancelled");
+});
+
 test("stream event transport uses the longer acknowledgment deadline for slow readers", async () => {
   const transport = createHttpLocalAgentGatewayTransport("https://gateway.example.test", {
     requestTimeoutMs: 100,
