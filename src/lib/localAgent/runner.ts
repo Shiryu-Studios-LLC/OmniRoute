@@ -5,7 +5,17 @@ import {
   type LocalDiscoveryResult,
 } from "./localDiscovery";
 import { LOCAL_AGENT_HEARTBEAT_PATH, signLocalAgentHeartbeat } from "./protocol";
-import { executeLocalCapability, executeLocalCapabilityStream } from "./capabilityExecutor";
+import {
+  buildComfyUiImageWorkflow,
+  executeLocalCapability,
+  executeLocalCapabilityStream,
+  executeLocalComfyUiImageJob,
+  LocalImageJobStoppedError,
+} from "./capabilityExecutor";
+import {
+  CLOUD_IMAGE_CAPABILITY,
+  parseCloudImageJobParameters,
+} from "../../shared/imageJobContract";
 import type { LocalMcpDependencies } from "./localMcp";
 import {
   LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
@@ -222,6 +232,176 @@ export async function runLocalAgentGatewayCycle(
       version: LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
     };
     if (Date.parse(request.expiresAt) <= (dependencies.now ?? Date.now)()) continue;
+
+    if (request.capability === CLOUD_IMAGE_CAPABILITY) {
+      const control = dependencies.gateway.getImageJobControl;
+      const upload = dependencies.gateway.uploadImageJobArtifact;
+      const complete = dependencies.gateway.completeImageJob;
+      const fail = dependencies.gateway.failImageJob;
+      if (!control || !upload || !complete || !fail) {
+        throw new Error("Local agent image-job transport is unavailable");
+      }
+      const parameters = parseCloudImageJobParameters(request.payload);
+      if (!parameters) {
+        await fail.call(dependencies.gateway, session, request.requestId, "capability_unavailable");
+        processed += 1;
+        continue;
+      }
+      try {
+        // Fail closed against stale capability advertisements and ensure a
+        // requested checkpoint came from this cycle's local discovery.
+        buildComfyUiImageWorkflow(parameters, discovery);
+      } catch {
+        await fail.call(dependencies.gateway, session, request.requestId, "capability_unavailable");
+        processed += 1;
+        continue;
+      }
+
+      const readControl = async () => {
+        if (dependencies.abortSignal?.aborted) return "cancelled" as const;
+        if (Date.parse(request.expiresAt) <= (dependencies.now ?? Date.now)()) {
+          return "expired" as const;
+        }
+        try {
+          return (
+            (await control.call(dependencies.gateway, session!, request.requestId)) ?? "expired"
+          );
+        } catch {
+          return "expired" as const;
+        }
+      };
+
+      const initialControl = await readControl();
+      if (initialControl !== "running") {
+        await fail.call(
+          dependencies.gateway,
+          session,
+          request.requestId,
+          initialControl === "cancelled" ? "cancelled" : "expired"
+        );
+        processed += 1;
+        continue;
+      }
+
+      const remainingMs = Math.max(
+        1,
+        Math.min(270_000, Date.parse(request.expiresAt) - (dependencies.now ?? Date.now)())
+      );
+      const expirySignal = AbortSignal.timeout(remainingMs);
+      const executionSignal = dependencies.abortSignal
+        ? AbortSignal.any([expirySignal, dependencies.abortSignal])
+        : expirySignal;
+      try {
+        const artifact = await executeLocalComfyUiImageJob(
+          {
+            ollamaUrl: config.ollamaUrl,
+            comfyUiUrl: config.comfyUiUrl,
+            mcpServers: config.mcpServers,
+          },
+          discovery,
+          parameters,
+          { fetch: dependencies.fetch, signal: executionSignal },
+          readControl
+        );
+        const beforeUpload = await readControl();
+        if (beforeUpload !== "running") {
+          await fail.call(
+            dependencies.gateway,
+            session,
+            request.requestId,
+            beforeUpload === "cancelled" ? "cancelled" : "expired"
+          );
+          processed += 1;
+          continue;
+        }
+        if (executionSignal.aborted) {
+          const state = await readControl();
+          await fail.call(
+            dependencies.gateway,
+            session,
+            request.requestId,
+            state === "cancelled"
+              ? "cancelled"
+              : state === "expired"
+                ? "expired"
+                : dependencies.abortSignal?.aborted
+                  ? "cancelled"
+                  : "expired"
+          );
+          processed += 1;
+          continue;
+        }
+        let artifactUploaded = false;
+        try {
+          artifactUploaded = await upload.call(
+            dependencies.gateway,
+            session,
+            request.requestId,
+            artifact.bytes,
+            artifact.contentType
+          );
+        } catch {
+          artifactUploaded = false;
+        }
+        if (!artifactUploaded) {
+          const state = await readControl();
+          await fail.call(
+            dependencies.gateway,
+            session,
+            request.requestId,
+            state === "cancelled"
+              ? "cancelled"
+              : state === "expired"
+                ? "expired"
+                : "artifact_upload_failed"
+          );
+          processed += 1;
+          continue;
+        }
+        const beforeComplete = await readControl();
+        if (beforeComplete !== "running") {
+          await fail.call(
+            dependencies.gateway,
+            session,
+            request.requestId,
+            beforeComplete === "cancelled" ? "cancelled" : "expired"
+          );
+          processed += 1;
+          continue;
+        }
+        let completed = false;
+        try {
+          completed = await complete.call(
+            dependencies.gateway,
+            session,
+            request.requestId,
+            artifact.promptId
+          );
+        } catch {
+          completed = false;
+        }
+        if (!completed) {
+          await fail.call(dependencies.gateway, session, request.requestId, "execution_failed");
+        }
+      } catch (error) {
+        const state = error instanceof LocalImageJobStoppedError ? error.status : null;
+        const failureCode =
+          state ??
+          (dependencies.abortSignal?.aborted
+            ? "cancelled"
+            : executionSignal.aborted
+              ? "expired"
+              : "execution_failed");
+        await fail.call(
+          dependencies.gateway,
+          session,
+          request.requestId,
+          failureCode === "cancelled" ? "cancelled" : failureCode
+        );
+      }
+      processed += 1;
+      continue;
+    }
 
     if (request.stream === true) {
       if (

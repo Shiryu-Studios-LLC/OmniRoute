@@ -54,6 +54,31 @@ export interface LocalAgentGatewayTransport {
     event: LocalAgentGatewayStreamEvent
   ): Promise<boolean>;
   cancelStream?(session: LocalAgentGatewaySession, requestId: string): Promise<boolean>;
+  getImageJobControl?(
+    session: LocalAgentGatewaySession,
+    requestId: string
+  ): Promise<"running" | "cancelled" | "expired" | null>;
+  uploadImageJobArtifact?(
+    session: LocalAgentGatewaySession,
+    requestId: string,
+    bytes: Uint8Array,
+    contentType: string
+  ): Promise<boolean>;
+  completeImageJob?(
+    session: LocalAgentGatewaySession,
+    requestId: string,
+    promptId: string
+  ): Promise<boolean>;
+  failImageJob?(
+    session: LocalAgentGatewaySession,
+    requestId: string,
+    code:
+      | "execution_failed"
+      | "capability_unavailable"
+      | "artifact_upload_failed"
+      | "cancelled"
+      | "expired"
+  ): Promise<boolean>;
 }
 
 /** Structural contract implemented by createConnectorGateway(). */

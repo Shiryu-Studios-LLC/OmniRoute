@@ -12,6 +12,12 @@ import {
   validateLocalMcpServers,
 } from "./localMcp";
 import type { LocalAgentGatewayStreamEvent } from "./gatewayProtocol";
+import {
+  CLOUD_IMAGE_CAPABILITY,
+  CLOUD_IMAGE_MAX_ARTIFACT_BYTES,
+  parseCloudImageJobParameters,
+  type CloudImageJobParameters,
+} from "../../shared/imageJobContract";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_GATEWAY_RESULT_BYTES = 56 * 1024;
@@ -19,9 +25,9 @@ const MAX_STREAM_OUTPUT_BYTES = 128 * 1024;
 const MAX_STREAM_LINE_BYTES = 64 * 1024;
 const STREAM_DELTA_BYTES = 4 * 1024;
 const OLLAMA_CHAT_TIMEOUT_MS = 25_000;
-const MAX_COMFYUI_IMAGES = 2;
-const COMFYUI_POLL_TIMEOUT_MS = 18_000;
+const COMFYUI_POLL_TIMEOUT_MS = 270_000;
 const COMFYUI_POLL_INTERVAL_MS = 400;
+const COMFYUI_CONTROL_POLL_INTERVAL_MS = 2_000;
 const TRUNCATION_MARKER = "\n[local agent result truncated]";
 
 export interface LocalCapabilityRequest {
@@ -199,7 +205,7 @@ function comfyUiOutputFiles(history: Record<string, unknown>, promptId: string) 
         continue;
       }
       images.push({ filename: image.filename, subfolder: image.subfolder, type: image.type });
-      if (images.length >= MAX_COMFYUI_IMAGES) return images;
+      if (images.length >= 1) return images;
     }
   }
   return images.length > 0 ? images : null;
@@ -216,7 +222,9 @@ async function fetchComfyUiImage(
     { filename: image.filename, subfolder: image.subfolder, type: image.type },
     dependencies.fetch,
     dependencies.resolveHost,
-    dependencies.signal
+    dependencies.signal,
+    CLOUD_IMAGE_MAX_ARTIFACT_BYTES,
+    120_000
   );
   const allowedTypes: Record<string, string> = {
     ".png": "image/png",
@@ -226,25 +234,142 @@ async function fetchComfyUiImage(
   };
   const extension = image.filename.slice(image.filename.lastIndexOf(".")).toLowerCase();
   const contentType = allowedTypes[extension];
-  if (!contentType || result.contentType !== contentType || result.bytes.byteLength === 0) {
+  if (
+    !contentType ||
+    result.contentType !== contentType ||
+    result.bytes.byteLength === 0 ||
+    result.bytes.byteLength > CLOUD_IMAGE_MAX_ARTIFACT_BYTES ||
+    !hasImageMagic(result.bytes, contentType)
+  ) {
     throw new Error("ComfyUI returned an unsupported image output");
   }
   return {
-    filename: image.filename,
     contentType,
-    data: Buffer.from(result.bytes).toString("base64"),
+    bytes: result.bytes,
   };
 }
 
-async function runComfyUiImageWorkflow(
-  baseUrl: string,
-  workflow: Record<string, unknown>,
-  dependencies: LocalCapabilityExecutorDependencies
-): Promise<Record<string, unknown>> {
-  if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
+function hasImageMagic(bytes: Uint8Array, contentType: string): boolean {
+  if (contentType === "image/png") {
+    return (
+      bytes.byteLength >= 8 &&
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47 &&
+      bytes[4] === 0x0d &&
+      bytes[5] === 0x0a &&
+      bytes[6] === 0x1a &&
+      bytes[7] === 0x0a
+    );
+  }
+  if (contentType === "image/jpeg") {
+    return bytes.byteLength >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  if (contentType === "image/webp") {
+    return (
+      bytes.byteLength >= 12 &&
+      String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF" &&
+      String.fromCharCode(...bytes.subarray(8, 12)) === "WEBP"
+    );
+  }
+  return false;
+}
+
+export function buildComfyUiImageWorkflow(
+  parameters: CloudImageJobParameters,
+  discovery: LocalDiscoveryResult
+): Record<string, unknown> {
+  const validated = parseCloudImageJobParameters(parameters);
+  if (!validated) throw new Error("ComfyUI image request parameters are invalid");
+  const comfy = discovery.services.find((service) => service.service === "comfyui");
+  if (!comfy?.reachable || !discovery.heartbeat.capabilities.includes(CLOUD_IMAGE_CAPABILITY)) {
+    throw new Error("ComfyUI image capability is unavailable");
+  }
+  const discoveredCheckpoints = comfy.models.flatMap((model) =>
+    model.startsWith("comfyui:checkpoint:") ? [model.slice("comfyui:checkpoint:".length)] : []
+  );
+  const checkpoint = validated.checkpoint ?? discoveredCheckpoints[0];
+  if (!checkpoint || !discoveredCheckpoints.includes(checkpoint)) {
+    throw new Error("ComfyUI checkpoint is unavailable");
+  }
+  return {
+    "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: checkpoint } },
+    "2": {
+      class_type: "CLIPTextEncode",
+      inputs: { text: validated.prompt, clip: ["1", 1] },
+    },
+    "3": {
+      class_type: "CLIPTextEncode",
+      inputs: { text: validated.negativePrompt ?? "", clip: ["1", 1] },
+    },
+    "4": {
+      class_type: "EmptyLatentImage",
+      inputs: { width: validated.width, height: validated.height, batch_size: 1 },
+    },
+    "5": {
+      class_type: "KSampler",
+      inputs: {
+        model: ["1", 0],
+        seed: validated.seed,
+        steps: validated.steps,
+        cfg: validated.cfg,
+        sampler_name: "euler",
+        scheduler: "normal",
+        positive: ["2", 0],
+        negative: ["3", 0],
+        latent_image: ["4", 0],
+        denoise: 1,
+      },
+    },
+    "6": { class_type: "VAEDecode", inputs: { samples: ["5", 0], vae: ["1", 2] } },
+    "7": {
+      class_type: "SaveImage",
+      inputs: { images: ["6", 0], filename_prefix: "omniroute-local" },
+    },
+  };
+}
+
+export type LocalImageJobControl = () => Promise<"running" | "cancelled" | "expired" | null>;
+
+export class LocalImageJobStoppedError extends Error {
+  constructor(readonly status: "cancelled" | "expired") {
+    super(`ComfyUI image job ${status}`);
+  }
+}
+
+export interface LocalComfyUiImageArtifact {
+  promptId: string;
+  contentType: string;
+  bytes: Uint8Array;
+}
+
+export async function executeLocalComfyUiImageJob(
+  config: LocalDiscoveryConfig,
+  discovery: LocalDiscoveryResult,
+  payload: unknown,
+  dependencies: LocalCapabilityExecutorDependencies,
+  checkControl: LocalImageJobControl
+): Promise<LocalComfyUiImageArtifact> {
+  const parameters = parseCloudImageJobParameters(payload);
+  if (!parameters) throw new Error("ComfyUI image request is invalid");
+  if (!config.comfyUiUrl) throw new Error("ComfyUI image capability is unavailable");
+  const workflow = buildComfyUiImageWorkflow(parameters, discovery);
+  let lastControlCheckAt = Number.NEGATIVE_INFINITY;
+  const requireRunning = async (force = false) => {
+    if (dependencies.signal?.aborted) throw new LocalImageJobStoppedError("expired");
+    const now = Date.now();
+    if (!force && now - lastControlCheckAt < COMFYUI_CONTROL_POLL_INTERVAL_MS) return;
+    lastControlCheckAt = now;
+    const state = await checkControl();
+    if (state !== "running") {
+      throw new LocalImageJobStoppedError(state === "cancelled" ? "cancelled" : "expired");
+    }
+  };
+  await requireRunning(true);
   const submitted = record(
     await requestLocalServiceJson(
-      baseUrl,
+      config.comfyUiUrl,
       "/prompt",
       dependencies.fetch,
       dependencies.resolveHost,
@@ -260,15 +385,15 @@ async function runComfyUiImageWorkflow(
   if (typeof promptId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(promptId)) {
     throw new Error("ComfyUI returned an invalid prompt identifier");
   }
-  if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
+  await requireRunning(true);
 
   const deadline = Date.now() + COMFYUI_POLL_TIMEOUT_MS;
   let outputFiles: ReturnType<typeof comfyUiOutputFiles> = null;
   while (Date.now() < deadline) {
-    if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
+    await requireRunning();
     const history = record(
       await requestLocalServiceJson(
-        baseUrl,
+        config.comfyUiUrl,
         `/history/${promptId}`,
         dependencies.fetch,
         dependencies.resolveHost,
@@ -287,7 +412,7 @@ async function runComfyUiImageWorkflow(
     if (status?.completed === true) {
       throw new Error("ComfyUI completed without safe image output metadata");
     }
-    if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
+    await requireRunning();
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(done, COMFYUI_POLL_INTERVAL_MS);
       function done() {
@@ -304,16 +429,10 @@ async function runComfyUiImageWorkflow(
   }
   if (!outputFiles?.length) throw new Error("ComfyUI prompt did not produce an image in time");
 
-  const images = [];
-  for (const image of outputFiles) {
-    if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
-    images.push(await fetchComfyUiImage(baseUrl, image, dependencies));
-  }
-  const result = { promptId, images };
-  if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_GATEWAY_RESULT_BYTES) {
-    throw new Error("ComfyUI output exceeds the gateway result size limit");
-  }
-  return result;
+  await requireRunning(true);
+  const image = await fetchComfyUiImage(config.comfyUiUrl, outputFiles[0], dependencies);
+  await requireRunning(true);
+  return { promptId, ...image };
 }
 
 /**
@@ -358,13 +477,7 @@ export async function executeLocalCapability(
   }
 
   if (request.capability === "comfyui:image") {
-    if (!config.comfyUiUrl) throw new Error("ComfyUI image capability is unavailable");
-    const body = record(JSON.parse(serializedPayload) as unknown);
-    const workflow = record(body?.workflow);
-    if (!body || Object.keys(body).some((key) => key !== "workflow") || !workflow) {
-      throw new Error("ComfyUI image payload must contain a workflow object");
-    }
-    return runComfyUiImageWorkflow(config.comfyUiUrl, workflow, dependencies);
+    throw new Error("ComfyUI image jobs require the artifact upload protocol");
   }
 
   const mcpCapability = parseLocalMcpCapability(request.capability);

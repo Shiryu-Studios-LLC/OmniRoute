@@ -4,6 +4,8 @@ import { isCloudCredentialEncryptionKey } from "./credentialEncryption";
 import { isCloudInferenceIdempotencySecret } from "./inferenceIdempotency";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
+import { handleGatewayImageJobRequest } from "./gatewayImageJobHttpApi";
+import type { GatewayImageArtifactBucket } from "./imageJobs";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
 import {
   CLOUD_CUSTOMER_BUSINESS_PROFILE_PATH,
@@ -60,6 +62,7 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
   OMNIROUTE_CLOUD_PUBLIC_ORIGIN?: string;
   GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
+  GATEWAY_ARTIFACTS?: GatewayImageArtifactBucket;
   MCP_EGRESS?: CloudMcpEgressBinding;
   OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN?: string;
   OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED?: string;
@@ -70,6 +73,7 @@ export interface CloudRuntimeOptions {
   now?: () => Date;
   adminRateLimit?: { limit: number; windowMs: number };
   customerInvokeRateLimit?: { limit: number; windowMs: number };
+  customerImageJobRateLimit?: { limit: number; windowMs: number };
   customerAuthFailureRateLimit?: { limit: number; windowMs: number };
   customerAuthFailureFallbackRateLimit?: { limit: number; windowMs: number };
   customerProviderBodyTimeoutMs?: number;
@@ -396,6 +400,30 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         } catch {
           return Response.json(
             { error: { message: "Cloud inference is unavailable", type: "cloud_inference_error" } },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (
+        url.pathname === "/__gateway/v1/customer/image-jobs" ||
+        url.pathname.startsWith("/__gateway/v1/customer/image-jobs/") ||
+        url.pathname === "/__gateway/v1/device/image-jobs" ||
+        url.pathname.startsWith("/__gateway/v1/device/image-jobs/")
+      ) {
+        try {
+          const response = await handleGatewayImageJobRequest(request, {
+            db: options.env?.DB,
+            sessions: options.env?.GATEWAY_SESSIONS,
+            artifacts: options.env?.GATEWAY_ARTIFACTS,
+            now: () => now().getTime(),
+            startRateLimit: options.customerImageJobRateLimit,
+            bodyReadTimeoutMs: options.gatewayRequestBodyTimeoutMs,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Image-job request could not be completed" },
             { status: 503, headers: { "Cache-Control": "no-store" } }
           );
         }

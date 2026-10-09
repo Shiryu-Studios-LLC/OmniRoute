@@ -6,6 +6,8 @@ import {
 import { cleanupExpiredCloudRateLimits } from "../src/cloud/rateLimit";
 import { cleanupExpiredCloudGatewayPairings } from "../src/cloud/gatewayPairing";
 import { cleanupExpiredCloudTenantOidcAuthArtifacts } from "../src/cloud/tenantOidcAuth";
+import { cleanupExpiredCloudImageJobs } from "../src/cloud/imageJobs";
+import type { GatewayImageArtifactBucket } from "../src/cloud/imageJobs";
 import {
   cleanupSettledCloudInferenceReservations,
   cleanupStaleCloudInferenceReservations,
@@ -25,6 +27,7 @@ type CloudflareEnv = Env & {
   OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED?: string;
   OMNIROUTE_CLOUD_PUBLIC_ORIGIN?: string;
   MCP_EGRESS?: { fetch(request: Request): Promise<Response> };
+  GATEWAY_ARTIFACTS: GatewayImageArtifactBucket;
 };
 
 export class GatewaySessionObject extends DurableObject<CloudflareEnv> {
@@ -110,6 +113,7 @@ const worker = {
         OMNIROUTE_CLOUD_PUBLIC_ORIGIN: env.OMNIROUTE_CLOUD_PUBLIC_ORIGIN,
         DB: env.DB,
         GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,
+        GATEWAY_ARTIFACTS: env.GATEWAY_ARTIFACTS,
         MCP_EGRESS: env.MCP_EGRESS,
       },
     }).fetch(request);
@@ -138,6 +142,10 @@ const worker = {
           {
             name: "expired-oidc-artifacts",
             run: () => cleanupExpiredCloudTenantOidcAuthArtifacts(env.DB),
+          },
+          {
+            name: "expired-gateway-image-jobs",
+            run: () => cleanupExpiredCloudImageJobs(env.DB, env.GATEWAY_ARTIFACTS),
           },
         ],
         undefined,

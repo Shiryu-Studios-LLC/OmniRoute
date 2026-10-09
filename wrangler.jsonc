@@ -20,6 +20,13 @@
       "migrations_dir": "cloudflare/migrations",
     },
   ],
+  "r2_buckets": [
+    {
+      "binding": "GATEWAY_ARTIFACTS",
+      "bucket_name": "omniroute-cloud-gateway-artifacts",
+      "preview_bucket_name": "omniroute-cloud-gateway-artifacts-preview",
+    },
+  ],
   "durable_objects": {
     "bindings": [
       {

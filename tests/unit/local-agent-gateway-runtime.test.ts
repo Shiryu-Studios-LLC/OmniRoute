@@ -88,6 +88,198 @@ test("gateway cycle heartbeats, connects, polls, executes, and submits a version
   });
 });
 
+test("ComfyUI image jobs upload raw artifact bytes before marking the job complete", async () => {
+  const calls: string[] = [];
+  let uploaded: Uint8Array | undefined;
+  let uploadedType = "";
+  let completedPromptId = "";
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
+  const result = await runLocalAgentGatewayCycle(
+    { ...config, comfyUiUrl: "http://127.0.0.1:8188" },
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      createNonce: () => "heartbeat-nonce-image-01",
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["comfyui:image"] },
+        services: [
+          { service: "comfyui", reachable: true, models: ["comfyui:checkpoint:model.safetensors"] },
+        ],
+      }),
+      fetch: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/heartbeat")) return Response.json({ accepted: true });
+        if (url.pathname === "/prompt") {
+          calls.push("prompt");
+          const body = JSON.parse(String(init?.body)) as { prompt: Record<string, unknown> };
+          assert.equal(Object.keys(body.prompt).length, 7);
+          return Response.json({ prompt_id: "image_job_prompt" });
+        }
+        if (url.pathname === "/history/image_job_prompt") {
+          calls.push("history");
+          return Response.json({
+            image_job_prompt: {
+              status: { completed: true, status_str: "success" },
+              outputs: {
+                "7": { images: [{ filename: "image.png", subfolder: "", type: "output" }] },
+              },
+            },
+          });
+        }
+        if (url.pathname === "/view") {
+          calls.push("view");
+          return new Response(png, { headers: { "content-type": "image/png" } });
+        }
+        throw new Error(`Unexpected request: ${url.href}`);
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => [
+          {
+            requestId: "image-job-1",
+            capability: "comfyui:image",
+            payload: {
+              prompt: "a house",
+              checkpoint: "model.safetensors",
+              width: 64,
+              height: 64,
+              steps: 2,
+              cfg: 1,
+              seed: 9,
+            },
+            expiresAt: "2026-10-08T12:01:00.000Z",
+          },
+        ],
+        submitResult: async () => {
+          calls.push("submitResult");
+          return true;
+        },
+        getImageJobControl: async () => {
+          calls.push("control");
+          return "running";
+        },
+        uploadImageJobArtifact: async (_activeSession, _requestId, bytes, contentType) => {
+          calls.push("upload");
+          uploaded = bytes;
+          uploadedType = contentType;
+          return true;
+        },
+        completeImageJob: async (_activeSession, _requestId, promptId) => {
+          calls.push("complete");
+          completedPromptId = promptId;
+          return true;
+        },
+        failImageJob: async () => false,
+      },
+    },
+    session
+  );
+  assert.equal(result.processed, 1);
+  assert.deepEqual(uploaded, png);
+  assert.equal(uploadedType, "image/png");
+  assert.equal(completedPromptId, "image_job_prompt");
+  assert.ok(calls.indexOf("upload") > calls.indexOf("view"));
+  assert.ok(calls.indexOf("complete") > calls.indexOf("upload"));
+  assert.ok(!calls.includes("submitResult"));
+});
+
+test("ComfyUI cancellation stops before artifact upload and reports a fixed failure code", async () => {
+  const calls: string[] = [];
+  let controlCalls = 0;
+  await runLocalAgentGatewayCycle(
+    { ...config, comfyUiUrl: "http://127.0.0.1:8188" },
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      createNonce: () => "heartbeat-nonce-image-02",
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["comfyui:image"] },
+        services: [
+          { service: "comfyui", reachable: true, models: ["comfyui:checkpoint:model.safetensors"] },
+        ],
+      }),
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/heartbeat")) return Response.json({ accepted: true });
+        if (url.pathname === "/prompt") return Response.json({ prompt_id: "cancelled_image_job" });
+        throw new Error(`ComfyUI should not be polled after cancellation: ${url.href}`);
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => [
+          {
+            requestId: "image-job-cancelled",
+            capability: "comfyui:image",
+            payload: { prompt: "a house", width: 64, height: 64, steps: 2, cfg: 1, seed: 9 },
+            expiresAt: "2026-10-08T12:01:00.000Z",
+          },
+        ],
+        submitResult: async () => false,
+        getImageJobControl: async () => (++controlCalls < 3 ? "running" : "cancelled"),
+        uploadImageJobArtifact: async () => {
+          calls.push("upload");
+          return true;
+        },
+        completeImageJob: async () => {
+          calls.push("complete");
+          return true;
+        },
+        failImageJob: async (_activeSession, _requestId, code) => {
+          calls.push(`fail:${code}`);
+          return true;
+        },
+      },
+    },
+    session
+  );
+  assert.deepEqual(calls, ["fail:cancelled"]);
+});
+
+test("ComfyUI image jobs reject raw workflow payloads without running ComfyUI", async () => {
+  const calls: string[] = [];
+  await runLocalAgentGatewayCycle(
+    { ...config, comfyUiUrl: "http://127.0.0.1:8188" },
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      createNonce: () => "heartbeat-nonce-image-03",
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["comfyui:image"] },
+        services: [
+          { service: "comfyui", reachable: true, models: ["comfyui:checkpoint:model.safetensors"] },
+        ],
+      }),
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/heartbeat")) return Response.json({ accepted: true });
+        calls.push(url.pathname);
+        throw new Error(`Unexpected request: ${url.href}`);
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => [
+          {
+            requestId: "image-job-raw-workflow",
+            capability: "comfyui:image",
+            payload: { workflow: { "1": { class_type: "MaliciousCustomNode" } } },
+            expiresAt: "2026-10-08T12:01:00.000Z",
+          },
+        ],
+        submitResult: async () => false,
+        getImageJobControl: async () => "running",
+        uploadImageJobArtifact: async () => false,
+        completeImageJob: async () => false,
+        failImageJob: async (_activeSession, _requestId, code) => {
+          calls.push(`fail:${code}`);
+          return true;
+        },
+      },
+    },
+    session
+  );
+  assert.deepEqual(calls, ["fail:capability_unavailable"]);
+});
+
 test("gateway shutdown aborts an in-flight unary local capability request", async () => {
   const controller = new AbortController();
   let localRequestSignal: AbortSignal | undefined;

@@ -1,5 +1,6 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { CLOUD_IMAGE_MAX_ARTIFACT_BYTES } from "../../shared/imageJobContract";
 import type { LocalAgentHeartbeatPayload } from "./protocol";
 import {
   discoverLocalMcpServers,
@@ -183,7 +184,9 @@ export async function requestLocalServiceBytes(
   query: Record<string, string>,
   fetcher: typeof fetch,
   resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxBytes = MAX_BINARY_RESPONSE_BYTES,
+  timeoutMs = REQUEST_TIMEOUT_MS
 ): Promise<{ bytes: Uint8Array; contentType: string }> {
   if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
     throw new Error("Local service path is invalid");
@@ -191,17 +194,27 @@ export async function requestLocalServiceBytes(
   const base = await validateLocalEndpoint(rawUrl, resolveHost);
   const url = appendPath(base, path);
   for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    maxBytes > CLOUD_IMAGE_MAX_ARTIFACT_BYTES ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > 120_000
+  ) {
+    throw new Error("Local service binary request limits are invalid");
+  }
   const response = await fetcher(url, {
     method: "GET",
     redirect: "error",
     signal: signal
-      ? AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal])
-      : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal])
+      : AbortSignal.timeout(timeoutMs),
     headers: { accept: "image/png,image/jpeg,image/webp" },
   });
   if (!response.ok) throw new Error(`Local service returned HTTP ${response.status}`);
   const advertisedLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(advertisedLength) && advertisedLength > MAX_BINARY_RESPONSE_BYTES) {
+  if (Number.isFinite(advertisedLength) && advertisedLength > maxBytes) {
     throw new Error("Local service binary response exceeds the size limit");
   }
   if (!response.body) throw new Error("Local service returned an empty response");
@@ -212,7 +225,7 @@ export async function requestLocalServiceBytes(
     const { done, value } = await reader.read();
     if (done) break;
     totalBytes += value.byteLength;
-    if (totalBytes > MAX_BINARY_RESPONSE_BYTES) {
+    if (totalBytes > maxBytes) {
       await reader.cancel();
       throw new Error("Local service binary response exceeds the size limit");
     }

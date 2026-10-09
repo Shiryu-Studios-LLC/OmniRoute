@@ -49,6 +49,7 @@ async function requestJson(
     token?: string;
     body?: unknown;
     headers?: Record<string, string>;
+    timeoutMs?: number;
   } = {}
 ): Promise<{ response: Response; body: Record<string, unknown> }> {
   const response = await fetch(url, {
@@ -59,7 +60,7 @@ async function requestJson(
       ...options.headers,
     },
     ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
   });
   const text = await response.text();
   let body: unknown;
@@ -222,7 +223,7 @@ async function startComfyUiFixture(): Promise<{ baseUrl: string; close: () => Pr
       new URL(request.url, "http://127.0.0.1").searchParams.get("filename") === "result.png"
     ) {
       response.writeHead(200, { "content-type": "image/png" });
-      response.end(Buffer.from([137, 80, 78, 71]));
+      response.end(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]));
       return;
     }
     response.writeHead(404).end();
@@ -389,6 +390,12 @@ test(
               binding: "DB",
               database_name: workerName,
               migrations_dir: migrationsDir,
+            },
+          ],
+          r2_buckets: [
+            {
+              binding: "GATEWAY_ARTIFACTS",
+              bucket_name: `${workerName}-artifacts`,
             },
           ],
           durable_objects: {
@@ -1314,22 +1321,21 @@ test(
         assert.equal(initialCycle.processed, 0, "the initial agent cycle should only connect");
 
         const idempotencyKey = `local-comfy-${randomUUID()}`;
-        const workflow = {
-          "1": {
-            class_type: "CheckpointLoaderSimple",
-            inputs: { ckpt_name: "fixture.safetensors" },
-          },
-        };
-        const invocation = requestJson(`${baseUrl}/__gateway/v1/customer/invoke`, {
+        const job = await requestJson(`${baseUrl}/__gateway/v1/customer/image-jobs`, {
           token: comfyCustomer.customerKey,
           headers: { "Idempotency-Key": idempotencyKey },
           body: {
             deviceId: comfyCustomer.deviceId,
-            capability: "comfyui:image",
-            payload: { workflow },
-            timeoutMs: 10_000,
+            prompt: "a small red apple",
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg: 1,
+            seed: 42,
           },
         });
+        assert.equal(job.response.status, 202, JSON.stringify(job.body));
+        const jobId = String(job.body.jobId);
 
         let processed = 0;
         const deadline = Date.now() + 5_000;
@@ -1339,23 +1345,22 @@ test(
           processed = cycle.processed;
           if (processed === 0) await delay(25);
         }
-        const result = await invocation;
-        assert.equal(
-          result.response.status,
-          200,
-          `ComfyUI invocation failed before the local agent could complete it: ${JSON.stringify(result.body)}`
-        );
         assert.equal(processed, 1, "the local agent should execute the queued ComfyUI request");
-        assert.deepEqual(result.body.result, {
-          version: 1,
-          outcome: {
-            ok: true,
-            value: {
-              promptId: "fixture_job_1",
-              images: [{ filename: "result.png", contentType: "image/png", data: "iVBORw==" }],
-            },
-          },
+        const status = await requestJson(`${baseUrl}/__gateway/v1/customer/image-jobs/${jobId}`, {
+          token: comfyCustomer.customerKey,
         });
+        assert.equal(status.response.status, 200, JSON.stringify(status.body));
+        assert.equal(status.body.status, "succeeded", JSON.stringify(status.body));
+        const imageResponse = await fetch(
+          `${baseUrl}/__gateway/v1/customer/image-jobs/${jobId}/image`,
+          { headers: { authorization: `Bearer ${comfyCustomer.customerKey}` } }
+        );
+        assert.equal(imageResponse.status, 200);
+        assert.equal(imageResponse.headers.get("content-type"), "image/png");
+        assert.deepEqual(
+          Array.from(new Uint8Array(await imageResponse.arrayBuffer())),
+          [137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]
+        );
       }
     );
 
@@ -1416,6 +1421,106 @@ test(
           (device.body.capabilities as string[]).includes("comfyui:image"),
           "the authenticated device heartbeat must persist the actual ComfyUI capability"
         );
+      }
+    );
+
+    await t.test(
+      "a real loopback ComfyUI image completes through the Worker, Durable Object, and local agent",
+      {
+        timeout: 90_000,
+        skip:
+          process.env.RUN_CLOUDFLARE_LOCAL_COMFYUI_IMAGE_INT !== "1"
+            ? "Set RUN_CLOUDFLARE_LOCAL_COMFYUI_IMAGE_INT=1 to run real loopback image generation."
+            : false,
+      },
+      async () => {
+        const comfyUrl = process.env.OMNIROUTE_LOCAL_COMFYUI_URL ?? "http://127.0.0.1:8188";
+        const comfyCustomer = await provisionCustomer("real-comfy-image", true, ["comfyui:image"]);
+        const runnerConfig = {
+          gatewayUrl: baseUrl,
+          deviceId: comfyCustomer.deviceId,
+          credential: comfyCustomer.credential,
+          comfyUiUrl: comfyUrl,
+          requestTimeoutMs: 5_000,
+        };
+        const discovery = await discoverLocalCapabilities(runnerConfig, {
+          fetch,
+          resolveHost: async () => ["127.0.0.1"],
+        });
+        assert.ok(
+          discovery.heartbeat.capabilities.includes("comfyui:image"),
+          `loopback ComfyUI must expose image generation: ${JSON.stringify(discovery)}`
+        );
+        const comfyService = discovery.services.find((service) => service.service === "comfyui");
+        const checkpoints = (comfyService?.models ?? [])
+          .filter((model) => model.startsWith("comfyui:checkpoint:"))
+          .map((model) => model.slice("comfyui:checkpoint:".length));
+        assert.ok(checkpoints.length > 0, "ComfyUI must expose an installed checkpoint");
+
+        const runnerDependencies = {
+          fetch,
+          resolveHost: async () => ["127.0.0.1"],
+          gateway: deviceTransport,
+        };
+        const initialCycle = await runLocalAgentGatewayCycle(runnerConfig, runnerDependencies);
+        let session: LocalAgentGatewaySession | undefined = initialCycle.session;
+        assert.equal(initialCycle.processed, 0);
+
+        const jobResponse = await requestJson(`${baseUrl}/__gateway/v1/customer/image-jobs`, {
+          token: comfyCustomer.customerKey,
+          headers: { "Idempotency-Key": `comfy-image-${randomUUID()}` },
+          body: {
+            deviceId: comfyCustomer.deviceId,
+            prompt: "a small red apple on a white background",
+            negativePrompt: "blurry, distorted",
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg: 1,
+            seed: 42,
+          },
+        });
+        assert.equal(jobResponse.response.status, 202, JSON.stringify(jobResponse.body));
+        assert.equal(jobResponse.body.status, "queued");
+        const jobId = String(jobResponse.body.jobId);
+        assert.match(jobId, /^[a-f0-9-]{36}$/i);
+
+        let processed = 0;
+        const deadline = Date.now() + 90_000;
+        while (processed === 0 && Date.now() < deadline) {
+          const cycle = await runLocalAgentGatewayCycle(runnerConfig, runnerDependencies, session);
+          session = cycle.session;
+          processed = cycle.processed;
+          if (processed === 0) await delay(25);
+        }
+        assert.equal(processed, 1, "the local agent should complete the queued ComfyUI image job");
+
+        let status: Record<string, unknown> = {};
+        const statusDeadline = Date.now() + 10_000;
+        while (Date.now() < statusDeadline) {
+          const result = await requestJson(`${baseUrl}/__gateway/v1/customer/image-jobs/${jobId}`, {
+            token: comfyCustomer.customerKey,
+          });
+          assert.equal(result.response.status, 200, JSON.stringify(result.body));
+          status = result.body;
+          if (status.status === "succeeded" || status.status === "failed") break;
+          await delay(100);
+        }
+        assert.equal(status.status, "succeeded", JSON.stringify(status));
+        assert.equal(status.imageAvailable, true);
+        const imageResponse = await fetch(
+          `${baseUrl}/__gateway/v1/customer/image-jobs/${jobId}/image`,
+          {
+            headers: { authorization: `Bearer ${comfyCustomer.customerKey}` },
+            signal: AbortSignal.timeout(10_000),
+          }
+        );
+        assert.equal(imageResponse.status, 200);
+        assert.equal(imageResponse.headers.get("content-type"), "image/png");
+        assert.equal(imageResponse.headers.get("x-content-type-options"), "nosniff");
+        const bytes = new Uint8Array(await imageResponse.arrayBuffer());
+        assert.ok(bytes.byteLength > 8, "the returned image must contain pixel data");
+        assert.deepEqual(Array.from(bytes.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
       }
     );
 

@@ -12,11 +12,21 @@ const MAX_REQUEST_BYTES = 80 * 1024;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const STREAM_EVENT_TIMEOUT_MS = 35_000;
+const IMAGE_JOB_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
+const IMAGE_JOB_TIMEOUT_MS = 120_000;
+const IMAGE_JOB_FAIL_CODES = new Set([
+  "execution_failed",
+  "capability_unavailable",
+  "artifact_upload_failed",
+  "cancelled",
+  "expired",
+]);
 
 export interface HttpGatewayTransportOptions {
   fetch: typeof fetch;
   requestTimeoutMs?: number;
   streamEventTimeoutMs?: number;
+  imageJobTimeoutMs?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -112,6 +122,14 @@ export function createHttpLocalAgentGatewayTransport(
     streamEventTimeout > 120_000
   ) {
     throw new Error("Invalid Local Agent gateway stream event timeout");
+  }
+  const imageJobTimeout = options.imageJobTimeoutMs ?? IMAGE_JOB_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(imageJobTimeout) ||
+    imageJobTimeout < 100 ||
+    imageJobTimeout > 120_000
+  ) {
+    throw new Error("Invalid Local Agent image-job timeout");
   }
 
   async function post(
@@ -285,6 +303,106 @@ export function createHttpLocalAgentGatewayTransport(
         response.body.version === LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION &&
         response.body.accepted === true
       );
+    },
+    async getImageJobControl(session: LocalAgentGatewaySession, requestId: string) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId)) return null;
+      const url = new URL(`${BASE_PATH}/image-jobs/${requestId}/control`, base.origin);
+      const response = await options.fetch(url, {
+        method: "GET",
+        redirect: "error",
+        signal: AbortSignal.timeout(imageJobTimeout),
+        headers: {
+          accept: "application/json",
+          "x-device-id": session.deviceId,
+          authorization: `Bearer ${session.sessionToken}`,
+        },
+      });
+      if (response.status === 404) return "expired";
+      if (!response.ok) return null;
+      const advertisedLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(advertisedLength) && advertisedLength > 1024) return null;
+      const text = await response.text();
+      if (new TextEncoder().encode(text).byteLength > 1024) return null;
+      let body: unknown;
+      try {
+        body = JSON.parse(text) as unknown;
+      } catch {
+        return null;
+      }
+      if (!isRecord(body)) return null;
+      return body.status === "running" || body.status === "cancelled" || body.status === "expired"
+        ? body.status
+        : null;
+    },
+    async uploadImageJobArtifact(session, requestId, bytes, contentType) {
+      if (
+        !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) ||
+        !(bytes instanceof Uint8Array) ||
+        bytes.byteLength < 1 ||
+        bytes.byteLength > IMAGE_JOB_MAX_ARTIFACT_BYTES ||
+        !["image/png", "image/jpeg", "image/webp"].includes(contentType)
+      ) {
+        return false;
+      }
+      const url = new URL(`${BASE_PATH}/image-jobs/${requestId}/artifact`, base.origin);
+      const response = await options.fetch(url, {
+        method: "PUT",
+        redirect: "error",
+        signal: AbortSignal.timeout(imageJobTimeout),
+        headers: {
+          "content-type": contentType,
+          "content-length": String(bytes.byteLength),
+          "x-device-id": session.deviceId,
+          authorization: `Bearer ${session.sessionToken}`,
+        },
+        body: bytes,
+      });
+      await response.body?.cancel();
+      return response.ok;
+    },
+    async completeImageJob(session, requestId, promptId) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId) || !/^[A-Za-z0-9_-]{1,128}$/.test(promptId)) {
+        return false;
+      }
+      const response = await options.fetch(
+        new URL(`${BASE_PATH}/image-jobs/${requestId}/complete`, base.origin),
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(imageJobTimeout),
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+            "x-device-id": session.deviceId,
+            authorization: `Bearer ${session.sessionToken}`,
+          },
+          body: JSON.stringify({ promptId }),
+        }
+      );
+      await response.body?.cancel();
+      return response.ok;
+    },
+    async failImageJob(session, requestId, code) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId) || !IMAGE_JOB_FAIL_CODES.has(code)) {
+        return false;
+      }
+      const response = await options.fetch(
+        new URL(`${BASE_PATH}/image-jobs/${requestId}/fail`, base.origin),
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(imageJobTimeout),
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+            "x-device-id": session.deviceId,
+            authorization: `Bearer ${session.sessionToken}`,
+          },
+          body: JSON.stringify({ code }),
+        }
+      );
+      await response.body?.cancel();
+      return response.ok;
     },
   };
 }

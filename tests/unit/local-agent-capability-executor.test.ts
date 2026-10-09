@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  buildComfyUiImageWorkflow,
   executeLocalCapability,
+  executeLocalComfyUiImageJob,
   executeLocalCapabilityStream,
 } from "../../src/lib/localAgent/capabilityExecutor";
 import type { LocalDiscoveryResult } from "../../src/lib/localAgent/localDiscovery";
@@ -13,8 +15,19 @@ const discovery: LocalDiscoveryResult = {
   },
   services: [
     { service: "ollama", reachable: true, models: ["qwen2.5:7b"] },
-    { service: "comfyui", reachable: true, models: ["sdxl.safetensors"] },
+    { service: "comfyui", reachable: true, models: ["comfyui:checkpoint:sdxl.safetensors"] },
   ],
+};
+
+const imageJob = {
+  prompt: "a red apple",
+  negativePrompt: "blurry",
+  checkpoint: "sdxl.safetensors",
+  width: 64,
+  height: 64,
+  steps: 1,
+  cfg: 1,
+  seed: 42,
 };
 
 test("dispatches discovered Ollama chat to the fixed local API with the capability model", async () => {
@@ -119,14 +132,13 @@ test("streams bounded Ollama chat deltas and usage from NDJSON", async () => {
   ]);
 });
 
-test("polls a bounded ComfyUI workflow and retrieves its completed image output", async () => {
+test("builds a fixed ComfyUI graph and returns validated raw image bytes", async () => {
   const requestedUrls: string[] = [];
   let requestedBody: Record<string, unknown> | null = null;
-  let historyCalls = 0;
-  const result = await executeLocalCapability(
+  const result = await executeLocalComfyUiImageJob(
     { comfyUiUrl: "http://127.0.0.1:8188" },
     discovery,
-    { capability: "comfyui:image", payload: { workflow: { "1": { class_type: "SaveImage" } } } },
+    imageJob,
     {
       resolveHost: async () => ["127.0.0.1"],
       fetch: async (input, init) => {
@@ -137,73 +149,101 @@ test("polls a bounded ComfyUI workflow and retrieves its completed image output"
           return Response.json({ prompt_id: "job_123" });
         }
         if (url.pathname.endsWith("/history/job_123")) {
-          historyCalls += 1;
-          return Response.json(
-            historyCalls === 1
-              ? {
-                  job_123: {
-                    status: { completed: false, status_str: "running" },
-                    outputs: { "3": { images: [] } },
-                  },
-                }
-              : {
-                  job_123: {
-                    status: { completed: true, status_str: "success" },
-                    outputs: {
-                      "9": {
-                        images: [{ filename: "result.png", subfolder: "", type: "output" }],
-                      },
-                    },
-                  },
-                }
-          );
+          return Response.json({
+            job_123: {
+              status: { completed: true, status_str: "success" },
+              outputs: {
+                "9": { images: [{ filename: "result.png", subfolder: "", type: "output" }] },
+              },
+            },
+          });
         }
         assert.equal(url.pathname, "/view");
         assert.equal(url.searchParams.get("filename"), "result.png");
         assert.equal(url.searchParams.get("type"), "output");
-        return new Response(new Uint8Array([1, 2, 3]), {
-          headers: { "content-type": "image/png" },
-        });
+        return new Response(
+          new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]),
+          {
+            headers: { "content-type": "image/png" },
+          }
+        );
       },
-    }
+    },
+    async () => "running"
   );
 
   assert.equal(requestedUrls[0], "http://127.0.0.1:8188/prompt");
-  assert.deepEqual(requestedBody, { prompt: { "1": { class_type: "SaveImage" } } });
-  assert.equal(historyCalls, 2);
+  assert.equal(Object.keys((requestedBody?.prompt ?? {}) as object).length, 7);
+  const graph = (requestedBody?.prompt ?? {}) as Record<string, { class_type: string }>;
+  assert.deepEqual([...new Set(Object.values(graph).map((node) => node.class_type))].sort(), [
+    "CLIPTextEncode",
+    "CheckpointLoaderSimple",
+    "EmptyLatentImage",
+    "KSampler",
+    "SaveImage",
+    "VAEDecode",
+  ]);
   assert.deepEqual(result, {
     promptId: "job_123",
-    images: [{ filename: "result.png", contentType: "image/png", data: "AQID" }],
+    contentType: "image/png",
+    bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]),
   });
 });
 
-test("stops a ComfyUI workflow when its gateway request expires", async () => {
-  const controller = new AbortController();
-  let historyCalls = 0;
+test("validates checkpoint discovery and image parameter bounds before building a graph", async () => {
+  const graph = buildComfyUiImageWorkflow(imageJob, discovery);
+  assert.equal(
+    (graph["1"] as { inputs: { ckpt_name: string } }).inputs.ckpt_name,
+    "sdxl.safetensors"
+  );
+  assert.throws(
+    () => buildComfyUiImageWorkflow({ ...imageJob, checkpoint: "attacker.safetensors" }, discovery),
+    /checkpoint is unavailable/
+  );
+  assert.throws(
+    () => buildComfyUiImageWorkflow({ ...imageJob, width: 2048 }, discovery),
+    /parameters|invalid/
+  );
+  assert.throws(
+    () => buildComfyUiImageWorkflow({ ...imageJob, steps: 31 }, discovery),
+    /parameters|invalid/
+  );
+});
+
+test("rejects raw caller workflow graphs before any ComfyUI request", async () => {
+  let calls = 0;
+  await assert.rejects(
+    executeLocalComfyUiImageJob(
+      { comfyUiUrl: "http://127.0.0.1:8188" },
+      discovery,
+      { workflow: { "1": { class_type: "MaliciousCustomNode", inputs: {} } } },
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        fetch: async () => {
+          calls += 1;
+          return Response.json({});
+        },
+      },
+      async () => "running"
+    ),
+    /invalid/
+  );
   await assert.rejects(
     executeLocalCapability(
       { comfyUiUrl: "http://127.0.0.1:8188" },
       discovery,
-      {
-        capability: "comfyui:image",
-        payload: { workflow: { "1": { class_type: "SaveImage" } } },
-      },
+      { capability: "comfyui:image", payload: { workflow: { "1": { class_type: "SaveImage" } } } },
       {
         resolveHost: async () => ["127.0.0.1"],
-        signal: controller.signal,
-        fetch: async (input) => {
-          if (new URL(String(input)).pathname === "/prompt") {
-            controller.abort();
-            return Response.json({ prompt_id: "expires_with_request" });
-          }
-          historyCalls += 1;
+        fetch: async () => {
+          calls += 1;
           return Response.json({});
         },
       }
     ),
-    /workflow was canceled/
+    /artifact upload protocol/
   );
-  assert.equal(historyCalls, 0, "expired work must not continue polling ComfyUI");
+  assert.equal(calls, 0);
 });
 
 test("rejects unavailable capabilities and oversized request payloads before network access", async () => {
@@ -242,7 +282,7 @@ test("rejects unavailable capabilities and oversized request payloads before net
   assert.equal(calls, 0);
 });
 
-test("rejects unsupported Ollama fields and invalid ComfyUI responses", async () => {
+test("rejects unsupported Ollama fields and refuses the old ComfyUI graph API", async () => {
   await assert.rejects(
     executeLocalCapability(
       { ollamaUrl: "http://127.0.0.1:11434" },
@@ -262,66 +302,141 @@ test("rejects unsupported Ollama fields and invalid ComfyUI responses", async ()
       { capability: "comfyui:image", payload: { workflow: {} } },
       { resolveHost: async () => ["127.0.0.1"], fetch: async () => Response.json({}) }
     ),
-    /invalid prompt identifier/
+    /artifact upload protocol/
   );
 });
 
 test("rejects unsafe ComfyUI output metadata and image payloads above the gateway bound", async () => {
-  const common = {
-    capability: "comfyui:image",
-    payload: { workflow: { "1": { class_type: "SaveImage" } } },
-  };
+  const common = imageJob;
   await assert.rejects(
-    executeLocalCapability({ comfyUiUrl: "http://127.0.0.1:8188" }, discovery, common, {
-      resolveHost: async () => ["127.0.0.1"],
-      fetch: async (input) => {
-        const url = new URL(String(input));
-        if (url.pathname.endsWith("/prompt")) return Response.json({ prompt_id: "job_123" });
-        return Response.json({
-          job_123: {
-            status: { completed: true, status_str: "success" },
-            outputs: { "9": { images: [{ filename: "../x.png", subfolder: "", type: "output" }] } },
-          },
-        });
+    executeLocalComfyUiImageJob(
+      { comfyUiUrl: "http://127.0.0.1:8188" },
+      discovery,
+      common,
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        fetch: async (input) => {
+          const url = new URL(String(input));
+          if (url.pathname.endsWith("/prompt")) return Response.json({ prompt_id: "job_123" });
+          return Response.json({
+            job_123: {
+              status: { completed: true, status_str: "success" },
+              outputs: {
+                "9": { images: [{ filename: "../x.png", subfolder: "", type: "output" }] },
+              },
+            },
+          });
+        },
       },
-    }),
+      async () => "running"
+    ),
     /completed without safe image output metadata/
   );
 
   await assert.rejects(
-    executeLocalCapability({ comfyUiUrl: "http://127.0.0.1:8188" }, discovery, common, {
+    executeLocalComfyUiImageJob(
+      { comfyUiUrl: "http://127.0.0.1:8188" },
+      discovery,
+      common,
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        fetch: async (input) => {
+          const url = new URL(String(input));
+          if (url.pathname.endsWith("/prompt")) return Response.json({ prompt_id: "job_123" });
+          if (url.pathname.endsWith("/history/job_123")) {
+            return Response.json({
+              job_123: {
+                outputs: {
+                  "9": { images: [{ filename: "result.png", subfolder: "", type: "output" }] },
+                },
+              },
+            });
+          }
+          return new Response(new Uint8Array(10 * 1024 * 1024 + 1), {
+            headers: { "content-type": "image/png" },
+          });
+        },
+      },
+      async () => "running"
+    ),
+    /exceeds the size limit/
+  );
+});
+
+test("stops a ComfyUI image job on cancellation without polling or fetching an artifact", async () => {
+  const requestedPaths: string[] = [];
+  let controls = 0;
+  await assert.rejects(
+    executeLocalComfyUiImageJob(
+      { comfyUiUrl: "http://127.0.0.1:8188" },
+      discovery,
+      imageJob,
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        fetch: async (input) => {
+          requestedPaths.push(new URL(String(input)).pathname);
+          if (new URL(String(input)).pathname.endsWith("/prompt")) {
+            return Response.json({ prompt_id: "cancelled_job" });
+          }
+          return Response.json({ cancelled_job: { status: { completed: false } } });
+        },
+      },
+      async () => (++controls === 1 ? "running" : "cancelled")
+    ),
+    /image job cancelled/
+  );
+  assert.deepEqual(requestedPaths, ["/prompt"]);
+});
+
+test("throttles ComfyUI job-control checks while polling local generation", async () => {
+  let controls = 0;
+  let historyCalls = 0;
+  await executeLocalComfyUiImageJob(
+    { comfyUiUrl: "http://127.0.0.1:8188" },
+    discovery,
+    imageJob,
+    {
       resolveHost: async () => ["127.0.0.1"],
       fetch: async (input) => {
         const url = new URL(String(input));
-        if (url.pathname.endsWith("/prompt")) return Response.json({ prompt_id: "job_123" });
-        if (url.pathname.endsWith("/history/job_123")) {
+        if (url.pathname === "/prompt") return Response.json({ prompt_id: "throttled_job" });
+        if (url.pathname === "/history/throttled_job") {
+          historyCalls += 1;
+          const completed = historyCalls >= 7;
           return Response.json({
-            job_123: {
-              outputs: {
-                "9": { images: [{ filename: "result.png", subfolder: "", type: "output" }] },
-              },
+            throttled_job: {
+              status: { completed, status_str: completed ? "success" : "running" },
+              outputs: completed
+                ? {
+                    "7": {
+                      images: [{ filename: "result.png", subfolder: "", type: "output" }],
+                    },
+                  }
+                : {},
             },
           });
         }
-        return new Response(new Uint8Array(40 * 1024 + 1), {
+        return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
           headers: { "content-type": "image/png" },
         });
       },
-    }),
-    /exceeds the size limit/
+    },
+    async () => {
+      controls += 1;
+      return "running";
+    }
   );
+  assert.equal(historyCalls, 7);
+  assert.ok(controls <= 5, `expected throttled checks, got ${controls} for ${historyCalls} polls`);
 });
 
 test("surfaces a ComfyUI workflow error instead of polling until timeout", async () => {
   const requestedPaths: string[] = [];
   await assert.rejects(
-    executeLocalCapability(
+    executeLocalComfyUiImageJob(
       { comfyUiUrl: "http://127.0.0.1:8188" },
       discovery,
-      {
-        capability: "comfyui:image",
-        payload: { workflow: { "1": { class_type: "SaveImage" } } },
-      },
+      imageJob,
       {
         resolveHost: async () => ["127.0.0.1"],
         fetch: async (input) => {
@@ -335,7 +450,8 @@ test("surfaces a ComfyUI workflow error instead of polling until timeout", async
             },
           });
         },
-      }
+      },
+      async () => "running"
     ),
     /workflow execution failed/
   );

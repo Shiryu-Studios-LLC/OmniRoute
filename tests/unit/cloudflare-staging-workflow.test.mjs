@@ -27,6 +27,23 @@ test("staging deploy constructs a staging-only Worker config without production 
   assert.match(workflow, /config\.name = "omniroute-cloud-runtime-staging"/);
   assert.match(workflow, /config\.workers_dev = true/);
   assert.match(workflow, /config\.routes = \[\]/);
+  assert.deepEqual(wranglerConfig.r2_buckets, [
+    {
+      binding: "GATEWAY_ARTIFACTS",
+      bucket_name: "omniroute-cloud-gateway-artifacts",
+      preview_bucket_name: "omniroute-cloud-gateway-artifacts-preview",
+    },
+  ]);
+  assert.match(workflow, /Expected exactly one private R2 image-artifact binding/);
+  assert.match(workflow, /artifactBucket\.binding !== "GATEWAY_ARTIFACTS"/);
+  assert.match(
+    workflow,
+    /config\.r2_buckets\[0\]\.bucket_name = "omniroute-cloud-runtime-staging-artifacts"/
+  );
+  assert.match(
+    workflow,
+    /config\.r2_buckets\[0\]\.preview_bucket_name = "omniroute-cloud-runtime-staging-artifacts-preview"/
+  );
   assert.match(
     workflow,
     /config\.d1_databases\[0\]\.database_name = "omniroute-cloud-runtime-staging"/
