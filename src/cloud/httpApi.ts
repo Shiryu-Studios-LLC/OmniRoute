@@ -78,6 +78,8 @@ export interface CloudApiOptions {
   db?: CloudDb;
   /** Privileged server-to-server token. Never expose this value to browser clients. */
   adminToken?: string;
+  /** Cloud deployment environment; staging/production enforce deployment token policy. */
+  environment?: string;
   /** Optional token limited to tenant provisioning and lifecycle operations. */
   maintenanceToken?: string;
   /** Base64-encoded 32-byte secret used only by the Worker credential envelope. */
@@ -481,6 +483,15 @@ export async function handleCloudApiRequest(
   request: Request,
   options: CloudApiOptions
 ): Promise<Response> {
+  const strictTokenPolicy =
+    options.environment === "staging" || options.environment === "production";
+  if (
+    strictTokenPolicy &&
+    ((options.adminToken !== undefined && !isDeploymentToken(options.adminToken)) ||
+      (options.maintenanceToken !== undefined && !isDeploymentToken(options.maintenanceToken)))
+  ) {
+    return json({ error: "Cloud API is not configured" }, 503);
+  }
   if (
     options.adminToken &&
     options.maintenanceToken &&
@@ -1640,4 +1651,8 @@ export async function handleCloudApiRequest(
     if (error instanceof ApiError) return json({ error: error.message }, error.status);
     return conflictOrError(error);
   }
+}
+
+function isDeploymentToken(value: string): boolean {
+  return /^[A-Za-z0-9._~+/=-]{32,512}$/.test(value);
 }

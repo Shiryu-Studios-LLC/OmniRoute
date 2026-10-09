@@ -336,6 +336,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           db: options.env?.DB,
           adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
           maintenanceToken: options.env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN,
+          environment: options.env?.OMNIROUTE_ENV,
           credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
           sessions: options.env?.GATEWAY_SESSIONS,
           now,

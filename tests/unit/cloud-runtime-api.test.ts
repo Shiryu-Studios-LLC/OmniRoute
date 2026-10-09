@@ -408,6 +408,63 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
   assert.equal(response.status, 401);
 });
 
+test("staging and production cloud admin tokens must meet the deployment secret policy", async () => {
+  const weakTokenDb = new TestD1();
+  const weakTokenRuntime = createCloudRuntime({
+    env: {
+      DB: weakTokenDb,
+      OMNIROUTE_ENV: "staging",
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: "short-admin-secret",
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: "valid-maintenance-token-0123456789",
+    },
+  });
+  const weakAdminResponse = await weakTokenRuntime.fetch(
+    request("/__cloud/v1/tenants/tenant-a", "short-admin-secret")
+  );
+  assert.equal(weakAdminResponse.status, 503);
+  assert.equal(
+    weakTokenDb.prepareCount,
+    0,
+    "invalid deployment secrets must fail before D1 access"
+  );
+
+  const weakMaintenanceDb = new TestD1();
+  const weakMaintenanceRuntime = createCloudRuntime({
+    env: {
+      DB: weakMaintenanceDb,
+      OMNIROUTE_ENV: "production",
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: "valid-admin-token-0123456789012345",
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: "short-maintenance",
+    },
+  });
+  const weakMaintenanceResponse = await weakMaintenanceRuntime.fetch(
+    request("/__cloud/v1/tenants/tenant-a/status", "short-maintenance")
+  );
+  assert.equal(weakMaintenanceResponse.status, 503);
+  assert.equal(
+    weakMaintenanceDb.prepareCount,
+    0,
+    "invalid maintenance secrets must fail before D1 access"
+  );
+
+  const validTokenRuntime = createCloudRuntime({
+    env: {
+      DB: new TestD1(),
+      OMNIROUTE_ENV: "staging",
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: "valid-admin.token_0123456789-abcdefgh",
+    },
+  });
+  assert.equal(
+    (
+      await validTokenRuntime.fetch(
+        request("/__cloud/v1/tenants/tenant-a", "valid-admin.token_0123456789-abcdefgh")
+      )
+    ).status,
+    200,
+    "the configured URL-safe deployment token format must remain accepted"
+  );
+});
+
 test("cloud runtime sends only the tenant admin API path boundary to the D1 admin handler", async () => {
   const db = new TestD1();
   const app = runtime(db);
