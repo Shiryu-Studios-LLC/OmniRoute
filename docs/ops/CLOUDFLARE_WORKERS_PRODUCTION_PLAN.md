@@ -365,6 +365,17 @@ errors, including `bun:sqlite`, native `keytar`/`koffi` modules, Playwright's
 also emitted 227 filesystem-tracing warnings. The standalone Worker dry run
 therefore does not satisfy the full-app production build exit criterion.
 
+OpenNext's current Cloudflare support matrix does not support Node.js
+Middleware. OmniRoute's Next.js 16 `src/proxy.ts` is explicitly Node-only and
+imports the local SQLite-backed authorization pipeline; the repository's proxy
+contract tests keep it from being changed to an Edge runtime without a complete
+replacement. A custom Worker wrapper around the generated OpenNext fetch
+handler does not remove this middleware graph. The next Phase 12 implementation
+must introduce and test a D1-backed authorization boundary before routing
+protected application requests to OpenNext. Existing D1 identity storage covers
+customer API keys and OIDC memberships, but not local API keys, CLI access
+tokens, or dashboard login settings, so full policy parity remains incomplete.
+
 **Exit:** production cloud build is reproducible and within size/runtime limits.
 
 ### 13. Security and isolation

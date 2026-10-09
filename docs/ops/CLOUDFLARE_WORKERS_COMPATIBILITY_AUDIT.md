@@ -123,6 +123,27 @@ The isolated Worker now includes tenant and customer APIs backed by D1, provider
 
 The full Next.js/OpenNext application build was reproduced on 2026-10-08. Next compiled and generated all 594 static pages, then OpenNext failed middleware bundling with 103 resolution errors, including `bun:sqlite`, native `keytar`/`koffi` modules, Playwright `chromium-bidi`, a generated TypeScript import, and `@opentelemetry/api`. The run emitted 227 filesystem-tracing warnings and grew `.next` to 7.4 GiB. The full application remains incompatible with Workers until its authorization and persistence graph is replaced with cloud-safe paths and local-only routes/features are isolated.
 
+OpenNext's current Cloudflare compatibility matrix distinguishes Middleware from
+Node.js Middleware: the former is supported, while the latter is not. OmniRoute
+uses Next.js 16 `src/proxy.ts`, and
+[`tests/unit/authz/proxy-contract.test.ts`](../../tests/unit/authz/proxy-contract.test.ts)
+locks it to its Node runtime because its current pipeline imports SQLite-backed
+auth and local-only policy modules. Supplying D1 through OpenNext's request
+context would not make this Node-only proxy buildable. A custom Worker can wrap
+the generated OpenNext fetch handler, but that wrapper alone does not remove the
+proxy graph or preserve the centralized authorization contract. The cloud build
+must replace that graph with a D1-backed authorization boundary before it can
+delegate protected routes to OpenNext. The current Cloudflare D1 schema has no
+parity tables for local `api_keys`, CLI access tokens, or dashboard login
+settings; those identities and their existing role/scope checks must be
+designed and tested before the local proxy is excluded.
+
+This compatibility finding is based on the current
+[OpenNext Cloudflare support matrix](https://opennext.js.org/cloudflare) and its
+[custom Worker guide](https://opennext.js.org/cloudflare/howtos/custom-worker),
+checked on 2026-10-08. The custom Worker guide describes wrapping the generated
+fetch handler; it does not replace application authorization.
+
 ## Exit criteria for Phase 0/1
 
 - A Worker-compatible entry point exists.
