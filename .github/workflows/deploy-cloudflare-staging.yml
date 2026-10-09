@@ -41,7 +41,11 @@ jobs:
         shell: bash
         env:
           CONFIRM_STAGING: ${{ inputs.confirm_staging }}
-          OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN }}
           OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY }}
           OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: ${{ secrets.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY }}
@@ -55,12 +59,21 @@ jobs:
           [[ -n "$CLOUDFLARE_API_TOKEN" ]] || { echo "Missing CLOUDFLARE_API_TOKEN in cloudflare-staging environment."; exit 1; }
           [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_ACCOUNT_ID must be a 32-character Cloudflare account ID."; exit 1; }
           [[ "$CLOUDFLARE_STAGING_D1_DATABASE_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_STAGING_D1_DATABASE_ID must be a 32-character staging D1 ID."; exit 1; }
-          [[ "$OMNIROUTE_CLOUD_ADMIN_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "OMNIROUTE_CLOUD_ADMIN_TOKEN must be 32–512 URL-safe characters with no whitespace or control characters."; exit 1; }
-          [[ "$OMNIROUTE_CLOUD_MAINTENANCE_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "OMNIROUTE_CLOUD_MAINTENANCE_TOKEN must be 32–512 URL-safe characters with no whitespace or control characters."; exit 1; }
-          [[ "$OMNIROUTE_CLOUD_MAINTENANCE_TOKEN" != "$OMNIROUTE_CLOUD_ADMIN_TOKEN" ]] || { echo "OMNIROUTE_CLOUD_MAINTENANCE_TOKEN must be distinct from OMNIROUTE_CLOUD_ADMIN_TOKEN."; exit 1; }
+          operator_token_names=(OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN OMNIROUTE_CLOUD_MAINTENANCE_TOKEN)
+          declare -A operator_token_values=()
+          for token_name in "${operator_token_names[@]}"; do
+            token_value="${!token_name:-}"
+            [[ "$token_value" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || { echo "$token_name must be 32–512 URL-safe characters with no whitespace or control characters."; exit 1; }
+            [[ -z "${operator_token_values[$token_value]+present}" ]] || { echo "Operator scope tokens must all be distinct."; exit 1; }
+            operator_token_values["$token_value"]="$token_name"
+          done
           [[ "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY must be a base64-encoded 32-byte key."; exit 1; }
           [[ "$OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY must be a base64-encoded 32-byte key."; exit 1; }
-          [[ "$OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY" != "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY" ]] || { echo "OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY must be distinct from OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY."; exit 1; }
+          for secret_name in OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY; do
+            secret_value="${!secret_name}"
+            [[ -z "${operator_token_values[$secret_value]+present}" ]] || { echo "$secret_name must be distinct from every operator token."; exit 1; }
+            operator_token_values["$secret_value"]="$secret_name"
+          done
           [[ "$OMNIROUTE_CLOUD_PUBLIC_ORIGIN" =~ ^https://omniroute-cloud-runtime-staging\.[A-Za-z0-9-]+\.workers\.dev$ ]] || { echo "OMNIROUTE_CLOUD_PUBLIC_ORIGIN must be the exact HTTPS origin for the isolated staging workers.dev host."; exit 1; }
           if [[ ! -d cloudflare/migrations ]] || ! find cloudflare/migrations -maxdepth 1 -type f -name '*.sql' -print -quit | grep -q .; then
             echo "No Cloudflare D1 SQL migrations found."
@@ -225,14 +238,50 @@ jobs:
           }
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
-      - name: Bind staging cloud admin token
+      - name: Bind staging identity admin token
         shell: bash
         env:
           WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
-          OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
-          printf '%s' "$OMNIROUTE_CLOUD_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+          printf '%s' "$OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+
+      - name: Bind staging inference admin token
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+
+      - name: Bind staging lifecycle admin token
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+
+      - name: Bind staging tenant-hosts admin token
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
+
+      - name: Bind staging Front Desk admin token
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
 
       - name: Bind staging cloud maintenance token
         shell: bash
@@ -266,7 +315,11 @@ jobs:
         env:
           STAGING_URL: ${{ steps.deploy.outputs.url }}
           EXPECTED_BUILD_SHA: ${{ github.sha }}
-          OMNIROUTE_CLOUD_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN }}
         run: |
           set -euo pipefail
@@ -275,11 +328,19 @@ jobs:
             echo "Staging Worker did not reject an unauthenticated admin request."
             exit 1
           }
-          authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/status")"
-          [[ "$authorized" == "404" ]] || {
-            echo "Staging Worker admin authorization smoke check returned an unexpected status."
+          lifecycle_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/status")"
+          [[ "$lifecycle_authorized" == "404" ]] || {
+            echo "Staging Worker lifecycle authorization smoke check returned an unexpected status."
             exit 1
           }
+          identity_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/oidc")"
+          [[ "$identity_authorized" == "404" ]] || { echo "Identity admin authorization smoke check returned HTTP $identity_authorized instead of 404."; exit 1; }
+          inference_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/inference-budget")"
+          [[ "$inference_authorized" == "404" ]] || { echo "Inference admin authorization smoke check returned HTTP $inference_authorized instead of 404."; exit 1; }
+          hosts_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenant-hosts?tenantId=__smoke_missing__")"
+          [[ "$hosts_authorized" == "200" ]] || { echo "Tenant-hosts admin authorization smoke check returned HTTP $hosts_authorized instead of 200."; exit 1; }
+          front_desk_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/front-desk/configs?tenantId=__smoke_missing__")"
+          [[ "$front_desk_authorized" == "200" ]] || { echo "Front Desk admin authorization smoke check returned HTTP $front_desk_authorized instead of 200."; exit 1; }
           maintenance_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_MAINTENANCE_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/status")"
           [[ "$maintenance_authorized" == "404" ]] || {
             echo "Staging Worker maintenance authorization smoke check returned an unexpected status."
@@ -290,6 +351,14 @@ jobs:
             echo "Staging Worker maintenance token escaped its tenant lifecycle scope."
             exit 1
           }
+          identity_out_of_scope="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/inference-budget")"
+          [[ "$identity_out_of_scope" == "401" ]] || { echo "Identity admin crossed into inference policy scope."; exit 1; }
+          inference_out_of_scope="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/oidc")"
+          [[ "$inference_out_of_scope" == "401" ]] || { echo "Inference admin crossed into identity scope."; exit 1; }
+          hosts_out_of_scope="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/front-desk/configs?tenantId=__smoke_missing__")"
+          [[ "$hosts_out_of_scope" == "401" ]] || { echo "Tenant-hosts admin crossed into Front Desk config scope."; exit 1; }
+          front_desk_out_of_scope="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenant-hosts?tenantId=__smoke_missing__")"
+          [[ "$front_desk_out_of_scope" == "401" ]] || { echo "Front Desk admin crossed into tenant-hosts scope."; exit 1; }
           health="$(curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused "$STAGING_URL/__cloud/health")"
           printf '%s' "$health" | node -e '
             let body = "";

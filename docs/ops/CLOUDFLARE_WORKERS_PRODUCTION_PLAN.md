@@ -434,35 +434,48 @@ The repository includes a manual-only GitHub Actions workflow at
 configure production routes or custom domains. Configure a protected GitHub
 Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STAGING_D1_DATABASE_ID`,
-`OMNIROUTE_CLOUD_ADMIN_TOKEN`, `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN`, and
+`OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN`,
+`OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN`,
+`OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN`,
+`OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN`,
+`OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN`,
+`OMNIROUTE_CLOUD_MAINTENANCE_TOKEN`, and
 `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY`, and
 `OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY`. Also set the non-secret GitHub
 Environment variable `OMNIROUTE_CLOUD_PUBLIC_ORIGIN` to the exact HTTPS origin
 for the isolated `omniroute-cloud-runtime-staging.<account>.workers.dev` host;
-the workflow validates and binds it for the customer OIDC callback. Both cloud tokens must be distinct and
-32–512 URL-safe characters. Both key secrets must be distinct base64-encoded
-32-byte values. All four secrets are required by the manual staging workflow. The
-admin token retains the full server-side cloud API scope. The maintenance token
-is limited to customer tenant provisioning and tenant lifecycle inspection or
-suspension/resumption; it cannot access provider, gateway, customer membership,
-or API-key management routes. Tenant lifecycle mutation events, provisioning
-request attempts, and successful owner-provisioning events are attributed to
-`cloud-maintenance`. The workflow validates that tokens and key secrets differ, binds all four
-through `wrangler secret put` using stdin, and checks that the maintenance token
-works on a lifecycle route while being rejected on provider CRUD.
+the workflow validates and binds it for the customer OIDC callback. Each of the
+six operator tokens must be distinct and 32–512 URL-safe characters. The
+identity token manages memberships, API keys, and OIDC configuration; the
+inference token manages only tenant inference entitlements and budgets; the
+lifecycle token manages tenant provisioning, lifecycle status, and maintenance
+history; the tenant-hosts token manages verified customer-host administration;
+the Front Desk token manages encrypted Front Desk configuration; and the
+maintenance token is limited to tenant lifecycle status and cannot provision
+customers.
+The two key secrets must be distinct base64-encoded 32-byte values, and all
+operator tokens must differ from both keys. All eight secrets are required by
+the manual staging workflow. The legacy `OMNIROUTE_CLOUD_ADMIN_TOKEN` is
+ignored in staging and production; it remains a local/test compatibility token.
+The workflow binds each scoped secret through `wrangler secret put` using stdin
+and checks successful use and cross-scope denial for the new route families.
+Tenant lifecycle status audit rows identify the lifecycle or maintenance actor;
+customer provisioning audit rows identify the lifecycle actor.
 
 The credential key must be a base64-encoded 32-byte key used only for Cloud
-credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The idempotency HMAC key must be a different base64-encoded 32-byte secret.
-Inference requests fail closed if this key is missing or invalid; provider
-credential writes also fail closed if their encryption key is unavailable. The D1 ID must resolve through the Cloudflare API
-to a database named exactly `omniroute-cloud-runtime-staging`. The workflow binds
-the admin, maintenance, credential-encryption, and idempotency-HMAC secrets
-through `wrangler secret put` using stdin. It applies pending D1
-migrations and checks `/__cloud/health`, `/__cloud/db`, `/__cloud/readiness`, and
-`/__cloud/runtime` after deployment. It also checks that the cloud admin API rejects
-an unauthenticated request and accepts the configured token without creating a
-resource. Readiness performs a D1 query and read-only Durable Object storage
-access; the runtime check verifies the staging name and deployed commit SHA.
+credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The idempotency
+HMAC key must be a different base64-encoded 32-byte secret. Inference requests
+fail closed if this key is missing or invalid; provider credential writes also
+fail closed if their encryption key is unavailable. The D1 ID must resolve
+through the Cloudflare API to a database named exactly
+`omniroute-cloud-runtime-staging`. The workflow binds each scoped operator,
+maintenance, credential-encryption, and idempotency-HMAC secret through
+`wrangler secret put` using stdin. It applies pending D1 migrations and checks
+`/__cloud/health`, `/__cloud/db`, `/__cloud/readiness`, and `/__cloud/runtime`
+after deployment. It also verifies that the cloud API rejects unauthenticated
+requests, each scoped credential reaches its assigned route family, and
+cross-scope requests are denied. Readiness performs D1, Durable Object, and R2
+probes; the runtime check verifies the staging name and deployed commit SHA.
 
 ### Worker customer inference subset
 

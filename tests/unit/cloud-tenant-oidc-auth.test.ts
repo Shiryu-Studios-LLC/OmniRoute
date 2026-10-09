@@ -391,14 +391,27 @@ test("cloud runtime dispatches the first-owner claim redemption route", async ()
   assert.equal(response.status, 400);
 });
 
-test("platform admin cannot link an unverified OIDC subject to a customer membership", async () => {
+test("identity admin cannot link an unverified OIDC subject to a customer membership", async () => {
   const { db, tenant, membership, identity } = await setup();
   const adminToken = "valid-cloud-admin-token-0123456789";
+  const inferenceToken = "valid-cloud-inference-token-0123456789";
+  const lifecycleToken = "valid-cloud-lifecycle-token-0123456789";
+  const hostsToken = "valid-cloud-hosts-admin-token-0123456789";
+  const frontDeskToken = "valid-cloud-frontdesk-admin-token-0123456789";
+  const maintenanceToken = "valid-cloud-maintenance-token-0123456789";
+  const idempotencyKey = Buffer.alloc(32, 42).toString("base64");
   const app = createCloudRuntime({
     env: {
       DB: db,
       OMNIROUTE_ENV: "production",
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
+      OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: adminToken,
+      OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: inferenceToken,
+      OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: lifecycleToken,
+      OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: hostsToken,
+      OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: frontDeskToken,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
     },
     now: () => new Date(NOW),
   });

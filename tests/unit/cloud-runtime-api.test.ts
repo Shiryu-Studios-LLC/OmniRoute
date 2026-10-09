@@ -380,6 +380,15 @@ function request(path: string, token = adminToken) {
 }
 
 const cloudCredentialKey = Buffer.alloc(32, 7).toString("base64");
+const cloudIdempotencyKey = Buffer.alloc(32, 8).toString("base64");
+const scopedOperatorTokens = {
+  identity: "cloud-identity-admin-token-0123456789",
+  inference: "cloud-inference-admin-token-0123456789",
+  lifecycle: "cloud-lifecycle-admin-token-0123456789",
+  hosts: "cloud-hosts-admin-token-0123456789012345",
+  frontDesk: "cloud-frontdesk-admin-token-0123456789",
+  maintenance: "cloud-maintenance-token-0123456789012",
+};
 
 function runtime(
   db = new TestD1(),
@@ -408,15 +417,207 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
   assert.equal(response.status, 401);
 });
 
+test("production operator tokens are limited to their route families", async () => {
+  const db = new TestD1();
+  const app = createCloudRuntime({
+    env: {
+      DB: db,
+      OMNIROUTE_ENV: "production",
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: "legacy-global-admin-token-0123456789",
+      OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: scopedOperatorTokens.identity,
+      OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
+      OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+      OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.hosts,
+      OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: cloudCredentialKey,
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: cloudIdempotencyKey,
+    },
+  });
+  const authorized = (path: string, token: string, method = "GET", body?: unknown) =>
+    app.fetch(
+      new Request(`https://omniroute.test${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+    );
+
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.identity)).status,
+    200
+  );
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/tenants/tenant-a/inference-budget",
+        scopedOperatorTokens.inference
+      )
+    ).status,
+    200
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/status", scopedOperatorTokens.lifecycle))
+      .status,
+    200
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenant-hosts?tenantId=tenant-a", scopedOperatorTokens.hosts))
+      .status,
+    200
+  );
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/front-desk/configs?tenantId=tenant-a",
+        scopedOperatorTokens.frontDesk
+      )
+    ).status,
+    200
+  );
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/front-desk/configs?tenantId=tenant-a",
+        scopedOperatorTokens.hosts
+      )
+    ).status,
+    401
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenant-hosts?tenantId=tenant-a", scopedOperatorTokens.frontDesk))
+      .status,
+    401
+  );
+
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/tenants/tenant-a/inference-budget",
+        scopedOperatorTokens.identity
+      )
+    ).status,
+    401
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.inference)).status,
+    401
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.lifecycle)).status,
+    401
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/status", scopedOperatorTokens.identity)).status,
+    401
+  );
+  const tenantProvisioningBody = {
+    id: "tenant-new",
+    name: "New customer",
+    slug: "new-customer",
+  };
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/tenants",
+        scopedOperatorTokens.maintenance,
+        "POST",
+        tenantProvisioningBody
+      )
+    ).status,
+    401,
+    "maintenance credentials must not provision customers"
+  );
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/tenants",
+        scopedOperatorTokens.lifecycle,
+        "POST",
+        tenantProvisioningBody
+      )
+    ).status,
+    400,
+    "the lifecycle credential reaches provisioning validation, which still requires a trusted owner"
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.maintenance))
+      .status,
+    401
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/oidc", "legacy-global-admin-token-0123456789"))
+      .status,
+    401
+  );
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/tenant-hosts?tenantId=tenant-a",
+        "legacy-global-admin-token-0123456789"
+      )
+    ).status,
+    401
+  );
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/front-desk/configs?tenantId=tenant-a",
+        "legacy-global-admin-token-0123456789"
+      )
+    ).status,
+    401
+  );
+
+  const duplicateScopeApp = createCloudRuntime({
+    env: {
+      DB: new TestD1(),
+      OMNIROUTE_ENV: "production",
+      OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: scopedOperatorTokens.identity,
+      OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
+      OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+      OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.identity,
+      OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: cloudCredentialKey,
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: cloudIdempotencyKey,
+    },
+  });
+  assert.equal(
+    (
+      await duplicateScopeApp.fetch(
+        new Request("https://omniroute.test/__cloud/v1/tenants/tenant-a/oidc", {
+          headers: { Authorization: `Bearer ${scopedOperatorTokens.identity}` },
+        })
+      )
+    ).status,
+    503,
+    "duplicate operator credentials disable admin routes until corrected"
+  );
+});
+
 test("staging readiness requires valid cloud runtime secrets without exposing their values", async () => {
   const sessions = {
     idFromName: (name: string) => name,
     get: () => ({ checkReadiness: async () => undefined }),
   } as never;
-  const adminToken = "valid-admin-token-0123456789012345";
-  const maintenanceToken = "valid-maintenance-token-0123456789";
+  const legacyAdminToken = "valid-admin-token-0123456789012345";
   const encryptionKey = Buffer.alloc(32, 7).toString("base64");
   const idempotencyKey = Buffer.alloc(32, 8).toString("base64");
+  const runtimeBindings = {
+    OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: scopedOperatorTokens.identity,
+    OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
+    OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+    OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.hosts,
+    OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
+    OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
+    OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
+    OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
+    GATEWAY_ARTIFACTS: { get: async () => null } as never,
+  };
   const readinessRequest = () =>
     new Request("https://omniroute.test/__cloud/readiness", { method: "GET" });
 
@@ -425,33 +626,42 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
       OMNIROUTE_ENV: "staging",
       DB: new TestD1(),
       GATEWAY_SESSIONS: sessions,
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
-      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: legacyAdminToken,
+      GATEWAY_ARTIFACTS: { get: async () => null } as never,
     },
   });
   const missingResponse = await missingRuntimeSecrets.fetch(readinessRequest());
   assert.equal(missingResponse.status, 503);
   const missingBody = (await missingResponse.json()) as {
     status: string;
-    checks: Record<string, string>;
+    checks: Record<string, unknown>;
   };
   assert.equal(missingBody.status, "not_ready");
   assert.deepEqual(missingBody.checks, {
     database: "ok",
     gateway: "ok",
+    artifacts: "ok",
     configuration: "unconfigured",
+    configurationIssues: [
+      "missing:identityAdminToken",
+      "missing:inferenceAdminToken",
+      "missing:lifecycleAdminToken",
+      "missing:tenantHostsAdminToken",
+      "missing:frontDeskAdminToken",
+      "missing:maintenanceToken",
+      "missing:credentialEncryptionKey",
+      "missing:idempotencyKey",
+    ],
   });
-  assert.doesNotMatch(JSON.stringify(missingBody), /valid-admin|valid-maintenance|secret|key/i);
+  assert.doesNotMatch(JSON.stringify(missingBody), /valid-admin|valid-maintenance/i);
 
   const malformedSecret = createCloudRuntime({
     env: {
       OMNIROUTE_ENV: "production",
       DB: new TestD1(),
       GATEWAY_SESSIONS: sessions,
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
-      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      ...runtimeBindings,
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: "malformed-encryption-key",
-      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
     },
   });
   const malformedResponse = await malformedSecret.fetch(readinessRequest());
@@ -467,10 +677,7 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
       OMNIROUTE_ENV: "staging",
       DB: new TestD1(),
       GATEWAY_SESSIONS: sessions,
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
-      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
-      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
-      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
+      ...runtimeBindings,
     },
   });
   const configuredResponse = await configuredRuntime.fetch(readinessRequest());
@@ -483,7 +690,9 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
   assert.deepEqual(configuredBody.checks, {
     database: "ok",
     gateway: "ok",
+    artifacts: "ok",
     configuration: "ok",
+    configurationIssues: [],
   });
 
   const reusedSecretRuntime = createCloudRuntime({
@@ -491,10 +700,9 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
       OMNIROUTE_ENV: "staging",
       DB: new TestD1(),
       GATEWAY_SESSIONS: sessions,
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: encryptionKey,
-      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      ...runtimeBindings,
+      OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: encryptionKey,
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
-      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
     },
   });
   const reusedSecretResponse = await reusedSecretRuntime.fetch(readinessRequest());
@@ -505,18 +713,18 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
   assert.equal(reusedSecretBody.checks.configuration, "error");
 });
 
-test("staging and production cloud admin tokens must meet the deployment secret policy", async () => {
+test("staging and production scoped operator tokens must meet the deployment secret policy", async () => {
   const weakTokenDb = new TestD1();
   const weakTokenRuntime = createCloudRuntime({
     env: {
       DB: weakTokenDb,
       OMNIROUTE_ENV: "staging",
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: "short-admin-secret",
-      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: "valid-maintenance-token-0123456789",
+      OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: "short-admin-secret",
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
     },
   });
   const weakAdminResponse = await weakTokenRuntime.fetch(
-    request("/__cloud/v1/tenants/tenant-a", "short-admin-secret")
+    request("/__cloud/v1/tenants/tenant-a/oidc", "short-admin-secret")
   );
   assert.equal(weakAdminResponse.status, 503);
   assert.equal(
@@ -530,7 +738,6 @@ test("staging and production cloud admin tokens must meet the deployment secret 
     env: {
       DB: weakMaintenanceDb,
       OMNIROUTE_ENV: "production",
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: "valid-admin-token-0123456789012345",
       OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: "short-maintenance",
     },
   });
@@ -548,13 +755,20 @@ test("staging and production cloud admin tokens must meet the deployment secret 
     env: {
       DB: new TestD1(),
       OMNIROUTE_ENV: "staging",
-      OMNIROUTE_CLOUD_ADMIN_TOKEN: "valid-admin.token_0123456789-abcdefgh",
+      OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: "valid-admin.token_0123456789-abcdefgh",
+      OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
+      OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+      OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.hosts,
+      OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: cloudCredentialKey,
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: cloudIdempotencyKey,
     },
   });
   assert.equal(
     (
       await validTokenRuntime.fetch(
-        request("/__cloud/v1/tenants/tenant-a", "valid-admin.token_0123456789-abcdefgh")
+        request("/__cloud/v1/tenants/tenant-a/oidc", "valid-admin.token_0123456789-abcdefgh")
       )
     ).status,
     200,
@@ -656,7 +870,7 @@ test("maintenance run history is bounded and readable only by the platform admin
   );
 });
 
-test("maintenance identity requires an owner to provision and cannot access cloud CRUD", async () => {
+test("maintenance identity can inspect lifecycle status but cannot provision or access cloud CRUD", async () => {
   const db = new TestD1();
   const app = runtime(db, undefined, undefined, "test-cloud-maintenance-secret");
   const provision = await app.fetch(
@@ -673,8 +887,8 @@ test("maintenance identity requires an owner to provision and cannot access clou
       }),
     })
   );
-  assert.equal(provision.status, 400);
-  assert.equal(db.auditRows[0][4], "cloud-maintenance");
+  assert.equal(provision.status, 401);
+  assert.equal(db.auditRows.length, 0);
 
   const lifecycle = await app.fetch(
     request("/__cloud/v1/tenants/tenant-a/status", "test-cloud-maintenance-secret")

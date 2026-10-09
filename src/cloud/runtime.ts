@@ -63,7 +63,13 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
   DB?: CloudDb;
+  /** Legacy unscoped operator token; honored only outside staging and production. */
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
@@ -115,33 +121,58 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
   const requireDeploymentConfiguration =
     env?.OMNIROUTE_ENV === "staging" || env?.OMNIROUTE_ENV === "production";
 
-  const configurationStatus = (): "ok" | "unconfigured" | "error" => {
-    const adminToken = env?.OMNIROUTE_CLOUD_ADMIN_TOKEN;
-    const maintenanceToken = env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN;
+  const configurationStatus = (): {
+    status: "ok" | "unconfigured" | "error";
+    issues: string[];
+  } => {
+    const scopedTokens = [
+      ["identityAdminToken", env?.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN],
+      ["inferenceAdminToken", env?.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN],
+      ["lifecycleAdminToken", env?.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN],
+      ["tenantHostsAdminToken", env?.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN],
+      ["frontDeskAdminToken", env?.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN],
+      ["maintenanceToken", env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN],
+    ] as const;
     const credentialEncryptionKey = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY;
     const idempotencyKey = env?.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY;
     const frontDeskConfigToken = env?.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN;
-    if (!adminToken || !maintenanceToken || !credentialEncryptionKey || !idempotencyKey) {
-      return "unconfigured";
+    const issues: string[] = [];
+    for (const [name, token] of scopedTokens) {
+      if (!token) issues.push(`missing:${name}`);
+      else if (!isDeploymentToken(token)) issues.push(`invalid:${name}`);
     }
-    if (
-      !isDeploymentToken(adminToken) ||
-      !isDeploymentToken(maintenanceToken) ||
-      !isCloudCredentialEncryptionKey(credentialEncryptionKey) ||
-      !isCloudInferenceIdempotencySecret(idempotencyKey) ||
-      (frontDeskConfigToken !== undefined && !isDeploymentToken(frontDeskConfigToken)) ||
-      new Set([
-        adminToken,
-        maintenanceToken,
-        credentialEncryptionKey,
-        idempotencyKey,
-        ...(frontDeskConfigToken ? [frontDeskConfigToken] : []),
-      ]).size !==
-        4 + (frontDeskConfigToken ? 1 : 0)
-    ) {
-      return "error";
+    if (!credentialEncryptionKey) issues.push("missing:credentialEncryptionKey");
+    else if (!isCloudCredentialEncryptionKey(credentialEncryptionKey)) {
+      issues.push("invalid:credentialEncryptionKey");
     }
-    return "ok";
+    if (!idempotencyKey) issues.push("missing:idempotencyKey");
+    else if (!isCloudInferenceIdempotencySecret(idempotencyKey)) {
+      issues.push("invalid:idempotencyKey");
+    }
+    if (frontDeskConfigToken !== undefined && !isDeploymentToken(frontDeskConfigToken)) {
+      issues.push("invalid:frontDeskServiceToken");
+    }
+    const configuredSecrets = [
+      ...scopedTokens.map(([, token]) => token).filter((token): token is string => Boolean(token)),
+      credentialEncryptionKey,
+      idempotencyKey,
+      ...(frontDeskConfigToken ? [frontDeskConfigToken] : []),
+    ].filter((secret): secret is string => Boolean(secret));
+    if (new Set(configuredSecrets).size !== configuredSecrets.length) {
+      issues.push("duplicate:operatorOrRuntimeSecret");
+    }
+    return {
+      status: issues.some((issue) => issue.startsWith("invalid:") || issue.startsWith("duplicate:"))
+        ? "error"
+        : issues.length > 0
+          ? "unconfigured"
+          : "ok",
+      issues,
+    };
+  };
+  const scopedOperatorToken = (token: string | undefined): string | undefined => {
+    if (!requireDeploymentConfiguration) return token;
+    return configurationStatus().status === "ok" ? token : undefined;
   };
 
   return {
@@ -161,7 +192,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         try {
           const response = await handleCloudFrontDeskConfigRequest(request, {
             db: options.env?.DB,
-            adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+            adminToken: requireDeploymentConfiguration
+              ? scopedOperatorToken(options.env?.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN)
+              : (options.env?.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN ??
+                options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN),
             serviceToken: options.env?.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN,
             credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
             now,
@@ -182,7 +216,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         try {
           const response = await handleCloudTenantHostsRequest(request, {
             db: options.env?.DB,
-            adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+            adminToken: requireDeploymentConfiguration
+              ? scopedOperatorToken(options.env?.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN)
+              : (options.env?.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN ??
+                options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN),
             now,
             resolveTxt: options.customerHostTxtResolver,
           });
@@ -352,11 +389,17 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           gateway: "ok" | "unconfigured" | "error";
           artifacts: "ok" | "unconfigured" | "error";
           configuration?: "ok" | "unconfigured" | "error";
+          configurationIssues?: string[];
         } = {
           database: "unconfigured",
           gateway: "unconfigured",
           artifacts: "unconfigured",
-          ...(configuration !== null ? { configuration } : {}),
+          ...(configuration !== null
+            ? {
+                configuration: configuration.status,
+                configurationIssues: configuration.issues,
+              }
+            : {}),
         };
 
         if (options.env?.DB) {
@@ -394,7 +437,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           checks.database === "ok" &&
           checks.gateway === "ok" &&
           checks.artifacts === "ok" &&
-          (configuration === null || configuration === "ok");
+          (configuration === null || configuration.status === "ok");
         return Response.json(
           {
             status: ready ? "ready" : "not_ready",
@@ -536,7 +579,16 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         return handleCloudApiRequest(request, {
           db: options.env?.DB,
           adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
-          maintenanceToken: options.env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN,
+          identityAdminToken: scopedOperatorToken(
+            options.env?.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN
+          ),
+          inferenceAdminToken: scopedOperatorToken(
+            options.env?.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN
+          ),
+          lifecycleAdminToken: scopedOperatorToken(
+            options.env?.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN
+          ),
+          maintenanceToken: scopedOperatorToken(options.env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN),
           environment: options.env?.OMNIROUTE_ENV,
           credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
           sessions: options.env?.GATEWAY_SESSIONS,

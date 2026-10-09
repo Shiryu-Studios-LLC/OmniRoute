@@ -83,8 +83,14 @@ const TENANT_SCOPED_COLLECTIONS = new Set([
 ]);
 export interface CloudApiOptions {
   db?: CloudDb;
-  /** Privileged server-to-server token. Never expose this value to browser clients. */
+  /** Local/test compatibility token. Ignored in staging and production. */
   adminToken?: string;
+  /** Production token limited to customer identity and membership administration. */
+  identityAdminToken?: string;
+  /** Production token limited to inference policy administration. */
+  inferenceAdminToken?: string;
+  /** Production token limited to tenant provisioning, lifecycle, and maintenance history. */
+  lifecycleAdminToken?: string;
   /** Cloud deployment environment; staging/production enforce deployment token policy. */
   environment?: string;
   /** Optional token limited to tenant provisioning and lifecycle operations. */
@@ -547,15 +553,26 @@ export async function handleCloudApiRequest(
     options.environment === "staging" || options.environment === "production";
   if (
     strictTokenPolicy &&
-    ((options.adminToken !== undefined && !isDeploymentToken(options.adminToken)) ||
-      (options.maintenanceToken !== undefined && !isDeploymentToken(options.maintenanceToken)))
+    [
+      options.identityAdminToken,
+      options.inferenceAdminToken,
+      options.lifecycleAdminToken,
+      options.maintenanceToken,
+    ].some((token) => token !== undefined && !isDeploymentToken(token))
   ) {
     return json({ error: "Cloud API is not configured" }, 503);
   }
+  const configuredOperatorTokens = [
+    options.identityAdminToken,
+    options.inferenceAdminToken,
+    options.lifecycleAdminToken,
+    options.maintenanceToken,
+  ].filter((token): token is string => Boolean(token));
   if (
-    options.adminToken &&
-    options.maintenanceToken &&
-    options.adminToken === options.maintenanceToken
+    new Set(configuredOperatorTokens).size !== configuredOperatorTokens.length ||
+    (!strictTokenPolicy &&
+      options.adminToken !== undefined &&
+      options.adminToken === options.maintenanceToken)
   ) {
     return json({ error: "Cloud API is not configured" }, 503);
   }
@@ -564,16 +581,51 @@ export async function handleCloudApiRequest(
   const strictTenantAuthorization = strictTokenPolicy;
   const tenantScopedRoute =
     strictTenantAuthorization && segments.length >= 2 && TENANT_SCOPED_COLLECTIONS.has(segments[1]);
-  const maintenanceRoute =
-    (segments.length === 0 && request.method === "POST") ||
-    (segments.length === 2 &&
-      segments[1] === "status" &&
-      (request.method === "GET" || request.method === "POST"));
+  const tenantStatusRoute =
+    segments.length === 2 &&
+    segments[1] === "status" &&
+    (request.method === "GET" || request.method === "POST");
+  const tenantProvisioningRoute = segments.length === 0 && request.method === "POST";
+  const maintenanceRoute = tenantStatusRoute;
+  const lifecycleAdminRoute = tenantStatusRoute || tenantProvisioningRoute;
   const isMaintenanceRunsPath =
     segments.length === 2 && segments[0] === "maintenance" && segments[1] === "runs";
+  const isCustomerIdentityPath =
+    (segments.length === 2 && segments[1] === "memberships" && request.method === "POST") ||
+    (segments.length === 3 && segments[1] === "memberships" && request.method === "PATCH") ||
+    (segments.length === 4 &&
+      segments[1] === "memberships" &&
+      segments[3] === "api-keys" &&
+      request.method === "POST") ||
+    (segments.length === 3 && segments[1] === "api-keys" && request.method === "DELETE") ||
+    (segments.length === 2 &&
+      segments[1] === "oidc" &&
+      ["GET", "PUT", "DELETE"].includes(request.method)) ||
+    (segments.length === 3 &&
+      segments[1] === "oidc" &&
+      segments[2] === "identities" &&
+      ["GET", "POST"].includes(request.method)) ||
+    (segments.length === 4 &&
+      segments[1] === "oidc" &&
+      segments[2] === "identities" &&
+      request.method === "DELETE") ||
+    (segments.length === 3 &&
+      segments[1] === "oidc" &&
+      segments[2] === "owner-claims" &&
+      request.method === "POST");
+  const inferencePolicyRoute =
+    segments.length === 2 &&
+    (segments[1] === "inference-entitlements" || segments[1] === "inference-budget");
   const isMaintenanceToken =
     maintenanceRoute && !!options.maintenanceToken && authorized(request, options.maintenanceToken);
-  const isAdminToken = !!options.adminToken && authorized(request, options.adminToken);
+  const isLegacyAdminToken =
+    !strictTokenPolicy && !!options.adminToken && authorized(request, options.adminToken);
+  const isIdentityAdminToken =
+    !!options.identityAdminToken && authorized(request, options.identityAdminToken);
+  const isInferenceAdminToken =
+    !!options.inferenceAdminToken && authorized(request, options.inferenceAdminToken);
+  const isLifecycleAdminToken =
+    !!options.lifecycleAdminToken && authorized(request, options.lifecycleAdminToken);
   let customerIdentity: CloudCustomerIdentity | null = null;
   if (tenantScopedRoute) {
     const authorization = request.headers.get("Authorization") ?? "";
@@ -597,17 +649,36 @@ export async function handleCloudApiRequest(
       return json({ error: "Owner or admin membership is required" }, 403);
     }
   }
-  if (!options.adminToken && !(maintenanceRoute && options.maintenanceToken)) {
+  if (
+    !options.adminToken &&
+    !options.identityAdminToken &&
+    !options.inferenceAdminToken &&
+    !options.lifecycleAdminToken &&
+    !(maintenanceRoute && options.maintenanceToken)
+  ) {
     return json({ error: "Cloud API is not configured" }, 503);
   }
-  if (!tenantScopedRoute && !isAdminToken && !isMaintenanceToken) {
+  const routeHasScopedOperator =
+    (isCustomerIdentityPath && isIdentityAdminToken) ||
+    (inferencePolicyRoute && isInferenceAdminToken) ||
+    ((lifecycleAdminRoute ||
+      isMaintenanceRunsPath ||
+      (segments.length === 1 && request.method === "GET")) &&
+      isLifecycleAdminToken);
+  if (!tenantScopedRoute && !routeHasScopedOperator && !isLegacyAdminToken && !isMaintenanceToken) {
     return json({ error: "Unauthorized" }, 401);
   }
   const auditActor = customerIdentity
     ? customerIdentity.principalId
-    : isMaintenanceToken && !isAdminToken
+    : isMaintenanceToken && !isLegacyAdminToken && !isLifecycleAdminToken
       ? "cloud-maintenance"
-      : "cloud-admin";
+      : isIdentityAdminToken
+        ? "cloud-identity-admin"
+        : isInferenceAdminToken
+          ? "cloud-inference-admin"
+          : isLifecycleAdminToken
+            ? "cloud-lifecycle-admin"
+            : "cloud-admin";
   if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
   if (request.method === "OPTIONS") return json({ error: "Method not allowed" }, 405);
   const db = options.db;
@@ -616,7 +687,8 @@ export async function handleCloudApiRequest(
   try {
     if (isMaintenanceRunsPath) {
       if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
-      if (!isAdminToken) return json({ error: "Unauthorized" }, 401);
+      if (!isLegacyAdminToken && !isLifecycleAdminToken)
+        return json({ error: "Unauthorized" }, 401);
       const platformTenant = await getCloudTenantById(db, CLOUD_PLATFORM_TENANT_ID);
       if (platformTenant?.kind !== "platform_admin" || !platformTenant.isActive) {
         return json({ error: "Cloud platform tenant is not configured" }, 503);
@@ -649,29 +721,6 @@ export async function handleCloudApiRequest(
     // Customer identity provisioning is a platform-admin control-plane action.
     // The global admin token authorizes these management calls but is never
     // accepted or mapped as a customer API key identity.
-    const isCustomerIdentityPath =
-      (segments.length === 2 && segments[1] === "memberships" && request.method === "POST") ||
-      (segments.length === 3 && segments[1] === "memberships" && request.method === "PATCH") ||
-      (segments.length === 4 &&
-        segments[1] === "memberships" &&
-        segments[3] === "api-keys" &&
-        request.method === "POST") ||
-      (segments.length === 3 && segments[1] === "api-keys" && request.method === "DELETE") ||
-      (segments.length === 2 &&
-        segments[1] === "oidc" &&
-        ["GET", "PUT", "DELETE"].includes(request.method)) ||
-      (segments.length === 3 &&
-        segments[1] === "oidc" &&
-        segments[2] === "identities" &&
-        ["GET", "POST"].includes(request.method)) ||
-      (segments.length === 4 &&
-        segments[1] === "oidc" &&
-        segments[2] === "identities" &&
-        request.method === "DELETE") ||
-      (segments.length === 3 &&
-        segments[1] === "oidc" &&
-        segments[2] === "owner-claims" &&
-        request.method === "POST");
     if (isCustomerIdentityPath) {
       const [tenantId, collection, resourceId] = segments;
       if (!validId(tenantId) || (resourceId !== undefined && !validId(resourceId))) {
@@ -786,7 +835,9 @@ export async function handleCloudApiRequest(
         if (segments.length === 3 && resourceId === "owner-claims" && request.method === "POST") {
           // A maintenance token can manage infrastructure, but only the platform admin may
           // bootstrap a customer identity or rotate its one-use owner claim.
-          if (!isAdminToken) return json({ error: "Unauthorized" }, 401);
+          if (!isLegacyAdminToken && !isIdentityAdminToken) {
+            return json({ error: "Unauthorized" }, 401);
+          }
           const { code, codeHash } = await createCloudTenantOidcOwnerClaimCode();
           const nowMs = now().getTime();
           const expiresAtMs = nowMs + CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS;
@@ -1198,7 +1249,9 @@ export async function handleCloudApiRequest(
           "A trusted ownerPrincipalId or explicit oidc_pending bootstrapMode is required"
         );
       }
-      if (oidcPendingRequested && !isAdminToken) return json({ error: "Unauthorized" }, 401);
+      if (oidcPendingRequested && !isLegacyAdminToken && !isIdentityAdminToken) {
+        return json({ error: "Unauthorized" }, 401);
+      }
       const provisioned = await provisionCloudCustomer(db, {
         id: body.id,
         name: body.name.trim(),

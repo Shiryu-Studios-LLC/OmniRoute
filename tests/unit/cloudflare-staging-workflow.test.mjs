@@ -67,7 +67,11 @@ test("staging deploy constructs a staging-only Worker config without production 
 
 test("staging secret values are piped to Wrangler and never printed or shell-traced", () => {
   const secretNames = [
-    "OMNIROUTE_CLOUD_ADMIN_TOKEN",
+    "OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN",
+    "OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN",
+    "OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN",
+    "OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN",
+    "OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN",
     "OMNIROUTE_CLOUD_MAINTENANCE_TOKEN",
     "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY",
     "OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY",
@@ -81,6 +85,7 @@ test("staging secret values are piped to Wrangler and never printed or shell-tra
     assert.doesNotMatch(workflow, new RegExp(`(?:echo|printf)\\s+(?:\\"|')?\\$${name}(?![\\w])`));
   }
 
+  assert.doesNotMatch(workflow, /OMNIROUTE_CLOUD_ADMIN_TOKEN/);
   assert.doesNotMatch(workflow, /^\s*set -x\s*$/m);
   assert.doesNotMatch(workflow, /wrangler secret put[^\n]*--var/);
 });
