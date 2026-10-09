@@ -571,6 +571,70 @@ test(
     assert.notEqual(customerA.deviceId, customerB.deviceId);
     assert.notEqual(customerA.credential, customerB.credential);
 
+    await t.test(
+      "D1 customer hosts resolve exact tenants without disclosing credentials",
+      async () => {
+        const hostA = "tenant-a.frontdesk.integration.test";
+        const hostB = "tenant-b.frontdesk.integration.test";
+        const unauthorized = await requestJson(`${baseUrl}/__cloud/v1/tenant-hosts`, {
+          body: { tenantId: customerA.tenantId, hostname: hostA },
+        });
+        assert.equal(unauthorized.response.status, 401);
+
+        for (const [tenantId, hostname] of [
+          [customerA.tenantId, hostA],
+          [customerB.tenantId, hostB],
+        ]) {
+          const registration = await requestJson(`${baseUrl}/__cloud/v1/tenant-hosts`, {
+            token: adminToken,
+            body: { tenantId, hostname },
+          });
+          assert.equal(registration.response.status, 201, JSON.stringify(registration.body));
+        }
+
+        const resolvedA = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/resolve?hostname=${encodeURIComponent(hostA.toUpperCase())}`
+        );
+        assert.equal(resolvedA.response.status, 200);
+        assert.equal((resolvedA.body.tenant as Record<string, unknown>).id, customerA.tenantId);
+        assert.ok(resolvedA.body.businessProfile);
+        assert.equal(JSON.stringify(resolvedA.body).includes(customerA.customerKey), false);
+        assert.equal(JSON.stringify(resolvedA.body).includes(customerB.customerKey), false);
+        assert.equal(JSON.stringify(resolvedA.body).includes(customerA.credential), false);
+        assert.equal(JSON.stringify(resolvedA.body).includes(customerB.credential), false);
+
+        const lookalike = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/resolve?hostname=${encodeURIComponent(`${hostA}.evil.test`)}`
+        );
+        assert.equal(lookalike.response.status, 404);
+
+        const crossTenantDelete = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/${hostA}?tenantId=${customerB.tenantId}`,
+          { method: "DELETE", token: adminToken }
+        );
+        assert.equal(crossTenantDelete.response.status, 404);
+        const retainedA = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/resolve?hostname=${hostA}`
+        );
+        assert.equal(retainedA.response.status, 200);
+
+        const removedA = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/${hostA}?tenantId=${customerA.tenantId}`,
+          { method: "DELETE", token: adminToken }
+        );
+        assert.equal(removedA.response.status, 200);
+        const noLongerResolved = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/resolve?hostname=${hostA}`
+        );
+        assert.equal(noLongerResolved.response.status, 404);
+        const retainedB = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/resolve?hostname=${hostB}`
+        );
+        assert.equal(retainedB.response.status, 200);
+        assert.equal((retainedB.body.tenant as Record<string, unknown>).id, customerB.tenantId);
+      }
+    );
+
     await t.test("device session and D1 state survive a local Worker restart", async () => {
       await stopWorker(child);
       child = startWorker();
@@ -661,8 +725,23 @@ test(
         const frontDeskBHost = "tenant-b.frontdesk.test";
         const frontDeskBKeyEnv = "FRONT_DESK_LOCAL_GATEWAY_B_KEY";
         const frontDeskBDashboardEnv = "FRONT_DESK_LOCAL_GATEWAY_B_DASHBOARD";
+
+        for (const [tenantId, hostname] of [
+          [customerA.tenantId, frontDeskHost],
+          [customerB.tenantId, frontDeskBHost],
+        ]) {
+          const registration = await requestJson(`${baseUrl}/__cloud/v1/tenant-hosts`, {
+            token: adminToken,
+            body: { tenantId, hostname },
+          });
+          assert.equal(
+            registration.response.status,
+            201,
+            `platform admin should register ${hostname} in D1: ${JSON.stringify(registration.body)}`
+          );
+        }
+
         const frontDeskTenantA = {
-          host: frontDeskHost,
           tenantId: customerA.tenantId,
           dashboardTokenEnv: frontDeskDashboardEnv,
           gateway: {
@@ -685,7 +764,6 @@ test(
         };
         const frontDeskTenantB = {
           ...frontDeskTenantA,
-          host: frontDeskBHost,
           tenantId: customerB.tenantId,
           dashboardTokenEnv: frontDeskBDashboardEnv,
           gateway: {
@@ -707,6 +785,7 @@ test(
             NODE_ENV: "test",
             NO_COLOR: "1",
             PORT: String(frontDeskPort),
+            FRONT_DESK_HOST_REGISTRY_URL: baseUrl,
             FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
             [frontDeskKeyEnv]: customerA.customerKey,
             [frontDeskDashboardEnv]: "local-frontdesk-dashboard-token",
@@ -746,6 +825,22 @@ test(
           await delay(50);
         }
         assert.equal(frontDeskReady, true, `Front Desk did not become ready:\n${frontDeskOutput}`);
+
+        const registeredProfile = await requestJson(
+          `${baseUrl}/__cloud/v1/tenant-hosts/resolve?hostname=${encodeURIComponent(frontDeskHost)}`
+        );
+        assert.equal(registeredProfile.response.status, 200);
+        const frontDeskBusiness = await requestHostJson(
+          frontDeskPort,
+          frontDeskHost,
+          "/business.json"
+        );
+        assert.equal(frontDeskBusiness.status, 200);
+        assert.equal(
+          frontDeskBusiness.body.name,
+          (registeredProfile.body.businessProfile as Record<string, unknown>).name,
+          "Front Desk should use the tenant business profile resolved from Worker D1"
+        );
 
         const chatRequest = requestHostJson(frontDeskPort, frontDeskHost, "/api/chat", {
           model: "ignored-by-gateway-fixture",
@@ -1177,11 +1272,9 @@ test(
       const replayResult = await invoke(customer.customerKey, customer.deviceId, idempotencyKey);
       assert.equal(replayResult.response.status, 200);
       assert.deepEqual(replayResult.body, firstResult.body);
-      assert.equal(
-        (await deviceTransport.poll(customer.session!))?.length,
-        0,
-        "replay must not enqueue again"
-      );
+      const requestsAfterReplay = await deviceTransport.poll(customer.session!);
+      assert.ok(requestsAfterReplay, "replay must leave the device session authorized");
+      assert.equal(requestsAfterReplay.length, 0, "replay must not enqueue again");
       return firstResult.body;
     };
 
@@ -1461,17 +1554,25 @@ test(
       }
     );
 
-    assert.equal(
-      (await invoke(customerA.customerKey, customerB.deviceId, `cross-tenant-${randomUUID()}`))
-        .response.status,
-      404,
-      "tenant A key must not invoke tenant B device"
+    const crossTenantA = await invoke(
+      customerA.customerKey,
+      customerB.deviceId,
+      `cross-tenant-${randomUUID()}`
     );
     assert.equal(
-      (await invoke(customerB.customerKey, customerA.deviceId, `cross-tenant-${randomUUID()}`))
-        .response.status,
+      crossTenantA.response.status,
       404,
-      "tenant B key must not invoke tenant A device"
+      `tenant A key must not invoke tenant B device: ${JSON.stringify(crossTenantA.body)}`
+    );
+    const crossTenantB = await invoke(
+      customerB.customerKey,
+      customerA.deviceId,
+      `cross-tenant-${randomUUID()}`
+    );
+    assert.equal(
+      crossTenantB.response.status,
+      404,
+      `tenant B key must not invoke tenant A device: ${JSON.stringify(crossTenantB.body)}`
     );
 
     const revokedDevice = await provisionCustomer("revoked");
