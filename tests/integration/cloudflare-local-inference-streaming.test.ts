@@ -330,7 +330,11 @@ test(
     assert.equal(connection.response.status, 201, JSON.stringify(connection.body));
 
     const idempotencyKey = `cloud-local-inference-${crypto.randomUUID()}`;
-    const inferenceRequest = (requestIdempotencyKey = idempotencyKey, bearerToken = customerKey) =>
+    const inferenceRequest = (
+      requestIdempotencyKey = idempotencyKey,
+      bearerToken = customerKey,
+      userContent = "hello from the local inference integration"
+    ) =>
       fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
@@ -340,7 +344,7 @@ test(
         },
         body: JSON.stringify({
           model,
-          messages: [{ role: "user", content: "hello from the local inference integration" }],
+          messages: [{ role: "user", content: userContent }],
           stream: true,
         }),
         signal: AbortSignal.timeout(20_000),
@@ -446,6 +450,20 @@ test(
       firstText,
       "replay should return the exact stored SSE transcript"
     );
+    const conflictingReplay = await inferenceRequest(
+      idempotencyKey,
+      customerKey,
+      "a different payload must not reuse the stored result"
+    );
+    assert.equal(
+      conflictingReplay.status,
+      409,
+      "the persisted idempotency key must reject a changed request after Worker restart"
+    );
+    const conflictBody = (await conflictingReplay.json()) as {
+      error?: { type?: unknown };
+    };
+    assert.equal(conflictBody.error?.type, "cloud_inference_error");
     const replayState = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
       token: adminToken,
     });

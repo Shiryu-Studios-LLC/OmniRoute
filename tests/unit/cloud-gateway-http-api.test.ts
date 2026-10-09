@@ -1458,6 +1458,42 @@ test("Worker cancels a stalled gateway request body after the configured read ti
   }
 });
 
+test("connect rate limit rejects before reading another unauthenticated request body", async () => {
+  const fixture = createRuntimeFixture({
+    gatewayConnectFallbackRateLimit: { limit: 1, windowMs: 60_000 },
+    gatewayRequestBodyTimeoutMs: 20,
+  });
+  try {
+    const malformed = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{",
+      })
+    );
+    assert.equal(malformed.status, 400);
+
+    const body = new ReadableStream<Uint8Array>({
+      pull() {
+        return new Promise(() => undefined);
+      },
+    });
+    const limited = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" })
+    );
+
+    assert.equal(limited.status, 429);
+    assert.deepEqual(await limited.json(), { error: "Device authentication rate limit exceeded" });
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
 test("customer invocation derives tenant from its API key, completes through the DO, and audits without payloads", async () => {
   const fixture = createRuntimeFixture();
   try {

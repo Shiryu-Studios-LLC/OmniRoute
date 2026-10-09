@@ -93,10 +93,12 @@ async function requestJsonWithTimeout(
   init: RequestInit | undefined,
   timeoutMs: number
 ): Promise<unknown> {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const signal = init?.signal ? AbortSignal.any([timeoutSignal, init.signal]) : timeoutSignal;
   const response = await fetcher(url, {
     ...init,
     redirect: "error",
-    signal: AbortSignal.timeout(timeoutMs),
+    signal,
   });
   if (!response.ok) throw new Error(`Local service returned HTTP ${response.status}`);
   const advertisedLength = Number(response.headers.get("content-length"));
@@ -180,7 +182,8 @@ export async function requestLocalServiceBytes(
   path: string,
   query: Record<string, string>,
   fetcher: typeof fetch,
-  resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost
+  resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost,
+  signal?: AbortSignal
 ): Promise<{ bytes: Uint8Array; contentType: string }> {
   if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
     throw new Error("Local service path is invalid");
@@ -191,7 +194,9 @@ export async function requestLocalServiceBytes(
   const response = await fetcher(url, {
     method: "GET",
     redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: signal
+      ? AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal])
+      : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: { accept: "image/png,image/jpeg,image/webp" },
   });
   if (!response.ok) throw new Error(`Local service returned HTTP ${response.status}`);

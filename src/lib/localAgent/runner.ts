@@ -302,6 +302,12 @@ export async function runLocalAgentGatewayCycle(
 
     let outcome: LocalAgentGatewayResult["outcome"];
     try {
+      const expirySignal = AbortSignal.timeout(
+        Math.max(1, Date.parse(request.expiresAt) - (dependencies.now ?? Date.now)())
+      );
+      const executionSignal = dependencies.abortSignal
+        ? AbortSignal.any([expirySignal, dependencies.abortSignal])
+        : expirySignal;
       const value = dependencies.execute
         ? await dependencies.execute(request, discovery)
         : await executeLocalCapability(
@@ -312,7 +318,11 @@ export async function runLocalAgentGatewayCycle(
             },
             discovery,
             request,
-            { fetch: dependencies.fetch, mcp: dependencies.mcp }
+            {
+              fetch: dependencies.fetch,
+              mcp: dependencies.mcp,
+              signal: executionSignal,
+            }
           );
       outcome = { ok: true, value };
     } catch {

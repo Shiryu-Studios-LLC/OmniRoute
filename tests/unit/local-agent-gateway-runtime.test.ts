@@ -88,6 +88,57 @@ test("gateway cycle heartbeats, connects, polls, executes, and submits a version
   });
 });
 
+test("gateway shutdown aborts an in-flight unary local capability request", async () => {
+  const controller = new AbortController();
+  let localRequestSignal: AbortSignal | undefined;
+  let submitted: LocalAgentGatewayResult | null = null;
+  await runLocalAgentGatewayCycle(
+    config,
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      createNonce: () => "heartbeat-nonce-shutdown",
+      abortSignal: controller.signal,
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+        services: [{ service: "ollama", reachable: true, models: ["local"] }],
+      }),
+      fetch: async (input, init) => {
+        if (new URL(String(input)).pathname.endsWith("/heartbeat")) {
+          return Response.json({ accepted: true });
+        }
+        localRequestSignal = init?.signal ?? undefined;
+        controller.abort();
+        assert.equal(localRequestSignal?.aborted, true);
+        throw new DOMException("Aborted", "AbortError");
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => [
+          {
+            requestId: "request-shutdown",
+            capability: "ollama:chat:local",
+            payload: { messages: [{ role: "user", content: "hello" }] },
+            expiresAt: "2026-10-08T12:01:00.000Z",
+          },
+        ],
+        submitResult: async (_activeSession, result) => {
+          submitted = result;
+          return true;
+        },
+      },
+    },
+    session
+  );
+
+  assert.equal(localRequestSignal?.aborted, true);
+  assert.deepEqual(submitted, {
+    version: 1,
+    requestId: "request-shutdown",
+    outcome: { ok: false, error: { code: "capability_execution_failed" } },
+  });
+});
+
 test("gateway cycle connects when there is no reusable session and returns a bounded failure result", async () => {
   let connected = 0;
   let submitted: LocalAgentGatewayResult | null = null;

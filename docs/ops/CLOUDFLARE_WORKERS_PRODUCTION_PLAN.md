@@ -356,10 +356,11 @@ plane boundary; it does not provide the missing OpenNext application fallback
 or resolve the Node/SQLite middleware graph documented in the compatibility
 audit.
 
-The latest Worker-only Wrangler dry run (2026-10-09) bundles 95 inputs
-(590,431 bytes; 108,568 bytes gzip; SHA-256
-`ae4b529208987d3f7e3e113d371c8289cb9684a654a1d0e324c4222c5317a919`) and
-succeeds. The AST boundary check reports 41 reachable source files and 665,149
+The latest Worker-only Wrangler dry run (2026-10-09, after the gateway
+pre-auth rate-limit update) bundles 95 inputs (591,198 bytes; 108,816 bytes
+gzip; SHA-256
+`3a38640fd2bfaa9928ee27198c475e78704bf6b2469fd54d969d5d608524f64d`) and
+succeeds. The AST boundary check reports 41 reachable source files and 665,867
 source bytes. It is a dry run; no deployment occurred. The full
 `npm run cloudflare:open-next:build` run took 12m37: Next compiled and generated
 594 static pages, then OpenNext failed middleware bundling with 103 resolution

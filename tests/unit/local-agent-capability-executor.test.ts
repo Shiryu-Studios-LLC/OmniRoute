@@ -177,6 +177,35 @@ test("polls a bounded ComfyUI workflow and retrieves its completed image output"
   });
 });
 
+test("stops a ComfyUI workflow when its gateway request expires", async () => {
+  const controller = new AbortController();
+  let historyCalls = 0;
+  await assert.rejects(
+    executeLocalCapability(
+      { comfyUiUrl: "http://127.0.0.1:8188" },
+      discovery,
+      {
+        capability: "comfyui:image",
+        payload: { workflow: { "1": { class_type: "SaveImage" } } },
+      },
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        signal: controller.signal,
+        fetch: async (input) => {
+          if (new URL(String(input)).pathname === "/prompt") {
+            controller.abort();
+            return Response.json({ prompt_id: "expires_with_request" });
+          }
+          historyCalls += 1;
+          return Response.json({});
+        },
+      }
+    ),
+    /workflow was canceled/
+  );
+  assert.equal(historyCalls, 0, "expired work must not continue polling ComfyUI");
+});
+
 test("rejects unavailable capabilities and oversized request payloads before network access", async () => {
   let calls = 0;
   const dependencies = {

@@ -33,6 +33,7 @@ export interface LocalCapabilityExecutorDependencies {
   fetch: typeof fetch;
   resolveHost?: (hostname: string) => Promise<string[]>;
   mcp?: LocalMcpDependencies;
+  signal?: AbortSignal;
 }
 
 export interface LocalCapabilityStreamDependencies extends LocalCapabilityExecutorDependencies {
@@ -214,7 +215,8 @@ async function fetchComfyUiImage(
     "/view",
     { filename: image.filename, subfolder: image.subfolder, type: image.type },
     dependencies.fetch,
-    dependencies.resolveHost
+    dependencies.resolveHost,
+    dependencies.signal
   );
   const allowedTypes: Record<string, string> = {
     ".png": "image/png",
@@ -239,6 +241,7 @@ async function runComfyUiImageWorkflow(
   workflow: Record<string, unknown>,
   dependencies: LocalCapabilityExecutorDependencies
 ): Promise<Record<string, unknown>> {
+  if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
   const submitted = record(
     await requestLocalServiceJson(
       baseUrl,
@@ -249,6 +252,7 @@ async function runComfyUiImageWorkflow(
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompt: workflow }),
+        signal: dependencies.signal,
       }
     )
   );
@@ -256,16 +260,19 @@ async function runComfyUiImageWorkflow(
   if (typeof promptId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(promptId)) {
     throw new Error("ComfyUI returned an invalid prompt identifier");
   }
+  if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
 
   const deadline = Date.now() + COMFYUI_POLL_TIMEOUT_MS;
   let outputFiles: ReturnType<typeof comfyUiOutputFiles> = null;
   while (Date.now() < deadline) {
+    if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
     const history = record(
       await requestLocalServiceJson(
         baseUrl,
         `/history/${promptId}`,
         dependencies.fetch,
-        dependencies.resolveHost
+        dependencies.resolveHost,
+        { signal: dependencies.signal }
       )
     );
     const historyEntry = history ? record(history[promptId]) : null;
@@ -280,13 +287,28 @@ async function runComfyUiImageWorkflow(
     if (status?.completed === true) {
       throw new Error("ComfyUI completed without safe image output metadata");
     }
-    await new Promise((resolve) => setTimeout(resolve, COMFYUI_POLL_INTERVAL_MS));
+    if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(done, COMFYUI_POLL_INTERVAL_MS);
+      function done() {
+        dependencies.signal?.removeEventListener("abort", cancel);
+        resolve();
+      }
+      function cancel() {
+        clearTimeout(timer);
+        reject(new Error("ComfyUI workflow was canceled"));
+      }
+      dependencies.signal?.addEventListener("abort", cancel, { once: true });
+      if (dependencies.signal?.aborted) cancel();
+    });
   }
   if (!outputFiles?.length) throw new Error("ComfyUI prompt did not produce an image in time");
 
   const images = [];
-  for (const image of outputFiles)
+  for (const image of outputFiles) {
+    if (dependencies.signal?.aborted) throw new Error("ComfyUI workflow was canceled");
     images.push(await fetchComfyUiImage(baseUrl, image, dependencies));
+  }
   const result = { promptId, images };
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_GATEWAY_RESULT_BYTES) {
     throw new Error("ComfyUI output exceeds the gateway result size limit");
@@ -326,6 +348,7 @@ export async function executeLocalCapability(
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...payload, model, stream: false }),
+        signal: dependencies.signal,
       },
       OLLAMA_CHAT_TIMEOUT_MS
     );

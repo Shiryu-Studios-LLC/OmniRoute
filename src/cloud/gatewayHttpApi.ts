@@ -196,6 +196,32 @@ export async function handleGatewayDeviceRequest(
   if (url.search || request.headers.has("authorization")) {
     return json({ error: "Unsupported gateway request metadata" }, 400);
   }
+  const clientIpBucket = cloudflareClientIpBucket(request);
+  if (path === `${PREFIX}/pair`) {
+    const rateLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: clientIpBucket
+        ? `gateway-device-pairing:exchange:${clientIpBucket}`
+        : "gateway-device-pairing:exchange:fallback",
+      ...(options.pairingExchangeRateLimit ??
+        (clientIpBucket ? { limit: 20, windowMs: 60_000 } : { limit: 100, windowMs: 60_000 })),
+      nowMs: options.now?.(),
+    });
+    if (!rateLimit.allowed) return json({ error: "Device pairing rate limit exceeded" }, 429);
+  } else if (path === `${PREFIX}/connect`) {
+    // Apply the pre-authentication limit before reading an attacker-controlled body.
+    const rateLimit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: clientIpBucket ?? "gateway-device:connect-attempts:fallback",
+      ...(clientIpBucket
+        ? (options.connectRateLimit ?? DEFAULT_CONNECT_RATE_LIMIT)
+        : (options.connectFallbackRateLimit ?? DEFAULT_CONNECT_FALLBACK_RATE_LIMIT)),
+      nowMs: options.now?.(),
+    });
+    if (!rateLimit.allowed) {
+      return json({ error: "Device authentication rate limit exceeded" }, 429);
+    }
+  }
   const body = await readJson(request, options.bodyReadTimeoutMs);
   if (!body) return json({ error: "Invalid or oversized JSON body" }, 400);
   if (path === `${PREFIX}/pair`) {
@@ -207,17 +233,6 @@ export async function handleGatewayDeviceRequest(
     ) {
       return json({ error: "Invalid device pairing request" }, 400);
     }
-    const clientIpBucket = cloudflareClientIpBucket(request);
-    const rateLimit = await consumeCloudRateLimit(options.db, {
-      tenantId: CLOUD_PLATFORM_TENANT_ID,
-      bucketKey: clientIpBucket
-        ? `gateway-device-pairing:exchange:${clientIpBucket}`
-        : "gateway-device-pairing:exchange:fallback",
-      ...(options.pairingExchangeRateLimit ??
-        (clientIpBucket ? { limit: 20, windowMs: 60_000 } : { limit: 100, windowMs: 60_000 })),
-      nowMs: options.now?.(),
-    });
-    if (!rateLimit.allowed) return json({ error: "Device pairing rate limit exceeded" }, 429);
     const codeLimit = await consumeCloudRateLimit(options.db, {
       tenantId: CLOUD_PLATFORM_TENANT_ID,
       bucketKey: `gateway-device-pairing:code:${await hashGatewayPairingCode(body.pairingCode)}`,
@@ -285,21 +300,6 @@ export async function handleGatewayDeviceRequest(
       !/^[A-Za-z0-9_-]{32,128}$/.test(body.credential)
     ) {
       return json({ error: "Invalid connect request" }, 400);
-    }
-    // On production Worker ingress, cf-connecting-ip is accepted only when
-    // edge-provided request.cf metadata is present. Local/test Requests fall
-    // back to one bounded bucket rather than persisting attacker-chosen IDs.
-    const clientIpBucket = cloudflareClientIpBucket(request);
-    const connectRateLimit = await consumeCloudRateLimit(options.db, {
-      tenantId: CLOUD_PLATFORM_TENANT_ID,
-      bucketKey: clientIpBucket ?? "gateway-device:connect-attempts:fallback",
-      ...(clientIpBucket
-        ? (options.connectRateLimit ?? DEFAULT_CONNECT_RATE_LIMIT)
-        : (options.connectFallbackRateLimit ?? DEFAULT_CONNECT_FALLBACK_RATE_LIMIT)),
-      nowMs: options.now?.(),
-    });
-    if (!connectRateLimit.allowed) {
-      return json({ error: "Device authentication rate limit exceeded" }, 429);
     }
     const session = await gateway.connect(body.deviceId, body.credential);
     return session
