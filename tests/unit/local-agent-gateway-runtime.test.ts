@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   runLocalAgentGatewayCycle,
+  runLocalAgentWithGateway,
   type LocalAgentRunnerConfig,
 } from "../../src/lib/localAgent/runner";
 import type {
@@ -417,6 +418,60 @@ test("gateway cycle reconnects when a cached device session has been revoked", a
     "heartbeat:session-reconnected",
     "poll:session-reconnected",
   ]);
+});
+
+test("gateway runner clears an offline session, backs off, and reconnects before polling again", async () => {
+  const controller = new AbortController();
+  const events: string[] = [];
+  const delays: number[] = [];
+  const replacementSession: LocalAgentGatewaySession = {
+    ...session,
+    sessionId: "session-after-outage",
+    sessionToken: "replacement-token",
+  };
+
+  await runLocalAgentWithGateway(
+    { ...config, retryBaseMs: 5, retryMaxMs: 20, heartbeatIntervalMs: 25 },
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+        services: [],
+      }),
+      fetch: async () => Response.json({ accepted: true }),
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+        if (delays.length === 2) controller.abort();
+      },
+      gateway: {
+        connect: async () => {
+          const connected = events.filter((event) => event.startsWith("connect:")).length + 1;
+          events.push(`connect:${connected}`);
+          return connected === 1 ? session : replacementSession;
+        },
+        heartbeat: async (activeSession) => {
+          events.push(`heartbeat:${activeSession.sessionId}`);
+          return true;
+        },
+        poll: async (activeSession) => {
+          events.push(`poll:${activeSession.sessionId}`);
+          return activeSession === session ? null : [];
+        },
+        submitResult: async () => true,
+      },
+    },
+    controller.signal
+  );
+
+  assert.deepEqual(events, [
+    "connect:1",
+    "heartbeat:session-123",
+    "poll:session-123",
+    "connect:2",
+    "heartbeat:session-after-outage",
+    "poll:session-after-outage",
+  ]);
+  assert.deepEqual(delays, [5, 25]);
 });
 
 test("gateway cycle ignores malformed and expired envelopes", async () => {
