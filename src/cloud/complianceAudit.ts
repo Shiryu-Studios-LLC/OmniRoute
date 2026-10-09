@@ -114,7 +114,7 @@ function scrubText(value: string): string {
       "$1[redacted]"
     )
     .replace(
-      /\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,})\b/gi,
+      /\b(?:orc_live_[A-Za-z0-9_-]{32,64}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,})\b/gi,
       "[redacted]"
     );
 }

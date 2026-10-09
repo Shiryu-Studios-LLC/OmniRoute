@@ -293,7 +293,11 @@ test("D1 compliance audit is tenant-scoped and scrubs sensitive metadata", async
       resource: "provider-connection",
       prompt: "private request text",
     },
-    metadata: { authorization: "Bearer super-secret", note: "enc:v1:abcdef:012345" },
+    metadata: {
+      authorization: "Bearer super-secret",
+      note: "enc:v1:abcdef:012345",
+      message: `Customer key: orc_live_${"A".repeat(43)}`,
+    },
   });
   await appendCloudComplianceAudit(db, {
     id: "audit-b",
@@ -311,6 +315,7 @@ test("D1 compliance audit is tenant-scoped and scrubs sensitive metadata", async
   assert.deepEqual(auditA[0].metadata, {
     authorization: "[redacted]",
     note: "[redacted]",
+    message: "Customer key: [redacted]",
   });
   assert.equal((await listCloudComplianceAudit(db, "tenant-b"))[0].id, "audit-b");
   await assert.rejects(
