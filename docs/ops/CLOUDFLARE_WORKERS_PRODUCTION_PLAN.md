@@ -139,7 +139,12 @@ issuing or redeeming claims.
 The Worker now has a D1-backed tenant MCP management registry at
 `/__cloud/v1/customer/mcp-servers`. Owner/admin customer API keys can manage
 tenant-owned configuration only when the tenant has opted into MCP. Credentials
-are encrypted at rest and omitted from responses and audit records. The Worker
+are encrypted at rest and omitted from responses and audit records. Owners and
+admins can also manage the same registry from the OIDC customer portal at
+`/__cloud/auth/mcp-servers`; portal writes bind the active OIDC session and
+current owner/admin membership in the audited D1 mutation. Public registry
+requests still require customer API keys. The portal can create, edit, and
+delete registrations, but does not expose discovery or invocation. The Worker
 now has opt-in discovery and invocation routes backed by a dedicated Node
 egress proxy. It sends tenant/server audit context and a short-lived
 HMAC-signed request; the proxy enforces timestamp bounds, nonce replay checks,

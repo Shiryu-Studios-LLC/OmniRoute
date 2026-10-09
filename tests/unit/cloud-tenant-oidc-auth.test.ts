@@ -32,6 +32,7 @@ import {
   CLOUD_TENANT_API_KEYS_PATH,
   CLOUD_TENANT_BUSINESS_PROFILE_PATH,
   CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH,
+  CLOUD_TENANT_MCP_SERVERS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -196,9 +197,11 @@ async function setup() {
     "0002_cloud_usage_audit_rate_limits.sql",
     "0003_cloud_platform_tenant.sql",
     "0005_cloud_customer_identity.sql",
+    "0008_cloud_tenant_settings.sql",
     "0015_cloud_tenant_oidc.sql",
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
+    "0019_cloud_tenant_mcp_servers.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
     "0022_provider_execution_contract.sql",
     "0023_cloud_tenant_business_profiles.sql",
@@ -567,6 +570,171 @@ test("business profile portal is owner/admin session scoped, origin checked, bou
     otherTenant.name,
     "the session cannot modify another tenant profile"
   );
+});
+
+test("MCP portal reuses encrypted CRUD with session-bound tenant authorization and safe audit", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  await db
+    .prepare("UPDATE cloud_tenant_settings SET mcp_enabled = 1 WHERE tenant_id = ?")
+    .bind(tenant.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const secret = "mcp-browser-credential-secret";
+  const path = `${ORIGIN}${CLOUD_TENANT_MCP_SERVERS_PATH}`;
+  const headers = (extra: Record<string, string> = {}) => ({
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+    ...extra,
+  });
+  const created = await portal.app.fetch(
+    new Request(path, {
+      method: "POST",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        name: "Private tools",
+        transport: "streamable_http",
+        endpoint: "https://mcp.example.test/mcp",
+        credential: secret,
+      }),
+    })
+  );
+  assert.equal(created.status, 201, await created.clone().text());
+  const createdBody = (await created.json()) as { server: { id: string; hasCredential: boolean } };
+  assert.equal(createdBody.server.hasCredential, true);
+  assert.doesNotMatch(JSON.stringify(createdBody), new RegExp(secret));
+  const stored = await db
+    .prepare<{ credential_encrypted: string }>(
+      "SELECT credential_encrypted FROM cloud_tenant_mcp_servers WHERE tenant_id = ? AND id = ?"
+    )
+    .bind(tenant.id, createdBody.server.id)
+    .first();
+  assert.ok(stored?.credential_encrypted);
+  assert.doesNotMatch(stored.credential_encrypted, new RegExp(secret));
+  assert.equal(
+    await decryptCloudCredential(stored.credential_encrypted, ENCRYPTION_KEY, {
+      tenantId: tenant.id,
+      connectionId: createdBody.server.id,
+      field: "mcpCredential",
+    }),
+    secret
+  );
+
+  const badOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: "https://attacker.example", "Content-Type": "application/json" }),
+      body: JSON.stringify({ name: "Nope" }),
+    })
+  );
+  assert.equal(badOrigin.status, 403);
+  const invalid = await portal.app.fetch(
+    new Request(path, {
+      method: "POST",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        name: "Invalid",
+        transport: "streamable_http",
+        endpoint: "http://localhost",
+      }),
+    })
+  );
+  assert.equal(invalid.status, 400);
+
+  const otherTenant = await createCloudCustomerTenant(db, {
+    id: "customer-mcp-portal-other",
+    name: "Other MCP Tenant",
+    slug: "other-mcp-tenant",
+  });
+  const otherMembership = await createCloudCustomerMembership(db, {
+    tenantId: otherTenant.id,
+    principalId: "other-mcp-owner",
+    role: "owner",
+  });
+  await setCloudTenantOidcConfig(db, ENCRYPTION_KEY, {
+    tenantId: otherTenant.id,
+    issuer: ISSUER,
+    clientId: "omni-client",
+    clientSecret: "other-secret",
+    isEnabled: true,
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: otherTenant.id,
+    issuer: ISSUER,
+    subject: "other-mcp-subject",
+    membershipId: otherMembership.id,
+  });
+  await db
+    .prepare("UPDATE cloud_tenant_settings SET mcp_enabled = 1 WHERE tenant_id = ?")
+    .bind(otherTenant.id)
+    .run();
+  const otherPortal = await createPortalSession(db, otherTenant.slug, "other-mcp-subject");
+  const foreignRead = await otherPortal.app.fetch(
+    new Request(path, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${otherPortal.cookie}` },
+    })
+  );
+  assert.deepEqual(await foreignRead.json(), { servers: [] });
+  const foreignUpdate = await otherPortal.app.fetch(
+    new Request(`${path}/${createdBody.server.id}`, {
+      method: "PUT",
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${otherPortal.cookie}`,
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "Stolen" }),
+    })
+  );
+  assert.equal(foreignUpdate.status, 404);
+
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "mcp-portal-member",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "mcp-portal-member-subject",
+    membershipId: member.id,
+  });
+  const memberPortal = await createPortalSession(db, tenant.slug, "mcp-portal-member-subject");
+  const denied = await memberPortal.app.fetch(
+    new Request(path, {
+      method: "GET",
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${memberPortal.cookie}` },
+    })
+  );
+  assert.equal(denied.status, 403);
+
+  const updated = await portal.app.fetch(
+    new Request(`${path}/${createdBody.server.id}`, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ name: "Updated tools", credential: "mcp-rotated-secret" }),
+    })
+  );
+  assert.equal(updated.status, 200, await updated.clone().text());
+  assert.doesNotMatch(await updated.text(), /mcp-rotated-secret/);
+  const auditRows = await db
+    .prepare<{ action: string; metadata_json: string | null }>(
+      "SELECT action, metadata_json FROM cloud_compliance_audit WHERE tenant_id = ? AND action LIKE 'cloud.mcp_server.%' ORDER BY timestamp, rowid"
+    )
+    .bind(tenant.id)
+    .all();
+  assert.deepEqual(
+    auditRows.results.map((row) => row.action),
+    ["cloud.mcp_server.create", "cloud.mcp_server.update"]
+  );
+  assert.ok(auditRows.results.every((row) => !JSON.stringify(row).includes("mcp-")));
+
+  const publicNoKey = await portal.app.fetch(
+    new Request(`${ORIGIN}/__cloud/v1/customer/mcp-servers`)
+  );
+  assert.equal(publicNoKey.status, 401);
 });
 
 test("provider connection portal enforces owner sessions and reuses encrypted fixed-contract API operations", async () => {

@@ -306,7 +306,7 @@ test(
       safeEnvPath,
       "--yes",
       "--command",
-      `INSERT INTO cloud_tenant_oidc_sessions (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms) VALUES (${sqlText(tokenHash)}, ${sqlText(tenantId)}, ${sqlText(String(membershipId))}, ${sqlText(String(identityId))}, ${nowMs}, ${expiresAtMs});`,
+      `UPDATE cloud_tenant_settings SET mcp_enabled = 1 WHERE tenant_id = ${sqlText(tenantId)}; INSERT INTO cloud_tenant_oidc_sessions (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms) VALUES (${sqlText(tokenHash)}, ${sqlText(tenantId)}, ${sqlText(String(membershipId))}, ${sqlText(String(identityId))}, ${nowMs}, ${expiresAtMs});`,
     ]);
     assert.equal(seedResult.status, 0, `${seedResult.stdout}\n${seedResult.stderr}`);
 
@@ -397,6 +397,44 @@ test(
     await page.getByText("Provider connection revoked.").waitFor();
     await providerRow.waitFor({ state: "detached" });
     assert.equal(await page.locator("#provider-connections").textContent(), "");
+
+    const mcpSecret = "mcp-test-browser-credential";
+    await page.locator("#mcp-server-name").fill("Browser MCP");
+    await page.locator("#mcp-server-endpoint").fill("https://mcp.example.test/mcp");
+    await page.locator("#mcp-server-credential").fill(mcpSecret);
+    await page.getByRole("button", { name: "Add MCP server" }).click();
+    await page.getByText("MCP server created. Credentials are never displayed.").waitFor();
+    assert.equal(await page.locator("#mcp-server-credential").inputValue(), "");
+    const mcpRow = page.locator("#mcp-servers .mcp-server-row").first();
+    await mcpRow.waitFor();
+    assert.equal((await mcpRow.textContent())?.includes(mcpSecret), false);
+    await mcpRow.getByLabel("Server name").fill("Browser MCP Edited");
+    await mcpRow.getByRole("button", { name: "Save MCP server" }).click();
+    await page.getByText("MCP server updated. Credentials are never displayed.").waitFor();
+    assert.equal((await page.locator("#mcp-servers").textContent())?.includes(mcpSecret), false);
+    const mcpResult = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT name, credential_encrypted FROM cloud_tenant_mcp_servers WHERE tenant_id = ${sqlText(tenantId)};`,
+    ]);
+    assert.equal(mcpResult.status, 0, `${mcpResult.stdout}\n${mcpResult.stderr}`);
+    assert.doesNotMatch(mcpResult.stdout, new RegExp(mcpSecret));
+    assert.match(mcpResult.stdout, /enc:v[12]:/);
+    assert.match(mcpResult.stdout, /Browser MCP Edited/);
+    await mcpRow.getByRole("button", { name: "Delete MCP server" }).click();
+    await page.getByText("MCP server deleted.").waitFor();
+    await mcpRow.waitFor({ state: "detached" });
 
     await page.getByRole("button", { name: "Create API key" }).click();
     await page.getByText("API key created.").waitFor();

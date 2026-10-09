@@ -218,6 +218,116 @@ const PORTAL_SCRIPT = `
     } finally { key.value = ""; button.disabled = false; }
   });
 
+  const loadMcpServers = async () => {
+    const data = await api("/__cloud/auth/mcp-servers");
+    if (!Array.isArray(data.servers)) throw new Error("Invalid MCP server response");
+    const list = byId("mcp-servers");
+    list.replaceChildren();
+    for (const server of data.servers) {
+      if (!server || typeof server.id !== "string" || typeof server.name !== "string" ||
+          typeof server.endpoint !== "string" || typeof server.transport !== "string" ||
+          typeof server.isActive !== "boolean" || typeof server.hasCredential !== "boolean") continue;
+      const row = node("li");
+      row.className = "mcp-server-row";
+      const form = node("form");
+      form.className = "mcp-server-form";
+      const nameLabel = node("label", "Server name");
+      const name = node("input");
+      name.maxLength = 128;
+      name.required = true;
+      name.value = server.name;
+      nameLabel.append(name);
+      const transportLabel = node("label", "Transport");
+      const transport = node("select");
+      for (const [value, label] of [["streamable_http", "Streamable HTTP"], ["sse", "SSE"]]) {
+        const option = node("option", label);
+        option.value = value;
+        option.selected = value === server.transport;
+        transport.append(option);
+      }
+      transportLabel.append(transport);
+      const endpointLabel = node("label", "HTTPS endpoint");
+      const endpoint = node("input");
+      endpoint.type = "url";
+      endpoint.maxLength = 2048;
+      endpoint.required = true;
+      endpoint.value = server.endpoint;
+      endpointLabel.append(endpoint);
+      const activeLabel = node("label", "Server active");
+      const active = node("input");
+      active.type = "checkbox";
+      active.checked = server.isActive;
+      activeLabel.append(active);
+      const credentialLabel = node("label", "Replace credential (leave blank to keep current)");
+      const credential = node("input");
+      credential.type = "password";
+      credential.autocomplete = "new-password";
+      credential.maxLength = 8192;
+      credentialLabel.append(credential);
+      const save = node("button", "Save MCP server");
+      save.type = "submit";
+      form.append(nameLabel, transportLabel, endpointLabel, activeLabel, credentialLabel, save);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        save.disabled = true;
+        const body = { name: name.value, transport: transport.value, endpoint: endpoint.value,
+          isActive: active.checked };
+        if (credential.value) body.credential = credential.value;
+        const serializedBody = JSON.stringify(body);
+        credential.value = "";
+        try {
+          await api("/__cloud/auth/mcp-servers/" + encodeURIComponent(server.id), {
+            method: "PUT", body: serializedBody,
+          });
+          setStatus("MCP server updated. Credentials are never displayed.");
+          await loadMcpServers();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "MCP server could not be updated.", true);
+        } finally { credential.value = ""; save.disabled = false; }
+      });
+      const remove = node("button", "Delete MCP server");
+      remove.type = "button";
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try {
+          await api("/__cloud/auth/mcp-servers/" + encodeURIComponent(server.id), { method: "DELETE" });
+          setStatus("MCP server deleted.");
+          await loadMcpServers();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "MCP server could not be deleted.", true);
+          remove.disabled = false;
+        }
+      });
+      row.append(node("p", (server.isActive ? "Active" : "Inactive") + " · " +
+        (server.hasCredential ? "Credential stored" : "No credential")), form, remove);
+      list.append(row);
+    }
+  };
+
+  byId("mcp-server-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("create-mcp-server");
+    const credential = byId("mcp-server-credential");
+    button.disabled = true;
+    const body = {
+      name: byId("mcp-server-name").value,
+      transport: byId("mcp-server-transport").value,
+      endpoint: byId("mcp-server-endpoint").value,
+      credential: credential.value || null,
+    };
+    const serializedBody = JSON.stringify(body);
+    credential.value = "";
+    try {
+      await api("/__cloud/auth/mcp-servers", { method: "POST", body: serializedBody });
+      byId("mcp-server-name").value = "";
+      byId("mcp-server-endpoint").value = "";
+      setStatus("MCP server created. Credentials are never displayed.");
+      await loadMcpServers();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "MCP server could not be created.", true);
+    } finally { credential.value = ""; button.disabled = false; }
+  });
+
   const loadApiKeys = async () => {
     const data = await api("/__cloud/auth/api-keys");
     if (!Array.isArray(data.keys)) throw new Error("Invalid API key list response");
@@ -457,6 +567,7 @@ const PORTAL_SCRIPT = `
         byId("manager-panel").hidden = false;
         byId("business-profile-panel").hidden = false;
         byId("provider-connection-panel").hidden = false;
+        byId("mcp-server-panel").hidden = false;
         try {
           await loadBusinessProfile();
         } catch (error) {
@@ -466,6 +577,11 @@ const PORTAL_SCRIPT = `
           await loadProviderConnections();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "Could not load provider connections.", true);
+        }
+        try {
+          await loadMcpServers();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load MCP servers.", true);
         }
         try {
           await loadApiKeys();
@@ -609,6 +725,23 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <label for="provider-api-key">OpenAI API key</label>
           <input id="provider-api-key" type="password" autocomplete="new-password" maxlength="8192" required>
           <button id="create-provider-connection" type="submit">Add OpenAI connection</button>
+        </form>
+      </section>
+      <section id="mcp-server-panel" hidden>
+        <h2>MCP server registrations</h2>
+        <p>Configure tenant-owned MCP endpoints. Credentials are encrypted before storage and never shown again. Discovery and tool calls remain disabled until controlled egress is enabled.</p>
+        <ul id="mcp-servers"></ul>
+        <h3>Add an MCP server</h3>
+        <form id="mcp-server-form">
+          <label for="mcp-server-name">Server name</label>
+          <input id="mcp-server-name" maxlength="128" required>
+          <label for="mcp-server-transport">Transport</label>
+          <select id="mcp-server-transport"><option value="streamable_http">Streamable HTTP</option><option value="sse">SSE</option></select>
+          <label for="mcp-server-endpoint">HTTPS endpoint</label>
+          <input id="mcp-server-endpoint" type="url" maxlength="2048" required>
+          <label for="mcp-server-credential">Credential (optional)</label>
+          <input id="mcp-server-credential" type="password" autocomplete="new-password" maxlength="8192">
+          <button id="create-mcp-server" type="submit">Add MCP server</button>
         </form>
       </section>
     </main>

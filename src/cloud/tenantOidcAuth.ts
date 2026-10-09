@@ -31,6 +31,7 @@ import {
   CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH,
   handleCloudCustomerProviderPortalRequest,
 } from "./customerProviderHttpApi";
+import { handleCloudTenantMcpPortalRequest } from "./tenantMcpHttpApi";
 import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
@@ -51,6 +52,7 @@ export const CLOUD_TENANT_API_KEYS_PATH = "/__cloud/auth/api-keys";
 export const CLOUD_TENANT_BUSINESS_PROFILE_PATH = "/__cloud/auth/business-profile";
 export const CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH =
   CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH;
+export const CLOUD_TENANT_MCP_SERVERS_PATH = "/__cloud/auth/mcp-servers";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -92,6 +94,10 @@ interface OidcSessionRow {
   issuer: string;
   subject: string;
   expires_at_ms: number;
+}
+
+interface ResolvedOidcSessionRow extends OidcSessionRow {
+  session_token_hash: string;
 }
 
 export interface CloudTenantOidcAuthOptions {
@@ -830,17 +836,17 @@ async function resolveSession(
   request: Request,
   options: CloudTenantOidcAuthOptions,
   nowMs: number
-): Promise<OidcSessionRow | null> {
+): Promise<ResolvedOidcSessionRow | null> {
   if (!options.db) return null;
   const token = getCookie(request, CLOUD_TENANT_OIDC_SESSION_COOKIE);
   if (!token || !TOKEN_PATTERN.test(token)) return null;
   const tokenHash = await sha256(token);
   return options.db
-    .prepare<OidcSessionRow>(
+    .prepare<ResolvedOidcSessionRow>(
       `SELECT session.tenant_id, tenant.name AS tenant_name, tenant.slug AS tenant_slug,
               membership.id AS membership_id, membership.principal_id, membership.role,
               identity.id AS identity_id, identity.issuer, identity.subject,
-              session.expires_at_ms
+              session.expires_at_ms, session.token_hash AS session_token_hash
          FROM cloud_tenant_oidc_sessions AS session
          JOIN tenants AS tenant ON tenant.id = session.tenant_id
            AND tenant.kind = 'customer' AND tenant.is_active = 1
@@ -865,7 +871,7 @@ async function requireMembershipManager(
   request: Request,
   options: CloudTenantOidcAuthOptions,
   nowMs: number
-): Promise<OidcSessionRow | null> {
+): Promise<ResolvedOidcSessionRow | null> {
   const session = await resolveSession(request, options, nowMs);
   if (!session || (session.role !== "owner" && session.role !== "admin")) return null;
   return session;
@@ -973,6 +979,35 @@ async function customerProviderConnectionsPortal(
       tenantId: session.tenant_id,
       principalId: session.principal_id,
       role: session.role,
+    }
+  );
+  return response ?? json({ error: "Not found" }, 404);
+}
+
+async function customerMcpServersPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (request.method !== "GET" && request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const response = await handleCloudTenantMcpPortalRequest(
+    request,
+    {
+      db: options.db,
+      credentialEncryptionKey: options.credentialEncryptionKey,
+      now: () => new Date(nowMs),
+    },
+    {
+      tenantId: session.tenant_id,
+      principalId: session.principal_id,
+      membershipId: session.membership_id,
+      role: session.role,
+      sessionTokenHash: session.session_token_hash,
     }
   );
   return response ?? json({ error: "Not found" }, 404);
@@ -1465,6 +1500,9 @@ export async function handleCloudTenantOidcAuthRequest(
   const isProviderConnections =
     pathname === CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH ||
     pathname.startsWith(`${CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH}/`);
+  const isMcpServers =
+    pathname === CLOUD_TENANT_MCP_SERVERS_PATH ||
+    pathname.startsWith(`${CLOUD_TENANT_MCP_SERVERS_PATH}/`);
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1479,6 +1517,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isApiKeyItem &&
     !isBusinessProfile &&
     !isProviderConnections &&
+    !isMcpServers &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1501,7 +1540,9 @@ export async function handleCloudTenantOidcAuthRequest(
         ? ["GET", "PUT"]
         : isProviderConnections
           ? ["GET", "POST", "PATCH", "DELETE"]
-          : [expectedMethod];
+          : isMcpServers
+            ? ["GET", "POST", "PUT", "DELETE"]
+            : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1517,6 +1558,7 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isBusinessProfile) return customerBusinessProfilePortal(request, options, origin, nowMs);
   if (isProviderConnections)
     return customerProviderConnectionsPortal(request, options, origin, nowMs);
+  if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
   if (isLogin) {
     return startLogin(request, options, origin, nowMs);
   }

@@ -296,7 +296,7 @@ export async function handleCloudTenantMcpRequest(
       tenantId: identity.tenantId,
       principalId: identity.principalId,
       membershipId: identity.membershipId,
-      apiKeyId: identity.apiKeyId,
+      authorization: { type: "api_key", apiKeyId: identity.apiKeyId },
     };
     if (request.method === "DELETE") {
       const deleted = await deleteCloudTenantMcpServer(options.db, route.id!, {
@@ -367,6 +367,129 @@ export async function handleCloudTenantMcpRequest(
                 : 502;
       return json({ error: "MCP server request could not be completed", code: error.code }, status);
     }
+    return json({ error: "Customer MCP configuration could not be completed" }, 503);
+  }
+}
+
+/** Owner/admin OIDC portal surface. Call only after the OIDC session is resolved and origin checked. */
+export async function handleCloudTenantMcpPortalRequest(
+  request: Request,
+  options: CloudTenantMcpHttpApiOptions,
+  identity: {
+    tenantId: string;
+    principalId: string;
+    membershipId: string;
+    role: "owner" | "admin" | "member" | "viewer";
+    sessionTokenHash: string;
+  }
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  const route = parseRoute(
+    url.pathname.replace(/^\/__cloud\/auth\/mcp-servers/, CLOUD_CUSTOMER_MCP_SERVERS_PATH)
+  );
+  if (!route) return null;
+  if (url.search !== "") return json({ error: "Query parameters are not supported" }, 400);
+  if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
+  if (request.method !== "GET" && request.headers.get("origin") !== url.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (identity.role !== "owner" && identity.role !== "admin") {
+    return json({ error: "Owner or admin membership is required" }, 403);
+  }
+  const allowedMethods = route.action
+    ? route.action === "discover"
+      ? ["GET"]
+      : ["POST"]
+    : route.isCollection
+      ? ["GET", "POST"]
+      : ["GET", "PUT", "DELETE"];
+  if (!allowedMethods.includes(request.method)) return json({ error: "Method not allowed" }, 405);
+  if (route.action) return json({ error: "Controlled MCP egress is not enabled" }, 503);
+
+  const now = options.now ?? (() => new Date());
+  const timestamp = now().toISOString();
+  try {
+    const limit = await consumeCloudRateLimit(options.db, {
+      tenantId: identity.tenantId,
+      bucketKey: `customer-mcp-portal:${identity.membershipId}`,
+      limit: 60,
+      windowMs: 60_000,
+      nowMs: now().getTime(),
+    });
+    if (!limit.allowed) return json({ error: "Customer MCP rate limit exceeded" }, 429);
+    if (!(await mcpIsEnabled(options.db, identity.tenantId))) {
+      return json({ error: "MCP is not enabled for this tenant" }, 403);
+    }
+    const actor: CloudTenantMcpMutationContext["actor"] = {
+      tenantId: identity.tenantId,
+      principalId: identity.principalId,
+      membershipId: identity.membershipId,
+      authorization: { type: "oidc_session", sessionTokenHash: identity.sessionTokenHash },
+    };
+    if (request.method === "GET") {
+      if (route.isCollection) {
+        return json({ servers: await listCloudTenantMcpServers(options.db, identity.tenantId) });
+      }
+      const server = await getCloudTenantMcpServer(options.db, identity.tenantId, route.id!);
+      return server ? json({ server }) : json({ error: "MCP server not found" }, 404);
+    }
+    if (request.method === "DELETE") {
+      const deleted = await deleteCloudTenantMcpServer(options.db, route.id!, {
+        actor,
+        now: timestamp,
+        audit: { id: crypto.randomUUID(), action: "cloud.mcp_server.delete" },
+      });
+      return deleted ? json({ deleted: true }) : json({ error: "MCP server not found" }, 404);
+    }
+    const body = await readJsonBody(request, options.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS);
+    if (body instanceof Response) return body;
+    let input;
+    try {
+      input = validateCloudMcpServerInput(body, request.method === "PUT");
+    } catch (error) {
+      return json(
+        { error: error instanceof Error ? error.message : "Invalid MCP server configuration" },
+        400
+      );
+    }
+    const context: CloudTenantMcpMutationContext = {
+      actor,
+      now: timestamp,
+      audit: {
+        id: crypto.randomUUID(),
+        action: `cloud.mcp_server.${request.method.toLowerCase()}`,
+      },
+    };
+    if (request.method === "POST") {
+      const server = await createCloudTenantMcpServer(
+        options.db,
+        input as ReturnType<typeof validateCloudMcpServerInput> & {
+          name: string;
+          transport: "sse" | "streamable_http";
+          endpoint: string;
+        },
+        context,
+        options.credentialEncryptionKey
+      );
+      return server
+        ? json({ server }, 201)
+        : json({ error: "MCP server could not be created" }, 403);
+    }
+    const server = await updateCloudTenantMcpServer(
+      options.db,
+      route.id!,
+      input as Partial<{
+        name: string;
+        transport: "sse" | "streamable_http";
+        endpoint: string;
+        isActive: boolean;
+        credential: string | null;
+      }>,
+      { ...context, audit: { ...context.audit, action: "cloud.mcp_server.update" } },
+      options.credentialEncryptionKey
+    );
+    return server ? json({ server }) : json({ error: "MCP server not found" }, 404);
+  } catch {
     return json({ error: "Customer MCP configuration could not be completed" }, 503);
   }
 }

@@ -36,7 +36,8 @@ export interface CloudTenantMcpActor {
   tenantId: string;
   principalId: string;
   membershipId: string;
-  apiKeyId: string;
+  authorization:
+    { type: "api_key"; apiKeyId: string } | { type: "oidc_session"; sessionTokenHash: string };
 }
 
 export interface CloudTenantMcpMutationContext {
@@ -172,7 +173,24 @@ function mapRow(row: ServerRow | null): CloudTenantMcpServer | null {
   };
 }
 
-function writeAuthorizedStatement(): string {
+function writeAuthorizedStatement(actor: CloudTenantMcpActor): string {
+  if (actor.authorization.type === "oidc_session") {
+    return `EXISTS (
+    SELECT 1
+      FROM tenants tenant
+      JOIN cloud_tenant_settings settings ON settings.tenant_id = tenant.id
+      JOIN cloud_customer_memberships membership
+        ON membership.tenant_id = tenant.id AND membership.id = ?
+      JOIN cloud_tenant_oidc_sessions session
+        ON session.tenant_id = tenant.id AND session.membership_id = membership.id
+     WHERE tenant.id = ? AND tenant.kind = 'customer' AND tenant.is_active = 1
+       AND settings.mcp_enabled = 1
+       AND membership.principal_id = ? AND membership.role IN ('owner', 'admin')
+       AND membership.is_active = 1
+       AND session.token_hash = ? AND session.revoked_at_ms IS NULL
+       AND session.expires_at_ms > ?
+  )`;
+  }
   return `EXISTS (
     SELECT 1
       FROM tenants tenant
@@ -191,7 +209,16 @@ function writeAuthorizedStatement(): string {
 }
 
 function authorizationValues(actor: CloudTenantMcpActor, now: string): unknown[] {
-  return [actor.membershipId, actor.tenantId, actor.principalId, actor.apiKeyId, now];
+  const expiresAt = actor.authorization.type === "oidc_session" ? Date.parse(now) : now;
+  return [
+    actor.membershipId,
+    actor.tenantId,
+    actor.principalId,
+    actor.authorization.type === "oidc_session"
+      ? actor.authorization.sessionTokenHash
+      : actor.authorization.apiKeyId,
+    expiresAt,
+  ];
 }
 
 async function runMutationWithAudit(
@@ -318,7 +345,7 @@ export async function createCloudTenantMcpServer(
          (id, tenant_id, name, transport, endpoint, credential_encrypted,
           is_active, created_at, updated_at)
        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-        WHERE ${writeAuthorizedStatement()}`
+        WHERE ${writeAuthorizedStatement(context.actor)}`
     )
     .bind(
       serverId,
@@ -388,7 +415,7 @@ export async function updateCloudTenantMcpServer(
   const update = db
     .prepare(
       `UPDATE cloud_tenant_mcp_servers SET ${assignments.join(", ")}
-        WHERE tenant_id = ? AND id = ? AND ${writeAuthorizedStatement()}`
+        WHERE tenant_id = ? AND id = ? AND ${writeAuthorizedStatement(context.actor)}`
     )
     .bind(...values);
   const written = await runMutationWithAudit(db, update, {
@@ -413,7 +440,7 @@ export async function deleteCloudTenantMcpServer(
   const remove = db
     .prepare(
       `DELETE FROM cloud_tenant_mcp_servers
-        WHERE tenant_id = ? AND id = ? AND ${writeAuthorizedStatement()}`
+        WHERE tenant_id = ? AND id = ? AND ${writeAuthorizedStatement(context.actor)}`
     )
     .bind(context.actor.tenantId, id, ...authorizationValues(context.actor, context.now));
   return runMutationWithAudit(db, remove, {
