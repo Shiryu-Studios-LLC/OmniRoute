@@ -142,6 +142,34 @@ test("Worker MCP transport rejects malformed and oversized proxy responses", asy
   );
 });
 
+test("Worker MCP transport cancels a proxy response body that stalls past the request deadline", async () => {
+  let cancelled = false;
+  const transport = createCloudMcpEgressTransport({
+    proxyToken: TOKEN,
+    timeoutMs: 100,
+    binding: {
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"status":200,'));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          })
+        ),
+    },
+  });
+  assert.ok(transport);
+
+  await assert.rejects(
+    transport.fetch("https://mcp.example.com/mcp", { method: "POST", body: "{}" }, CONTEXT),
+    (error: unknown) => error instanceof McpOutboundEgressError && /timed out/.test(error.message)
+  );
+  assert.equal(cancelled, true, "the response reader is cancelled after the deadline");
+});
+
 test("Worker MCP transport propagates caller cancellation to the VPC proxy request", async () => {
   let aborted = false;
   const transport = createCloudMcpEgressTransport({

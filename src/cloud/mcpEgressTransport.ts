@@ -19,18 +19,46 @@ interface ProxyResponseEnvelope {
   body: string;
 }
 
-async function readBoundedText(response: Response, limit: number): Promise<string> {
+async function readBoundedText(
+  response: Response,
+  limit: number,
+  signal: AbortSignal
+): Promise<string> {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await new Promise<ReadableStreamReadResult<Uint8Array>>(
+        (resolve, reject) => {
+          if (signal.aborted) {
+            void reader.cancel();
+            reject(new Error("MCP egress proxy response read aborted"));
+            return;
+          }
+          const onAbort = () => {
+            signal.removeEventListener("abort", onAbort);
+            void reader.cancel();
+            reject(new Error("MCP egress proxy response read aborted"));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          reader.read().then(
+            (result) => {
+              signal.removeEventListener("abort", onAbort);
+              resolve(result);
+            },
+            (error: unknown) => {
+              signal.removeEventListener("abort", onAbort);
+              reject(error);
+            }
+          );
+        }
+      );
       if (done) break;
       total += value.byteLength;
       if (total > limit) {
-        await reader.cancel();
+        void reader.cancel();
         throw new McpOutboundEgressError(
           "MCP_OUTBOUND_DNS_REJECTED",
           "MCP egress proxy response exceeded the configured limit"
@@ -249,7 +277,11 @@ export function createCloudMcpEgressTransport(input: {
             "MCP egress proxy rejected the request"
           );
         }
-        const text = await readBoundedText(response, MAX_PROXY_BODY_BYTES + 16_384);
+        const text = await readBoundedText(
+          response,
+          MAX_PROXY_BODY_BYTES + 16_384,
+          controller.signal
+        );
         let decoded: unknown;
         try {
           decoded = JSON.parse(text) as unknown;
