@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Cross-references openapi.yaml x-loopback-only / x-always-protected annotations
- * against the compile-time constants in src/server/authz/routeGuard.ts.
+ * against the compile-time constants in src/shared/authz/localOnlyRoutes.ts
+ * and src/server/authz/routeGuard.ts.
  *
  * Fails if any YAML annotation disagrees with the routeGuard.ts constants.
  */
@@ -12,6 +13,7 @@ import * as yaml from "js-yaml";
 
 const ROOT = process.cwd();
 const OPENAPI_PATH = path.join(ROOT, "docs", "openapi.yaml");
+const LOCAL_ONLY_ROUTES_PATH = path.join(ROOT, "src", "shared", "authz", "localOnlyRoutes.ts");
 const ROUTE_GUARD_PATH = path.join(ROOT, "src", "server", "authz", "routeGuard.ts");
 
 function parseStringArray(match) {
@@ -26,8 +28,9 @@ function parseStringArray(match) {
 }
 
 const guardSrc = fs.readFileSync(ROUTE_GUARD_PATH, "utf-8");
+const localOnlyRoutesSrc = fs.readFileSync(LOCAL_ONLY_ROUTES_PATH, "utf-8");
 const LOCAL_ONLY_PREFIXES = parseStringArray(
-  guardSrc.match(/export const LOCAL_ONLY_API_PREFIXES.*?=\s*\[([^\]]+)\]/s)
+  localOnlyRoutesSrc.match(/export const LOCAL_ONLY_API_PREFIXES.*?=\s*\[([^\]]+)\]/s)
 );
 const ALWAYS_PROTECTED_PATHS = parseStringArray(
   guardSrc.match(/export const ALWAYS_PROTECTED_API_PATHS.*?=\s*\[([^\]]+)\]/s)
