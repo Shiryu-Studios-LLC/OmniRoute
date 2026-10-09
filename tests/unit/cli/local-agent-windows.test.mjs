@@ -81,6 +81,39 @@ test("Windows task install keeps secrets out of task arguments and starts the ma
   );
 });
 
+test("Windows task update stops a running instance and restores it after activation failure", () => {
+  const calls = [];
+  let failedActivation = false;
+  assert.throws(
+    () =>
+      installLocalAgentWindowsTask(
+        { credential },
+        {
+          platform: "win32",
+          nodePath: "C:\\Program Files\\Node\\node.exe",
+          cliPath: "C:\\Users\\owner\\App Data\\OmniRoute\\omniroute.mjs",
+          userId,
+          taskName,
+          exec: (command, args) => {
+            calls.push([command, args]);
+            if (command === "powershell.exe") return inspection(true, managedXml(), 4);
+            if (args[0] === "/Run" && !failedActivation) {
+              failedActivation = true;
+              throw new Error("simulated activation failure");
+            }
+            return "";
+          },
+        }
+      ),
+    /simulated activation failure/
+  );
+
+  assert.deepEqual(
+    calls.filter(([command]) => command === "schtasks.exe").map(([, args]) => args[0]),
+    ["/End", "/Create", "/Run", "/Create", "/Run"]
+  );
+});
+
 test("Windows task controls inspect ownership and provide install, run, stop, status, uninstall", () => {
   const calls = [];
   const exec = (command, args) => {

@@ -246,8 +246,10 @@ export function installLocalAgentWindowsTask(
     throw new Error("Windows Local Agent task install is supported on Windows.");
   const identity = resolveTaskIdentity({ userId, taskName, exec });
   const prior = readManagedTask(exec, identity);
+  const priorWasRunning = prior?.state === 4;
   const file = writeTaskFile(taskXml({ nodePath, cliPath, userId: identity.userId }));
   try {
+    if (priorWasRunning) run(["/End", "/TN", identity.taskName], exec);
     run(["/Create", "/TN", identity.taskName, "/XML", file.filePath, "/F"], exec);
     run(["/Run", "/TN", identity.taskName], exec);
   } catch (error) {
@@ -255,6 +257,7 @@ export function installLocalAgentWindowsTask(
       const rollback = writeTaskFile(prior.xml);
       try {
         run(["/Create", "/TN", identity.taskName, "/XML", rollback.filePath, "/F"], exec);
+        if (priorWasRunning) run(["/Run", "/TN", identity.taskName], exec);
       } catch {
         // Preserve the activation error; the existing task remains managed.
       } finally {
