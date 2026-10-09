@@ -33,6 +33,7 @@ import {
   CLOUD_TENANT_BUSINESS_PROFILE_PATH,
   CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH,
   CLOUD_TENANT_MCP_SERVERS_PATH,
+  CLOUD_TENANT_ONBOARDING_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -196,8 +197,10 @@ async function setup() {
     "0001_cloud_runtime.sql",
     "0002_cloud_usage_audit_rate_limits.sql",
     "0003_cloud_platform_tenant.sql",
+    "0004_cloud_gateway_devices.sql",
     "0005_cloud_customer_identity.sql",
     "0008_cloud_tenant_settings.sql",
+    "0010_cloud_inference_policy.sql",
     "0015_cloud_tenant_oidc.sql",
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
@@ -735,6 +738,122 @@ test("MCP portal reuses encrypted CRUD with session-bound tenant authorization a
     new Request(`${ORIGIN}/__cloud/v1/customer/mcp-servers`)
   );
   assert.equal(publicNoKey.status, 401);
+});
+
+test("onboarding readiness portal returns only nine tenant-scoped booleans to owner/admin sessions", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  await db
+    .prepare(
+      "UPDATE cloud_tenant_settings SET local_ai_enabled = 1, mcp_enabled = 1 WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const path = `${ORIGIN}${CLOUD_TENANT_ONBOARDING_PATH}`;
+  const response = await portal.app.fetch(
+    new Request(path, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}` },
+    })
+  );
+  assert.equal(response.status, 200, await response.clone().text());
+  const text = await response.text();
+  const readiness = JSON.parse(text) as Record<string, unknown>;
+  assert.deepEqual(
+    Object.keys(readiness).sort(),
+    [
+      "activeOwner",
+      "activeProviderConnection",
+      "businessProfileConfigured",
+      "enabledInferenceEntitlement",
+      "localAiEnabled",
+      "mcpEnabled",
+      "oidcConfigured",
+      "oidcEnabled",
+      "registeredDevice",
+    ].sort()
+  );
+  assert.ok(Object.values(readiness).every((value) => typeof value === "boolean"));
+  assert.equal(readiness.activeOwner, true);
+  assert.equal(readiness.localAiEnabled, true);
+  assert.equal(readiness.mcpEnabled, true);
+  assert.equal(readiness.enabledInferenceEntitlement, false);
+  assert.doesNotMatch(text, new RegExp(`${tenant.id}|${tenant.slug}|${ISSUER}|${ENCRYPTION_KEY}`));
+
+  const otherTenant = await createCloudCustomerTenant(db, {
+    id: "customer-onboarding-portal-other",
+    name: "Other Onboarding Tenant",
+    slug: "other-onboarding",
+  });
+  const otherMembership = await createCloudCustomerMembership(db, {
+    tenantId: otherTenant.id,
+    principalId: "other-onboarding-owner",
+    role: "owner",
+  });
+  await setCloudTenantOidcConfig(db, ENCRYPTION_KEY, {
+    tenantId: otherTenant.id,
+    issuer: ISSUER,
+    clientId: "omni-client",
+    clientSecret: "other-secret",
+    isEnabled: true,
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: otherTenant.id,
+    issuer: ISSUER,
+    subject: "other-onboarding-subject",
+    membershipId: otherMembership.id,
+  });
+  const otherPortal = await createPortalSession(db, otherTenant.slug, "other-onboarding-subject");
+  const otherResponse = await otherPortal.app.fetch(
+    new Request(path, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${otherPortal.cookie}` },
+    })
+  );
+  const otherReadiness = (await otherResponse.json()) as Record<string, unknown>;
+  assert.equal(otherResponse.status, 200);
+  assert.equal(otherReadiness.localAiEnabled, false);
+  assert.equal(otherReadiness.mcpEnabled, false);
+  assert.ok(Object.values(otherReadiness).every((value) => typeof value === "boolean"));
+
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "onboarding-portal-member",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "onboarding-portal-member-subject",
+    membershipId: member.id,
+  });
+  const memberPortal = await createPortalSession(
+    db,
+    tenant.slug,
+    "onboarding-portal-member-subject"
+  );
+  const denied = await memberPortal.app.fetch(
+    new Request(path, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${memberPortal.cookie}` },
+    })
+  );
+  assert.equal(denied.status, 403);
+
+  const wrongOrigin = await portal.app.fetch(
+    new Request(path, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        Origin: "https://attacker.example",
+      },
+    })
+  );
+  assert.equal(wrongOrigin.status, 403);
+  const publicWithoutKey = await portal.app.fetch(
+    new Request(`${ORIGIN}/__cloud/v1/customer/onboarding`)
+  );
+  assert.equal(publicWithoutKey.status, 401);
 });
 
 test("provider connection portal enforces owner sessions and reuses encrypted fixed-contract API operations", async () => {

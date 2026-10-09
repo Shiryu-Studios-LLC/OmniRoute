@@ -331,6 +331,14 @@ test(
     await page.getByRole("heading", { name: "Chromium Portal Customer" }).waitFor();
     await page.getByText("Your role: owner").waitFor();
     await page.getByText("owner · Active").waitFor();
+    await page.getByRole("heading", { name: "Onboarding readiness" }).waitFor();
+    await page.getByText(/Inference access is default-deny/).waitFor();
+    await page.getByText(/Only a platform admin can configure entitlements/).waitFor();
+    assert.equal(await page.locator("#onboarding-readiness li").count(), 9);
+    assert.equal(
+      (await page.locator("#onboarding-readiness").textContent())?.includes(tenantId),
+      false
+    );
     await page.getByLabel("Business name").fill("Browser Configured Business");
     await page.getByLabel("Description").fill("Tenant-managed profile from the customer portal.");
     await page.getByLabel("Hours").fill("Weekdays 9 to 5");

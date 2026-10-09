@@ -32,6 +32,7 @@ import {
   handleCloudCustomerProviderPortalRequest,
 } from "./customerProviderHttpApi";
 import { handleCloudTenantMcpPortalRequest } from "./tenantMcpHttpApi";
+import { getCloudCustomerOnboardingReadiness } from "./tenantOnboardingHttpApi";
 import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
@@ -53,6 +54,7 @@ export const CLOUD_TENANT_BUSINESS_PROFILE_PATH = "/__cloud/auth/business-profil
 export const CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH =
   CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH;
 export const CLOUD_TENANT_MCP_SERVERS_PATH = "/__cloud/auth/mcp-servers";
+export const CLOUD_TENANT_ONBOARDING_PATH = "/__cloud/auth/onboarding";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -1013,6 +1015,36 @@ async function customerMcpServersPortal(
   return response ?? json({ error: "Not found" }, 404);
 }
 
+async function customerOnboardingReadinessPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  nowMs: number
+): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  if (new URL(request.url).search !== "") {
+    return json({ error: "Query parameters are not supported" }, 400);
+  }
+  if (!options.db) return json({ error: "Customer onboarding status is unavailable" }, 503);
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  try {
+    const limit = await consumeCloudRateLimit(options.db, {
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      bucketKey: `customer-onboarding-portal:${session.tenant_id}:${session.membership_id}`,
+      limit: 60,
+      windowMs: 60_000,
+      nowMs,
+    });
+    if (!limit.allowed) return json({ error: "Customer onboarding rate limit exceeded" }, 429);
+    const readiness = await getCloudCustomerOnboardingReadiness(options.db, session.tenant_id);
+    return readiness
+      ? json(readiness)
+      : json({ error: "Customer onboarding status is unavailable" }, 503);
+  } catch {
+    return json({ error: "Customer onboarding status is unavailable" }, 503);
+  }
+}
+
 async function listMemberships(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1503,6 +1535,7 @@ export async function handleCloudTenantOidcAuthRequest(
   const isMcpServers =
     pathname === CLOUD_TENANT_MCP_SERVERS_PATH ||
     pathname.startsWith(`${CLOUD_TENANT_MCP_SERVERS_PATH}/`);
+  const isOnboarding = pathname === CLOUD_TENANT_ONBOARDING_PATH;
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1518,6 +1551,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isBusinessProfile &&
     !isProviderConnections &&
     !isMcpServers &&
+    !isOnboarding &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1542,7 +1576,9 @@ export async function handleCloudTenantOidcAuthRequest(
           ? ["GET", "POST", "PATCH", "DELETE"]
           : isMcpServers
             ? ["GET", "POST", "PUT", "DELETE"]
-            : [expectedMethod];
+            : isOnboarding
+              ? ["GET"]
+              : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1559,6 +1595,7 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isProviderConnections)
     return customerProviderConnectionsPortal(request, options, origin, nowMs);
   if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
+  if (isOnboarding) return customerOnboardingReadinessPortal(request, options, nowMs);
   if (isLogin) {
     return startLogin(request, options, origin, nowMs);
   }

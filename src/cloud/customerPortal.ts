@@ -328,6 +328,31 @@ const PORTAL_SCRIPT = `
     } finally { credential.value = ""; button.disabled = false; }
   });
 
+  const loadOnboardingReadiness = async () => {
+    const data = await api("/__cloud/auth/onboarding");
+    const steps = [
+      ["activeOwner", "Organization owner assigned"],
+      ["oidcConfigured", "Organization sign-in configured", "OIDC configuration is managed by a platform admin."],
+      ["oidcEnabled", "Organization sign-in enabled", "Only a platform admin can enable OIDC."],
+      ["activeProviderConnection", "Provider connection active"],
+      ["businessProfileConfigured", "Business profile saved"],
+      ["enabledInferenceEntitlement", "Inference entitlement enabled", "Inference is default-deny. Only a platform admin can configure entitlements."],
+      ["registeredDevice", "Local Agent device registered"],
+      ["localAiEnabled", "Local AI enabled"],
+      ["mcpEnabled", "MCP enabled"],
+    ];
+    const list = byId("onboarding-readiness");
+    list.replaceChildren();
+    for (const [key, label, note] of steps) {
+      if (typeof data[key] !== "boolean") throw new Error("Invalid onboarding readiness response");
+      const row = node("li");
+      const state = node("strong", data[key] ? "Complete" : "Awaiting setup");
+      row.append(node("span", label + ": "), state);
+      if (note) row.append(node("p", note));
+      list.append(row);
+    }
+  };
+
   const loadApiKeys = async () => {
     const data = await api("/__cloud/auth/api-keys");
     if (!Array.isArray(data.keys)) throw new Error("Invalid API key list response");
@@ -568,6 +593,7 @@ const PORTAL_SCRIPT = `
         byId("business-profile-panel").hidden = false;
         byId("provider-connection-panel").hidden = false;
         byId("mcp-server-panel").hidden = false;
+        byId("onboarding-readiness-panel").hidden = false;
         try {
           await loadBusinessProfile();
         } catch (error) {
@@ -582,6 +608,11 @@ const PORTAL_SCRIPT = `
           await loadMcpServers();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "Could not load MCP servers.", true);
+        }
+        try {
+          await loadOnboardingReadiness();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load onboarding readiness.", true);
         }
         try {
           await loadApiKeys();
@@ -743,6 +774,11 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <input id="mcp-server-credential" type="password" autocomplete="new-password" maxlength="8192">
           <button id="create-mcp-server" type="submit">Add MCP server</button>
         </form>
+      </section>
+      <section id="onboarding-readiness-panel" hidden>
+        <h2>Onboarding readiness</h2>
+        <p>This checklist reports setup status only. OIDC configuration and inference entitlements can be changed only by a platform admin. Inference access is default-deny.</p>
+        <ul id="onboarding-readiness"></ul>
       </section>
     </main>
     <script nonce="${nonce}">${PORTAL_SCRIPT}</script>

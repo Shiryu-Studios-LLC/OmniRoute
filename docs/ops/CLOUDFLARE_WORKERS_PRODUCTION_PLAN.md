@@ -465,7 +465,10 @@ owner/admin saves the tenant's profile; a default profile row alone does not
 count. The response contains no issuer URLs, provider names, device
 identifiers, or credential values, rejects tenant selectors, and uses pre-auth
 edge-IP plus tenant rate limits. This is a readiness view; it does not perform
-owner identity verification or provider/MCP provisioning.
+owner identity verification or provider/MCP provisioning. The OIDC customer portal
+now renders the same nine flags for owner/admin sessions using a read-only,
+tenant-scoped route. OIDC setup and inference entitlement changes remain
+platform-admin-only, and inference remains default-deny unless explicitly enabled.
 
 After the repository is cloud-ready:
 

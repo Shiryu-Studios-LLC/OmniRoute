@@ -20,6 +20,18 @@ interface OnboardingStatusRow {
   mcp_enabled: number;
 }
 
+export interface CloudCustomerOnboardingReadiness {
+  activeOwner: boolean;
+  oidcConfigured: boolean;
+  oidcEnabled: boolean;
+  activeProviderConnection: boolean;
+  businessProfileConfigured: boolean;
+  enabledInferenceEntitlement: boolean;
+  registeredDevice: boolean;
+  localAiEnabled: boolean;
+  mcpEnabled: boolean;
+}
+
 export interface CloudCustomerOnboardingApiOptions {
   db?: CloudDb;
   now?: () => Date;
@@ -31,6 +43,64 @@ export interface CloudCustomerOnboardingApiOptions {
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
+}
+
+/** Read the existing nine boolean flags for one trusted, already-authorized tenant identity. */
+export async function getCloudCustomerOnboardingReadiness(
+  db: CloudDb,
+  tenantId: string
+): Promise<CloudCustomerOnboardingReadiness | null> {
+  const row = await db
+    .prepare<OnboardingStatusRow>(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM cloud_customer_memberships m
+            WHERE m.tenant_id = t.id AND m.role = 'owner' AND m.is_active = 1
+         ) AS active_owner,
+         EXISTS (
+           SELECT 1 FROM cloud_tenant_oidc_configs o WHERE o.tenant_id = t.id
+         ) AS oidc_configured,
+         EXISTS (
+           SELECT 1 FROM cloud_tenant_oidc_configs o
+            WHERE o.tenant_id = t.id AND o.is_enabled = 1
+         ) AS oidc_enabled,
+         EXISTS (
+           SELECT 1 FROM provider_connections p
+            WHERE p.tenant_id = t.id AND p.is_active = 1
+         ) AS active_provider_connection,
+         EXISTS (
+           SELECT 1 FROM cloud_tenant_business_profiles b
+            WHERE b.tenant_id = t.id AND b.configured_at IS NOT NULL
+         ) AS business_profile_configured,
+         EXISTS (
+           SELECT 1 FROM cloud_inference_entitlements e
+            WHERE e.tenant_id = t.id AND e.enabled = 1
+         ) AS enabled_inference_entitlement,
+         EXISTS (
+           SELECT 1 FROM cloud_gateway_devices d
+            WHERE d.tenant_id = t.id AND d.revoked_at IS NULL
+         ) AS registered_device,
+         s.local_ai_enabled,
+         s.mcp_enabled
+       FROM tenants t
+       JOIN cloud_tenant_settings s ON s.tenant_id = t.id
+      WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
+      LIMIT 1`
+    )
+    .bind(tenantId)
+    .first();
+  if (!row) return null;
+  return {
+    activeOwner: row.active_owner === 1,
+    oidcConfigured: row.oidc_configured === 1,
+    oidcEnabled: row.oidc_enabled === 1,
+    activeProviderConnection: row.active_provider_connection === 1,
+    businessProfileConfigured: row.business_profile_configured === 1,
+    enabledInferenceEntitlement: row.enabled_inference_entitlement === 1,
+    registeredDevice: row.registered_device === 1,
+    localAiEnabled: row.local_ai_enabled === 1,
+    mcpEnabled: row.mcp_enabled === 1,
+  };
 }
 
 /** Read-only tenant readiness flags are scoped only by the authenticated API key. */
@@ -89,57 +159,9 @@ export async function handleCloudCustomerOnboardingRequest(
   }
 
   try {
-    const row = await options.db
-      .prepare<OnboardingStatusRow>(
-        `SELECT
-           EXISTS (
-             SELECT 1 FROM cloud_customer_memberships m
-              WHERE m.tenant_id = t.id AND m.role = 'owner' AND m.is_active = 1
-           ) AS active_owner,
-           EXISTS (
-             SELECT 1 FROM cloud_tenant_oidc_configs o WHERE o.tenant_id = t.id
-           ) AS oidc_configured,
-           EXISTS (
-             SELECT 1 FROM cloud_tenant_oidc_configs o
-              WHERE o.tenant_id = t.id AND o.is_enabled = 1
-           ) AS oidc_enabled,
-           EXISTS (
-             SELECT 1 FROM provider_connections p
-              WHERE p.tenant_id = t.id AND p.is_active = 1
-           ) AS active_provider_connection,
-           EXISTS (
-             SELECT 1 FROM cloud_tenant_business_profiles b
-              WHERE b.tenant_id = t.id AND b.configured_at IS NOT NULL
-           ) AS business_profile_configured,
-           EXISTS (
-             SELECT 1 FROM cloud_inference_entitlements e
-              WHERE e.tenant_id = t.id AND e.enabled = 1
-           ) AS enabled_inference_entitlement,
-           EXISTS (
-             SELECT 1 FROM cloud_gateway_devices d
-              WHERE d.tenant_id = t.id AND d.revoked_at IS NULL
-           ) AS registered_device,
-           s.local_ai_enabled,
-           s.mcp_enabled
-         FROM tenants t
-         JOIN cloud_tenant_settings s ON s.tenant_id = t.id
-        WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
-        LIMIT 1`
-      )
-      .bind(identity.tenantId)
-      .first();
-    if (!row) return json({ error: "Customer onboarding status is unavailable" }, 503);
-    return json({
-      activeOwner: row.active_owner === 1,
-      oidcConfigured: row.oidc_configured === 1,
-      oidcEnabled: row.oidc_enabled === 1,
-      activeProviderConnection: row.active_provider_connection === 1,
-      businessProfileConfigured: row.business_profile_configured === 1,
-      enabledInferenceEntitlement: row.enabled_inference_entitlement === 1,
-      registeredDevice: row.registered_device === 1,
-      localAiEnabled: row.local_ai_enabled === 1,
-      mcpEnabled: row.mcp_enabled === 1,
-    });
+    const readiness = await getCloudCustomerOnboardingReadiness(options.db, identity.tenantId);
+    if (!readiness) return json({ error: "Customer onboarding status is unavailable" }, 503);
+    return json(readiness);
   } catch {
     return json({ error: "Customer onboarding status is unavailable" }, 503);
   }
