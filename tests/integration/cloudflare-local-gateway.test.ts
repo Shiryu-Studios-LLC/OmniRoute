@@ -1000,6 +1000,94 @@ test(
           false,
           "Front Desk tenant B response must not expose its API key"
         );
+
+        await frontDeskTest.test(
+          "overlapping A/B chats stay tenant-bound when gateway B completes first",
+          async () => {
+            const messageA = "Concurrent request for tenant A.";
+            const messageB = "Concurrent request for tenant B.";
+            const concurrentChatA = requestHostJson(frontDeskPort, frontDeskHost, "/api/chat", {
+              messages: [{ role: "user", content: messageA }],
+            });
+            const concurrentChatB = requestHostJson(frontDeskPort, frontDeskBHost, "/api/chat", {
+              messages: [{ role: "user", content: messageB }],
+            });
+
+            const pollForRequest = async (
+              session: NonNullable<typeof customerA.session>,
+              tenantLabel: string
+            ) => {
+              const deadline = Date.now() + 10_000;
+              while (Date.now() < deadline) {
+                const requests = await deviceTransport.poll(session);
+                if (requests?.length) return requests[0]!;
+                await delay(25);
+              }
+              assert.fail(
+                `Concurrent Front Desk chat did not reach tenant ${tenantLabel}'s device. Front Desk logs:\n${frontDeskOutput}`
+              );
+            };
+
+            const [requestA, requestB] = await Promise.all([
+              pollForRequest(customerA.session!, "A"),
+              pollForRequest(customerB.session!, "B"),
+            ]);
+            assert.equal(requestA.capability, capability);
+            assert.equal(requestB.capability, capability);
+            assert.deepEqual(requestA.payload, {
+              messages: [{ role: "user", content: messageA }],
+              options: { temperature: 0.2 },
+            });
+            assert.deepEqual(requestB.payload, {
+              messages: [{ role: "user", content: messageB }],
+              options: { temperature: 0.2 },
+            });
+
+            assert.equal(
+              await deviceTransport.submitResult(customerB.session!, {
+                version: 1,
+                requestId: requestB.requestId,
+                outcome: {
+                  ok: true,
+                  value: { message: { role: "assistant", content: "Concurrent result for B." } },
+                },
+              }),
+              true
+            );
+            const responseB = await concurrentChatB;
+            assert.equal(responseB.status, 200, JSON.stringify(responseB.body));
+            assert.deepEqual(responseB.body.choices, [
+              {
+                index: 0,
+                message: { role: "assistant", content: "Concurrent result for B." },
+                finish_reason: "stop",
+              },
+            ]);
+
+            assert.equal(
+              await deviceTransport.submitResult(customerA.session!, {
+                version: 1,
+                requestId: requestA.requestId,
+                outcome: {
+                  ok: true,
+                  value: { message: { role: "assistant", content: "Concurrent result for A." } },
+                },
+              }),
+              true
+            );
+            const responseA = await concurrentChatA;
+            assert.equal(responseA.status, 200, JSON.stringify(responseA.body));
+            assert.deepEqual(responseA.body.choices, [
+              {
+                index: 0,
+                message: { role: "assistant", content: "Concurrent result for A." },
+                finish_reason: "stop",
+              },
+            ]);
+            assert.equal(JSON.stringify(responseA.body).includes(customerB.customerKey), false);
+            assert.equal(JSON.stringify(responseB.body).includes(customerA.customerKey), false);
+          }
+        );
       }
     );
 
