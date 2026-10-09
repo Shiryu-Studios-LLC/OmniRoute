@@ -137,11 +137,24 @@ issuing or redeeming claims.
 The Worker now has a D1-backed tenant MCP management registry at
 `/__cloud/v1/customer/mcp-servers`. Owner/admin customer API keys can manage
 tenant-owned configuration only when the tenant has opted into MCP. Credentials
-are encrypted at rest and omitted from responses and audit records. This slice
-does not connect to, discover, or invoke saved endpoints; cloud invocation
-remains disabled until the dedicated controlled-egress proxy described below
-exists and passes staging validation. Migration
+are encrypted at rest and omitted from responses and audit records. The Worker
+now has opt-in discovery and invocation routes backed by a dedicated Node
+egress proxy. It sends tenant/server audit context and a short-lived
+HMAC-signed request; the proxy enforces timestamp bounds, nonce replay checks,
+payload/time limits, manual redirects, and the existing pinned public-IP
+transport, and a per-Worker-identity request limit. D1 tests prove the egress flag defaults off, owner discovery and
+invocation use only the selected tenant/server, and another tenant cannot
+invoke that server. The route remains disabled unless the explicit runtime
+egress flag, fixed VPC binding, and signing secret are configured. No VPC
+service or staging account is configured, so discovery
+and invocation remain disabled in deployed environments pending isolated
+staging validation. Migration
 `0019_cloud_tenant_mcp_servers.sql` must be applied before using the registry.
+
+The Worker and Node proxy receive the same signing secret through their
+respective runtime configuration, and the Worker binding must target the
+dedicated VPC Service only. The current branch's production Wrangler config
+does not include that binding or enable the egress flag.
 
 #### Egress decision (2026-10-08)
 
@@ -173,10 +186,13 @@ tenant and server identifiers for audit plus the already-authorized endpoint,
 RPC body, and only that server's credential. The proxy accepts calls only
 from the Worker service identity, treats tenant/server fields as audit
 context rather than authorization by themselves, and does not persist
-credentials. A/B tests must prove a tenant A principal cannot resolve or
-invoke tenant B's server, and proxy tests must prove rebinding, mixed DNS,
-redirect, private/reserved IP, non-443 port, oversized body, and timeout cases
-fail closed. If a customer MCP service is intentionally on a private customer
+credentials. A/B tests prove a tenant A principal cannot resolve or invoke
+tenant B's server. Proxy/runtime tests cover signature tampering, timestamp and
+replay rejection, private literal destinations, redirects, payload bounds,
+timeouts, and missing/unsafe endpoints; the pinned Node transport separately
+rejects unsafe resolved address sets and ports. Isolated staging must still
+prove service-binding scope, rebinding/mixed-DNS behavior, and network-layer
+private/reserved-IP denials. If a customer MCP service is intentionally on a private customer
 network, route it through that customer's authenticated Local Agent instead;
 do not expand the shared Worker's network access to reach it.
 
@@ -186,8 +202,9 @@ though Gateway policies can filter public egress. It is too broad for this
 boundary and must not be added to the production Worker. A VPC Service to a
 dedicated proxy is the candidate to validate in isolated staging, including
 service binding scope, Tunnel reachability, Gateway/network-layer egress
-denials, and the proxy's connect-time pinning. No staging account or proxy is
-configured, so MCP invocation stays disabled.
+denials, and the proxy's connect-time pinning. The proxy and Worker adapter
+source are implemented and unit-tested, but no VPC Service or staging account
+is configured, so MCP invocation stays disabled.
 
 References: [VPC Services](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/),
 [Workers Binding API](https://developers.cloudflare.com/workers-vpc/api/),

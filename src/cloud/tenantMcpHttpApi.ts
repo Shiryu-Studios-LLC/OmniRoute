@@ -1,10 +1,16 @@
 import type { CloudDb } from "./db";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
+import { createCloudMcpEgressTransport, type CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
+import {
+  createTenantRemoteMcpRuntime,
+  TenantRemoteMcpError,
+} from "../lib/mcp/tenantRemoteMcpRuntime";
 import {
   createCloudTenantMcpServer,
   deleteCloudTenantMcpServer,
   getCloudTenantMcpServer,
+  getCloudTenantMcpCredential,
   listCloudTenantMcpServers,
   validateCloudMcpServerInput,
   type CloudTenantMcpMutationContext,
@@ -21,6 +27,9 @@ const TENANT_RATE_LIMIT = { limit: 60, windowMs: 60_000 };
 export interface CloudTenantMcpHttpApiOptions {
   db?: CloudDb;
   credentialEncryptionKey?: string;
+  egressBinding?: CloudMcpEgressBinding;
+  egressProxyToken?: string;
+  egressEnabled?: boolean;
   now?: () => Date;
   failedKeyRateLimit?: { limit: number; windowMs: number };
   failedKeyFallbackRateLimit?: { limit: number; windowMs: number };
@@ -32,12 +41,29 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
 }
 
-function parseRoute(pathname: string): { isCollection: boolean; id?: string } | null {
+function parseRoute(pathname: string): {
+  isCollection: boolean;
+  id?: string;
+  action?: "discover" | "invoke";
+  toolName?: string;
+} | null {
   if (pathname === CLOUD_CUSTOMER_MCP_SERVERS_PATH) return { isCollection: true };
   const prefix = `${CLOUD_CUSTOMER_MCP_SERVERS_PATH}/`;
   if (!pathname.startsWith(prefix)) return null;
-  const id = pathname.slice(prefix.length);
+  const segments = pathname.slice(prefix.length).split("/");
+  const id = segments[0] ?? "";
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null;
+  if (segments.length === 2 && segments[1] === "tools") {
+    return { isCollection: false, id, action: "discover" };
+  }
+  if (
+    segments.length === 3 &&
+    segments[1] === "tools" &&
+    /^[A-Za-z0-9_.-]{1,128}$/.test(segments[2] ?? "")
+  ) {
+    return { isCollection: false, id, action: "invoke", toolName: segments[2] };
+  }
+  if (segments.length !== 1) return null;
   return { isCollection: false, id };
 }
 
@@ -121,7 +147,45 @@ async function mcpIsEnabled(db: CloudDb, tenantId: string): Promise<boolean> {
   return row?.mcp_enabled === 1;
 }
 
-/** Customer MCP registry configuration only; this handler performs no outbound requests. */
+function createTenantMcpRuntime(
+  options: CloudTenantMcpHttpApiOptions,
+  identity: NonNullable<Awaited<ReturnType<typeof authenticateCloudCustomerApiKey>>>
+) {
+  const db = options.db!;
+  const transport = createCloudMcpEgressTransport({
+    binding: options.egressBinding,
+    proxyToken: options.egressProxyToken,
+  });
+  if (!transport) return null;
+  return createTenantRemoteMcpRuntime({
+    transport,
+    authorization: {
+      resolveTenant: async (principal) =>
+        principal.subject === identity.principalId ? identity.tenantId : null,
+      canAccessServer: async (principal, tenantId, _serverId) => {
+        if (
+          principal.subject !== identity.principalId ||
+          tenantId !== identity.tenantId ||
+          (identity.role !== "owner" && identity.role !== "admin") ||
+          !(await mcpIsEnabled(db, tenantId))
+        ) {
+          return false;
+        }
+        // Keep existence checks in the tenant-qualified registry lookup so a
+        // foreign or absent ID receives the same not-found response.
+        return true;
+      },
+    },
+    registry: {
+      listByTenant: (tenantId) => listCloudTenantMcpServers(db, tenantId),
+      getById: (tenantId, serverId) => getCloudTenantMcpServer(db, tenantId, serverId),
+    },
+    getCredential: (tenantId, serverId) =>
+      getCloudTenantMcpCredential(db, tenantId, serverId, options.credentialEncryptionKey),
+  });
+}
+
+/** Tenant MCP configuration and controlled-egress discovery/invocation routes. */
 export async function handleCloudTenantMcpRequest(
   request: Request,
   options: CloudTenantMcpHttpApiOptions
@@ -131,7 +195,14 @@ export async function handleCloudTenantMcpRequest(
   if (!route) return null;
   if (url.search !== "") return json({ error: "Query parameters are not supported" }, 400);
   if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
-  const allowedMethods = route.isCollection ? ["GET", "POST"] : ["GET", "PUT", "DELETE"];
+  const allowedMethods =
+    route.action === "discover"
+      ? ["GET"]
+      : route.action === "invoke"
+        ? ["POST"]
+        : route.isCollection
+          ? ["GET", "POST"]
+          : ["GET", "PUT", "DELETE"];
   if (!allowedMethods.includes(request.method)) return json({ error: "Method not allowed" }, 405);
 
   const now = options.now ?? (() => new Date());
@@ -180,6 +251,38 @@ export async function handleCloudTenantMcpRequest(
   try {
     if (!(await mcpIsEnabled(options.db, identity.tenantId))) {
       return json({ error: "MCP is not enabled for this tenant" }, 403);
+    }
+    if (route.action) {
+      const remoteMcp = createTenantMcpRuntime(options, identity);
+      if (!options.egressEnabled || !remoteMcp) {
+        return json({ error: "Controlled MCP egress is not enabled" }, 503);
+      }
+      const principal = { subject: identity.principalId };
+      if (route.action === "discover") {
+        const discovery = await remoteMcp.discoverTools(principal, route.id!);
+        return json({ discovery });
+      }
+      const body = await readJsonBody(request, options.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS);
+      if (body instanceof Response) return body;
+      if (
+        typeof body !== "object" ||
+        body === null ||
+        Array.isArray(body) ||
+        Object.keys(body).some((key) => key !== "arguments") ||
+        ((body as Record<string, unknown>).arguments !== undefined &&
+          (typeof (body as Record<string, unknown>).arguments !== "object" ||
+            (body as Record<string, unknown>).arguments === null ||
+            Array.isArray((body as Record<string, unknown>).arguments)))
+      ) {
+        return json({ error: "Tool arguments must be a JSON object" }, 400);
+      }
+      const result = await remoteMcp.invokeTool(
+        principal,
+        route.id!,
+        route.toolName!,
+        ((body as Record<string, unknown>).arguments as Record<string, unknown> | undefined) ?? {}
+      );
+      return json({ result });
     }
     if (request.method === "GET") {
       if (route.isCollection) {
@@ -250,7 +353,20 @@ export async function handleCloudTenantMcpRequest(
       options.credentialEncryptionKey
     );
     return server ? json({ server }) : json({ error: "MCP server not found" }, 404);
-  } catch {
+  } catch (error) {
+    if (error instanceof TenantRemoteMcpError) {
+      const status =
+        error.code === "UNAUTHENTICATED"
+          ? 401
+          : error.code === "TENANT_FORBIDDEN"
+            ? 403
+            : error.code === "MCP_SERVER_NOT_FOUND"
+              ? 404
+              : error.code === "MCP_SERVER_INACTIVE"
+                ? 409
+                : 502;
+      return json({ error: "MCP server request could not be completed", code: error.code }, status);
+    }
     return json({ error: "Customer MCP configuration could not be completed" }, 503);
   }
 }

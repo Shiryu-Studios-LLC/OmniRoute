@@ -68,3 +68,14 @@ test("Worker graph rejects native binary paths and non-literal runtime loads", (
     }
   );
 });
+
+test("production Worker graph includes only the Worker MCP adapter, never the Node egress proxy", () => {
+  const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+  const entry = path.join(repoRoot, "cloudflare/worker.ts");
+  const result = analyzeWorkerGraph(repoRoot, entry);
+  const relativeFiles = result.files.map(({ file }) => path.relative(repoRoot, file));
+
+  assert.deepEqual(result.violations, []);
+  assert.ok(relativeFiles.includes("src/cloud/mcpEgressTransport.ts"));
+  assert.ok(!relativeFiles.some((file) => file.startsWith("cloudflare/mcp-egress-proxy/")));
+});

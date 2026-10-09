@@ -12,6 +12,7 @@ import {
   handleCloudCustomerOnboardingRequest,
 } from "./tenantOnboardingHttpApi";
 import { CLOUD_CUSTOMER_MCP_SERVERS_PATH, handleCloudTenantMcpRequest } from "./tenantMcpHttpApi";
+import type { CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
@@ -42,6 +43,9 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
   OMNIROUTE_CLOUD_PUBLIC_ORIGIN?: string;
   GATEWAY_SESSIONS?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
+  MCP_EGRESS?: CloudMcpEgressBinding;
+  OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN?: string;
+  OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED?: string;
 }
 
 export interface CloudRuntimeOptions {
@@ -124,6 +128,9 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           const response = await handleCloudTenantMcpRequest(request, {
             db: options.env?.DB,
             credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            egressBinding: options.env?.MCP_EGRESS,
+            egressProxyToken: options.env?.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN,
+            egressEnabled: options.env?.OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED === "true",
             now,
             tenantRateLimit: options.customerMcpRateLimit,
             failedKeyRateLimit: options.customerMcpAuthFailureRateLimit,

@@ -6,8 +6,7 @@
  * Worker without trusting request-supplied tenant IDs.
  * Outbound requests require an explicit controlled-egress transport; never
  * pass global fetch here. Worker callers need an egress proxy because Workers
- * fetch has no socket lookup hook. Remote tool invocation remains disabled
- * until credentials are integrated with that same controlled-egress boundary.
+ * fetch has no socket lookup hook.
  */
 import { McpOutboundEgressError, type McpOutboundTransport } from "./mcpOutboundTransport.ts";
 
@@ -52,6 +51,8 @@ export interface TenantRemoteMcpRuntimeOptions {
   timeoutMs?: number;
   maxResponseBytes?: number;
   maxTools?: number;
+  /** Return a transient server credential; callers must keep it out of registry results/audits. */
+  getCredential?(tenantId: string, serverId: string): Promise<string | null>;
 }
 
 export interface DiscoveredRemoteMcpTool {
@@ -314,7 +315,7 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
     principal: RemoteMcpPrincipal,
     serverId: string,
     action: "discover" | "invoke"
-  ): Promise<RegisteredRemoteMcpServer> {
+  ): Promise<{ tenantId: string; server: RegisteredRemoteMcpServer }> {
     if (!principal || typeof principal.subject !== "string" || principal.subject.length === 0) {
       throw new TenantRemoteMcpError("UNAUTHENTICATED", "Authentication is required");
     }
@@ -330,28 +331,35 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
     if (!server.isActive) {
       throw new TenantRemoteMcpError("MCP_SERVER_INACTIVE", "MCP server is inactive");
     }
-    return server;
+    return { tenantId, server };
   }
 
   async function postJsonRpc(
     endpoint: URL,
     message: Record<string, unknown>,
-    sessionId?: string
+    sessionId?: string,
+    authorization?: string,
+    context?: { tenantId: string; serverId: string }
   ): Promise<{ response: Response; body: string }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await transport.fetch(endpoint.toString(), {
-        method: "POST",
-        redirect: "manual",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+      const response = await transport.fetch(
+        endpoint.toString(),
+        {
+          method: "POST",
+          redirect: "manual",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+            ...(authorization ? { Authorization: authorization } : {}),
+          },
+          body: JSON.stringify(message),
         },
-        body: JSON.stringify(message),
-      });
+        context
+      );
       if (response.status >= 300 && response.status < 400) {
         throw new TenantRemoteMcpError(
           "MCP_UPSTREAM_REDIRECT_REJECTED",
@@ -376,11 +384,21 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
     }
   }
 
-  async function discoverTools(
+  async function connectAndListTools(
     principal: RemoteMcpPrincipal,
-    serverId: string
-  ): Promise<RemoteMcpDiscovery> {
-    const server = await resolveAuthorizedServer(principal, serverId, "discover");
+    serverId: string,
+    action: "discover" | "invoke"
+  ): Promise<{
+    tenantId: string;
+    server: RegisteredRemoteMcpServer;
+    endpoint: URL;
+    authorization?: string;
+    sessionId?: string;
+    protocolVersion: string | null;
+    serverInfo: RemoteMcpDiscovery["serverInfo"];
+    tools: DiscoveredRemoteMcpTool[];
+  }> {
+    const { tenantId, server } = await resolveAuthorizedServer(principal, serverId, action);
     if (server.transport !== "streamable_http") {
       throw new TenantRemoteMcpError(
         "MCP_TRANSPORT_UNSUPPORTED",
@@ -388,16 +406,24 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       );
     }
     const endpoint = parseSafeEndpoint(server.endpoint);
-    const initialized = await postJsonRpc(endpoint, {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: MCP_PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: "OmniRoute", version: "cloud" },
+    const credential = await options.getCredential?.(tenantId, server.id);
+    const authorization = credential ? `Bearer ${credential}` : undefined;
+    const initialized = await postJsonRpc(
+      endpoint,
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "OmniRoute", version: "cloud" },
+        },
       },
-    });
+      undefined,
+      authorization,
+      { tenantId, serverId: server.id }
+    );
     const initResponse = parseRpcResponse(initialized.body);
     const initResult = initResponse.result;
     if (!initResult || typeof initResult !== "object" || Array.isArray(initResult)) {
@@ -409,21 +435,46 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
     const init = initResult as Record<string, unknown>;
     const sessionId = initialized.response.headers.get("Mcp-Session-Id") ?? undefined;
 
-    await postJsonRpc(endpoint, { jsonrpc: "2.0", method: "notifications/initialized" }, sessionId);
+    await postJsonRpc(
+      endpoint,
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      sessionId,
+      authorization,
+      { tenantId, serverId: server.id }
+    );
     const listed = await postJsonRpc(
       endpoint,
       { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
-      sessionId
+      sessionId,
+      authorization,
+      { tenantId, serverId: server.id }
     );
     const listResponse = parseRpcResponse(listed.body);
     const listResult = listResponse.result;
     return {
-      serverId: server.id,
-      serverName: server.name,
-      transport: server.transport,
+      tenantId,
+      server,
+      endpoint,
+      ...(authorization ? { authorization } : {}),
+      ...(sessionId ? { sessionId } : {}),
       protocolVersion: typeof init.protocolVersion === "string" ? init.protocolVersion : null,
       serverInfo: parseServerInfo(init.serverInfo),
       tools: parseTools(listResult, maxTools),
+    };
+  }
+
+  async function discoverTools(
+    principal: RemoteMcpPrincipal,
+    serverId: string
+  ): Promise<RemoteMcpDiscovery> {
+    const connection = await connectAndListTools(principal, serverId, "discover");
+    return {
+      serverId: connection.server.id,
+      serverName: connection.server.name,
+      transport: connection.server.transport,
+      protocolVersion: connection.protocolVersion,
+      serverInfo: connection.serverInfo,
+      tools: connection.tools,
     };
   }
 
@@ -452,17 +503,36 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
   async function invokeTool(
     principal: RemoteMcpPrincipal,
     serverId: string,
-    _toolName: string,
-    _arguments: Record<string, unknown>
-  ): Promise<never> {
-    await resolveAuthorizedServer(principal, serverId, "invoke");
-    // Keep invocation disabled until encrypted credentials are integrated
-    // with transport that pins DNS answers at connection time. A DNS preflight
-    // followed by ordinary fetch does not prevent rebinding.
-    throw new TenantRemoteMcpError(
-      "MCP_INVOCATION_DISABLED",
-      "Remote MCP invocation is disabled until credentials and target-runtime controlled egress are integrated"
+    toolName: string,
+    arguments_: Record<string, unknown>
+  ): Promise<unknown> {
+    if (typeof toolName !== "string" || toolName.length < 1 || toolName.length > 128) {
+      throw new TenantRemoteMcpError("MCP_UPSTREAM_PROTOCOL_ERROR", "MCP tool name is invalid");
+    }
+    const connection = await connectAndListTools(principal, serverId, "invoke");
+    if (!connection.tools.some((tool) => tool.name === toolName)) {
+      throw new TenantRemoteMcpError("MCP_UPSTREAM_PROTOCOL_ERROR", "MCP tool was not found");
+    }
+    const called = await postJsonRpc(
+      connection.endpoint,
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: toolName, arguments: arguments_ },
+      },
+      connection.sessionId,
+      connection.authorization,
+      { tenantId: connection.tenantId, serverId }
     );
+    const parsed = parseRpcResponse(called.body);
+    if (!parsed.result || typeof parsed.result !== "object" || Array.isArray(parsed.result)) {
+      throw new TenantRemoteMcpError(
+        "MCP_UPSTREAM_PROTOCOL_ERROR",
+        "MCP server returned an invalid tool result"
+      );
+    }
+    return parsed.result;
   }
 
   return { discoverForTenant, discoverTools, invokeTool };

@@ -363,6 +363,97 @@ test("MCP registry derives tenant from key and returns 404 for another tenant's 
   }
 });
 
+test("MCP discovery and invocation require explicit controlled-egress enablement and remain tenant scoped", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provision(db, "mcp-egress-owner");
+    const other = await provision(db, "mcp-egress-other");
+    await enableMcp(db, owner.tenantId, other.tenantId);
+    const created = await call(
+      db,
+      request(owner.token, "POST", COLLECTION, {
+        name: "Private tools",
+        transport: "streamable_http",
+        endpoint: "https://mcp.example.com/rpc",
+        credential: "tenant-server-secret",
+      })
+    );
+    const server = await body<{ server: { id: string } }>(created!);
+    const serverPath = `${COLLECTION}/${server.server.id}`;
+    let proxyCalls = 0;
+    const egressBinding = {
+      async fetch(proxyRequest: Request): Promise<Response> {
+        proxyCalls += 1;
+        assert.equal(proxyRequest.url, "http://omniroute-mcp-egress.internal:8080/v1/mcp/forward");
+        const proxyBody = (await proxyRequest.json()) as {
+          tenantId: string;
+          serverId: string;
+          body: string;
+          headers?: { upstreamAuthorization?: string };
+        };
+        assert.equal(proxyBody.tenantId, owner.tenantId);
+        assert.equal(proxyBody.serverId, server.server.id);
+        assert.equal(proxyBody.headers?.upstreamAuthorization, "Bearer tenant-server-secret");
+        const rpc = JSON.parse(proxyBody.body) as { method: string; id?: number };
+        const result =
+          rpc.method === "initialize"
+            ? { protocolVersion: "2024-11-05", serverInfo: { name: "fixture" } }
+            : rpc.method === "tools/list"
+              ? { tools: [{ name: "lookup", inputSchema: { type: "object" } }] }
+              : { content: [{ type: "text", text: "ok" }] };
+        return Response.json({
+          status: 200,
+          headers: { contentType: "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }),
+        });
+      },
+    };
+
+    const disabled = await call(db, request(owner.token, "GET", `${serverPath}/tools`), {
+      egressBinding,
+      egressProxyToken: "proxy-token-" + "x".repeat(32),
+    });
+    assert.equal(disabled?.status, 503);
+    assert.equal(proxyCalls, 0);
+
+    const discovered = await call(db, request(owner.token, "GET", `${serverPath}/tools`), {
+      egressEnabled: true,
+      egressBinding,
+      egressProxyToken: "proxy-token-" + "x".repeat(32),
+    });
+    assert.equal(discovered?.status, 200, await discovered?.clone().text());
+    assert.equal(proxyCalls, 3);
+    assert.doesNotMatch(await discovered!.text(), /tenant-server-secret/);
+
+    const invoked = await call(
+      db,
+      request(owner.token, "POST", `${serverPath}/tools/lookup`, { arguments: {} }),
+      {
+        egressEnabled: true,
+        egressBinding,
+        egressProxyToken: "proxy-token-" + "x".repeat(32),
+      }
+    );
+    assert.equal(invoked?.status, 200);
+    assert.equal(proxyCalls, 7);
+    assert.match(await invoked!.text(), /"text":"ok"/);
+
+    const invokedByOtherTenant = await call(
+      db,
+      request(other.token, "POST", `${serverPath}/tools/lookup`, { arguments: {} }),
+      {
+        egressEnabled: true,
+        egressBinding,
+        egressProxyToken: "proxy-token-" + "x".repeat(32),
+      }
+    );
+    assert.equal(invokedByOtherTenant?.status, 404);
+    assert.equal(proxyCalls, 7);
+  } finally {
+    db.db.close();
+  }
+});
+
 test("MCP endpoint schemas reject unsafe or ambiguous URLs without probing them", async () => {
   const db = await migratedDb();
   try {

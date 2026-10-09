@@ -198,7 +198,7 @@ test("redirects are not followed and response size is bounded", async () => {
   );
 });
 
-test("upstream timeouts are bounded and invocation stays disabled without secure credentials", async () => {
+test("upstream timeouts are bounded and invocation requires a valid remote protocol response", async () => {
   const timedOutRuntime = runtime({
     timeoutMs: 100,
     transport: {
@@ -216,7 +216,7 @@ test("upstream timeouts are bounded and invocation stays disabled without secure
   );
   await assertRuntimeError(
     runtime().invokeTool(principal("a"), serverA.id, "lookup", {}),
-    "MCP_INVOCATION_DISABLED"
+    "MCP_UPSTREAM_PROTOCOL_ERROR"
   );
   await assertRuntimeError(
     runtime().invokeTool(principal("a"), serverB.id, "lookup", {}),
