@@ -20,6 +20,9 @@ const enabled = process.env.RUN_CLOUDFLARE_LOCAL_INT === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const adminToken = "local-integration-admin-token-only";
 const maintenanceToken = "local-integration-maintenance-token-only";
+const frontDeskConfigToken = "local-integration-front-desk-config-token-only";
+const credentialEncryptionKey = Buffer.alloc(32, 17).toString("base64");
+const idempotencyHmacKey = Buffer.alloc(32, 29).toString("base64");
 const capability = "ollama:chat:integration-test";
 const localOllamaBaseUrl = "http://127.0.0.1:11434";
 
@@ -411,6 +414,9 @@ test(
     const localSecrets = [
       `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}`,
       `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}`,
+      `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY=${credentialEncryptionKey}`,
+      `OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY=${idempotencyHmacKey}`,
+      `OMNIROUTE_FRONT_DESK_CONFIG_TOKEN=${frontDeskConfigToken}`,
     ].join("\n");
     await writeFile(path.join(tempDir, ".env"), `${localSecrets}\n`, { mode: 0o600 });
     await writeFile(path.join(tempDir, ".dev.vars"), `${localSecrets}\n`, { mode: 0o600 });
@@ -765,11 +771,7 @@ test(
 
         const frontDeskHost = "tenant-a.frontdesk.test";
         const frontDeskPort = await getUnusedPort();
-        const frontDeskKeyEnv = "FRONT_DESK_LOCAL_GATEWAY_KEY";
-        const frontDeskDashboardEnv = "FRONT_DESK_LOCAL_GATEWAY_DASHBOARD";
         const frontDeskBHost = "tenant-b.frontdesk.test";
-        const frontDeskBKeyEnv = "FRONT_DESK_LOCAL_GATEWAY_B_KEY";
-        const frontDeskBDashboardEnv = "FRONT_DESK_LOCAL_GATEWAY_B_DASHBOARD";
 
         for (const [tenantId, hostname] of [
           [customerA.tenantId, frontDeskHost],
@@ -786,42 +788,33 @@ test(
           );
         }
 
-        const frontDeskTenantA = {
-          tenantId: customerA.tenantId,
-          dashboardTokenEnv: frontDeskDashboardEnv,
-          gateway: {
-            baseUrl,
-            customerApiKeyEnv: frontDeskKeyEnv,
-            deviceId: customerA.deviceId,
-            ollamaModel: "integration-test",
-          },
-          business: {
-            name: "Local Gateway Integration A",
-            description: "Isolated test business A",
-            hours: "Always",
-            services: [],
-            assistant: {
-              name: "Integration assistant",
-              tone: "helpful",
-              handoff: "Offer a follow-up.",
+        for (const [tenant, hostname, dashboardToken] of [
+          [customerA, frontDeskHost, "local-frontdesk-dashboard-token-a"],
+          [customerB, frontDeskBHost, "local-frontdesk-dashboard-token-b"],
+        ] as const) {
+          const savedConfig = await requestJson(`${baseUrl}/__cloud/v1/front-desk/configs`, {
+            method: "PUT",
+            token: adminToken,
+            body: {
+              hostname,
+              customerApiKey: tenant.customerKey,
+              dashboardToken,
+              gateway: {
+                baseUrl,
+                deviceId: tenant.deviceId,
+                ollamaModel: "integration-test",
+                imageGeneration: null,
+              },
             },
-          },
-        };
-        const frontDeskTenantB = {
-          ...frontDeskTenantA,
-          tenantId: customerB.tenantId,
-          dashboardTokenEnv: frontDeskBDashboardEnv,
-          gateway: {
-            ...frontDeskTenantA.gateway,
-            customerApiKeyEnv: frontDeskBKeyEnv,
-            deviceId: customerB.deviceId,
-          },
-          business: {
-            ...frontDeskTenantA.business,
-            name: "Local Gateway Integration B",
-          },
-        };
-        const frontDeskTenants = [frontDeskTenantA, frontDeskTenantB];
+          });
+          assert.equal(
+            savedConfig.response.status,
+            200,
+            `tenant-owned Front Desk config should save through D1: ${JSON.stringify(savedConfig.body)}`
+          );
+          assert.equal(JSON.stringify(savedConfig.body).includes(tenant.customerKey), false);
+          assert.equal(JSON.stringify(savedConfig.body).includes(dashboardToken), false);
+        }
         const frontDeskChild = spawn(process.execPath, ["server.js"], {
           cwd: frontDeskTempDir,
           env: {
@@ -831,11 +824,7 @@ test(
             NO_COLOR: "1",
             PORT: String(frontDeskPort),
             FRONT_DESK_HOST_REGISTRY_URL: baseUrl,
-            FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
-            [frontDeskKeyEnv]: customerA.customerKey,
-            [frontDeskDashboardEnv]: "local-frontdesk-dashboard-token",
-            [frontDeskBKeyEnv]: customerB.customerKey,
-            [frontDeskBDashboardEnv]: "local-frontdesk-dashboard-token-b",
+            FRONT_DESK_CONFIG_TOKEN: frontDeskConfigToken,
           },
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -1358,21 +1347,35 @@ test(
       }
     );
 
-    const invoke = (customerKey: string, deviceId: string, idempotencyKey: string) =>
+    const invoke = (
+      customerKey: string,
+      deviceId: string,
+      idempotencyKey: string,
+      requestedCapability = capability
+    ) =>
       requestJson(`${baseUrl}/__gateway/v1/customer/invoke`, {
         token: customerKey,
         headers: { "Idempotency-Key": idempotencyKey },
         body: {
           deviceId,
-          capability,
+          capability: requestedCapability,
           payload: { prompt: "local Worker integration payload" },
           timeoutMs: 10_000,
         },
       });
 
-    const invokeAndComplete = async (customer: typeof customerA, expectedAnswer: string) => {
+    const invokeAndComplete = async (
+      customer: typeof customerA,
+      expectedAnswer: string,
+      requestedCapability = capability
+    ) => {
       const idempotencyKey = `local-replay-${randomUUID()}`;
-      const invocation = invoke(customer.customerKey, customer.deviceId, idempotencyKey);
+      const invocation = invoke(
+        customer.customerKey,
+        customer.deviceId,
+        idempotencyKey,
+        requestedCapability
+      );
       let deviceRequests: Awaited<ReturnType<typeof deviceTransport.poll>> = null;
       const pollDeadline = Date.now() + 5_000;
       while (!deviceRequests?.length && Date.now() < pollDeadline) {
@@ -1402,7 +1405,12 @@ test(
         outcome: { ok: true, value: { answer: expectedAnswer } },
       });
 
-      const replayResult = await invoke(customer.customerKey, customer.deviceId, idempotencyKey);
+      const replayResult = await invoke(
+        customer.customerKey,
+        customer.deviceId,
+        idempotencyKey,
+        requestedCapability
+      );
       assert.equal(replayResult.response.status, 200);
       assert.deepEqual(replayResult.body, firstResult.body);
       const requestsAfterReplay = await deviceTransport.poll(customer.session!);
@@ -1410,6 +1418,54 @@ test(
       assert.equal(requestsAfterReplay.length, 0, "replay must not enqueue again");
       return firstResult.body;
     };
+
+    await t.test(
+      "tenant-local device catalogs reject another tenant's advertised model",
+      async () => {
+        const modelA = "ollama:chat:tenant-a-model";
+        const modelB = "ollama:chat:tenant-b-model";
+        const catalogA = await provisionCustomer("catalog-a", true, [modelA]);
+        const catalogB = await provisionCustomer("catalog-b", true, [modelB]);
+
+        const [deviceA, deviceB] = await Promise.all([
+          requestJson(
+            `${baseUrl}/__cloud/v1/tenants/${catalogA.tenantId}/gateway-devices/${catalogA.deviceId}`,
+            { token: adminToken }
+          ),
+          requestJson(
+            `${baseUrl}/__cloud/v1/tenants/${catalogB.tenantId}/gateway-devices/${catalogB.deviceId}`,
+            { token: adminToken }
+          ),
+        ]);
+        assert.equal(deviceA.response.status, 200);
+        assert.deepEqual(deviceA.body.capabilities, [modelA]);
+        assert.equal(deviceB.response.status, 200);
+        assert.deepEqual(deviceB.body.capabilities, [modelB]);
+        assert.equal(JSON.stringify(deviceA.body).includes(modelB), false);
+        assert.equal(JSON.stringify(deviceB.body).includes(modelA), false);
+
+        await invokeAndComplete(catalogA, "tenant A model completed", modelA);
+        await invokeAndComplete(catalogB, "tenant B model completed", modelB);
+
+        const wrongModelA = await invoke(
+          catalogA.customerKey,
+          catalogA.deviceId,
+          `wrong-model-${randomUUID()}`,
+          modelB
+        );
+        assert.equal(wrongModelA.response.status, 409);
+        assert.equal(
+          wrongModelA.body.error,
+          "Capability is unavailable",
+          `tenant A must not invoke tenant B's model: ${JSON.stringify(wrongModelA.body)}`
+        );
+        assert.deepEqual(
+          await deviceTransport.poll(catalogA.session!),
+          [],
+          "a model absent from tenant A's catalog must not enqueue work"
+        );
+      }
+    );
 
     await t.test(
       "a ComfyUI capability completes through the local agent executor, Worker, D1, and Durable Object",
@@ -2005,9 +2061,6 @@ test(
     // The local worker config and environment were generated under tempDir, not
     // the repository; assert this invariant to guard against future test changes.
     const localEnv = await readFile(path.join(tempDir, ".env"), "utf8");
-    assert.equal(
-      localEnv,
-      `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}\nOMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}\n`
-    );
+    assert.equal(localEnv, `${localSecrets}\n`);
   }
 );

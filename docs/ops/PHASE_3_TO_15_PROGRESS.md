@@ -196,6 +196,8 @@ Phase 13 privileged API configuration follow-up (2026-10-08): the base Wrangler 
 
 Phase 14 CI follow-up (2026-10-09): `.github/workflows/cloudflare-worker-check.yml` now runs the isolated Worker graph check/dry-run bundle and Cloudflare migration-numbering check on pushes, pull requests, and manual dispatch. It uses read-only repository permissions and no deployment credentials. This catches Worker graph and migration regressions before staging, but does not replace the manual staging deployment or live validation; no Cloudflare resources are created by this workflow.
 
+Phase 15 local acceptance follow-up (2026-10-09): the opt-in Wrangler integration now provisions tenants A and B with different advertised Ollama model capabilities, confirms each D1 device record exposes only its own capability, completes each tenant's own model invocation, and rejects a wrong-catalog invocation before it reaches the Durable Object queue. The real Front Desk A/B test now saves each tenant's encrypted configuration through the Worker and starts Front Desk with only the verified-host registry URL and service token; it no longer supplies static per-tenant configuration or API-key environment variables. The combined local D1/Worker/Durable Object/Front Desk integration passes 8/8 enabled tests (3 optional host-service cases skipped); this remains local evidence and does not replace staging validation.
+
 ## Next actions
 
 1. Isolate the Next middleware dependency graph behind a cloud-specific D1 authorization path; verify a complete OpenNext build before treating the full application as Worker-ready. The isolated Cloud Worker dry run is green at 81 inputs / 402,713 bytes.
