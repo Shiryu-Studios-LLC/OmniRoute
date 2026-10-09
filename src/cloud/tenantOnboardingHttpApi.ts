@@ -13,6 +13,7 @@ interface OnboardingStatusRow {
   oidc_configured: number;
   oidc_enabled: number;
   active_provider_connection: number;
+  business_profile_configured: number;
   enabled_inference_entitlement: number;
   registered_device: number;
   local_ai_enabled: number;
@@ -107,6 +108,10 @@ export async function handleCloudCustomerOnboardingRequest(
               WHERE p.tenant_id = t.id AND p.is_active = 1
            ) AS active_provider_connection,
            EXISTS (
+             SELECT 1 FROM cloud_tenant_business_profiles b
+              WHERE b.tenant_id = t.id AND b.configured_at IS NOT NULL
+           ) AS business_profile_configured,
+           EXISTS (
              SELECT 1 FROM cloud_inference_entitlements e
               WHERE e.tenant_id = t.id AND e.enabled = 1
            ) AS enabled_inference_entitlement,
@@ -129,6 +134,7 @@ export async function handleCloudCustomerOnboardingRequest(
       oidcConfigured: row.oidc_configured === 1,
       oidcEnabled: row.oidc_enabled === 1,
       activeProviderConnection: row.active_provider_connection === 1,
+      businessProfileConfigured: row.business_profile_configured === 1,
       enabledInferenceEntitlement: row.enabled_inference_entitlement === 1,
       registeredDevice: row.registered_device === 1,
       localAiEnabled: row.local_ai_enabled === 1,

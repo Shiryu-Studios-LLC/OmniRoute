@@ -77,6 +77,7 @@ async function migratedDb() {
     "0005_cloud_customer_identity.sql",
     "0008_cloud_tenant_settings.sql",
     "0023_cloud_tenant_business_profiles.sql",
+    "0024_cloud_tenant_business_profile_configuration.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }

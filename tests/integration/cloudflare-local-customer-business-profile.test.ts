@@ -225,6 +225,10 @@ test(
       `${migrationResult.stdout}\n${migrationResult.stderr}`,
       /0023_cloud_tenant_business_profiles\.sql|0023_cloud_tenant_business_profiles/
     );
+    assert.match(
+      `${migrationResult.stdout}\n${migrationResult.stderr}`,
+      /0024_cloud_tenant_business_profile_configuration\.sql|0024_cloud_tenant_business_profile_configuration/
+    );
 
     const startWorker = () =>
       spawn(

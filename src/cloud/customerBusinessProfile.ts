@@ -77,7 +77,8 @@ export async function updateCloudCustomerBusinessProfile(
       .prepare(
         `UPDATE cloud_tenant_business_profiles
             SET name = ?, description = ?, hours = ?, services_json = ?, assistant_name = ?,
-                assistant_tone = ?, assistant_handoff = ?, updated_at = ?
+                assistant_tone = ?, assistant_handoff = ?, updated_at = ?,
+                configured_at = COALESCE(configured_at, ?)
           WHERE tenant_id = ?
             AND EXISTS (
               SELECT 1 FROM cloud_customer_memberships m
@@ -99,6 +100,7 @@ export async function updateCloudCustomerBusinessProfile(
         profile.assistant.name,
         profile.assistant.tone,
         profile.assistant.handoff,
+        input.updatedAt,
         input.updatedAt,
         input.tenantId,
         input.membershipId,

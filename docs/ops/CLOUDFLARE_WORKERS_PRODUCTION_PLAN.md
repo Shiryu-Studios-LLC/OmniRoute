@@ -448,13 +448,15 @@ not provision provider credentials, MCP servers, Front Desk branding, or a
 browser-based customer setup flow.
 
 Owner/admin customer API keys can read `/__cloud/v1/customer/onboarding` for
-eight tenant-derived boolean flags: active owner, OIDC configured/enabled,
-active provider connection, enabled cloud inference entitlement, at least one
-non-revoked Local Agent device, and Local AI and MCP opt-ins. The response
-contains no issuer URLs, provider names, device identifiers, or credential
-values, rejects tenant selectors, and uses pre-auth edge-IP plus tenant rate
-limits. This is a readiness view; it does not complete owner identity
-verification or self-service provider/MCP provisioning.
+nine tenant-derived boolean flags: active owner, OIDC configured/enabled,
+active provider connection, configured business profile, enabled cloud
+inference entitlement, at least one non-revoked Local Agent device, and Local
+AI and MCP opt-ins. `businessProfileConfigured` becomes true after an
+owner/admin saves the tenant's profile; a default profile row alone does not
+count. The response contains no issuer URLs, provider names, device
+identifiers, or credential values, rejects tenant selectors, and uses pre-auth
+edge-IP plus tenant rate limits. This is a readiness view; it does not perform
+owner identity verification or provider/MCP provisioning.
 
 After the repository is cloud-ready:
 

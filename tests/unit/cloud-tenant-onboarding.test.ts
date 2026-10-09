@@ -104,6 +104,8 @@ async function migratedDb(): Promise<SqliteCloudDb> {
     "0016_cloud_tenant_oidc_sessions.sql",
     "0017_cloud_gateway_pairings.sql",
     "0018_cloud_tenant_membership_invitations.sql",
+    "0023_cloud_tenant_business_profiles.sql",
+    "0024_cloud_tenant_business_profile_configuration.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
@@ -249,11 +251,36 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       oidcConfigured: true,
       oidcEnabled: false,
       activeProviderConnection: false,
+      businessProfileConfigured: false,
       enabledInferenceEntitlement: false,
       registeredDevice: false,
       localAiEnabled: true,
       mcpEnabled: false,
     });
+
+    const profileResponse = await runtime.fetch(
+      new Request("https://omniroute.test/__cloud/v1/customer/business-profile", {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${customerA.ownerApiKey.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "Onboarding A Business",
+          description: "Configured during onboarding",
+          hours: "Weekdays",
+          services: [],
+          assistant: {
+            name: "Front Desk",
+            tone: "helpful",
+            handoff: "Offer a callback.",
+          },
+        }),
+      })
+    );
+    assert.equal(profileResponse?.status, 200);
+    const afterProfileSetup = await runtime.fetch(getRequest(customerA.ownerApiKey.token));
+    assert.equal((await afterProfileSetup?.json()).businessProfileConfigured, true);
 
     await db
       .prepare("UPDATE cloud_customer_memberships SET is_active = 0 WHERE id = ?")
@@ -277,6 +304,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       oidcConfigured: true,
       oidcEnabled: true,
       activeProviderConnection: true,
+      businessProfileConfigured: false,
       enabledInferenceEntitlement: true,
       registeredDevice: true,
       localAiEnabled: true,
@@ -288,6 +316,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       assert.deepEqual(Object.keys(status).sort(), [
         "activeOwner",
         "activeProviderConnection",
+        "businessProfileConfigured",
         "enabledInferenceEntitlement",
         "localAiEnabled",
         "mcpEnabled",
