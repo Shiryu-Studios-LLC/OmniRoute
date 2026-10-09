@@ -9,6 +9,7 @@ import {
   cleanupSettledCloudInferenceReservations,
   getCloudInferenceBudgetStatus,
   getCloudInferenceEntitlement,
+  listCloudInferenceEntitlements,
   releaseCloudInferenceReservation,
   reserveCloudInferenceTokens,
   setCloudInferenceEntitlement,
@@ -568,4 +569,23 @@ test("invalid limits and token counts are rejected before touching D1", async ()
   } finally {
     db.db.close();
   }
+});
+
+test("entitlement listing rejects an unsuccessful D1 read", async () => {
+  const db = {
+    prepare() {
+      return {
+        bind() {
+          return this;
+        },
+        async all() {
+          return { results: [], success: false };
+        },
+      };
+    },
+  } as unknown as CloudDb;
+
+  await assert.rejects(listCloudInferenceEntitlements(db, "tenant-a"), {
+    message: "D1 inference entitlements could not be read",
+  });
 });

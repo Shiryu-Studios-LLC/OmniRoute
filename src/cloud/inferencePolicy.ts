@@ -243,6 +243,7 @@ export async function listCloudInferenceEntitlements(
     )
     .bind(tenantId)
     .all();
+  if (!rows.success) throw new Error("D1 inference entitlements could not be read");
   return rows.results.map(entitlementFromRow);
 }
 
