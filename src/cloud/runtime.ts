@@ -318,6 +318,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
             now: () => now().getTime(),
             fetcher: options.fetcher,
+            customerHostTxtResolver: options.customerHostTxtResolver,
           });
           if (response) return response;
           return new Response("Not Found", { status: 404 });

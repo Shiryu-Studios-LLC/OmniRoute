@@ -41,6 +41,7 @@ const PORTAL_SCRIPT = `
   const providerList = byId("provider-connections");
   let newlyIssuedToken = null;
   let nextCursor = null;
+  let pendingHostChallenge = null;
 
   const formatDate = (value) => {
     if (typeof value !== "string") return "No expiration";
@@ -452,6 +453,68 @@ const PORTAL_SCRIPT = `
       : "No active Ollama-capable Local Agent is registered yet.";
   };
 
+  const loadVerifiedCustomerHosts = async () => {
+    const data = await api("/__cloud/auth/front-desk/hosts");
+    if (!Array.isArray(data.hosts)) throw new Error("Invalid verified host response");
+    const list = byId("verified-customer-hosts");
+    list.replaceChildren();
+    for (const host of data.hosts) {
+      if (!host || typeof host.hostname !== "string" || typeof host.verifiedAt !== "string") continue;
+      list.append(node("li", host.hostname + " · verified " + host.verifiedAt));
+    }
+    if (!data.hosts.length) list.append(node("li", "No verified hosts yet."));
+  };
+
+  byId("customer-host-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("issue-host-challenge");
+    button.disabled = true;
+    byId("host-challenge-result").replaceChildren();
+    pendingHostChallenge = null;
+    try {
+      const result = await api("/__cloud/auth/front-desk/hosts/challenge", {
+        method: "POST",
+        body: JSON.stringify({ hostname: byId("customer-hostname").value }),
+      });
+      if (typeof result.hostname !== "string" || typeof result.challengeId !== "string" ||
+          typeof result.recordName !== "string" || typeof result.recordValue !== "string" ||
+          typeof result.expiresAt !== "string") throw new Error("Invalid DNS challenge response");
+      pendingHostChallenge = { hostname: result.hostname, challengeId: result.challengeId };
+      const output = byId("host-challenge-result");
+      output.append(node("p", "Add this DNS TXT record, then verify it. The value is shown only once."));
+      output.append(node("p", "Record name: " + result.recordName));
+      output.append(node("p", "Record type: TXT"));
+      const value = node("code", result.recordValue);
+      output.append(value, node("p", "Expires: " + result.expiresAt));
+      byId("verify-host-challenge").disabled = false;
+      setStatus("DNS ownership challenge issued.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Host challenge could not be issued.", true);
+    } finally { button.disabled = false; }
+  });
+
+  byId("verify-host-challenge").addEventListener("click", async () => {
+    if (!pendingHostChallenge) return;
+    const button = byId("verify-host-challenge");
+    button.disabled = true;
+    try {
+      await api("/__cloud/auth/front-desk/hosts/verify", {
+        method: "POST",
+        body: JSON.stringify(pendingHostChallenge),
+      });
+      pendingHostChallenge = null;
+      byId("host-challenge-result").replaceChildren();
+      byId("customer-hostname").value = "";
+      setStatus("Host ownership verified and added to Front Desk setup.");
+      await loadVerifiedCustomerHosts();
+      await loadFrontDeskConfig();
+      await loadOnboardingReadiness();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Host ownership could not be verified.", true);
+      button.disabled = false;
+    }
+  });
+
   byId("front-desk-config-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = byId("save-front-desk-config");
@@ -792,11 +855,17 @@ const PORTAL_SCRIPT = `
         byId("local-ai-settings-panel").hidden = false;
         byId("mcp-settings-panel").hidden = false;
         byId("front-desk-config-panel").hidden = false;
+        byId("customer-host-panel").hidden = false;
         byId("onboarding-readiness-panel").hidden = false;
         try {
           await loadBusinessProfile();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "Could not load business profile.", true);
+        }
+        try {
+          await loadVerifiedCustomerHosts();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load verified hosts.", true);
         }
         try {
           await loadFrontDeskConfig();
@@ -997,9 +1066,21 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <button id="create-mcp-server" type="submit">Add MCP server</button>
         </form>
       </section>
+      <section id="customer-host-panel" hidden>
+        <h2>Verify a Front Desk host</h2>
+        <p>Enter the hostname you control. Add the DNS TXT record shown below, then verify ownership. TXT values are disclosed once and are never stored in plain text.</p>
+        <ul id="verified-customer-hosts"></ul>
+        <form id="customer-host-form">
+          <label for="customer-hostname">Hostname</label>
+          <input id="customer-hostname" type="text" maxlength="253" autocomplete="url" required>
+          <button id="issue-host-challenge" type="submit">Issue DNS challenge</button>
+        </form>
+        <div id="host-challenge-result" aria-live="polite"></div>
+        <button id="verify-host-challenge" type="button" disabled>Verify DNS record</button>
+      </section>
       <section id="front-desk-config-panel" hidden>
         <h2>Front Desk setup</h2>
-        <p>Configure an already verified customer host. Host ownership verification and domain registration are managed by a platform admin.</p>
+        <p>Configure one of your verified customer hosts.</p>
         <p id="front-desk-configured" aria-live="polite"></p>
         <form id="front-desk-config-form">
           <label for="front-desk-host">Verified customer host</label>

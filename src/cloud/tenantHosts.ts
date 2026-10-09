@@ -1,5 +1,12 @@
 import type { CloudDb } from "./db";
 
+export interface CloudCustomerHostPortalAuthorization {
+  tenantId: string;
+  membershipId: string;
+  sessionTokenHash: string;
+  nowMs: number;
+}
+
 export interface CloudAdminVerifiedCustomerHost {
   hostname: string;
   tenantId: string;
@@ -114,7 +121,9 @@ export function prepareCustomerHostVerificationChallengeInsert(
     tokenHash: string;
     createdAtMs: number;
     expiresAtMs: number;
-  }
+  },
+  portalAuthorization?: CloudCustomerHostPortalAuthorization,
+  replaceActiveChallenge = false
 ) {
   const hostname = normalizeCustomerHostname(input.hostname);
   if (!hostname) throw new TypeError("Invalid customer hostname");
@@ -133,6 +142,7 @@ export function prepareCustomerHostVerificationChallengeInsert(
        SELECT ?, t.id, ?, ?, ?, ?, 0
          FROM tenants t
         WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
+          ${portalAuthorization ? `AND ${portalSessionPredicate()}` : ""}
           AND NOT EXISTS (
             SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = ?
           )
@@ -143,7 +153,7 @@ export function prepareCustomerHostVerificationChallengeInsert(
          expires_at_ms = excluded.expires_at_ms,
          attempts = 0
        WHERE cloud_customer_host_verification_challenges.tenant_id = excluded.tenant_id
-         AND cloud_customer_host_verification_challenges.expires_at_ms <= ?
+         AND (cloud_customer_host_verification_challenges.expires_at_ms <= ? OR ? = 1)
          AND NOT EXISTS (
            SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = excluded.hostname
          )`
@@ -155,8 +165,10 @@ export function prepareCustomerHostVerificationChallengeInsert(
       input.createdAtMs,
       input.expiresAtMs,
       input.tenantId,
+      ...(portalAuthorization ? portalSessionBindings(portalAuthorization) : []),
       hostname,
-      input.createdAtMs
+      input.createdAtMs,
+      replaceActiveChallenge ? 1 : 0
     );
 }
 
@@ -179,16 +191,24 @@ export async function getCustomerHostVerificationChallenge(
 
 export function prepareCustomerHostVerificationAttemptUpdate(
   db: CloudDb,
-  input: { hostname: string; tenantId: string; challengeId: string; nowMs: number }
+  input: { hostname: string; tenantId: string; challengeId: string; nowMs: number },
+  portalAuthorization?: CloudCustomerHostPortalAuthorization
 ) {
   return db
     .prepare(
       `UPDATE cloud_customer_host_verification_challenges
           SET attempts = attempts + 1
         WHERE hostname = ? AND tenant_id = ? AND challenge_id = ?
-          AND expires_at_ms > ? AND attempts < 5`
+          AND expires_at_ms > ? AND attempts < 5
+          ${portalAuthorization ? `AND ${portalSessionPredicate()}` : ""}`
     )
-    .bind(input.hostname, input.tenantId, input.challengeId, input.nowMs);
+    .bind(
+      input.hostname,
+      input.tenantId,
+      input.challengeId,
+      input.nowMs,
+      ...(portalAuthorization ? portalSessionBindings(portalAuthorization) : [])
+    );
 }
 
 export function prepareDnsVerifiedCustomerHostInsert(
@@ -200,27 +220,32 @@ export function prepareDnsVerifiedCustomerHostInsert(
     tokenHash: string;
     verifiedAt: string;
     nowMs: number;
-  }
+    verifiedBy?: string;
+  },
+  portalAuthorization?: CloudCustomerHostPortalAuthorization
 ) {
   return db
     .prepare(
       `INSERT INTO cloud_verified_customer_hosts
          (hostname, tenant_id, verified_at, verified_by, created_at)
-       SELECT c.hostname, c.tenant_id, ?, 'dns-txt', ?
+       SELECT c.hostname, c.tenant_id, ?, ?, ?
          FROM cloud_customer_host_verification_challenges c
          JOIN tenants t ON t.id = c.tenant_id
         WHERE c.hostname = ? AND c.tenant_id = ? AND c.challenge_id = ?
           AND c.token_hash = ? AND c.expires_at_ms > ? AND c.attempts < 5
-          AND t.kind = 'customer' AND t.is_active = 1`
+          AND t.kind = 'customer' AND t.is_active = 1
+          ${portalAuthorization ? `AND ${portalSessionPredicate()}` : ""}`
     )
     .bind(
       input.verifiedAt,
+      input.verifiedBy ?? "dns-txt",
       input.verifiedAt,
       input.hostname,
       input.tenantId,
       input.challengeId,
       input.tokenHash,
-      input.nowMs
+      input.nowMs,
+      ...(portalAuthorization ? portalSessionBindings(portalAuthorization) : [])
     );
 }
 
@@ -232,14 +257,16 @@ export function prepareCustomerHostVerificationChallengeDelete(
     challengeId: string;
     tokenHash: string;
     nowMs: number;
-  }
+  },
+  portalAuthorization?: CloudCustomerHostPortalAuthorization
 ) {
   return db
     .prepare(
       `DELETE FROM cloud_customer_host_verification_challenges
         WHERE hostname = ? AND tenant_id = ? AND challenge_id = ? AND token_hash = ?
           AND expires_at_ms > ? AND attempts < 5
-          AND EXISTS (SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = ?)`
+          AND EXISTS (SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = ?)
+          ${portalAuthorization ? `AND ${portalSessionPredicate()}` : ""}`
     )
     .bind(
       input.hostname,
@@ -247,8 +274,34 @@ export function prepareCustomerHostVerificationChallengeDelete(
       input.challengeId,
       input.tokenHash,
       input.nowMs,
-      input.hostname
+      input.hostname,
+      ...(portalAuthorization ? portalSessionBindings(portalAuthorization) : [])
     );
+}
+
+function portalSessionPredicate(): string {
+  return `EXISTS (
+    SELECT 1 FROM cloud_tenant_oidc_sessions s
+    JOIN cloud_customer_memberships m
+      ON m.tenant_id = s.tenant_id AND m.id = s.membership_id
+    JOIN cloud_tenant_oidc_identities i
+      ON i.tenant_id = s.tenant_id AND i.id = s.identity_id AND i.membership_id = s.membership_id
+    JOIN cloud_tenant_oidc_configs c
+      ON c.tenant_id = i.tenant_id AND c.issuer = i.issuer AND c.is_enabled = 1
+    JOIN tenants t ON t.id = s.tenant_id AND t.kind = 'customer' AND t.is_active = 1
+    WHERE s.token_hash = ? AND s.tenant_id = ? AND s.membership_id = ?
+      AND s.revoked_at_ms IS NULL AND s.expires_at_ms > ?
+      AND m.is_active = 1 AND m.role IN ('owner', 'admin')
+  )`;
+}
+
+function portalSessionBindings(authorization: CloudCustomerHostPortalAuthorization): unknown[] {
+  return [
+    authorization.sessionTokenHash,
+    authorization.tenantId,
+    authorization.membershipId,
+    authorization.nowMs,
+  ];
 }
 
 export async function listAdminVerifiedCustomerHosts(

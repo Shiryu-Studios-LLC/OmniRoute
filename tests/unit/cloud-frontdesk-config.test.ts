@@ -80,7 +80,12 @@ const IDEMPOTENCY_KEY = "frontdesk-config-idempotency-key-0123456789";
 const ENCRYPTION_KEY = btoa(String.fromCharCode(...new Uint8Array(32).fill(17)));
 const DASHBOARD_SECRET = "dashboard_token_secret_for_tenant_b_0123456789";
 
-async function fixture() {
+async function fixture(
+  options: {
+    now?: () => Date;
+    customerHostTxtResolver?: (recordName: string) => Promise<string[] | null>;
+  } = {}
+) {
   const db = new SqliteCloudDb();
   for (const migration of [
     "0001_cloud_runtime.sql",
@@ -92,8 +97,11 @@ async function fixture() {
     "0008_cloud_tenant_settings.sql",
     "0015_cloud_tenant_oidc.sql",
     "0016_cloud_tenant_oidc_sessions.sql",
+    "0021_cloud_maintenance_runs.sql",
     "0025_verified_customer_hosts.sql",
     "0028_cloud_frontdesk_configs.sql",
+    "0029_cloud_maintenance_image_job_task.sql",
+    "0030_cloud_customer_host_verification_challenges.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
@@ -142,7 +150,8 @@ async function fixture() {
       OMNIROUTE_FRONT_DESK_CONFIG_TOKEN: SERVICE_TOKEN,
       OMNIROUTE_CLOUD_PUBLIC_ORIGIN: "https://cloud.test",
     },
-    now: () => new Date(NOW),
+    now: options.now ?? (() => new Date(NOW)),
+    customerHostTxtResolver: options.customerHostTxtResolver,
   });
 
   const call = (path: string, options: { method?: string; token?: string; body?: unknown } = {}) =>
@@ -438,6 +447,286 @@ test("customer Front Desk portal is tenant scoped, owner/admin only, redacted, a
       body: configBody("front-a.example.test", tenantA.ownerApiKey.token, "frontdesk-device-a"),
     });
     assert.equal(afterRevocation.status, 403);
+  } finally {
+    db.db.close();
+  }
+});
+
+test("customer host portal is tenant isolated and protects DNS challenges across session changes", async () => {
+  let nowMs = Date.parse(NOW);
+  let dnsValues: string[] = [];
+  let onDnsLookup: () => Promise<void> = async () => undefined;
+  const { db, tenantA, tenantB, runtime } = await fixture({
+    now: () => new Date(nowMs),
+    customerHostTxtResolver: async () => {
+      await onDnsLookup();
+      return dnsValues;
+    },
+  });
+  const hashToken = async (token: string) => {
+    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+    return Array.from(new Uint8Array(hash), (part) => part.toString(16).padStart(2, "0")).join("");
+  };
+  const addSession = async (
+    tenant: typeof tenantA,
+    membershipId: string,
+    token: string,
+    identityId: string,
+    subject: string
+  ) => {
+    const issuer = `https://${tenant.tenant.slug}.identity.example.test`;
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO cloud_tenant_oidc_configs
+      (tenant_id, issuer, client_id, client_secret_encrypted, scopes_json, is_enabled, created_at, updated_at)
+      VALUES (?, ?, 'client', 'enc:v1:test', '["openid"]', 1, ?, ?)`
+      )
+      .bind(tenant.tenant.id, issuer, NOW, NOW)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_identities
+      (id, tenant_id, issuer, subject, membership_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(identityId, tenant.tenant.id, issuer, subject, membershipId, NOW)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_sessions
+      (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        await hashToken(token),
+        tenant.tenant.id,
+        membershipId,
+        identityId,
+        nowMs,
+        nowMs + 3_600_000
+      )
+      .run();
+  };
+  const ownerA = "host-portal-owner-session-token-01234567890123456789";
+  const ownerB = "host-portal-owner-b-session-token-01234567890123456789";
+  const memberToken = "host-portal-member-session-token-01234567890123456789";
+  const viewerToken = "host-portal-viewer-session-token-01234567890123456789";
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenantA.tenant.id,
+    principalId: "host-portal-member",
+    role: "member",
+    now: NOW,
+  });
+  const viewer = await createCloudCustomerMembership(db, {
+    tenantId: tenantA.tenant.id,
+    principalId: "host-portal-viewer",
+    role: "viewer",
+    now: NOW,
+  });
+  await addSession(tenantA, tenantA.ownerMembership.id, ownerA, "host-owner-a", "owner-a");
+  await addSession(tenantA, member.id, memberToken, "host-member-a", "member-a");
+  await addSession(tenantA, viewer.id, viewerToken, "host-viewer-a", "viewer-a");
+  await addSession(tenantB, tenantB.ownerMembership.id, ownerB, "host-owner-b", "owner-b");
+  const call = (path: string, token: string, method = "GET", body?: unknown, origin = true) =>
+    runtime.fetch(
+      new Request(`https://cloud.test${path}`, {
+        method,
+        headers: {
+          Cookie: `omni_customer_session=${token}`,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...(body === undefined || !origin ? {} : { Origin: "https://cloud.test" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+    );
+  const challenge = async (token: string, hostname: string) => {
+    const response = await call("/__cloud/auth/front-desk/hosts/challenge", token, "POST", {
+      hostname,
+    });
+    return {
+      response,
+      body: (await response.json()) as { challengeId?: string; recordValue?: string },
+    };
+  };
+
+  try {
+    assert.equal(
+      (
+        await call("/__cloud/auth/front-desk/hosts/challenge", memberToken, "POST", {
+          hostname: "member.example.test",
+        })
+      ).status,
+      403
+    );
+    assert.equal(
+      (
+        await call("/__cloud/auth/front-desk/hosts/challenge", viewerToken, "POST", {
+          hostname: "viewer.example.test",
+        })
+      ).status,
+      403
+    );
+    assert.equal(
+      (await call(`/__cloud/auth/front-desk/hosts?tenantId=${tenantB.tenant.id}`, ownerA)).status,
+      400
+    );
+    assert.equal(
+      (
+        await call("/__cloud/auth/front-desk/hosts/challenge", ownerA, "POST", {
+          hostname: "spoof.example.test",
+          tenantId: tenantB.tenant.id,
+        })
+      ).status,
+      400
+    );
+    assert.equal(
+      (
+        await call(
+          "/__cloud/auth/front-desk/hosts/challenge",
+          ownerA,
+          "POST",
+          {
+            hostname: "missing-origin.example.test",
+          },
+          false
+        )
+      ).status,
+      403
+    );
+
+    const [issuedA, issuedB] = await Promise.all([
+      challenge(ownerA, "success.customer-a.example.test"),
+      challenge(ownerB, "pending.customer-b.example.test"),
+    ]);
+    assert.equal(issuedA.response.status, 201);
+    assert.equal(issuedB.response.status, 201);
+    assert.ok(issuedA.body.challengeId && issuedA.body.recordValue);
+    assert.ok(issuedB.body.challengeId && issuedB.body.recordValue);
+    const rotatedA = await challenge(ownerA, "success.customer-a.example.test");
+    assert.equal(rotatedA.response.status, 201);
+    assert.notEqual(rotatedA.body.challengeId, issuedA.body.challengeId);
+    assert.notEqual(rotatedA.body.recordValue, issuedA.body.recordValue);
+    const crossTenantVerify = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+      hostname: "pending.customer-b.example.test",
+      challengeId: issuedB.body.challengeId,
+    });
+    assert.equal(crossTenantVerify.status, 404);
+
+    const mismatchChallenge = await challenge(ownerA, "attempts.customer-a.example.test");
+    assert.equal(mismatchChallenge.response.status, 201);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const mismatch = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+        hostname: "attempts.customer-a.example.test",
+        challengeId: mismatchChallenge.body.challengeId,
+      });
+      assert.equal(mismatch.status, 422);
+    }
+    const exhausted = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+      hostname: "attempts.customer-a.example.test",
+      challengeId: mismatchChallenge.body.challengeId,
+    });
+    assert.equal(exhausted.status, 410);
+
+    const expiredChallenge = await challenge(ownerA, "expired.customer-a.example.test");
+    assert.equal(expiredChallenge.response.status, 201);
+    nowMs += 31 * 60_000;
+    const expired = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+      hostname: "expired.customer-a.example.test",
+      challengeId: expiredChallenge.body.challengeId,
+    });
+    assert.equal(expired.status, 410);
+
+    const pending = await challenge(ownerA, "rollback.customer-a.example.test");
+    assert.equal(pending.response.status, 201);
+    dnsValues = [pending.body.recordValue!];
+    const tokenHash = await hashToken(pending.body.recordValue!);
+    const storedChallenge = await db
+      .prepare<{ token_hash: string }>(
+        "SELECT token_hash FROM cloud_customer_host_verification_challenges WHERE hostname = ?"
+      )
+      .bind("rollback.customer-a.example.test")
+      .first();
+    assert.equal(storedChallenge?.token_hash, tokenHash);
+    assert.notEqual(storedChallenge?.token_hash, pending.body.recordValue);
+
+    await db.exec(`CREATE TRIGGER reject_customer_host_verify_audit BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action = 'customer.host.verify' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END`);
+    const rolledBack = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+      hostname: "rollback.customer-a.example.test",
+      challengeId: pending.body.challengeId,
+    });
+    assert.equal(rolledBack.status, 503);
+    assert.equal(
+      await db
+        .prepare("SELECT 1 FROM cloud_verified_customer_hosts WHERE hostname = ?")
+        .bind("rollback.customer-a.example.test")
+        .first(),
+      null
+    );
+    assert.ok(
+      await db
+        .prepare("SELECT 1 FROM cloud_customer_host_verification_challenges WHERE hostname = ?")
+        .bind("rollback.customer-a.example.test")
+        .first()
+    );
+    await db.exec("DROP TRIGGER reject_customer_host_verify_audit");
+
+    const verified = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+      hostname: "rollback.customer-a.example.test",
+      challengeId: pending.body.challengeId,
+    });
+    assert.equal(verified.status, 201, await verified.clone().text());
+    const replay = await call("/__cloud/auth/front-desk/hosts/verify", ownerA, "POST", {
+      hostname: "rollback.customer-a.example.test",
+      challengeId: pending.body.challengeId,
+    });
+    assert.equal(replay.status, 404);
+    const listed = await call("/__cloud/auth/front-desk/hosts", ownerA);
+    const listedText = await listed.text();
+    assert.equal(listed.status, 200, listedText);
+    assert.match(listedText, /rollback\.customer-a\.example\.test/);
+    assert.doesNotMatch(listedText, new RegExp(pending.body.recordValue!));
+    const audit = await db
+      .prepare<{ actor: string; action: string; metadata_json: string | null }>(
+        `SELECT actor, action, metadata_json FROM cloud_compliance_audit
+        WHERE action IN ('customer.host.challenge.issue', 'customer.host.verify')`
+      )
+      .all();
+    assert.ok(
+      audit.results.some((row) => row.actor === `membership:${tenantA.ownerMembership.id}`)
+    );
+    assert.ok(audit.results.some((row) => row.action === "customer.host.verify"));
+    assert.doesNotMatch(JSON.stringify(audit.results), new RegExp(pending.body.recordValue!));
+
+    const revokedSessionChallenge = await challenge(
+      ownerA,
+      "revoked-session.customer-a.example.test"
+    );
+    assert.equal(revokedSessionChallenge.response.status, 201);
+    dnsValues = [revokedSessionChallenge.body.recordValue!];
+    onDnsLookup = async () => {
+      await db
+        .prepare("UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ? WHERE token_hash = ?")
+        .bind(nowMs, await hashToken(ownerA))
+        .run();
+    };
+    const revokedDuringLookup = await call(
+      "/__cloud/auth/front-desk/hosts/verify",
+      ownerA,
+      "POST",
+      {
+        hostname: "revoked-session.customer-a.example.test",
+        challengeId: revokedSessionChallenge.body.challengeId,
+      }
+    );
+    assert.equal(revokedDuringLookup.status, 403);
+    assert.equal(
+      await db
+        .prepare("SELECT 1 FROM cloud_verified_customer_hosts WHERE hostname = ?")
+        .bind("revoked-session.customer-a.example.test")
+        .first(),
+      null
+    );
+    onDnsLookup = async () => undefined;
   } finally {
     db.db.close();
   }

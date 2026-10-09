@@ -347,6 +347,42 @@ test(
       (await page.locator("#onboarding-readiness").textContent())?.includes(tenantId),
       false
     );
+    await page.getByRole("heading", { name: "Verify a Front Desk host" }).waitFor();
+    await page.getByLabel("Hostname").fill("browser-customer.example.test");
+    const challengeResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/__cloud/auth/front-desk/hosts/challenge") &&
+        response.request().method() === "POST"
+    );
+    await page.getByRole("button", { name: "Issue DNS challenge" }).click();
+    const challengeResponse = await challengeResponsePromise;
+    assert.equal(challengeResponse.status(), 201, await challengeResponse.text());
+    const challenge = (await challengeResponse.json()) as {
+      recordName: string;
+      recordValue: string;
+      challengeId: string;
+    };
+    assert.equal(challenge.recordName, "_omniroute-challenge.browser-customer.example.test");
+    assert.equal(typeof challenge.recordValue, "string");
+    await page.getByText(challenge.recordValue, { exact: true }).waitFor();
+    const challengeStorage = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT token_hash FROM cloud_customer_host_verification_challenges WHERE hostname = 'browser-customer.example.test';`,
+    ]);
+    assert.equal(challengeStorage.status, 0, challengeStorage.stderr);
+    assert.ok(!challengeStorage.stdout.includes(challenge.recordValue));
     await page.locator("#local-ai-opt-in-enabled").check();
     await page.getByRole("button", { name: "Save Local AI setting" }).click();
     await page

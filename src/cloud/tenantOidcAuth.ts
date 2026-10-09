@@ -38,6 +38,11 @@ import {
 } from "./customerProviderHttpApi";
 import { handleCloudTenantMcpPortalRequest } from "./tenantMcpHttpApi";
 import { handleCloudFrontDeskConfigPortalRequest } from "./frontDeskConfigHttpApi";
+import {
+  CLOUD_CUSTOMER_FRONT_DESK_HOSTS_PATH,
+  handleCloudCustomerHostPortalRequest,
+} from "./tenantHostsHttpApi";
+import type { CustomerHostTxtResolver } from "./tenantHostDns";
 import { getCloudCustomerOnboardingReadiness } from "./tenantOnboardingHttpApi";
 import {
   invalidateCloudTenantDeviceSessions,
@@ -125,6 +130,7 @@ export interface CloudTenantOidcAuthOptions {
   credentialEncryptionKey?: string;
   now?: () => number;
   fetcher?: typeof fetch;
+  customerHostTxtResolver?: CustomerHostTxtResolver;
 }
 
 function json(body: unknown, status = 200, headers?: HeadersInit): Response {
@@ -1041,6 +1047,22 @@ async function customerFrontDeskConfigPortal(
   if (request.method !== "GET" && request.headers.get("origin") !== origin.origin) {
     return json({ error: "Origin not allowed" }, 403);
   }
+  if (
+    new URL(request.url).pathname === CLOUD_CUSTOMER_FRONT_DESK_HOSTS_PATH ||
+    new URL(request.url).pathname.startsWith(`${CLOUD_CUSTOMER_FRONT_DESK_HOSTS_PATH}/`)
+  ) {
+    const response = await handleCloudCustomerHostPortalRequest(
+      request,
+      { db: options.db, now: () => new Date(nowMs), resolveTxt: options.customerHostTxtResolver },
+      {
+        tenantId: session.tenant_id,
+        membershipId: session.membership_id,
+        sessionTokenHash: session.session_token_hash,
+        role: session.role,
+      }
+    );
+    return response ?? json({ error: "Not found" }, 404);
+  }
   const response = await handleCloudFrontDeskConfigPortalRequest(
     request,
     {
@@ -1805,7 +1827,7 @@ export async function handleCloudTenantOidcAuthRequest(
           : isMcpServers
             ? ["GET", "POST", "PUT", "DELETE"]
             : isFrontDesk
-              ? ["GET", "PUT", "DELETE"]
+              ? ["GET", "PUT", "DELETE", "POST"]
               : isOnboarding
                 ? ["GET"]
                 : isMcpSettings

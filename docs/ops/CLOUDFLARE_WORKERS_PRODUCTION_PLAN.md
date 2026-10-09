@@ -286,6 +286,13 @@ Desk branding, and end-to-end customer onboarding still require further work.
 Dynamic Front Desk config retrieval requires a one-time shared service token in
 OmniRoute and Front Desk secret stores; no customer-specific server file edits
 are needed once a verified host and tenant config have been provisioned.
+Customer owners/admins can now provision a host themselves in the OIDC Front
+Desk portal: the portal issues a short-lived DNS TXT challenge, discloses the
+value once, verifies it through the fixed resolver, and lists the tenant's
+verified hosts. Tenant identity comes from the active portal session, and the
+host can then be configured in the same portal. The platform-admin host API
+remains available for break-glass registration. The portal flow is locally
+tested; hosted DNS and staging deployment validation remain open.
 
 **Exit:** a new tenant can be created without manually editing server files.
 
