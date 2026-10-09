@@ -702,6 +702,101 @@ test("maintenance identity requires an owner to provision and cannot access clou
   assert.equal(membershipMutation.status, 401);
 });
 
+test("tenant and device lifecycle routes enforce the platform-admin and maintenance token boundary", async () => {
+  const maintenanceToken = "test-cloud-maintenance-secret";
+  const tenantStatusPath = "/__cloud/v1/tenants/tenant-a/status";
+  const deviceListPath = "/__cloud/v1/tenants/tenant-a/gateway-devices";
+
+  const makeLifecycleRequest = (method: "GET" | "POST", token?: string) =>
+    new Request(`https://omniroute.test${tenantStatusPath}`, {
+      method,
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(method === "POST" ? { body: JSON.stringify({ status: "suspended" }) } : {}),
+    });
+
+  const makeDeviceRequest = (path: string, method: "GET" | "POST" | "DELETE", token?: string) =>
+    new Request(`https://omniroute.test${path}`, {
+      method,
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(method === "POST" ? { body: JSON.stringify({}) } : {}),
+    });
+
+  const db = new TestD1();
+  const app = runtime(db, undefined, undefined, maintenanceToken);
+
+  // The maintenance credential is intentionally scoped to status lifecycle and
+  // provisioning operations; it cannot enumerate or manage customer devices.
+  assert.equal((await app.fetch(makeLifecycleRequest("GET"))).status, 401);
+  assert.equal((await app.fetch(makeLifecycleRequest("GET", adminToken))).status, 200);
+  assert.equal((await app.fetch(makeLifecycleRequest("GET", maintenanceToken))).status, 200);
+  assert.equal((await app.fetch(makeDeviceRequest(deviceListPath, "GET"))).status, 401);
+  assert.equal((await app.fetch(makeDeviceRequest(deviceListPath, "GET", adminToken))).status, 200);
+  for (const [path, method] of [
+    [deviceListPath, "GET"],
+    [deviceListPath, "POST"],
+    [`${deviceListPath}/device-a`, "DELETE"],
+    [`${deviceListPath}/device-a/rotate-credential`, "POST"],
+  ] as const) {
+    const maintenanceDeviceResponse = await app.fetch(
+      makeDeviceRequest(path, method, maintenanceToken)
+    );
+    assert.equal(maintenanceDeviceResponse.status, 401, `${method} ${path} is admin-only`);
+    assert.deepEqual(await maintenanceDeviceResponse.json(), { error: "Unauthorized" });
+  }
+
+  const maintenanceMutation = await app.fetch(
+    new Request(`https://omniroute.test${tenantStatusPath}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${maintenanceToken}`,
+        "Content-Type": "application/json",
+        "x-request-id": "maintenance-lifecycle-request",
+      },
+      body: JSON.stringify({ status: "suspended" }),
+    })
+  );
+  assert.equal(maintenanceMutation.status, 200);
+  assert.equal(db.auditRows.length, 2);
+  for (const row of db.auditRows) {
+    assert.equal(row[1], "tenant_shiryu_admin", "lifecycle audits use the platform tenant");
+    assert.equal(row[3], "tenant.lifecycle.status");
+    assert.equal(row[4], "cloud-maintenance", "actor comes from the verified token class");
+    assert.equal(row[5], "tenant-a");
+    assert.equal(row[8], "tenant");
+    assert.equal(row[9], row === db.auditRows[0] ? "attempted" : "success");
+    assert.equal(row[10], "maintenance-lifecycle-request");
+    assert.equal(String(row[11]).includes(maintenanceToken), false);
+  }
+
+  const adminDb = new TestD1();
+  const adminApp = runtime(adminDb, undefined, undefined, maintenanceToken);
+  const adminMutation = await adminApp.fetch(
+    new Request(`https://omniroute.test${tenantStatusPath}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+        "x-request-id": "admin-lifecycle-request",
+      },
+      body: JSON.stringify({ status: "suspended" }),
+    })
+  );
+  assert.equal(adminMutation.status, 200);
+  assert.equal(adminDb.auditRows.length, 2);
+  assert.deepEqual(
+    adminDb.auditRows.map((row) => row[4]),
+    ["cloud-admin", "cloud-admin"],
+    "platform-admin requests retain canonical audit attribution"
+  );
+  assert.equal(JSON.stringify(adminDb.auditRows).includes(adminToken), false);
+});
+
 test("cloud admin API fails closed when admin and maintenance tokens are identical", async () => {
   const app = createCloudRuntime({
     env: {
