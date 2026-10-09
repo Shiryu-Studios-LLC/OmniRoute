@@ -451,6 +451,127 @@ test("identity admin cannot link an unverified OIDC subject to a customer member
   assert.ok(identity.id);
 });
 
+test("platform OIDC activation refuses destructive issuer changes but permits same-issuer updates", async () => {
+  const identityAdminToken = "test-identity-admin-token-for-oidc-cutover";
+  const { db, tenant, membership } = await setup();
+  const app = runtime(db, undefined, undefined, identityAdminToken);
+  const configPath = `${ORIGIN}/__cloud/v1/tenants/${tenant.id}/oidc`;
+  const activate = (issuer: string) =>
+    app.fetch(
+      new Request(configPath, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${identityAdminToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          issuer,
+          clientId: "rotated-client",
+          clientSecret: "rotated-client-secret",
+          isEnabled: true,
+        }),
+      })
+    );
+  const deleteConfig = () =>
+    app.fetch(
+      new Request(configPath, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${identityAdminToken}` },
+      })
+    );
+
+  const existingLink = db.raw
+    .prepare(
+      "SELECT issuer, subject, membership_id FROM cloud_tenant_oidc_identities WHERE tenant_id = ?"
+    )
+    .all(tenant.id);
+  const changedIssuer = await activate("https://replacement-idp.example");
+  assert.equal(changedIssuer.status, 400, await changedIssuer.clone().text());
+  assert.deepEqual(await changedIssuer.json(), {
+    error:
+      "OIDC issuer cannot be changed while active owners or linked identities exist; complete a verified recovery flow first",
+  });
+  assert.equal(
+    (
+      db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER
+  );
+  assert.deepEqual(
+    db.raw
+      .prepare(
+        "SELECT issuer, subject, membership_id FROM cloud_tenant_oidc_identities WHERE tenant_id = ?"
+      )
+      .all(tenant.id),
+    existingLink,
+    "a rejected cutover must preserve the current owner/member identity links"
+  );
+  const linkedDelete = await deleteConfig();
+  assert.equal(linkedDelete.status, 409);
+  assert.deepEqual(await linkedDelete.json(), {
+    error:
+      "OIDC configuration cannot be deleted while active owners or linked identities exist; complete a verified recovery flow first",
+  });
+
+  const sameIssuer = await activate(ISSUER);
+  assert.equal(sameIssuer.status, 200, await sameIssuer.clone().text());
+  assert.equal(
+    db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+      .get(tenant.id)?.count,
+    1,
+    "same-issuer client rotation must not unlink identities"
+  );
+
+  await db
+    .prepare("DELETE FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+    .bind(tenant.id)
+    .run();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const ownerWithoutLink = await activate("https://another-idp.example");
+  assert.equal(ownerWithoutLink.status, 400);
+  assert.equal(
+    (
+      db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER,
+    "an orphaned active owner also prevents an unrecoverable issuer cutover"
+  );
+  const ownerDelete = await deleteConfig();
+  assert.equal(ownerDelete.status, 409);
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET is_active = 0 WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const ownerlessCutover = await activate("https://another-idp.example");
+  assert.equal(ownerlessCutover.status, 200, await ownerlessCutover.clone().text());
+  assert.equal(
+    (
+      db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(tenant.id) as { issuer: string }
+    ).issuer,
+    "https://another-idp.example",
+    "issuer changes remain possible after tenant identity recovery has removed active owners and links"
+  );
+  const deleted = await deleteConfig();
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await deleted.json(), { deleted: true });
+  assert.equal(
+    db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+      .get(tenant.id)?.count,
+    0
+  );
+});
+
 function getCookieValue(response: Response, name: string): string {
   const cookies = response.headers.getSetCookie();
   const cookie = cookies.find((value) => value.startsWith(`${name}=`));
@@ -464,7 +585,8 @@ function runtime(
   sessions?: {
     idFromName(name: string): unknown;
     get(id: unknown): { revokeSession(deviceId: string, timestamp: string): Promise<unknown> };
-  }
+  },
+  identityAdminToken?: string
 ) {
   const oidcProxyToken = "oidc-proxy-test-secret-with-at-least-thirty-two-characters";
   const oidcProxy = fetcher
@@ -479,6 +601,18 @@ function runtime(
       OMNIROUTE_ENV: "production",
       OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ORIGIN,
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
+      ...(identityAdminToken
+        ? {
+            OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: identityAdminToken,
+            OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: "test-inference-admin-token-for-oidc-cutover",
+            OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: "test-lifecycle-admin-token-for-oidc-cutover",
+            OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN:
+              "test-tenant-hosts-admin-token-for-oidc-cutover",
+            OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: "test-front-desk-admin-token-for-oidc-cutover",
+            OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: "test-maintenance-admin-token-for-oidc-cutover",
+            OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: Buffer.alloc(32, 42).toString("base64"),
+          }
+        : {}),
       ...(oidcProxy
         ? {
             OIDC_EGRESS: { fetch: (request: Request) => oidcProxy(request) },

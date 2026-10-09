@@ -55,6 +55,7 @@ import {
   type CloudInferenceEntitlement,
 } from "./inferencePolicy";
 import {
+  CLOUD_TENANT_OIDC_CONFIG_DELETE_BLOCKED,
   deleteCloudTenantOidcConfig,
   deleteCloudTenantOidcIdentity,
   getCloudTenantOidcConfig,
@@ -824,7 +825,11 @@ export async function handleCloudApiRequest(
           }
           if (request.method === "DELETE") {
             await recordAudit("customer.oidc.config.delete", tenantId, "attempted");
-            if (!(await deleteCloudTenantOidcConfig(db, tenantId))) {
+            const deleted = await deleteCloudTenantOidcConfig(db, tenantId);
+            if (deleted === "recovery_required") {
+              return json({ error: CLOUD_TENANT_OIDC_CONFIG_DELETE_BLOCKED }, 409);
+            }
+            if (deleted === "not_found") {
               return json({ error: "OIDC configuration not found" }, 404);
             }
             await recordAudit("customer.oidc.config.delete", tenantId, "success");

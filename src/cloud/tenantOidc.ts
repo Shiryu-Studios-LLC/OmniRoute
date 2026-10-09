@@ -7,6 +7,10 @@ import {
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const DEFAULT_SCOPES = ["openid", "profile", "email"];
+const OIDC_ISSUER_CHANGE_BLOCKED =
+  "OIDC issuer cannot be changed while active owners or linked identities exist; complete a verified recovery flow first";
+export const CLOUD_TENANT_OIDC_CONFIG_DELETE_BLOCKED =
+  "OIDC configuration cannot be deleted while active owners or linked identities exist; complete a verified recovery flow first";
 
 export interface CloudTenantOidcConfig {
   tenantId: string;
@@ -220,6 +224,24 @@ export async function setCloudTenantOidcConfig(
     .prepare<ConfigRow>("SELECT * FROM cloud_tenant_oidc_configs WHERE tenant_id = ? LIMIT 1")
     .bind(tenantId)
     .first();
+  if (existing && existing.issuer !== issuer) {
+    const protectedIdentityState = await db
+      .prepare<{ blocked: number }>(
+        `SELECT CASE WHEN EXISTS (
+                  SELECT 1 FROM cloud_customer_memberships membership
+                   WHERE membership.tenant_id = ? AND membership.role = 'owner'
+                     AND membership.is_active = 1
+                ) OR EXISTS (
+                  SELECT 1 FROM cloud_tenant_oidc_identities identity
+                   WHERE identity.tenant_id = ?
+                ) THEN 1 ELSE 0 END AS blocked`
+      )
+      .bind(tenantId, tenantId)
+      .first();
+    if (protectedIdentityState?.blocked === 1) {
+      throw new TypeError(OIDC_ISSUER_CHANGE_BLOCKED);
+    }
+  }
   const scopes = requireScopes(input.scopes ?? (existing ? mapConfig(existing).scopes : undefined));
   if (!existing && !clientSecret) throw new TypeError("OIDC clientSecret is required for setup");
   const now = input.now ?? new Date().toISOString();
@@ -234,16 +256,9 @@ export async function setCloudTenantOidcConfig(
   const isEnabled =
     input.isEnabled === undefined ? (existing?.is_enabled ?? 0) === 1 : input.isEnabled;
   const createdAt = existing?.created_at ?? now;
-  const statements: ReturnType<CloudDb["prepare"]>[] = [];
-  if (existing && existing.issuer !== issuer) {
-    statements.push(
-      db.prepare("DELETE FROM cloud_tenant_oidc_identities WHERE tenant_id = ?").bind(tenantId)
-    );
-  }
-  statements.push(
-    db
-      .prepare(
-        `INSERT INTO cloud_tenant_oidc_configs
+  const statement = db
+    .prepare(
+      `INSERT INTO cloud_tenant_oidc_configs
            (tenant_id, issuer, client_id, client_secret_encrypted, scopes_json,
             is_enabled, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -253,20 +268,31 @@ export async function setCloudTenantOidcConfig(
            client_secret_encrypted = excluded.client_secret_encrypted,
            scopes_json = excluded.scopes_json,
            is_enabled = excluded.is_enabled,
-           updated_at = excluded.updated_at`
-      )
-      .bind(
-        tenantId,
-        issuer,
-        clientId,
-        secretEnvelope,
-        JSON.stringify(scopes),
-        isEnabled ? 1 : 0,
-        createdAt,
-        now
-      )
-  );
-  const results = await db.batch(statements);
+           updated_at = excluded.updated_at
+         WHERE cloud_tenant_oidc_configs.issuer = excluded.issuer
+            OR (
+              NOT EXISTS (
+                SELECT 1 FROM cloud_customer_memberships membership
+                 WHERE membership.tenant_id = excluded.tenant_id
+                   AND membership.role = 'owner' AND membership.is_active = 1
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM cloud_tenant_oidc_identities identity
+                 WHERE identity.tenant_id = excluded.tenant_id
+              )
+            )`
+    )
+    .bind(
+      tenantId,
+      issuer,
+      clientId,
+      secretEnvelope,
+      JSON.stringify(scopes),
+      isEnabled ? 1 : 0,
+      createdAt,
+      now
+    );
+  const results = await db.batch([statement]);
   if (
     results.some(
       (result) =>
@@ -280,22 +306,50 @@ export async function setCloudTenantOidcConfig(
   }
   const config = await getCloudTenantOidcConfig(db, tenantId);
   if (!config) throw new Error("OIDC configuration could not be read after save");
+  if (config.issuer !== issuer) throw new TypeError(OIDC_ISSUER_CHANGE_BLOCKED);
   return config;
 }
 
-export async function deleteCloudTenantOidcConfig(db: CloudDb, tenantId: string): Promise<boolean> {
+export async function deleteCloudTenantOidcConfig(
+  db: CloudDb,
+  tenantId: string
+): Promise<"deleted" | "not_found" | "recovery_required"> {
   requireId(tenantId, "tenantId");
-  const results = await db.batch([
-    db.prepare("DELETE FROM cloud_tenant_oidc_identities WHERE tenant_id = ?").bind(tenantId),
-    db.prepare("DELETE FROM cloud_tenant_oidc_configs WHERE tenant_id = ?").bind(tenantId),
-  ]);
-  return results.some(
-    (result) =>
-      typeof result === "object" &&
-      result !== null &&
-      "meta" in result &&
-      Number((result as { meta?: { changes?: number } }).meta?.changes ?? 0) > 0
-  );
+  const result = await db
+    .prepare(
+      `DELETE FROM cloud_tenant_oidc_configs
+        WHERE tenant_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM cloud_customer_memberships membership
+             WHERE membership.tenant_id = cloud_tenant_oidc_configs.tenant_id
+               AND membership.role = 'owner' AND membership.is_active = 1
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_identities identity
+             WHERE identity.tenant_id = cloud_tenant_oidc_configs.tenant_id
+          )`
+    )
+    .bind(tenantId)
+    .run();
+  if (!result.success) throw new Error("OIDC configuration could not be deleted");
+  if (Number(result.meta?.changes ?? 0) === 1) return "deleted";
+
+  const current = await db
+    .prepare<{ blocked: number }>(
+      `SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM cloud_customer_memberships membership
+                 WHERE membership.tenant_id = cloud_tenant_oidc_configs.tenant_id
+                   AND membership.role = 'owner' AND membership.is_active = 1
+              ) OR EXISTS (
+                SELECT 1 FROM cloud_tenant_oidc_identities identity
+                 WHERE identity.tenant_id = cloud_tenant_oidc_configs.tenant_id
+              ) THEN 1 ELSE 0 END AS blocked
+         FROM cloud_tenant_oidc_configs
+        WHERE tenant_id = ? LIMIT 1`
+    )
+    .bind(tenantId)
+    .first();
+  return current?.blocked === 1 ? "recovery_required" : "not_found";
 }
 
 export async function listCloudTenantOidcIdentities(

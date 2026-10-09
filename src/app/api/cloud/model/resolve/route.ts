@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
-import { validateApiKey, getModelAliases } from "@/models";
+import { validateApiKey } from "@/models";
+import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+import { getCloudModelAliasesForTenant } from "@/lib/db/models/aliases";
 import { cloudResolveAliasSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -10,7 +12,12 @@ export async function POST(request: Request) {
     rawBody = await request.json();
   } catch {
     return NextResponse.json(
-      { error: { message: "Invalid request", details: [{ field: "body", message: "Invalid JSON body" }] } },
+      {
+        error: {
+          message: "Invalid request",
+          details: [{ field: "body", message: "Invalid JSON body" }],
+        },
+      },
       { status: 400 }
     );
   }
@@ -34,8 +41,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
     }
 
+    const metadata = await getApiKeyMetadata(apiKey);
+    if (!metadata?.tenantId) {
+      return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
+    }
+
     // Get model aliases
-    const modelAliases = await getModelAliases();
+    const modelAliases = await getCloudModelAliasesForTenant(metadata.tenantId);
     const resolvedValue = modelAliases[alias];
     const resolved = typeof resolvedValue === "string" ? resolvedValue : null;
 

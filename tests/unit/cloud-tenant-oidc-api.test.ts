@@ -333,8 +333,8 @@ test("first-owner claims require the platform admin, enabled OIDC, and no existi
   assert.equal(noConfig.status, 409);
 });
 
-test("Cloud OIDC config changes clear old issuer links and deletion clears the tenant config", async () => {
-  const { db, memberA } = await makeDb();
+test("Cloud OIDC config preserves links on same-issuer updates and rejects destructive issuer changes", async () => {
+  const { db, ownerA, memberA } = await makeDb();
   const created = await call(db, "customer-a/oidc", "PUT", {
     issuer: "https://id.example.com/tenant-a",
     clientId: "client-a",
@@ -351,7 +351,7 @@ test("Cloud OIDC config changes clear old issuer links and deletion clears the t
   });
 
   const update = await call(db, "customer-a/oidc", "PUT", {
-    issuer: "https://id.example.com/tenant-a-v2",
+    issuer: "https://id.example.com/tenant-a",
     clientId: "client-a-v2",
   });
   assert.equal(update.status, 200);
@@ -360,18 +360,41 @@ test("Cloud OIDC config changes clear old issuer links and deletion clears the t
   assert.equal(updatedConfig.hasClientSecret, true, "updates preserve the encrypted secret");
   assert.equal(
     ((await json(await call(db, "customer-a/oidc/identities"))) as unknown[]).length,
-    0,
-    "changing issuer clears exact links tied to the previous issuer"
+    1,
+    "same-issuer client rotation preserves exact identity links"
   );
 
-  const relinked = await addCloudTenantOidcIdentity(db, {
-    tenantId: "customer-a",
+  const changedIssuer = await call(db, "customer-a/oidc", "PUT", {
     issuer: "https://id.example.com/tenant-a-v2",
-    subject: "member-subject-v2",
-    membershipId: memberA.id,
-    now: NOW,
+    clientId: "client-a-v2",
   });
-  assert.equal(relinked.issuer, "https://id.example.com/tenant-a-v2");
+  assert.equal(changedIssuer.status, 400);
+  assert.match(
+    ((await json(changedIssuer)) as { error: string }).error,
+    /complete a verified recovery flow first/
+  );
+  assert.equal(
+    ((await json(await call(db, "customer-a/oidc/identities"))) as unknown[]).length,
+    1,
+    "rejected issuer changes must not delete the existing identity link"
+  );
+
+  const blockedDelete = await call(db, "customer-a/oidc", "DELETE");
+  assert.equal(blockedDelete.status, 409);
+  assert.match(
+    ((await json(blockedDelete)) as { error: string }).error,
+    /complete a verified recovery flow first/
+  );
+  await db
+    .prepare("DELETE FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+    .bind("customer-a")
+    .run();
+  const ownerStillActive = await call(db, "customer-a/oidc", "DELETE");
+  assert.equal(ownerStillActive.status, 409, "an active owner also blocks config deletion");
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET is_active = 0 WHERE tenant_id = ? AND id = ?")
+    .bind("customer-a", ownerA.id)
+    .run();
 
   const deleted = await call(db, "customer-a/oidc", "DELETE");
   assert.equal(deleted.status, 200);

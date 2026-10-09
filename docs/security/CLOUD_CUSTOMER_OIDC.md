@@ -75,6 +75,14 @@ disabled. An administrator cannot attach an unverified issuer/subject to a membe
 identity links are created only by a verified OIDC callback, invitation redemption, or
 first-owner claim.
 
+Platform-admin OIDC configuration can rotate a client ID or secret while keeping the same
+issuer. Changing the issuer is rejected while the tenant has any active owner membership or
+any linked OIDC identity. An issuer change would otherwise remove those identity links without
+safely transferring the owner to the new issuer. Deleting the active configuration is also
+rejected while an active owner or linked identity exists. Issuer cutover and configuration
+deletion remain unavailable until a verified recovery flow can establish the replacement
+identity. Unused configurations with no active owners or identity links can still be deleted.
+
 The session cookie is `HttpOnly`, `SameSite=Lax`, scoped to `/__cloud/auth`, and expires
 within eight hours. The database stores a hash of the opaque cookie token. Session
 introspection checks tenant, membership, identity-link, enabled-issuer, and revocation state

@@ -85,6 +85,49 @@ class SqliteCloudDb implements CloudDb {
   }
 }
 
+class UnsuccessfulBudgetWriteStatement<T = unknown> implements CloudDbStatement<T> {
+  constructor(
+    private readonly statement: CloudDbStatement<T>,
+    private readonly failWrite: boolean
+  ) {}
+
+  bind(...values: unknown[]): CloudDbStatement<T> {
+    this.statement.bind(...values);
+    return this;
+  }
+
+  first<U = T>(column?: string): Promise<U | null> {
+    return this.statement.first<U>(column);
+  }
+
+  all<U = T>(): Promise<{ results: U[]; success: boolean; meta?: Record<string, unknown> }> {
+    return this.statement.all<U>();
+  }
+
+  run(): Promise<{ success: boolean; meta?: Record<string, unknown> }> {
+    return this.failWrite ? Promise.resolve({ success: false }) : this.statement.run();
+  }
+}
+
+class UnsuccessfulBudgetWriteDb implements CloudDb {
+  constructor(private readonly db: SqliteCloudDb) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    return new UnsuccessfulBudgetWriteStatement(
+      this.db.prepare<T>(sql),
+      sql.includes("INSERT INTO cloud_inference_monthly_budgets")
+    );
+  }
+
+  batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    return this.db.batch(statements);
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.db.exec(sql);
+  }
+}
+
 const NOW = "2026-10-08T12:00:00.000Z";
 
 async function makeDb(): Promise<SqliteCloudDb> {
@@ -179,6 +222,24 @@ test("cloud inference policy migration is idempotent and does not enable unconfi
       now: NOW,
     });
     assert.deepEqual(await reserve(db), { kind: "denied" }, "disabled entitlements remain denied");
+  } finally {
+    db.db.close();
+  }
+});
+
+test("monthly budget configuration fails when D1 reports an unsuccessful write", async () => {
+  const db = await makeDb();
+  try {
+    await assert.rejects(
+      setCloudInferenceMonthlyBudget(new UnsuccessfulBudgetWriteDb(db), {
+        tenantId: "tenant-a",
+        monthlyTokenLimit: 1,
+        now: NOW,
+      }),
+      /D1 inference monthly budget write failed/
+    );
+    const stored = await getCloudInferenceBudgetStatus(db, "tenant-a", new Date(NOW));
+    assert.equal(stored?.monthlyTokenLimit, null);
   } finally {
     db.db.close();
   }

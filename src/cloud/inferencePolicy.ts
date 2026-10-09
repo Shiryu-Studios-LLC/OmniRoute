@@ -255,7 +255,7 @@ export async function setCloudInferenceMonthlyBudget(
   const tenantId = requireId(input.tenantId, "tenantId");
   const monthlyTokenLimit = requireTokens(input.monthlyTokenLimit, "monthlyTokenLimit");
   const now = validTimestamp(input.now);
-  await db
+  const result = await db
     .prepare(
       `INSERT INTO cloud_inference_monthly_budgets (tenant_id, monthly_token_limit, created_at, updated_at)
        VALUES (?, ?, ?, ?)
@@ -265,6 +265,7 @@ export async function setCloudInferenceMonthlyBudget(
     )
     .bind(tenantId, monthlyTokenLimit, now, now)
     .run();
+  if (!result.success) throw new Error("D1 inference monthly budget write failed");
 }
 
 /**

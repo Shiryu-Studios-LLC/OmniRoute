@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { getProviderConnections, getModelAliases } from "@/models";
+import { getProviderConnections } from "@/models";
 import { getApiKeyMetadata, validateApiKey } from "@/lib/db/apiKeys";
+import { getCloudModelAliasesForTenant } from "@/lib/db/models/aliases";
 import { enterApiKeyTenantContext } from "@/server/authz/tenantMembership";
 import { runWithTenantContext } from "@/lib/tenantContext";
 
@@ -65,7 +66,7 @@ export async function POST(request) {
         }));
 
         // Get model aliases
-        const modelAliases = await getModelAliases();
+        const modelAliases = await getCloudModelAliasesForTenant(metadata.tenantId);
 
         return NextResponse.json({
           connections: mappedConnections,

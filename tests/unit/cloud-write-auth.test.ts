@@ -26,6 +26,7 @@ const tenantProvisioning =
 const tenantContext = await import("../../src/lib/tenantContext.ts");
 const credentialsRoute = await import("../../src/app/api/cloud/credentials/update/route.ts");
 const aliasRoute = await import("../../src/app/api/cloud/models/alias/route.ts");
+const resolveAliasRoute = await import("../../src/app/api/cloud/model/resolve/route.ts");
 const cloudAuthRoute = await import("../../src/app/api/cloud/auth/route.ts");
 
 async function resetStorage() {
@@ -112,6 +113,21 @@ function cloudAuthRequest(token: string | null) {
   const headers = new Headers();
   if (token) headers.set("authorization", `Bearer ${token}`);
   return new Request("http://localhost/api/cloud/auth", { method: "POST", headers });
+}
+
+function cloudAliasListRequest(token: string) {
+  return new Request("http://localhost/api/cloud/models/alias", {
+    method: "GET",
+    headers: { authorization: `Bearer ${token}` },
+  });
+}
+
+function cloudResolveAliasRequest(token: string, alias: string) {
+  return new Request("http://localhost/api/cloud/model/resolve", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ alias }),
+  });
 }
 
 async function captureConsoleLog<T>(fn: () => Promise<T>): Promise<{ value: T; logs: string }> {
@@ -213,6 +229,63 @@ test("PUT /api/cloud/models/alias accepts API key with manage scope", async () =
   assert.equal(aliases["fast-default"], "openai/gpt-4o-mini");
 });
 
+test("PUT /api/cloud/models/alias denies customer manage keys and preserves platform writes", async () => {
+  await localDb.setModelAlias("platform-owned", "openai/original-model");
+  const platformKey = await createKey(["manage"]);
+  const customer = await tenantProvisioning.provisionCustomerTenant({
+    name: "Customer Alias Writer",
+    slug: "customer-alias-writer",
+    owner: { principalId: "customer-alias-writer-owner", identityVerified: true },
+    provisionedBy: "platform-cloud-alias-write-test",
+  });
+  const customerManageKey = await tenantContext.runWithTenantContext(
+    { tenantId: customer.tenant.id, principalId: "customer-alias-writer-admin", role: "owner" },
+    () => createKey(["manage"])
+  );
+  const customerMetadata = await (
+    await import("../../src/lib/db/apiKeys.ts")
+  ).getApiKeyMetadata(customerManageKey.key);
+  assert.equal(customerMetadata?.tenantId, customer.tenant.id);
+
+  const customerResponse = await aliasRoute.PUT(
+    cloudAliasRequest(customerManageKey.key, {
+      alias: "customer-global-write",
+      model: "anthropic/customer-model",
+    })
+  );
+  assert.equal(customerResponse.status, 403);
+  assert.deepEqual(await localDb.getModelAliases(), {
+    "platform-owned": "openai/original-model",
+  });
+
+  const customerAlternateHeaderResponse = await aliasRoute.PUT(
+    new Request("http://localhost/api/cloud/models/alias", {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": customerManageKey.key,
+      },
+      body: JSON.stringify({ alias: "customer-alt-header-write", model: "openai/customer-model" }),
+    })
+  );
+  assert.equal(customerAlternateHeaderResponse.status, 403);
+  assert.deepEqual(await localDb.getModelAliases(), {
+    "platform-owned": "openai/original-model",
+  });
+
+  const platformResponse = await aliasRoute.PUT(
+    cloudAliasRequest(platformKey.key, {
+      alias: "platform-global-write",
+      model: "openai/platform-model",
+    })
+  );
+  assert.equal(platformResponse.status, 200);
+  assert.deepEqual(await localDb.getModelAliases(), {
+    "platform-owned": "openai/original-model",
+    "platform-global-write": "openai/platform-model",
+  });
+});
+
 test("POST /api/cloud/auth scopes provider connection reads to the authenticated customer tenant", async () => {
   const platformConnection = await createActiveConnection("platform-project-marker");
   assert.ok(platformConnection.id);
@@ -258,6 +331,59 @@ test("POST /api/cloud/auth scopes provider connection reads to the authenticated
   );
   assert.equal(customerRows.length, 1);
   assert.equal(customerRows[0].id, customerConnection.id);
+});
+
+test("cloud alias reads preserve platform aliases and hide them from customer API keys", async () => {
+  await localDb.setModelAlias("platform-private", "openai/platform-model");
+
+  const platformKey = await createKey();
+  const customer = await tenantProvisioning.provisionCustomerTenant({
+    name: "Customer Cloud Aliases",
+    slug: "customer-cloud-aliases",
+    owner: { principalId: "customer-cloud-aliases-owner", identityVerified: true },
+    provisionedBy: "platform-cloud-aliases-test",
+  });
+
+  // The legacy key_value namespace is global. Seed another mapping while the
+  // customer context is active to prove the cloud customer surfaces never
+  // expose entries merely because the key belongs to that customer.
+  await tenantContext.runWithTenantContext(
+    { tenantId: customer.tenant.id, principalId: customer.apiKey.id, role: "owner" },
+    () => localDb.setModelAlias("customer-private", "anthropic/customer-model")
+  );
+
+  const platformAuth = await cloudAuthRoute.POST(cloudAuthRequest(platformKey.key));
+  const platformAuthBody = await platformAuth.json();
+  const customerAuth = await cloudAuthRoute.POST(cloudAuthRequest(customer.apiKey.key));
+  const customerAuthBody = await customerAuth.json();
+  const platformList = await aliasRoute.GET(cloudAliasListRequest(platformKey.key));
+  const platformListBody = await platformList.json();
+  const customerList = await aliasRoute.GET(cloudAliasListRequest(customer.apiKey.key));
+  const customerListBody = await customerList.json();
+  const platformResolve = await resolveAliasRoute.POST(
+    cloudResolveAliasRequest(platformKey.key, "platform-private")
+  );
+  const customerResolve = await resolveAliasRoute.POST(
+    cloudResolveAliasRequest(customer.apiKey.key, "platform-private")
+  );
+
+  assert.equal(platformAuth.status, 200);
+  assert.equal(platformAuthBody.modelAliases["platform-private"], "openai/platform-model");
+  assert.equal(platformAuthBody.modelAliases["customer-private"], "anthropic/customer-model");
+  assert.equal(customerAuth.status, 200);
+  assert.deepEqual(customerAuthBody.modelAliases, {});
+  assert.equal(platformList.status, 200);
+  assert.equal(platformListBody.aliases["platform-private"], "openai/platform-model");
+  assert.equal(platformListBody.aliases["customer-private"], "anthropic/customer-model");
+  assert.equal(customerList.status, 200);
+  assert.deepEqual(customerListBody.aliases, {});
+  assert.equal(platformResolve.status, 200);
+  assert.deepEqual(await platformResolve.json(), {
+    alias: "platform-private",
+    provider: "openai",
+    model: "platform-model",
+  });
+  assert.equal(customerResolve.status, 404);
 });
 
 test("cloud write routes keep 401 for missing or invalid Bearer credentials", async () => {
