@@ -15,6 +15,7 @@ import {
   type CloudProviderNodeInput,
 } from "./providers";
 import type { CloudDb } from "./db";
+import { authenticateCloudCustomerApiKey, type CloudCustomerIdentity } from "./customerIdentity";
 import {
   CLOUD_PLATFORM_TENANT_ID,
   getCloudTenantById,
@@ -75,6 +76,12 @@ import { isProviderExecutionLocation, isProviderOwnershipMode } from "./provider
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
 const BODY_READ_TIMEOUT_MS = 10_000;
+const TENANT_SCOPED_COLLECTIONS = new Set([
+  "provider-connections",
+  "provider-nodes",
+  "gateway-devices",
+  "usage",
+]);
 export interface CloudApiOptions {
   db?: CloudDb;
   /** Privileged server-to-server token. Never expose this value to browser clients. */
@@ -555,6 +562,9 @@ export async function handleCloudApiRequest(
   }
   const segments = decodeSegments(new URL(request.url).pathname);
   if (!segments) return json({ error: "Malformed path" }, 400);
+  const strictTenantAuthorization = strictTokenPolicy;
+  const tenantScopedRoute =
+    strictTenantAuthorization && segments.length >= 2 && TENANT_SCOPED_COLLECTIONS.has(segments[1]);
   const maintenanceRoute =
     (segments.length === 0 && request.method === "POST") ||
     (segments.length === 2 &&
@@ -565,11 +575,40 @@ export async function handleCloudApiRequest(
   const isMaintenanceToken =
     maintenanceRoute && !!options.maintenanceToken && authorized(request, options.maintenanceToken);
   const isAdminToken = !!options.adminToken && authorized(request, options.adminToken);
+  let customerIdentity: CloudCustomerIdentity | null = null;
+  if (tenantScopedRoute) {
+    const authorization = request.headers.get("Authorization") ?? "";
+    const keyMatch = /^Bearer (orc_live_[A-Za-z0-9_-]{1,96})$/.exec(authorization);
+    if (keyMatch && options.db) {
+      try {
+        customerIdentity = await authenticateCloudCustomerApiKey(
+          options.db,
+          keyMatch[1],
+          (options.now ?? (() => new Date()))().toISOString()
+        );
+      } catch {
+        return json({ error: "Customer authentication is unavailable" }, 503);
+      }
+    }
+    if (!customerIdentity || customerIdentity.tenantId !== segments[0]) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+    const isRead = request.method === "GET";
+    if (!isRead && customerIdentity.role !== "owner" && customerIdentity.role !== "admin") {
+      return json({ error: "Owner or admin membership is required" }, 403);
+    }
+  }
   if (!options.adminToken && !(maintenanceRoute && options.maintenanceToken)) {
     return json({ error: "Cloud API is not configured" }, 503);
   }
-  if (!isAdminToken && !isMaintenanceToken) return json({ error: "Unauthorized" }, 401);
-  const auditActor = isMaintenanceToken && !isAdminToken ? "cloud-maintenance" : "cloud-admin";
+  if (!tenantScopedRoute && !isAdminToken && !isMaintenanceToken) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+  const auditActor = customerIdentity
+    ? customerIdentity.principalId
+    : isMaintenanceToken && !isAdminToken
+      ? "cloud-maintenance"
+      : "cloud-admin";
   if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
   if (request.method === "OPTIONS") return json({ error: "Method not allowed" }, 405);
   const db = options.db;
@@ -1269,7 +1308,7 @@ export async function handleCloudApiRequest(
           tenantId,
           timestamp: now().toISOString(),
           action: `cloud.api.${request.method.toLowerCase()}`,
-          actor: "cloud-admin",
+          actor: auditActor,
           target: [collection, resourceId].filter(Boolean).join("/"),
           resourceType: "cloud-api",
           status: "attempted",
@@ -1608,7 +1647,7 @@ export async function handleCloudApiRequest(
             tenantId,
             timestamp: now().toISOString(),
             action: "gateway.device.credential.rotate",
-            actor: "cloud-admin",
+            actor: auditActor,
             target: resourceId,
             resourceType: "gateway-device-credential",
             status: "success",
@@ -1632,7 +1671,7 @@ export async function handleCloudApiRequest(
             tenantId,
             timestamp: now().toISOString(),
             action: "gateway.device.credential.revoke",
-            actor: "cloud-admin",
+            actor: auditActor,
             target: resourceId,
             resourceType: "gateway-device-credential",
             status: "success",

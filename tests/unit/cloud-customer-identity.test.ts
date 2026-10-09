@@ -94,6 +94,7 @@ async function fixture() {
     "0006_gateway_invocation_idempotency.sql",
     "0007_gateway_device_service_health.sql",
     "0008_cloud_tenant_settings.sql",
+    "0010_cloud_inference_policy.sql",
   ]) {
     await d1.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
@@ -230,6 +231,90 @@ test("platform admin can provision a tenant, owner membership, and one-time key 
     assert.equal(
       await d1.prepare("SELECT id FROM tenants WHERE id = 'tenant-uncreated'").first(),
       null
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("production routine tenant operations bind to the customer API key tenant and role", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const owner = await createCloudCustomerMembership(d1, {
+      tenantId: "tenant-customer",
+      principalId: "owner-subject",
+      role: "owner",
+      now,
+    });
+    const ownerKey = await issueCloudCustomerApiKey(d1, {
+      tenantId: owner.tenantId,
+      membershipId: owner.id,
+      now,
+    });
+    const viewer = await createCloudCustomerMembership(d1, {
+      tenantId: "tenant-customer",
+      principalId: "viewer-subject",
+      role: "viewer",
+      now,
+    });
+    const viewerKey = await issueCloudCustomerApiKey(d1, {
+      tenantId: viewer.tenantId,
+      membershipId: viewer.id,
+      now,
+    });
+    const adminToken = "valid-cloud-admin-token-0123456789";
+    const call = (path: string, token: string, method = "GET", body?: unknown) =>
+      handleCloudApiRequest(
+        new Request(`https://omniroute.test/__cloud/v1/tenants/${path}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        }),
+        { db: d1, adminToken, environment: "production", now: () => new Date(now) }
+      );
+
+    assert.equal(
+      (await call("tenant-customer/provider-connections", ownerKey.token)).status,
+      200,
+      "a customer owner may read their own provider connections"
+    );
+    assert.equal(
+      (await call("tenant-customer/provider-connections", adminToken)).status,
+      401,
+      "the global operator token cannot access routine tenant data"
+    );
+    assert.equal(
+      (await call("tenant-other/provider-connections", ownerKey.token)).status,
+      401,
+      "a customer key cannot choose another tenant from the URL"
+    );
+    assert.equal(
+      (
+        await call("tenant-customer/provider-connections", viewerKey.token, "POST", {
+          id: "viewer-connection",
+          provider: "openai",
+        })
+      ).status,
+      403,
+      "viewer membership cannot mutate tenant provider configuration"
+    );
+    assert.equal(
+      (await call("tenant-customer/inference-entitlements", ownerKey.token)).status,
+      401,
+      "customer keys cannot access platform-managed inference entitlements"
+    );
+    assert.equal(
+      (await call("tenant-customer/inference-entitlements", adminToken)).status,
+      200,
+      "the platform token retains inference entitlement administration"
+    );
+    assert.equal(
+      (await call("tenant-customer/status", adminToken)).status,
+      200,
+      "the global token retains platform lifecycle operations"
     );
   } finally {
     d1.db.close();
