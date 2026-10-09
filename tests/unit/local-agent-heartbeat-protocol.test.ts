@@ -93,6 +93,7 @@ test("signed heartbeats update status and reject tampering, replay, and stale ti
   const updated = asTenant("agent_tenant_a", () => agents.acceptLocalAgentHeartbeat(request));
   assert.equal(updated.status, "busy");
   assert.deepEqual(updated.capabilities, ["comfyui", "ollama"]);
+  assert.deepEqual(updated.serviceHealth, { ollama: true, comfyui: false });
   assert.notEqual(
     signLocalAgentHeartbeat(registration.credential, nowMs, "signed-health-tamper-0001", payload),
     signLocalAgentHeartbeat(registration.credential, nowMs, "signed-health-tamper-0001", {
@@ -101,6 +102,39 @@ test("signed heartbeats update status and reject tampering, replay, and stale ti
     })
   );
   assert.equal(updated.lastSeenAt, new Date(nowMs).toISOString());
+
+  const nextNonce = "health-omitted-heartbeat-0001";
+  const legacyPayload = { status: "online" as const, capabilities: ["ollama"] };
+  const legacyUpdated = asTenant("agent_tenant_a", () =>
+    agents.acceptLocalAgentHeartbeat({
+      deviceId: registration.device.id,
+      credential: registration.credential,
+      timestamp: nowMs + 1,
+      nonce: nextNonce,
+      signature: signLocalAgentHeartbeat(
+        registration.credential,
+        nowMs + 1,
+        nextNonce,
+        legacyPayload
+      ),
+      payload: legacyPayload,
+      nowMs: nowMs + 1,
+    })
+  );
+  assert.equal(
+    legacyUpdated.serviceHealth,
+    null,
+    "older agents clear stale health and remain valid"
+  );
+  core
+    .getDbInstance()
+    .prepare("UPDATE local_agent_devices SET service_health_json = ? WHERE id = ?")
+    .run("{malformed", registration.device.id);
+  assert.equal(
+    asTenant("agent_tenant_a", () => agents.getLocalAgent(registration.device.id))?.serviceHealth,
+    null,
+    "corrupt stored health fails closed"
+  );
 
   assert.throws(
     () => asTenant("agent_tenant_a", () => agents.acceptLocalAgentHeartbeat(request)),

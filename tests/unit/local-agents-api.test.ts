@@ -136,7 +136,11 @@ test("heartbeat is device-authenticated, tenant-bound, uncached, and replay-prot
   );
   const timestamp = Date.now();
   const nonce = "api-route-heartbeat-nonce-001";
-  const payload = { status: "online" as const, capabilities: ["ollama"] };
+  const payload = {
+    status: "online" as const,
+    capabilities: ["ollama"],
+    serviceHealth: { ollama: true, comfyui: false },
+  };
   const body = {
     deviceId: registration.device.id,
     credential: registration.credential,
@@ -151,6 +155,10 @@ test("heartbeat is device-authenticated, tenant-bound, uncached, and replay-prot
   );
   assert.equal(accepted.status, 200, await accepted.clone().text());
   assert.equal(accepted.headers.get("cache-control"), "no-store");
+  assert.deepEqual(
+    ((await accepted.json()) as { agent: { serviceHealth: unknown } }).agent.serviceHealth,
+    payload.serviceHealth
+  );
   const transitionAudit = asTenant("api_agent_a", () =>
     compliance.getAuditLog({ resourceType: "local_agent", limit: 10 })
   );
@@ -160,6 +168,7 @@ test("heartbeat is device-authenticated, tenant-bound, uncached, and replay-prot
     previousStatus: "offline",
     status: "online",
     capabilitiesChanged: true,
+    serviceHealthChanged: true,
   });
 
   const unchangedNonce = "api-route-heartbeat-nonce-004";

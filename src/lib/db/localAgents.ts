@@ -22,6 +22,7 @@ const heartbeatSchema = z
     serviceHealth: z.object({ ollama: z.boolean(), comfyui: z.boolean() }).strict().optional(),
   })
   .strict();
+const serviceHealthSchema = z.object({ ollama: z.boolean(), comfyui: z.boolean() }).strict();
 
 export interface LocalAgentDevice {
   id: string;
@@ -29,6 +30,7 @@ export interface LocalAgentDevice {
   name: string;
   status: "online" | "busy" | "offline";
   capabilities: string[];
+  serviceHealth: { ollama: boolean; comfyui: boolean } | null;
   createdAt: string;
   lastSeenAt: string | null;
   revokedAt: string | null;
@@ -47,6 +49,7 @@ interface DeviceRow {
   credential_hash: string;
   status: string;
   capabilities_json: string;
+  service_health_json: string | null;
   created_at: string;
   last_seen_at: string | null;
   revoked_at: string | null;
@@ -54,6 +57,7 @@ interface DeviceRow {
 
 function toDevice(row: DeviceRow): LocalAgentDevice {
   let capabilities: string[] = [];
+  let serviceHealth: LocalAgentDevice["serviceHealth"] = null;
   try {
     const parsed: unknown = JSON.parse(row.capabilities_json);
     if (Array.isArray(parsed) && parsed.every((entry) => typeof entry === "string")) {
@@ -62,12 +66,22 @@ function toDevice(row: DeviceRow): LocalAgentDevice {
   } catch {
     // Treat malformed persisted metadata as empty; never expose raw DB content.
   }
+  if (row.service_health_json) {
+    try {
+      const parsed: unknown = JSON.parse(row.service_health_json);
+      const result = serviceHealthSchema.safeParse(parsed);
+      if (result.success) serviceHealth = result.data;
+    } catch {
+      // Treat malformed persisted metadata as unavailable; never expose raw DB content.
+    }
+  }
   return {
     id: row.id,
     tenantId: row.tenant_id,
     name: row.name,
     status: row.status === "online" || row.status === "busy" ? row.status : "offline",
     capabilities,
+    serviceHealth,
     createdAt: row.created_at,
     lastSeenAt: row.last_seen_at,
     revokedAt: row.revoked_at,
@@ -99,7 +113,7 @@ export function registerLocalAgent(input: {
 export function listLocalAgents(): LocalAgentDevice[] {
   const rows = getDbInstance()
     .prepare(
-      `SELECT id, tenant_id, name, credential_hash, status, capabilities_json,
+      `SELECT id, tenant_id, name, credential_hash, status, capabilities_json, service_health_json,
               created_at, last_seen_at, revoked_at
          FROM local_agent_devices WHERE tenant_id = ? ORDER BY created_at DESC`
     )
@@ -110,7 +124,7 @@ export function listLocalAgents(): LocalAgentDevice[] {
 export function getLocalAgent(id: string): LocalAgentDevice | null {
   const row = getDbInstance()
     .prepare(
-      `SELECT id, tenant_id, name, credential_hash, status, capabilities_json,
+      `SELECT id, tenant_id, name, credential_hash, status, capabilities_json, service_health_json,
               created_at, last_seen_at, revoked_at
          FROM local_agent_devices WHERE tenant_id = ? AND id = ?`
     )
@@ -170,7 +184,7 @@ export function acceptLocalAgentHeartbeat(request: LocalAgentHeartbeatRequest): 
   const db = getDbInstance();
   const row = db
     .prepare(
-      `SELECT id, tenant_id, name, credential_hash, status, capabilities_json,
+      `SELECT id, tenant_id, name, credential_hash, status, capabilities_json, service_health_json,
               created_at, last_seen_at, revoked_at
          FROM local_agent_devices WHERE tenant_id = ? AND id = ?`
     )
@@ -200,12 +214,13 @@ export function acceptLocalAgentHeartbeat(request: LocalAgentHeartbeatRequest): 
     const result = db
       .prepare(
         `UPDATE local_agent_devices
-            SET status = ?, capabilities_json = ?, last_seen_at = ?
+            SET status = ?, capabilities_json = ?, service_health_json = ?, last_seen_at = ?
           WHERE tenant_id = ? AND id = ? AND revoked_at IS NULL`
       )
       .run(
         payload.status,
         JSON.stringify([...payload.capabilities].sort()),
+        payload.serviceHealth ? JSON.stringify(payload.serviceHealth) : null,
         seenAt,
         tenantId,
         request.deviceId

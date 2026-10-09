@@ -51,7 +51,9 @@ export async function POST(request: Request) {
           const capabilitiesChanged =
             JSON.stringify([...previous.capabilities].sort()) !==
             JSON.stringify([...updated.capabilities].sort());
-          if (previous.status !== updated.status || capabilitiesChanged) {
+          const serviceHealthChanged =
+            JSON.stringify(previous.serviceHealth) !== JSON.stringify(updated.serviceHealth);
+          if (previous.status !== updated.status || capabilitiesChanged || serviceHealthChanged) {
             logAuditEvent({
               action: "localAgent.heartbeat_transition",
               target: updated.id,
@@ -61,6 +63,7 @@ export async function POST(request: Request) {
                 previousStatus: previous.status,
                 status: updated.status,
                 capabilitiesChanged,
+                serviceHealthChanged,
               },
             });
           }
