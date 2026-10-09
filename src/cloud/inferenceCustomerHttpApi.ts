@@ -1044,6 +1044,17 @@ export async function handleCloudInferenceCustomerRequest(
       isActive: true,
     });
     for (const connection of connections) {
+      // This route dispatches directly to OpenAI using an API-key header. Hosted
+      // credentials are metadata-only until hosted dispatch and billing exist.
+      // Null authType is accepted for pre-contract API-key rows; OAuth and other
+      // auth modes must never be treated as an API key merely because apiKey is set.
+      if (
+        connection.credentialOwnership !== "customer_managed" ||
+        connection.executionLocation !== "third_party" ||
+        (connection.authType !== null && connection.authType !== "api_key")
+      ) {
+        continue;
+      }
       if (!connection.apiKey || !isCloudCredentialEnvelope(connection.apiKey)) continue;
       apiKey = await decryptCloudCredential(connection.apiKey, options.credentialEncryptionKey, {
         tenantId: identity.tenantId,

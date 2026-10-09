@@ -273,6 +273,45 @@ test("fixed Responses endpoints, decrypts tenant-bound credential, records usage
   }
 });
 
+test("inference skips hosted credentials and dispatches with a customer-managed OpenAI key", async () => {
+  const f = await fixture();
+  try {
+    const hostedKey = "sk-hosted-never-dispatch-this-key";
+    const hostedEnvelope = await encryptCloudCredential(hostedKey, WRAP_KEY, {
+      tenantId: TENANT_A,
+      connectionId: "hosted-openai",
+      field: "apiKey",
+    });
+    await createCloudProviderConnection(f.db, {
+      id: "hosted-openai",
+      tenantId: TENANT_A,
+      provider: "openai",
+      authType: "api_key",
+      apiKey: hostedEnvelope,
+      credentialOwnership: "shiryu_hosted",
+      executionLocation: "shiryu_hosted",
+      priority: -1,
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+
+    const authorizations: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      authorizations.push(new Headers((init as RequestInit).headers).get("authorization") ?? "");
+      return upstream()(input, init);
+    };
+    const response = await f.runtime(fetcher).fetch(request(f.issued.token));
+
+    assert.equal(response.status, 200);
+    assert.equal(authorizations.length, 2);
+    assert.ok(authorizations.every((authorization) => authorization === `Bearer ${OPENAI_KEY}`));
+    assert.ok(authorizations.every((authorization) => !authorization.includes(hostedKey)));
+    assert.equal(JSON.parse(await response.text()).object, "chat.completion");
+  } finally {
+    f.db.db.close();
+  }
+});
+
 test("streaming inference settles terminal usage before done and replays the exact SSE transcript", async () => {
   const f = await fixture();
   try {

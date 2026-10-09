@@ -4,6 +4,10 @@ import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
 import {
+  CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH,
+  handleCloudCustomerProviderRequest,
+} from "./customerProviderHttpApi";
+import {
   CLOUD_CUSTOMER_SETTINGS_PATH,
   handleCloudCustomerSettingsRequest,
 } from "./tenantSettingsHttpApi";
@@ -55,6 +59,7 @@ export interface CloudRuntimeOptions {
   customerInvokeRateLimit?: { limit: number; windowMs: number };
   customerAuthFailureRateLimit?: { limit: number; windowMs: number };
   customerAuthFailureFallbackRateLimit?: { limit: number; windowMs: number };
+  customerProviderBodyTimeoutMs?: number;
   cloudInferenceRateLimit?: { limit: number; windowMs: number };
   cloudInferenceAuthFailureRateLimit?: { limit: number; windowMs: number };
   cloudInferenceRequestBodyTimeoutMs?: number;
@@ -100,6 +105,26 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         } catch {
           return Response.json(
             { error: "Customer settings request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (
+        url.pathname === CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH ||
+        url.pathname.startsWith(`${CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH}/`)
+      ) {
+        try {
+          const response = await handleCloudCustomerProviderRequest(request, {
+            db: options.env?.DB,
+            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            now,
+            bodyReadTimeoutMs: options.customerProviderBodyTimeoutMs,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Customer provider connection request could not be completed" },
             { status: 503, headers: { "Cache-Control": "no-store" } }
           );
         }

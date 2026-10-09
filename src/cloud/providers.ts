@@ -241,11 +241,23 @@ export async function createCloudProviderConnection(
   db: CloudDb,
   input: CloudProviderConnectionInput
 ): Promise<CloudProviderConnection> {
+  await prepareCloudProviderConnectionInsert(db, input).run();
+
+  const created = await getCloudProviderConnectionById(db, input.tenantId, input.id);
+  if (!created) throw new Error("Provider connection was inserted but could not be read back");
+  return created;
+}
+
+/** Build the canonical provider insert for atomic D1 mutation+audit batches. */
+export function prepareCloudProviderConnectionInsert(
+  db: CloudDb,
+  input: CloudProviderConnectionInput
+) {
   const executionContract = validateProviderExecutionContract(input);
   const now = input.updatedAt ?? input.createdAt ?? new Date().toISOString();
   const createdAt = input.createdAt ?? now;
 
-  await db
+  return db
     .prepare(
       `INSERT INTO provider_connections (
         id, tenant_id, provider, auth_type, name, email, priority, is_active,
@@ -286,12 +298,7 @@ export async function createCloudProviderConnection(
       executionContract.executionLocation,
       createdAt,
       now
-    )
-    .run();
-
-  const created = await getCloudProviderConnectionById(db, input.tenantId, input.id);
-  if (!created) throw new Error("Provider connection was inserted but could not be read back");
-  return created;
+    );
 }
 
 export async function updateCloudProviderConnection(
@@ -310,9 +317,40 @@ export async function updateCloudProviderConnection(
     tenantId,
     updatedAt: new Date().toISOString(),
   };
+  await prepareCloudProviderConnectionUpdate(db, tenantId, id, merged).run();
+  return getCloudProviderConnectionById(db, tenantId, id);
+}
+
+/** Build the canonical provider update for atomic D1 mutation+audit batches. */
+export function prepareCloudProviderConnectionUpdate(
+  db: CloudDb,
+  tenantId: string,
+  id: string,
+  merged: CloudProviderConnectionInput,
+  expected?: {
+    provider?: string;
+    credentialOwnership?: ProviderOwnershipMode;
+    executionLocation?: ProviderExecutionLocation;
+  }
+) {
   const executionContract = validateProviderExecutionContract(merged);
 
-  await db
+  const conditions = ["tenant_id = ?", "id = ?"];
+  const conditionValues: unknown[] = [tenantId, id];
+  if (expected?.provider !== undefined) {
+    conditions.push("provider = ?");
+    conditionValues.push(expected.provider);
+  }
+  if (expected?.credentialOwnership !== undefined) {
+    conditions.push("credential_ownership = ?");
+    conditionValues.push(expected.credentialOwnership);
+  }
+  if (expected?.executionLocation !== undefined) {
+    conditions.push("execution_location = ?");
+    conditionValues.push(expected.executionLocation);
+  }
+
+  return db
     .prepare(
       `UPDATE provider_connections SET
         provider = ?, auth_type = ?, name = ?, email = ?, priority = ?, is_active = ?,
@@ -321,7 +359,7 @@ export async function updateCloudProviderConnection(
         last_error_at = ?, api_key = ?, id_token = ?, provider_specific_data = ?,
         expires_in = ?, display_name = ?, global_priority = ?, default_model = ?,
         token_type = ?, credential_ownership = ?, execution_location = ?, updated_at = ?
-       WHERE tenant_id = ? AND id = ?`
+       WHERE ${conditions.join(" AND ")}`
     )
     .bind(
       merged.provider,
@@ -351,12 +389,8 @@ export async function updateCloudProviderConnection(
       executionContract.credentialOwnership,
       executionContract.executionLocation,
       merged.updatedAt,
-      tenantId,
-      id
-    )
-    .run();
-
-  return getCloudProviderConnectionById(db, tenantId, id);
+      ...conditionValues
+    );
 }
 
 export async function deleteCloudProviderConnection(
@@ -364,11 +398,38 @@ export async function deleteCloudProviderConnection(
   tenantId: string,
   id: string
 ): Promise<boolean> {
-  const result = await db
-    .prepare("DELETE FROM provider_connections WHERE tenant_id = ? AND id = ?")
-    .bind(tenantId, id)
-    .run();
+  const result = await prepareCloudProviderConnectionDelete(db, tenantId, id).run();
   return result.success && Number(result.meta?.changes ?? 0) > 0;
+}
+
+/** Build the tenant-qualified provider delete for atomic D1 mutation+audit batches. */
+export function prepareCloudProviderConnectionDelete(
+  db: CloudDb,
+  tenantId: string,
+  id: string,
+  expected?: {
+    provider?: string;
+    credentialOwnership?: ProviderOwnershipMode;
+    executionLocation?: ProviderExecutionLocation;
+  }
+) {
+  const conditions = ["tenant_id = ?", "id = ?"];
+  const values: unknown[] = [tenantId, id];
+  if (expected?.provider !== undefined) {
+    conditions.push("provider = ?");
+    values.push(expected.provider);
+  }
+  if (expected?.credentialOwnership !== undefined) {
+    conditions.push("credential_ownership = ?");
+    values.push(expected.credentialOwnership);
+  }
+  if (expected?.executionLocation !== undefined) {
+    conditions.push("execution_location = ?");
+    values.push(expected.executionLocation);
+  }
+  return db
+    .prepare(`DELETE FROM provider_connections WHERE ${conditions.join(" AND ")}`)
+    .bind(...values);
 }
 
 export async function getCloudProviderNodes(
