@@ -9,14 +9,16 @@ import {
   isCloudCredentialEnvelope,
 } from "./credentialEncryption";
 
-export const CLOUD_MCP_TRANSPORTS = ["sse", "streamable_http"] as const;
+export const CLOUD_MCP_TRANSPORTS = ["streamable_http"] as const;
 export type CloudMcpTransport = (typeof CLOUD_MCP_TRANSPORTS)[number];
+const LEGACY_CLOUD_MCP_TRANSPORTS = ["sse"] as const;
 
 export interface CloudTenantMcpServer {
   id: string;
   tenantId: string;
   name: string;
-  transport: CloudMcpTransport;
+  /** SSE is retained in read responses so existing registrations remain manageable. */
+  transport: CloudMcpTransport | (typeof LEGACY_CLOUD_MCP_TRANSPORTS)[number];
   endpoint: string;
   isActive: boolean;
   hasCredential: boolean;
@@ -97,7 +99,7 @@ export function validateCloudMcpServerInput(
       typeof input.transport !== "string" ||
       !CLOUD_MCP_TRANSPORTS.includes(input.transport as CloudMcpTransport)
     ) {
-      throw new TypeError("transport must be sse or streamable_http");
+      throw new TypeError("transport must be streamable_http");
     }
     result.transport = input.transport as CloudMcpTransport;
   }
@@ -140,9 +142,37 @@ export function validateCloudMcpEndpoint(value: unknown): string {
     value.includes("?") ||
     value.includes("#") ||
     endpoint.search !== "" ||
+    endpoint.hash !== "" ||
+    (endpoint.port !== "" && endpoint.port !== "443")
+  ) {
+    throw new TypeError(
+      "endpoint must be HTTPS on port 443 without embedded credentials, query, or fragment"
+    );
+  }
+  return endpoint.toString();
+}
+
+function validateLegacyCloudMcpEndpoint(value: unknown): string {
+  if (typeof value !== "string" || value.length > 2_048 || value.trim() !== value) {
+    throw new TypeError("endpoint must be an HTTPS URL of at most 2048 characters");
+  }
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    throw new TypeError("endpoint must be an HTTPS URL");
+  }
+  if (
+    endpoint.protocol !== "https:" ||
+    endpoint.hostname.length === 0 ||
+    endpoint.username !== "" ||
+    endpoint.password !== "" ||
+    value.includes("?") ||
+    value.includes("#") ||
+    endpoint.search !== "" ||
     endpoint.hash !== ""
   ) {
-    throw new TypeError("endpoint must be HTTPS without embedded credentials, query, or fragment");
+    throw new TypeError("legacy endpoint is invalid");
   }
   return endpoint.toString();
 }
@@ -152,18 +182,31 @@ function requireId(value: string, field: string): void {
 }
 
 function mapRow(row: ServerRow | null): CloudTenantMcpServer | null {
-  if (!row || !CLOUD_MCP_TRANSPORTS.includes(row.transport as CloudMcpTransport)) return null;
+  if (
+    !row ||
+    (!CLOUD_MCP_TRANSPORTS.includes(row.transport as CloudMcpTransport) &&
+      !LEGACY_CLOUD_MCP_TRANSPORTS.includes(
+        row.transport as (typeof LEGACY_CLOUD_MCP_TRANSPORTS)[number]
+      ))
+  ) {
+    return null;
+  }
   let endpoint: string;
   try {
     endpoint = validateCloudMcpEndpoint(row.endpoint);
   } catch {
-    return null;
+    // Keep pre-existing registrations visible so owners can edit or remove them.
+    try {
+      endpoint = validateLegacyCloudMcpEndpoint(row.endpoint);
+    } catch {
+      return null;
+    }
   }
   return {
     id: row.id,
     tenantId: row.tenant_id,
     name: row.name,
-    transport: row.transport as CloudMcpTransport,
+    transport: row.transport as CloudTenantMcpServer["transport"],
     endpoint,
     isActive: row.is_active === 1,
     hasCredential:

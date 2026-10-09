@@ -432,8 +432,8 @@ export async function handleCloudTenantHostsRequest(
     return json({ hosts: await listAdminVerifiedCustomerHosts(db, tenantId) });
   }
   if (route === "" && request.method === "POST") {
-    // Platform admins register domains only after confirming ownership through
-    // their existing out-of-band verification process. No DNS claim is implied.
+    // Direct registration is a platform-admin break-glass path. Routine customer
+    // onboarding should use the DNS challenge and verification routes above.
     const registration = await readRegistration(request);
     if (!registration) return json({ error: "Invalid tenant host registration" }, 400);
     const timestamp = now().toISOString();

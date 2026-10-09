@@ -147,6 +147,31 @@ async function mcpIsEnabled(db: CloudDb, tenantId: string): Promise<boolean> {
   return row?.mcp_enabled === 1;
 }
 
+async function canActivateMcpServerUpdate(
+  db: CloudDb,
+  tenantId: string,
+  serverId: string,
+  input: Partial<{ transport: "streamable_http"; endpoint: string; isActive: boolean }>
+): Promise<boolean> {
+  if (input.isActive !== true) return true;
+  const current = await getCloudTenantMcpServer(db, tenantId, serverId);
+  if (!current) return true;
+  let currentEndpointIsSupported = true;
+  try {
+    validateCloudMcpServerInput({
+      name: current.name,
+      transport: current.transport,
+      endpoint: current.endpoint,
+    });
+  } catch {
+    currentEndpointIsSupported = false;
+  }
+  const currentConfigIsSupported =
+    current.transport === "streamable_http" && currentEndpointIsSupported;
+  if (currentConfigIsSupported) return true;
+  return input.transport === "streamable_http" && input.endpoint !== undefined;
+}
+
 function createTenantMcpRuntime(
   options: CloudTenantMcpHttpApiOptions,
   identity: NonNullable<Awaited<ReturnType<typeof authenticateCloudCustomerApiKey>>>
@@ -318,6 +343,27 @@ export async function handleCloudTenantMcpRequest(
         400
       );
     }
+    if (
+      request.method === "PUT" &&
+      !(await canActivateMcpServerUpdate(
+        options.db,
+        identity.tenantId,
+        route.id!,
+        input as Partial<{
+          transport: "streamable_http";
+          endpoint: string;
+          isActive: boolean;
+        }>
+      ))
+    ) {
+      return json(
+        {
+          error:
+            "Activating a legacy MCP server requires Streamable HTTP and an HTTPS port 443 endpoint",
+        },
+        400
+      );
+    }
     const context: CloudTenantMcpMutationContext = {
       actor,
       now: timestamp,
@@ -328,7 +374,7 @@ export async function handleCloudTenantMcpRequest(
         options.db,
         input as ReturnType<typeof validateCloudMcpServerInput> & {
           name: string;
-          transport: "sse" | "streamable_http";
+          transport: "streamable_http";
           endpoint: string;
         },
         context,
@@ -344,7 +390,7 @@ export async function handleCloudTenantMcpRequest(
       route.id!,
       input as Partial<{
         name: string;
-        transport: "sse" | "streamable_http";
+        transport: "streamable_http";
         endpoint: string;
         isActive: boolean;
         credential: string | null;
@@ -452,6 +498,27 @@ export async function handleCloudTenantMcpPortalRequest(
         400
       );
     }
+    if (
+      request.method === "PUT" &&
+      !(await canActivateMcpServerUpdate(
+        options.db,
+        identity.tenantId,
+        route.id!,
+        input as Partial<{
+          transport: "streamable_http";
+          endpoint: string;
+          isActive: boolean;
+        }>
+      ))
+    ) {
+      return json(
+        {
+          error:
+            "Activating a legacy MCP server requires Streamable HTTP and an HTTPS port 443 endpoint",
+        },
+        400
+      );
+    }
     const context: CloudTenantMcpMutationContext = {
       actor,
       now: timestamp,
@@ -465,7 +532,7 @@ export async function handleCloudTenantMcpPortalRequest(
         options.db,
         input as ReturnType<typeof validateCloudMcpServerInput> & {
           name: string;
-          transport: "sse" | "streamable_http";
+          transport: "streamable_http";
           endpoint: string;
         },
         context,
@@ -480,7 +547,7 @@ export async function handleCloudTenantMcpPortalRequest(
       route.id!,
       input as Partial<{
         name: string;
-        transport: "sse" | "streamable_http";
+        transport: "streamable_http";
         endpoint: string;
         isActive: boolean;
         credential: string | null;

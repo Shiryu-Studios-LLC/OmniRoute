@@ -91,9 +91,8 @@ export function prepareAdminVerifiedCustomerHostInsert(
   db: CloudDb,
   input: { hostname: string; tenantId: string; verifiedAt: string; verifiedBy: string }
 ) {
-  // This is deliberately a platform-admin operation. The admin must complete
-  // hostname ownership verification out of band before this row is inserted;
-  // this Worker slice does not claim or perform DNS verification itself.
+  // Keep direct registration as a platform-admin break-glass operation. Routine
+  // customer hosts should use the DNS challenge flow in tenantHostsHttpApi.ts.
   const hostname = normalizeCustomerHostname(input.hostname);
   if (!hostname) throw new TypeError("Invalid customer hostname");
   return db

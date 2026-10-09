@@ -307,7 +307,11 @@ test("MCP registry requires enabled customer opt-in and owner or admin API keys"
     const owner = await provision(db, "mcp-opt-a");
     const member = await makePrincipal(db, owner.tenantId, "member", "mcp-opt-member");
     const admin = await makePrincipal(db, owner.tenantId, "admin", "mcp-opt-admin");
-    const config = { name: "One", transport: "sse", endpoint: "https://mcp.example.test" };
+    const config = {
+      name: "One",
+      transport: "streamable_http",
+      endpoint: "https://mcp.example.test",
+    };
     assert.equal((await call(db, request(owner.token, "GET")))?.status, 403);
     assert.equal((await call(db, request(owner.token, "POST", COLLECTION, config)))?.status, 403);
     await enableMcp(db, owner.tenantId);
@@ -330,7 +334,7 @@ test("MCP registry derives tenant from key and returns 404 for another tenant's 
       db,
       request(ownerA.token, "POST", COLLECTION, {
         name: "A only",
-        transport: "sse",
+        transport: "streamable_http",
         endpoint: "https://mcp-a.example.test/sse",
       })
     );
@@ -354,7 +358,7 @@ test("MCP registry derives tenant from key and returns 404 for another tenant's 
       request(ownerB.token, "POST", COLLECTION, {
         tenantId: ownerA.tenantId,
         name: "Override",
-        transport: "sse",
+        transport: "streamable_http",
         endpoint: "https://mcp-b.example.test/sse",
       })
     );
@@ -581,22 +585,131 @@ test("MCP endpoint schemas reject unsafe or ambiguous URLs without probing them"
   try {
     const owner = await provision(db, "mcp-endpoint-a");
     await enableMcp(db, owner.tenantId);
+    const unsupportedTransport = await call(
+      db,
+      request(owner.token, "POST", COLLECTION, {
+        name: "Legacy SSE",
+        transport: "sse",
+        endpoint: "https://mcp.example.test/events",
+      })
+    );
+    assert.equal(unsupportedTransport?.status, 400);
+
     for (const endpoint of [
       "http://mcp.example.test/mcp",
       "https://user:pass@mcp.example.test/mcp",
       "https://mcp.example.test/mcp?token=secret",
       "https://mcp.example.test/mcp#fragment",
+      "https://mcp.example.test:8443/mcp",
     ]) {
       const response = await call(
         db,
-        request(owner.token, "POST", COLLECTION, { name: "Bad", transport: "sse", endpoint })
+        request(owner.token, "POST", COLLECTION, {
+          name: "Bad",
+          transport: "streamable_http",
+          endpoint,
+        })
       );
       assert.equal(response?.status, 400, endpoint);
     }
+
+    const legacyDisabledEndpoint = "https://legacy.example.test:8443/mcp";
+    const insertLegacy = db.prepare(
+      `INSERT INTO cloud_tenant_mcp_servers
+         (id, tenant_id, name, transport, endpoint, credential_encrypted, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)`
+    );
+    await insertLegacy
+      .bind(
+        "legacy-disabled-sse",
+        owner.tenantId,
+        "Legacy SSE",
+        "sse",
+        "https://legacy.example.test/mcp",
+        NOW,
+        NOW
+      )
+      .run();
+    await insertLegacy
+      .bind(
+        "legacy-disabled-port",
+        owner.tenantId,
+        "Legacy port",
+        "streamable_http",
+        legacyDisabledEndpoint,
+        NOW,
+        NOW
+      )
+      .run();
+    const listed = await call(db, request(owner.token, "GET", COLLECTION));
+    const listedBody = await body<{
+      servers: Array<{ id: string; transport: string; endpoint: string; isActive: boolean }>;
+    }>(listed!);
+    assert.deepEqual(
+      listedBody.servers.find((server) => server.id === "legacy-disabled-sse"),
+      {
+        id: "legacy-disabled-sse",
+        tenantId: owner.tenantId,
+        name: "Legacy SSE",
+        transport: "sse",
+        endpoint: "https://legacy.example.test/mcp",
+        isActive: false,
+        hasCredential: false,
+        createdAt: NOW,
+        updatedAt: NOW,
+      }
+    );
+    assert.equal(
+      listedBody.servers.find((server) => server.id === "legacy-disabled-port")?.endpoint,
+      legacyDisabledEndpoint
+    );
+
+    const deactivateLegacy = await call(
+      db,
+      request(owner.token, "PUT", `${COLLECTION}/legacy-disabled-sse`, { isActive: false })
+    );
+    assert.equal(deactivateLegacy?.status, 200, "legacy rows remain editable while disabled");
+    const activateSseWithoutMigration = await call(
+      db,
+      request(owner.token, "PUT", `${COLLECTION}/legacy-disabled-sse`, { isActive: true })
+    );
+    assert.equal(activateSseWithoutMigration?.status, 400);
+    const activateSseWithMigration = await call(
+      db,
+      request(owner.token, "PUT", `${COLLECTION}/legacy-disabled-sse`, {
+        transport: "streamable_http",
+        endpoint: "https://legacy.example.test/mcp",
+        isActive: true,
+      })
+    );
+    assert.equal(activateSseWithMigration?.status, 200);
+
+    const activatePortWithoutMigration = await call(
+      db,
+      request(owner.token, "PUT", `${COLLECTION}/legacy-disabled-port`, {
+        endpoint: "https://legacy.example.test/mcp",
+        isActive: true,
+      })
+    );
+    assert.equal(activatePortWithoutMigration?.status, 400);
+    const activatePortWithMigration = await call(
+      db,
+      request(owner.token, "PUT", `${COLLECTION}/legacy-disabled-port`, {
+        transport: "streamable_http",
+        endpoint: "https://legacy.example.test/mcp",
+        isActive: true,
+      })
+    );
+    assert.equal(activatePortWithMigration?.status, 200);
+    const deleteMigratedLegacy = await call(
+      db,
+      request(owner.token, "DELETE", `${COLLECTION}/legacy-disabled-port`)
+    );
+    assert.equal(deleteMigratedLegacy?.status, 200, "legacy rows remain deletable");
     const count = await db
       .prepare<{ count: number }>("SELECT COUNT(*) AS count FROM cloud_tenant_mcp_servers")
       .first();
-    assert.equal(count?.count, 0);
+    assert.equal(count?.count, 1, "legacy rows remain available for owner cleanup");
   } finally {
     db.db.close();
   }
@@ -630,7 +743,7 @@ test("credential writes fail closed without encryption and audit failure rolls b
       db,
       request(owner.token, "POST", COLLECTION, {
         name: "Atomic",
-        transport: "sse",
+        transport: "streamable_http",
         endpoint: "https://mcp.example.test/sse",
       })
     );

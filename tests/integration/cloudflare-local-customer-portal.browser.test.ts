@@ -334,7 +334,7 @@ test(
     await page.getByRole("heading", { name: "Onboarding readiness" }).waitFor();
     await page.getByText(/Inference access is default-deny/).waitFor();
     await page.getByText(/Only a platform admin can configure entitlements/).waitFor();
-    assert.equal(await page.locator("#onboarding-readiness li").count(), 9);
+    assert.equal(await page.locator("#onboarding-readiness li").count(), 11);
     assert.equal(await page.locator("#local-ai-opt-in-enabled").isChecked(), false);
     assert.equal(await page.locator("#mcp-opt-in-enabled").isChecked(), false);
     assert.equal(await page.locator("#mcp-server-panel").isVisible(), false);
@@ -485,6 +485,107 @@ test(
     await mcpRow.getByRole("button", { name: "Delete MCP server" }).click();
     await page.getByText("MCP server deleted.").waitFor();
     await mcpRow.waitFor({ state: "detached" });
+
+    const legacyEndpoint = "https://legacy.example.test:8443/mcp";
+    const legacySeed = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--command",
+      `INSERT INTO cloud_tenant_mcp_servers (id, tenant_id, name, transport, endpoint, is_active, created_at, updated_at) VALUES ('legacy-port', ${sqlText(tenantId)}, 'Legacy Port', 'streamable_http', ${sqlText(legacyEndpoint)}, 0, '2026-10-09T00:00:00.000Z', '2026-10-09T00:00:00.000Z');`,
+    ]);
+    assert.equal(legacySeed.status, 0, `${legacySeed.stdout}\n${legacySeed.stderr}`);
+    const seededLegacy = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT id, tenant_id, name, transport, endpoint, is_active FROM cloud_tenant_mcp_servers WHERE tenant_id = ${sqlText(tenantId)} AND id = 'legacy-port';`,
+    ]);
+    assert.equal(seededLegacy.status, 0, `${seededLegacy.stdout}\n${seededLegacy.stderr}`);
+    assert.match(seededLegacy.stdout, /legacy-port/);
+    await page.reload({ waitUntil: "networkidle" });
+    assert.equal(await page.locator("#mcp-server-panel").isVisible(), true);
+    const legacyApi = await page.evaluate(async () => {
+      const response = await fetch("/__cloud/auth/mcp-servers", { credentials: "same-origin" });
+      return { status: response.status, body: await response.text() };
+    });
+    assert.equal(legacyApi.status, 200, legacyApi.body);
+    assert.match(legacyApi.body, /legacy-port/);
+    const legacyRow = page.locator("#mcp-servers .mcp-server-row").first();
+    await legacyRow.waitFor();
+    assert.equal(await legacyRow.getByLabel("Server name").inputValue(), "Legacy Port");
+    await legacyRow.getByLabel("Server name").fill("Legacy Port Renamed");
+    await legacyRow.getByRole("button", { name: "Save MCP server" }).click();
+    await page.getByText("MCP server updated. Credentials are never displayed.").waitFor();
+    const renamedLegacy = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT name, transport, endpoint, is_active FROM cloud_tenant_mcp_servers WHERE tenant_id = ${sqlText(tenantId)} AND id = 'legacy-port';`,
+    ]);
+    assert.equal(renamedLegacy.status, 0, `${renamedLegacy.stdout}\n${renamedLegacy.stderr}`);
+    assert.match(renamedLegacy.stdout, /Legacy Port Renamed/);
+    assert.ok(renamedLegacy.stdout.includes(legacyEndpoint), renamedLegacy.stdout);
+
+    await legacyRow.getByLabel("HTTPS endpoint (port 443)").fill("https://legacy.example.test/mcp");
+    await legacyRow.getByLabel("Server active").check();
+    await legacyRow.getByRole("button", { name: "Save MCP server" }).click();
+    await page.getByText("MCP server updated. Credentials are never displayed.").waitFor();
+    const migratedLegacy = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT transport, endpoint, is_active FROM cloud_tenant_mcp_servers WHERE tenant_id = ${sqlText(tenantId)} AND id = 'legacy-port';`,
+    ]);
+    assert.equal(migratedLegacy.status, 0, `${migratedLegacy.stdout}\n${migratedLegacy.stderr}`);
+    assert.match(migratedLegacy.stdout, /streamable_http/);
+    assert.ok(
+      migratedLegacy.stdout.includes("https://legacy.example.test/mcp"),
+      migratedLegacy.stdout
+    );
+    assert.match(migratedLegacy.stdout, /"is_active":\s*1/);
+    await legacyRow.getByRole("button", { name: "Delete MCP server" }).click();
+    await page.getByText("MCP server deleted.").waitFor();
+    await legacyRow.waitFor({ state: "detached" });
+
     await page.locator("#mcp-opt-in-enabled").uncheck();
     await page.getByRole("button", { name: "Save MCP setting" }).click();
     await page.getByText("MCP configuration disabled.").waitFor();

@@ -48,6 +48,9 @@ test("Cloud Worker serves the customer portal with nonce CSP and safe DOM render
   assert.match(html, /Copy and hide token/);
   assert.match(html, /writeText\(newlyIssuedToken\)/);
   assert.match(html, /clearIssuedToken/);
+  assert.match(html, /HTTPS endpoint \(port 443\)/);
+  assert.match(html, /Streamable HTTP/);
+  assert.doesNotMatch(html, /value="sse">SSE<\/option>/);
   assert.doesNotMatch(html, /localStorage|sessionStorage/);
   assert.match(html, /expectedUpdatedAt/);
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i, "the page must not use inline event handlers");

@@ -218,6 +218,14 @@ const PORTAL_SCRIPT = `
     } finally { key.value = ""; button.disabled = false; }
   });
 
+  const isSupportedMcpEndpoint = (value) => {
+    try {
+      const endpoint = new URL(value);
+      return endpoint.protocol === "https:" && endpoint.hostname.length > 0 &&
+        (endpoint.port === "" || endpoint.port === "443") && !endpoint.username &&
+        !endpoint.password && !endpoint.search && !endpoint.hash;
+    } catch { return false; }
+  };
   const loadMcpServers = async () => {
     const data = await api("/__cloud/auth/mcp-servers");
     if (!Array.isArray(data.servers)) throw new Error("Invalid MCP server response");
@@ -239,19 +247,24 @@ const PORTAL_SCRIPT = `
       nameLabel.append(name);
       const transportLabel = node("label", "Transport");
       const transport = node("select");
-      for (const [value, label] of [["streamable_http", "Streamable HTTP"], ["sse", "SSE"]]) {
+      const transportOptions = [["streamable_http", "Streamable HTTP"]];
+      if (server.transport === "sse") {
+        transportOptions.push(["sse", "SSE (legacy, unsupported)"]);
+      }
+      for (const [value, label] of transportOptions) {
         const option = node("option", label);
         option.value = value;
         option.selected = value === server.transport;
         transport.append(option);
       }
       transportLabel.append(transport);
-      const endpointLabel = node("label", "HTTPS endpoint");
+      const endpointLabel = node("label", "HTTPS endpoint (port 443)");
       const endpoint = node("input");
       endpoint.type = "url";
       endpoint.maxLength = 2048;
       endpoint.required = true;
       endpoint.value = server.endpoint;
+      const endpointWasSupported = isSupportedMcpEndpoint(server.endpoint);
       endpointLabel.append(endpoint);
       const activeLabel = node("label", "Server active");
       const active = node("input");
@@ -270,7 +283,17 @@ const PORTAL_SCRIPT = `
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         save.disabled = true;
-        const body = { name: name.value, transport: transport.value, endpoint: endpoint.value,
+        const endpointIsSupported = isSupportedMcpEndpoint(endpoint.value);
+        const migratingUnsupportedConfig =
+          (server.transport !== "streamable_http" || !endpointWasSupported) &&
+          transport.value === "streamable_http" && endpointIsSupported;
+        const body = { name: name.value,
+          ...(transport.value !== server.transport || migratingUnsupportedConfig
+            ? { transport: transport.value }
+            : {}),
+          ...(endpoint.value !== server.endpoint || endpointWasSupported || migratingUnsupportedConfig
+            ? { endpoint: endpoint.value }
+            : {}),
           isActive: active.checked };
         if (credential.value) body.credential = credential.value;
         const serializedBody = JSON.stringify(body);
@@ -959,15 +982,15 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
       </section>
       <section id="mcp-server-panel" hidden>
         <h2>MCP server registrations</h2>
-        <p>Configure tenant-owned MCP endpoints. Credentials are encrypted before storage and never shown again. Discovery and tool calls remain disabled until controlled egress is enabled.</p>
+          <p>Configure tenant-owned Streamable HTTP MCP endpoints on HTTPS port 443. Credentials are encrypted before storage and never shown again. Discovery and tool calls remain disabled until controlled egress is enabled.</p>
         <ul id="mcp-servers"></ul>
         <h3>Add an MCP server</h3>
         <form id="mcp-server-form">
           <label for="mcp-server-name">Server name</label>
           <input id="mcp-server-name" maxlength="128" required>
           <label for="mcp-server-transport">Transport</label>
-          <select id="mcp-server-transport"><option value="streamable_http">Streamable HTTP</option><option value="sse">SSE</option></select>
-          <label for="mcp-server-endpoint">HTTPS endpoint</label>
+          <select id="mcp-server-transport"><option value="streamable_http">Streamable HTTP</option></select>
+          <label for="mcp-server-endpoint">HTTPS endpoint (port 443)</label>
           <input id="mcp-server-endpoint" type="url" maxlength="2048" required>
           <label for="mcp-server-credential">Credential (optional)</label>
           <input id="mcp-server-credential" type="password" autocomplete="new-password" maxlength="8192">
