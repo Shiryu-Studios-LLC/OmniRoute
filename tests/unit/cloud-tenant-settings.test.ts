@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
+import {
+  createCloudCustomerMembership,
+  issueCloudCustomerApiKey,
+} from "../../src/cloud/customerIdentity";
 import { provisionCloudCustomer } from "../../src/cloud/provisioning";
+import { createCloudRuntime } from "../../src/cloud/runtime";
+import { handleCloudCustomerSettingsRequest } from "../../src/cloud/tenantSettingsHttpApi";
 import { getCloudTenantSettings } from "../../src/cloud/tenantSettings";
 
 class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
@@ -155,6 +161,201 @@ test("customer provisioning returns tenant-bound opt-in settings initialized by 
         .first()) !== null,
       true
     );
+  } finally {
+    db.db.close();
+  }
+});
+
+test("customer settings are tenant-derived, role-gated, and audited atomically", async () => {
+  const db = await migratedDb();
+  try {
+    const ownerA = await provisionCloudCustomer(db, {
+      id: "settings-a",
+      name: "Settings A",
+      slug: "settings-a",
+      ownerPrincipalId: "settings-owner-a",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const ownerB = await provisionCloudCustomer(db, {
+      id: "settings-b",
+      name: "Settings B",
+      slug: "settings-b",
+      ownerPrincipalId: "settings-owner-b",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const member = await createCloudCustomerMembership(db, {
+      tenantId: "settings-a",
+      principalId: "settings-member-a",
+      role: "member",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const memberKey = await issueCloudCustomerApiKey(db, {
+      tenantId: "settings-a",
+      membershipId: member.id,
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const app = createCloudRuntime({
+      env: { DB: db },
+      now: () => new Date("2026-10-08T12:01:00.000Z"),
+    });
+    const get = async (token: string) =>
+      app.fetch(
+        new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      );
+    const update = async (token: string, body: unknown) =>
+      app.fetch(
+        new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        })
+      );
+
+    assert.equal((await get(ownerA.ownerApiKey.token)).status, 200);
+    assert.equal(
+      (await update(memberKey.token, { localAiEnabled: true, mcpEnabled: false })).status,
+      403
+    );
+    const updateResponse = await update(ownerA.ownerApiKey.token, {
+      localAiEnabled: true,
+      mcpEnabled: true,
+    });
+    assert.equal(updateResponse.status, 200);
+    assert.deepEqual(await updateResponse.json(), {
+      tenantId: "settings-a",
+      localAiEnabled: true,
+      mcpEnabled: true,
+      createdAt: "2026-10-08T12:00:00.000Z",
+      updatedAt: "2026-10-08T12:01:00.000Z",
+    });
+    assert.equal((await get(ownerB.ownerApiKey.token)).status, 200);
+    assert.deepEqual(await (await get(ownerB.ownerApiKey.token)).json(), {
+      tenantId: "settings-b",
+      localAiEnabled: false,
+      mcpEnabled: false,
+      createdAt: "2026-10-08T12:00:00.000Z",
+      updatedAt: "2026-10-08T12:00:00.000Z",
+    });
+    assert.equal(
+      (
+        await db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = ?"
+          )
+          .bind("settings-a", "customer.settings.update")
+          .first<{ count: number }>()
+      )?.count,
+      1
+    );
+
+    await db.exec(`CREATE TRIGGER reject_customer_settings_audit
+      BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action = 'customer.settings.update'
+      BEGIN SELECT RAISE(ABORT, 'settings audit unavailable'); END;`);
+    const rejectedUpdate = await update(ownerA.ownerApiKey.token, {
+      localAiEnabled: false,
+      mcpEnabled: false,
+    });
+    assert.equal(rejectedUpdate.status, 503);
+    assert.equal(
+      (
+        (await get(ownerA.ownerApiKey.token).then((response) => response.json())) as {
+          localAiEnabled: boolean;
+          mcpEnabled: boolean;
+        }
+      ).localAiEnabled,
+      true
+    );
+  } finally {
+    db.db.close();
+  }
+});
+
+test("customer settings applies pre-auth IP limits and bounded streaming body reads", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provisionCloudCustomer(db, {
+      id: "settings-bounds",
+      name: "Settings Bounds",
+      slug: "settings-bounds",
+      ownerPrincipalId: "settings-bounds-owner",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const now = () => new Date("2026-10-08T12:01:00.000Z");
+    const request = (token: string) => {
+      const result = new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      Object.defineProperty(result, "cf", { value: {} });
+      result.headers.set("cf-connecting-ip", "203.0.113.17");
+      return result;
+    };
+    const authOptions = {
+      db,
+      now,
+      failedKeyRateLimit: { limit: 1, windowMs: 60_000 },
+    };
+    assert.equal(
+      (await handleCloudCustomerSettingsRequest(request("orc_live_invalid"), authOptions))?.status,
+      401
+    );
+    assert.equal(
+      (await handleCloudCustomerSettingsRequest(request("orc_live_invalid"), authOptions))?.status,
+      429
+    );
+
+    let cancelled = false;
+    const oversized = new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${owner.ownerApiKey.token}`,
+        "Content-Type": "application/json",
+      },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(16 * 1024 + 1).fill(32));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    const oversizedResponse = await handleCloudCustomerSettingsRequest(oversized, { db, now });
+    assert.equal(oversizedResponse?.status, 413);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(cancelled, true);
+
+    let slowCancelled = false;
+    const slow = new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${owner.ownerApiKey.token}`,
+        "Content-Type": "application/json",
+      },
+      body: new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>(() => undefined);
+        },
+        cancel() {
+          slowCancelled = true;
+        },
+      }),
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    const slowResponse = await handleCloudCustomerSettingsRequest(slow, {
+      db,
+      now,
+      bodyReadTimeoutMs: 5,
+    });
+    assert.equal(slowResponse?.status, 408);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(slowCancelled, true);
   } finally {
     db.db.close();
   }

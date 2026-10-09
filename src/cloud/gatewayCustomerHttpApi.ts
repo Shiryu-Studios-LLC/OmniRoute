@@ -11,6 +11,7 @@ import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { appendCloudUsageRecord } from "./usage";
 import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
+import { getCloudTenantSettings } from "./tenantSettings";
 import { deleteCloudGatewayPairing, issueCloudGatewayPairing } from "./gatewayPairing";
 import {
   claimGatewayIdempotency,
@@ -165,6 +166,36 @@ export async function handleGatewayCustomerRequest(
     return rateLimit.allowed
       ? json({ error: "Unauthorized" }, 401)
       : json({ error: "Authentication rate limit exceeded" }, 429);
+  }
+  let tenantSettings;
+  try {
+    tenantSettings = await getCloudTenantSettings(options.db, identity.tenantId);
+  } catch {
+    return json({ error: "Customer settings are unavailable" }, 503);
+  }
+  if (!tenantSettings?.localAiEnabled) {
+    try {
+      await appendCloudComplianceAudit(options.db, {
+        id: crypto.randomUUID(),
+        tenantId: identity.tenantId,
+        timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+        action:
+          url.pathname === PAIRING_PATH ? "gateway.device.pair.issue" : "gateway.customer.invoke",
+        actor: identity.principalId,
+        target: null,
+        resourceType: "gateway-capability",
+        status: "denied",
+        requestId: requestIdFrom(request),
+        metadata: {
+          apiKeyId: identity.apiKeyId,
+          role: identity.role,
+          reason: "local-ai-disabled",
+        },
+      });
+    } catch {
+      return json({ error: "Local AI access audit is unavailable" }, 503);
+    }
+    return json({ error: "Local AI is disabled for this tenant" }, 403);
   }
   if (url.pathname === PAIRING_PATH) {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);

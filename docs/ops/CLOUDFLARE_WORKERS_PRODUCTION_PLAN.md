@@ -124,19 +124,53 @@ Complete the existing `multi-tenant` foundation:
 
 #### Egress decision (2026-10-08)
 
-Cloudflare Workers VPC now offers a possible public-egress path: a VPC Network
-binding to `cf1:network` can send Worker `fetch()` calls through Cloudflare
-Gateway, where existing Gateway policies and logs apply. Workers VPC is in open
-beta and documented as free during beta. The same `cf1:network` binding also
-reaches every Tunnel, Mesh route, and WAN destination in the account, so it is
-not a least-privilege MCP proxy by itself. Do not add this binding to the
-production Worker until an isolated staging account/network has a verified
-Gateway policy that blocks private destinations and restricts outbound
-destinations; the current staging environment is not configured.
+The least-privilege Cloudflare shape is a **VPC Service bound to one dedicated
+MCP egress proxy**, not a Worker `fetch()` to a customer URL and not an
+account-wide `cf1:network` binding. Cloudflare documents that a VPC Service
+routes to its configured host and port regardless of the URL host supplied by
+the Worker, and specifically describes this fixed-service scope as an SSRF
+control. The proxy is the only origin the Worker can reach through this
+binding. Keep the proxy behind a dedicated Cloudflare Tunnel; do not bind the
+Worker to a customer network or to `cf1:network`.
 
-References: [Workers VPC overview](https://developers.cloudflare.com/workers-vpc/),
+The proxy is still a security boundary, not a transparent relay. It must use
+the existing Node pinned-egress transport (or an equivalent implementation)
+to resolve all A/AAAA records, reject the entire set if any answer is
+non-public, connect only to that validated address set while retaining TLS
+verification for the requested hostname, and reject redirects. Its host
+network must have no route to customer/private networks and must block
+loopback, private, link-local, shared, reserved, and metadata destinations at
+the network layer, allowing outbound TCP 443 only. Bound request/response
+sizes and time, rate-limit the Worker identity, and never log request bodies,
+authorization headers, or credentials.
+
+For tenant isolation, the Worker must derive the caller and tenant from
+authenticated server-side state, authorize `invoke` against the requested
+server, and fetch that server only with a tenant-qualified registry lookup.
+The Worker sends a short-lived, authenticated proxy request carrying the
+tenant and server identifiers for audit plus the already-authorized endpoint,
+RPC body, and only that server's credential. The proxy accepts calls only
+from the Worker service identity, treats tenant/server fields as audit
+context rather than authorization by themselves, and does not persist
+credentials. A/B tests must prove a tenant A principal cannot resolve or
+invoke tenant B's server, and proxy tests must prove rebinding, mixed DNS,
+redirect, private/reserved IP, non-443 port, oversized body, and timeout cases
+fail closed. If a customer MCP service is intentionally on a private customer
+network, route it through that customer's authenticated Local Agent instead;
+do not expand the shared Worker's network access to reach it.
+
+Workers VPC is currently in beta. A VPC Network bound to `cf1:network` can
+reach every Tunnel, Mesh route, and WAN destination in the account, even
+though Gateway policies can filter public egress. It is too broad for this
+boundary and must not be added to the production Worker. A VPC Service to a
+dedicated proxy is the candidate to validate in isolated staging, including
+service binding scope, Tunnel reachability, Gateway/network-layer egress
+denials, and the proxy's connect-time pinning. No staging account or proxy is
+configured, so MCP invocation stays disabled.
+
+References: [VPC Services](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/),
+[Workers Binding API](https://developers.cloudflare.com/workers-vpc/api/),
 [VPC Networks](https://developers.cloudflare.com/workers-vpc/configuration/vpc-networks/),
-[Workers VPC pricing](https://developers.cloudflare.com/workers-vpc/platform/pricing/),
 and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/post/2026-06-05-gateway-egress/).
 
 ### 6. Front Desk tenancy
@@ -310,6 +344,14 @@ a request using the same key after rotation can instead conflict because its
 request fingerprint changed. The Cloud Worker route is not the Next application
 route documented in `docs/openapi.yaml`, and this bounded subset does not imply
 full OpenAI Chat Completions compatibility.
+
+Customer owner/admin API keys can read and update tenant-local-AI and MCP
+opt-in flags at `PUT /__cloud/v1/customer/settings`. The route derives tenant
+identity from the active D1 API-key membership, rejects writes from member and
+viewer roles, rate-limits by tenant, and commits the settings update with a
+tenant-scoped audit record. This configures feature availability only; it does
+not provision provider credentials, MCP servers, Front Desk branding, or a
+browser-based customer setup flow.
 
 After the repository is cloud-ready:
 

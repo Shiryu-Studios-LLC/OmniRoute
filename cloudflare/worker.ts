@@ -11,6 +11,7 @@ import {
   cleanupStaleCloudInferenceReservations,
 } from "../src/cloud/inferencePolicy";
 import { cleanupExpiredCloudInferenceResponses } from "../src/cloud/inferenceIdempotency";
+import { runCloudMaintenanceTasks } from "../src/cloud/maintenance";
 import { createCloudRuntime } from "../src/cloud/runtime";
 
 type CloudflareEnv = Env & {
@@ -109,14 +110,26 @@ const worker = {
   },
   scheduled(_controller: ScheduledController, env: CloudflareEnv, context: ExecutionContext): void {
     context.waitUntil(
-      Promise.all([
-        cleanupExpiredCloudRateLimits(env.DB),
-        cleanupExpiredCloudGatewayPairings(env.DB),
-        cleanupStaleCloudInferenceReservations(env.DB),
-        cleanupSettledCloudInferenceReservations(env.DB),
-        cleanupExpiredCloudInferenceResponses(env.DB),
-        cleanupExpiredCloudTenantOidcAuthArtifacts(env.DB),
-      ]).then(() => undefined)
+      runCloudMaintenanceTasks([
+        { name: "expired-rate-limits", run: () => cleanupExpiredCloudRateLimits(env.DB) },
+        { name: "expired-gateway-pairings", run: () => cleanupExpiredCloudGatewayPairings(env.DB) },
+        {
+          name: "stale-inference-reservations",
+          run: () => cleanupStaleCloudInferenceReservations(env.DB),
+        },
+        {
+          name: "settled-inference-reservations",
+          run: () => cleanupSettledCloudInferenceReservations(env.DB),
+        },
+        {
+          name: "expired-inference-responses",
+          run: () => cleanupExpiredCloudInferenceResponses(env.DB),
+        },
+        {
+          name: "expired-oidc-artifacts",
+          run: () => cleanupExpiredCloudTenantOidcAuthArtifacts(env.DB),
+        },
+      ])
     );
   },
 };

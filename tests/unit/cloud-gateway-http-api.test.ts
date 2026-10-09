@@ -145,6 +145,7 @@ function createRuntimeFixture(
     gatewayPairingIssueRateLimit?: { limit: number; windowMs: number };
     gatewayPairingExchangeRateLimit?: { limit: number; windowMs: number };
     currentClock?: boolean;
+    localAiEnabled?: boolean;
   } = {}
 ) {
   const d1 = new SqliteD1();
@@ -156,6 +157,7 @@ function createRuntimeFixture(
     "0005_cloud_customer_identity.sql",
     "0006_gateway_invocation_idempotency.sql",
     "0007_gateway_device_service_health.sql",
+    "0008_cloud_tenant_settings.sql",
     "0017_cloud_gateway_pairings.sql",
   ]) {
     d1.db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
@@ -173,6 +175,11 @@ function createRuntimeFixture(
        VALUES (?, ?, ?, 'customer', 1, ?, ?)`
     )
     .run("tenant-b", "Beta", "beta", now, now);
+  if (options.localAiEnabled !== false) {
+    d1.db
+      .prepare("UPDATE cloud_tenant_settings SET local_ai_enabled = 1 WHERE tenant_id IN (?, ?)")
+      .run("tenant-a", "tenant-b");
+  }
 
   const sessions = new TestDurableObjectNamespace();
   const runtime = createCloudRuntime({
@@ -365,6 +372,123 @@ test("customer owner can pair a Local Agent once; code and device stay tenant-bo
     assert.equal(JSON.parse(deniedReplayAudit.metadata_json).pairingHash, storedPairing.code_hash);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("tenant local-AI opt-in gates pairing and invocation and invalidates outstanding pairing grants", async () => {
+  const disabledFixture = createRuntimeFixture({ localAiEnabled: false });
+  try {
+    const owner = await customerKey(disabledFixture, "tenant-a", "owner");
+    assert.equal((await disabledFixture.fetch(pairingIssueRequest(owner.token))).status, 403);
+    const invocation = await disabledFixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/customer/invoke", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${owner.token}`,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      })
+    );
+    assert.equal(invocation.status, 403);
+  } finally {
+    disabledFixture.d1.db.close();
+  }
+
+  const revocationFixture = createRuntimeFixture();
+  try {
+    const owner = await customerKey(revocationFixture, "tenant-a", "owner");
+    const issued = await revocationFixture.fetch(pairingIssueRequest(owner.token));
+    assert.equal(issued.status, 201);
+    const { pairingCode } = (await issued.json()) as { pairingCode: string };
+    revocationFixture.d1.db
+      .prepare("UPDATE cloud_tenant_settings SET local_ai_enabled = 0 WHERE tenant_id = ?")
+      .run("tenant-a");
+    const exchange = await revocationFixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/pair", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: 1, pairingCode }),
+      })
+    );
+    assert.notEqual(exchange.status, 200);
+    assert.equal(
+      (
+        revocationFixture.d1.db
+          .prepare("SELECT COUNT(*) AS count FROM cloud_gateway_devices WHERE tenant_id = ?")
+          .get("tenant-a") as { count: number }
+      ).count,
+      0
+    );
+  } finally {
+    revocationFixture.d1.db.close();
+  }
+});
+
+test("Local AI opt-out blocks reconnects and revokes active sessions before re-enabling", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const pairing = await fixture.fetch(pairingIssueRequest(owner.token));
+    const { pairingCode } = (await pairing.json()) as { pairingCode: string };
+    const exchange = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/pair", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: 1, pairingCode }),
+      })
+    );
+    assert.equal(exchange.status, 201);
+    const paired = (await exchange.json()) as { deviceId: string; credential: string };
+    const connect = async () =>
+      fixture.fetch(
+        new Request("https://cloud.example.test/__gateway/v1/device/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ version: 1, ...paired }),
+        })
+      );
+    const connected = await connect();
+    assert.equal(connected.status, 200);
+    const { session } = (await connected.json()) as {
+      session: { sessionToken: string };
+    };
+    const settingsRequest = (localAiEnabled: boolean) =>
+      fixture.fetch(
+        new Request("https://cloud.example.test/__cloud/v1/customer/settings", {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${owner.token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ localAiEnabled, mcpEnabled: false }),
+        })
+      );
+    assert.equal((await settingsRequest(false)).status, 200);
+    assert.equal((await connect()).status, 401);
+
+    const poll = () =>
+      fixture.fetch(
+        new Request("https://cloud.example.test/__gateway/v1/device/poll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            version: 1,
+            deviceId: paired.deviceId,
+            sessionToken: session.sessionToken,
+          }),
+        })
+      );
+    assert.equal((await poll()).status, 401);
+    assert.equal((await settingsRequest(true)).status, 200);
+    assert.equal((await poll()).status, 401, "a revoked pre-opt-out session must not return");
+    assert.equal(
+      (await connect()).status,
+      200,
+      "the device can reconnect with its active credential"
+    );
+  } finally {
+    fixture.d1.db.close();
   }
 });
 

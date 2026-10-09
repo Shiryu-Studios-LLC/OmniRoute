@@ -3,6 +3,10 @@ import { handleCloudApiRequest } from "./httpApi";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
+import {
+  CLOUD_CUSTOMER_SETTINGS_PATH,
+  handleCloudCustomerSettingsRequest,
+} from "./tenantSettingsHttpApi";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
@@ -66,6 +70,22 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       if (url.pathname === CLOUD_CUSTOMER_PORTAL_PATH) {
         const response = handleCloudCustomerPortalRequest(request);
         if (response) return response;
+      }
+
+      if (url.pathname === CLOUD_CUSTOMER_SETTINGS_PATH) {
+        try {
+          const response = await handleCloudCustomerSettingsRequest(request, {
+            db: options.env?.DB,
+            sessions: options.env?.GATEWAY_SESSIONS,
+            now,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Customer settings request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
       }
 
       if (

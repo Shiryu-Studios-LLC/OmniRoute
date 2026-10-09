@@ -530,6 +530,16 @@ test(
       );
       const customerKey = String(tenantResult.body.ownerApiKey.token);
       assert.match(customerKey, /^orc_live_/);
+      const settingsResult = await requestJson(`${baseUrl}/__cloud/v1/customer/settings`, {
+        method: "PUT",
+        token: customerKey,
+        body: { localAiEnabled: true, mcpEnabled: false },
+      });
+      assert.equal(
+        settingsResult.response.status,
+        200,
+        `${label} local AI setting failed: ${JSON.stringify(settingsResult.body)}\n${output}`
+      );
 
       const deviceId = `device-${randomUUID().replaceAll("-", "").slice(0, 20)}`;
       const credential = `local-device-${randomUUID().replaceAll("-", "")}`.padEnd(43, "x");

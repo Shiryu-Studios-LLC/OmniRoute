@@ -83,11 +83,13 @@ export async function issueCloudGatewayPairing(
           JOIN cloud_customer_api_keys k
             ON k.tenant_id = m.tenant_id AND k.membership_id = m.id
           JOIN tenants t ON t.id = m.tenant_id
+          JOIN cloud_tenant_settings s ON s.tenant_id = t.id
           WHERE m.tenant_id = ? AND m.id = ? AND m.principal_id = ?
             AND m.is_active = 1 AND m.role IN ('owner', 'admin')
             AND k.id = ? AND k.revoked_at IS NULL
             AND (k.expires_at IS NULL OR k.expires_at > ?)
             AND t.kind = 'customer' AND t.is_active = 1
+            AND s.local_ai_enabled = 1
         )`
     )
     .bind(
@@ -126,7 +128,14 @@ export async function consumeCloudGatewayPairing(
   const pairing = await db
     .prepare<{ tenant_id: string; issued_by: string; api_key_id: string }>(
       `SELECT tenant_id, issued_by, api_key_id FROM cloud_gateway_pairings
-        WHERE code_hash = ? AND consumed_at IS NULL AND expires_at > ? LIMIT 1`
+        WHERE code_hash = ? AND consumed_at IS NULL AND expires_at > ?
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_settings s
+            JOIN tenants t ON t.id = s.tenant_id
+            WHERE s.tenant_id = cloud_gateway_pairings.tenant_id
+              AND s.local_ai_enabled = 1 AND t.kind = 'customer' AND t.is_active = 1
+          )
+        LIMIT 1`
     )
     .bind(codeHash, timestamp)
     .first();
@@ -149,6 +158,7 @@ export async function consumeCloudGatewayPairing(
               JOIN cloud_customer_api_keys k
                 ON k.tenant_id = m.tenant_id AND k.membership_id = m.id
               JOIN tenants t ON t.id = m.tenant_id
+              JOIN cloud_tenant_settings s ON s.tenant_id = t.id
               WHERE m.tenant_id = cloud_gateway_pairings.tenant_id
                 AND m.id = cloud_gateway_pairings.membership_id
                 AND m.principal_id = cloud_gateway_pairings.issued_by
@@ -156,6 +166,7 @@ export async function consumeCloudGatewayPairing(
                 AND k.id = cloud_gateway_pairings.api_key_id AND k.revoked_at IS NULL
                 AND (k.expires_at IS NULL OR k.expires_at > ?)
                 AND t.kind = 'customer' AND t.is_active = 1
+                AND s.local_ai_enabled = 1
             )`
       )
       .bind(timestamp, consumeNonce, codeHash, timestamp, timestamp),

@@ -1,4 +1,5 @@
 import type { CloudDb } from "./db";
+import { getCloudTenantSettings } from "./tenantSettings";
 import type { GatewayDeviceDirectory, GatewayDeviceRecord } from "./connectorGateway";
 import { getCloudTenantById } from "./tenants";
 
@@ -306,8 +307,11 @@ export async function rotateCloudGatewayDeviceCredential(
 export class D1GatewayDeviceDirectory implements GatewayDeviceDirectory {
   constructor(private readonly db: CloudDb) {}
 
-  getDevice(deviceId: string): Promise<GatewayDeviceRecord | null> {
-    return getCloudGatewayDevice(this.db, deviceId);
+  async getDevice(deviceId: string): Promise<GatewayDeviceRecord | null> {
+    const device = await getCloudGatewayDevice(this.db, deviceId);
+    if (!device) return null;
+    const settings = await getCloudTenantSettings(this.db, device.tenantId);
+    return settings?.localAiEnabled ? device : null;
   }
 
   revokeDevice(tenantId: string, deviceId: string, revokedAt: string): Promise<boolean> {
