@@ -24,6 +24,7 @@ import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
   CLOUD_TENANT_MEMBERS_PATH,
+  CLOUD_TENANT_API_KEYS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -1416,6 +1417,169 @@ test("OIDC owner member API paginates only its tenant and CAS-updates with key r
     changedFields: ["isActive"],
   });
   assert.equal(JSON.stringify(audits).includes("external-user-17"), false);
+});
+
+test("OIDC portal owners can issue, list, and revoke only their own API keys", async () => {
+  const { db, tenant, membership: owner } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, owner.id)
+    .run();
+  const { app, cookie } = await createPortalSession(db, tenant.slug, "external-user-17");
+  const headers = { Origin: ORIGIN, Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${cookie}` };
+
+  const empty = await app.fetch(new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, { headers }));
+  assert.equal(empty.status, 200);
+  assert.deepEqual(await empty.json(), { keys: [] });
+
+  const issued = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ expiresAt: new Date(NOW + 60_000).toISOString() }),
+    })
+  );
+  assert.equal(issued.status, 201);
+  const issuedBody = (await issued.json()) as {
+    key: { id: string; token: string; createdAt: string; expiresAt: string };
+  };
+  assert.match(issuedBody.key.token, /^orc_live_[A-Za-z0-9_-]{43}$/);
+  assert.equal(issuedBody.key.expiresAt, new Date(NOW + 60_000).toISOString());
+  const storedKey = db.raw
+    .prepare("SELECT key_hash FROM cloud_customer_api_keys WHERE id = ?")
+    .get(issuedBody.key.id) as { key_hash: string };
+  assert.equal(storedKey.key_hash, createHash("sha256").update(issuedBody.key.token).digest("hex"));
+  assert.notEqual(storedKey.key_hash, issuedBody.key.token);
+
+  const listed = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, { headers })
+  );
+  assert.equal(listed.status, 200);
+  const listBody = (await listed.json()) as { keys: Array<Record<string, unknown>> };
+  assert.equal(listBody.keys.length, 1);
+  assert.equal(listBody.keys[0]?.id, issuedBody.key.id);
+  assert.equal("token" in listBody.keys[0]!, false);
+  assert.equal(JSON.stringify(listBody).includes(issuedBody.key.token), false);
+
+  const otherMembership = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "other-key-owner",
+    role: "member",
+  });
+  const otherKey = await issueCloudCustomerApiKey(db, {
+    tenantId: tenant.id,
+    membershipId: otherMembership.id,
+  });
+  const crossMembershipRevoke = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}/${otherKey.id}`, {
+      method: "DELETE",
+      headers,
+    })
+  );
+  assert.equal(crossMembershipRevoke.status, 404);
+  assert.equal(
+    (
+      db.raw
+        .prepare("SELECT revoked_at FROM cloud_customer_api_keys WHERE id = ?")
+        .get(otherKey.id) as { revoked_at: string | null }
+    ).revoked_at,
+    null,
+    "an owner cannot revoke another member's key through the self-service route"
+  );
+
+  const revoked = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}/${issuedBody.key.id}`, {
+      method: "DELETE",
+      headers,
+    })
+  );
+  assert.equal(revoked.status, 200);
+  const replay = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}/${issuedBody.key.id}`, {
+      method: "DELETE",
+      headers,
+    })
+  );
+  assert.equal(replay.status, 404);
+  assert.equal(
+    db.raw
+      .prepare(
+        `SELECT COUNT(*) AS count FROM cloud_compliance_audit
+          WHERE tenant_id = ? AND action IN ('customer.api_key.portal.create', 'customer.api_key.portal.revoke')`
+      )
+      .get(tenant.id)?.count,
+    2
+  );
+});
+
+test("OIDC members cannot list or issue customer API keys", async () => {
+  const { db, tenant } = await setup();
+  const { app, cookie } = await createPortalSession(db, tenant.slug, "external-user-17");
+  const headers = {
+    Origin: ORIGIN,
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${cookie}`,
+    "Content-Type": "application/json",
+  };
+  const list = await app.fetch(new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, { headers }));
+  assert.equal(list.status, 403);
+  const create = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ expiresAt: null }),
+    })
+  );
+  assert.equal(create.status, 403);
+  assert.equal(
+    db.raw.prepare("SELECT COUNT(*) AS count FROM cloud_customer_api_keys").get()?.count,
+    0
+  );
+});
+
+test("OIDC portal API-key issue requires same-origin requests and rolls back on audit failure", async () => {
+  const { db, tenant, membership: owner } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, owner.id)
+    .run();
+  const { app, cookie } = await createPortalSession(db, tenant.slug, "external-user-17");
+  const crossOrigin = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, {
+      method: "POST",
+      headers: {
+        Origin: "https://attacker.example",
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${cookie}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expiresAt: null }),
+    })
+  );
+  assert.equal(crossOrigin.status, 403);
+
+  await db.exec(`
+    CREATE TRIGGER fail_portal_key_audit BEFORE INSERT ON cloud_compliance_audit
+    WHEN NEW.action = 'customer.api_key.portal.create'
+    BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;
+  `);
+  const failed = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, {
+      method: "POST",
+      headers: {
+        Origin: ORIGIN,
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${cookie}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expiresAt: null }),
+    })
+  );
+  assert.equal(failed.status, 503);
+  assert.equal(
+    db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_customer_api_keys WHERE tenant_id = ?")
+      .get(tenant.id)?.count,
+    0,
+    "key issuance must roll back when its audit cannot be written"
+  );
 });
 
 test("OIDC member API restricts admins from owners and preserves the last active owner", async () => {

@@ -35,7 +35,97 @@ const PORTAL_SCRIPT = `
   const inviteForm = byId("redeem-form");
   const memberList = byId("members");
   const nextButton = byId("next-page");
+  const apiKeyList = byId("api-keys");
+  const apiKeyResult = byId("api-key-result");
+  let newlyIssuedToken = null;
   let nextCursor = null;
+
+  const formatDate = (value) => {
+    if (typeof value !== "string") return "No expiration";
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : value;
+  };
+
+  const clearIssuedToken = () => {
+    newlyIssuedToken = null;
+    apiKeyResult.replaceChildren();
+  };
+
+  const loadApiKeys = async () => {
+    const data = await api("/__cloud/auth/api-keys");
+    if (!Array.isArray(data.keys)) throw new Error("Invalid API key list response");
+    apiKeyList.replaceChildren();
+    for (const key of data.keys) {
+      if (!key || typeof key.id !== "string" || typeof key.createdAt !== "string" ||
+          (key.expiresAt !== null && typeof key.expiresAt !== "string") ||
+          (key.revokedAt !== null && typeof key.revokedAt !== "string")) continue;
+      const row = node("li");
+      row.className = "api-key-row";
+      const revoked = key.revokedAt !== null;
+      row.append(node("p", "Created " + formatDate(key.createdAt) + " · " +
+        (key.expiresAt ? "Expires " + formatDate(key.expiresAt) : "Does not expire") + " · " +
+        (revoked ? "Revoked " + formatDate(key.revokedAt) : "Active")));
+      if (!revoked) {
+        const revoke = node("button", "Revoke key");
+        revoke.type = "button";
+        revoke.addEventListener("click", async () => {
+          revoke.disabled = true;
+          try {
+            await api("/__cloud/auth/api-keys/" + encodeURIComponent(key.id), { method: "DELETE" });
+            setStatus("API key revoked.");
+            await loadApiKeys();
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Could not revoke API key.", true);
+            revoke.disabled = false;
+          }
+        });
+        row.append(revoke);
+      }
+      apiKeyList.append(row);
+    }
+  };
+
+  byId("api-key-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    clearIssuedToken();
+    const button = byId("issue-api-key");
+    button.disabled = true;
+    const expiration = byId("api-key-expires-at").value;
+    try {
+      const data = await api("/__cloud/auth/api-keys", {
+        method: "POST",
+        body: JSON.stringify({ expiresAt: expiration ? new Date(expiration).toISOString() : null }),
+      });
+      if (!data.key || typeof data.key.id !== "string" || typeof data.key.createdAt !== "string" ||
+          typeof data.key.token !== "string" || !data.key.token) {
+        throw new Error("Invalid API key response");
+      }
+      newlyIssuedToken = data.key.token;
+      const token = node("code", newlyIssuedToken);
+      const copy = node("button", "Copy and hide token");
+      copy.type = "button";
+      copy.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(newlyIssuedToken);
+          clearIssuedToken();
+          setStatus("API key copied. The token was hidden.");
+        } catch {
+          setStatus("Could not copy the token. You can still copy it manually or hide it.", true);
+        }
+      });
+      const dismiss = node("button", "Hide token");
+      dismiss.type = "button";
+      dismiss.addEventListener("click", clearIssuedToken);
+      apiKeyResult.append(
+        node("p", "Copy this API key now. It will not be shown again."), token, copy, dismiss
+      );
+      byId("api-key-expires-at").value = "";
+      setStatus("API key created.");
+      await loadApiKeys();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not create API key.", true);
+    } finally { button.disabled = false; }
+  });
 
   const signIn = (event) => {
     event.preventDefault();
@@ -196,7 +286,13 @@ const PORTAL_SCRIPT = `
       byId("membership-role").textContent = session.membership.role;
       window.customerPortalRole = session.membership.role;
       if (session.membership.role === "owner" || session.membership.role === "admin") {
+        byId("api-key-panel").hidden = false;
         byId("manager-panel").hidden = false;
+        try {
+          await loadApiKeys();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load API keys.", true);
+        }
         try {
           await loadMembers();
         } catch (error) {
@@ -268,6 +364,18 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
         <p>Organization: <span id="tenant-slug-label"></span> · Your role: <span id="membership-role"></span></p>
         <button id="logout" type="button">Sign out</button>
         <p id="member-readonly" hidden>Your account does not have member-management access.</p>
+      </section>
+      <section id="api-key-panel" hidden>
+        <h2>Your API keys</h2>
+        <p>API keys grant access to your organization. Store them securely and revoke any key you no longer need.</p>
+        <ul id="api-keys"></ul>
+        <h3>Create an API key</h3>
+        <form id="api-key-form">
+          <label for="api-key-expires-at">Expiration (optional)</label>
+          <input id="api-key-expires-at" type="datetime-local">
+          <button id="issue-api-key" type="submit">Create API key</button>
+        </form>
+        <div id="api-key-result" aria-live="polite"></div>
       </section>
       <section id="manager-panel" hidden>
         <h2>Members</h2>

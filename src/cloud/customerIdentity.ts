@@ -298,7 +298,13 @@ export async function updateCloudCustomerMembership(
 /** Issue a random tenant-bound key. The raw token is returned once and is never stored. */
 export async function issueCloudCustomerApiKey(
   db: CloudDb,
-  input: { tenantId: string; membershipId: string; expiresAt?: string | null; now?: string }
+  input: {
+    tenantId: string;
+    membershipId: string;
+    expiresAt?: string | null;
+    audit?: CloudComplianceAuditInput;
+    now?: string;
+  }
 ): Promise<IssuedCloudCustomerApiKey> {
   requireId(input.tenantId, "tenantId");
   requireId(input.membershipId, "membershipId");
@@ -325,18 +331,31 @@ export async function issueCloudCustomerApiKey(
 
   const token = createToken();
   const id = crypto.randomUUID();
-  const result = await db
+  const insert = db
     .prepare(
       `INSERT INTO cloud_customer_api_keys
          (id, tenant_id, membership_id, key_hash, created_at, expires_at)
        VALUES (?, ?, ?, ?, ?, ?)`
     )
-    .bind(id, input.tenantId, input.membershipId, await hashToken(token), now, expiresAt)
-    .run();
+    .bind(id, input.tenantId, input.membershipId, await hashToken(token), now, expiresAt);
+  const results = input.audit
+    ? await db.batch([
+        insert,
+        prepareCloudComplianceAuditInsert(db, input.audit, {
+          requirePreviousStatementChange: true,
+        }).statement,
+      ])
+    : [await insert.run()];
   if (
-    !result.success ||
-    (result.meta?.changes !== undefined && Number(result.meta.changes) !== 1)
+    results.some(
+      (result) =>
+        !result || typeof result !== "object" || !("success" in result) || result.success === false
+    )
   ) {
+    throw new Error("Customer API key could not be issued");
+  }
+  const insertResult = results[0] as { meta?: { changes?: unknown } };
+  if (insertResult.meta?.changes !== undefined && Number(insertResult.meta.changes) !== 1) {
     throw new Error("Customer API key could not be issued");
   }
   return {
@@ -352,18 +371,47 @@ export async function issueCloudCustomerApiKey(
 /** Revoke one key within the explicitly selected tenant. Call only after platform-admin authorization. */
 export async function revokeCloudCustomerApiKey(
   db: CloudDb,
-  input: { tenantId: string; apiKeyId: string; now?: string }
+  input: {
+    tenantId: string;
+    apiKeyId: string;
+    membershipId?: string;
+    audit?: CloudComplianceAuditInput;
+    now?: string;
+  }
 ): Promise<boolean> {
   requireId(input.tenantId, "tenantId");
   requireId(input.apiKeyId, "apiKeyId");
-  const result = await db
+  if (input.membershipId !== undefined) requireId(input.membershipId, "membershipId");
+  const update = db
     .prepare(
       `UPDATE cloud_customer_api_keys SET revoked_at = ?
-        WHERE tenant_id = ? AND id = ? AND revoked_at IS NULL`
+        WHERE tenant_id = ? AND id = ? AND revoked_at IS NULL
+          AND (? IS NULL OR membership_id = ?)`
     )
-    .bind(input.now ?? new Date().toISOString(), input.tenantId, input.apiKeyId)
-    .run();
-  return result.success && Number(result.meta?.changes ?? 0) === 1;
+    .bind(
+      input.now ?? new Date().toISOString(),
+      input.tenantId,
+      input.apiKeyId,
+      input.membershipId ?? null,
+      input.membershipId ?? null
+    );
+  const results = input.audit
+    ? await db.batch([
+        update,
+        prepareCloudComplianceAuditInsert(db, input.audit, {
+          requirePreviousStatementChange: true,
+        }).statement,
+      ])
+    : [await update.run()];
+  const result = results[0] as { success?: boolean; meta?: { changes?: unknown } } | undefined;
+  return (
+    result?.success === true &&
+    (result.meta?.changes === undefined || Number(result.meta.changes) === 1) &&
+    results.every(
+      (entry) =>
+        !!entry && typeof entry === "object" && "success" in entry && entry.success !== false
+    )
+  );
 }
 
 /** Resolve a bearer secret to authoritative D1 membership identity; callers supply no tenant ID. */

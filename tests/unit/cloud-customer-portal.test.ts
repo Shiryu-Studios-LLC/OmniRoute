@@ -36,6 +36,14 @@ test("Cloud Worker serves the customer portal with nonce CSP and safe DOM render
   assert.match(html, /__cloud\/auth\/members\/invitations/);
   assert.match(html, /__cloud\/auth\/oidc\/invitations\/redeem/);
   assert.match(html, /__cloud\/auth\/logout/);
+  assert.match(html, /__cloud\/auth\/api-keys/);
+  assert.match(html, /api-key-panel/);
+  assert.match(html, /expiresAt:/);
+  assert.match(html, /method: "DELETE"/);
+  assert.match(html, /Copy and hide token/);
+  assert.match(html, /writeText\(newlyIssuedToken\)/);
+  assert.match(html, /clearIssuedToken/);
+  assert.doesNotMatch(html, /localStorage|sessionStorage/);
   assert.match(html, /expectedUpdatedAt/);
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i, "the page must not use inline event handlers");
   assert.doesNotMatch(html, /principalId|\.subject|identity\.subject/);

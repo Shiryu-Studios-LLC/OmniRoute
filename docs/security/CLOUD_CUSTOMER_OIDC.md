@@ -78,6 +78,13 @@ session unusable. Invitation
 creation requires an exact same-origin POST and the active owner/admin session; the cookie
 does not authorize existing API routes.
 
+Owner/admin portal sessions can manage API keys attached to their own membership at
+`/__cloud/auth/api-keys`: GET lists metadata, POST returns a newly issued token once, and
+DELETE revokes one of that membership's keys. Members cannot list or issue keys through this
+portal path. The raw token is not stored or written to audit; key creation/revocation and the
+tenant-scoped audit row are committed together. Listing is tenant- and membership-scoped and
+does not return tokens.
+
 ## Issuer endpoint handling
 
 OIDC discovery, token exchange, and JWKS retrieval use HTTPS endpoints from the tenant's

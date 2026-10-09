@@ -5,6 +5,8 @@ import {
   CloudMembershipConflictError,
   CloudLastActiveOwnerError,
   getCloudCustomerMembership,
+  issueCloudCustomerApiKey,
+  revokeCloudCustomerApiKey,
   updateCloudCustomerMembership,
   type CloudCustomerRole,
 } from "./customerIdentity";
@@ -36,6 +38,7 @@ export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
   "/__cloud/auth/oidc/invitations/redeem";
 export const CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH = "/__cloud/auth/oidc/owner/claim";
 export const CLOUD_TENANT_MEMBERS_PATH = "/__cloud/auth/members";
+export const CLOUD_TENANT_API_KEYS_PATH = "/__cloud/auth/api-keys";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -1020,6 +1023,168 @@ async function updateMembership(
   });
 }
 
+async function checkPortalApiKeyRateLimit(
+  db: CloudDb,
+  session: OidcSessionRow,
+  action: "list" | "write",
+  nowMs: number
+): Promise<boolean> {
+  const result = await consumeCloudRateLimit(db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-api-key:${action}:${session.tenant_id}:${session.membership_id}`,
+    limit: action === "list" ? 60 : 20,
+    windowMs: 60_000,
+    nowMs,
+  });
+  return result.allowed;
+}
+
+async function listPortalApiKeys(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  nowMs: number
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "API key service unavailable" }, 503);
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (!(await checkPortalApiKeyRateLimit(db, session, "list", nowMs))) {
+    return json({ error: "API key read rate limit exceeded" }, 429);
+  }
+  const rows = await db
+    .prepare<{
+      id: string;
+      created_at: string;
+      expires_at: string | null;
+      revoked_at: string | null;
+    }>(
+      `SELECT id, created_at, expires_at, revoked_at
+         FROM cloud_customer_api_keys
+        WHERE tenant_id = ? AND membership_id = ?
+        ORDER BY created_at DESC, id DESC LIMIT 100`
+    )
+    .bind(session.tenant_id, session.membership_id)
+    .all();
+  if (!rows.success) return json({ error: "API key service unavailable" }, 503);
+  return json({
+    keys: rows.results.map((row) => ({
+      id: row.id,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      revokedAt: row.revoked_at,
+    })),
+  });
+}
+
+async function createPortalApiKey(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "API key service unavailable" }, 503);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (!(await checkPortalApiKeyRateLimit(db, session, "write", nowMs))) {
+    return json({ error: "API key write rate limit exceeded" }, 429);
+  }
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBounded(new Response(request.body), 2048);
+  } catch {
+    return json({ error: "Invalid request body" }, 400);
+  }
+  if (
+    !isRecord(body) ||
+    Object.keys(body).some((key) => key !== "expiresAt") ||
+    (body.expiresAt !== undefined && body.expiresAt !== null && typeof body.expiresAt !== "string")
+  ) {
+    return json({ error: "Invalid API key request" }, 400);
+  }
+  const timestamp = new Date(nowMs).toISOString();
+  const expiresAt = body.expiresAt as string | null | undefined;
+  const requestId = request.headers.get("cf-ray") ?? request.headers.get("x-request-id");
+  try {
+    const key = await issueCloudCustomerApiKey(db, {
+      tenantId: session.tenant_id,
+      membershipId: session.membership_id,
+      expiresAt,
+      now: timestamp,
+      audit: {
+        id: crypto.randomUUID(),
+        tenantId: session.tenant_id,
+        timestamp,
+        action: "customer.api_key.portal.create",
+        actor: session.membership_id,
+        target: "self",
+        resourceType: "customer-api-key",
+        status: "success",
+        requestId: requestId && requestId.length <= 512 ? requestId : null,
+        metadata: { expiresAt: expiresAt ?? null },
+      },
+    });
+    return json(
+      { key: { id: key.id, createdAt: key.createdAt, expiresAt: key.expiresAt, token: key.token } },
+      201
+    );
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof RangeError) {
+      return json({ error: "Invalid API key expiry" }, 400);
+    }
+    throw error;
+  }
+}
+
+async function revokePortalApiKey(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number,
+  apiKeyId: string
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "API key service unavailable" }, 503);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (!(await checkPortalApiKeyRateLimit(db, session, "write", nowMs))) {
+    return json({ error: "API key write rate limit exceeded" }, 429);
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(apiKeyId)) return json({ error: "API key not found" }, 404);
+  const timestamp = new Date(nowMs).toISOString();
+  const requestId = request.headers.get("cf-ray") ?? request.headers.get("x-request-id");
+  const revoked = await revokeCloudCustomerApiKey(db, {
+    tenantId: session.tenant_id,
+    apiKeyId,
+    membershipId: session.membership_id,
+    now: timestamp,
+    audit: {
+      id: crypto.randomUUID(),
+      tenantId: session.tenant_id,
+      timestamp,
+      action: "customer.api_key.portal.revoke",
+      actor: session.membership_id,
+      target: apiKeyId,
+      resourceType: "customer-api-key",
+      status: "success",
+      requestId: requestId && requestId.length <= 512 ? requestId : null,
+      metadata: {},
+    },
+  });
+  return revoked
+    ? json({ id: apiKeyId, revokedAt: timestamp })
+    : json({ error: "API key not found" }, 404);
+}
+
 async function createMembershipInvitation(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1191,6 +1356,8 @@ export async function handleCloudTenantOidcAuthRequest(
   const isLogout = pathname === CLOUD_TENANT_OIDC_LOGOUT_PATH;
   const isMembers = pathname === CLOUD_TENANT_MEMBERS_PATH;
   const isMemberItem = pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`);
+  const isApiKeyCollection = pathname === CLOUD_TENANT_API_KEYS_PATH;
+  const isApiKeyItem = pathname.startsWith(`${CLOUD_TENANT_API_KEYS_PATH}/`);
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1201,6 +1368,8 @@ export async function handleCloudTenantOidcAuthRequest(
     !isLogout &&
     !isMembers &&
     !isMemberItem &&
+    !isApiKeyCollection &&
+    !isApiKeyItem &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1208,13 +1377,20 @@ export async function handleCloudTenantOidcAuthRequest(
     return null;
   }
   const expectedMethod =
-    isCreateInvitation || isRedeemInvitation || isRedeemOwnerClaim || isLogout
-      ? "POST"
-      : isMemberItem
-        ? "PATCH"
-        : "GET";
-  if (request.method !== expectedMethod) {
-    return json({ error: "Method not allowed" }, 405, { Allow: expectedMethod });
+    isApiKeyCollection || isApiKeyItem
+      ? ""
+      : isCreateInvitation || isRedeemInvitation || isRedeemOwnerClaim || isLogout
+        ? "POST"
+        : isMemberItem
+          ? "PATCH"
+          : "GET";
+  const allowedMethods = isApiKeyCollection
+    ? ["GET", "POST"]
+    : isApiKeyItem
+      ? ["DELETE"]
+      : [expectedMethod];
+  if (!allowedMethods.includes(request.method)) {
+    return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
   const origin = expectedOrigin(request, options);
   if (!origin)
@@ -1230,6 +1406,20 @@ export async function handleCloudTenantOidcAuthRequest(
   }
   if (isCallback) return callback(request, options, origin, nowMs);
   if (isCreateInvitation) return createMembershipInvitation(request, options, origin, nowMs);
+  if (isApiKeyCollection) {
+    return request.method === "POST"
+      ? createPortalApiKey(request, options, origin, nowMs)
+      : listPortalApiKeys(request, options, nowMs);
+  }
+  if (isApiKeyItem) {
+    return revokePortalApiKey(
+      request,
+      options,
+      origin,
+      nowMs,
+      pathname.slice(`${CLOUD_TENANT_API_KEYS_PATH}/`.length)
+    );
+  }
   if (isRedeemInvitation) return redeemMembershipInvitation(request, options, origin, nowMs);
   if (isRedeemOwnerClaim) return redeemFirstOwnerClaim(request, options, origin, nowMs);
   if (isLogout) return logoutSession(request, options, origin, nowMs);
