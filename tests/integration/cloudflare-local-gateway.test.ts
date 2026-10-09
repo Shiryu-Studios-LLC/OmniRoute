@@ -121,6 +121,44 @@ async function requestHostJson(
   });
 }
 
+async function requestHostBytes(
+  port: number,
+  host: string,
+  pathname: string,
+  timeoutMs = 30_000
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+  return await new Promise((resolve, reject) => {
+    const request = http.request(
+      { hostname: "127.0.0.1", port, path: pathname, method: "GET", headers: { host } },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        response.on("data", (chunk: Buffer | string) => {
+          const bytes = Buffer.from(chunk);
+          totalBytes += bytes.byteLength;
+          if (totalBytes > 10 * 1024 * 1024) {
+            request.destroy(new Error("Front Desk image exceeded 10 MiB"));
+            return;
+          }
+          chunks.push(bytes);
+        });
+        response.on("end", () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            headers: response.headers,
+            body: Buffer.concat(chunks, totalBytes),
+          });
+        });
+      }
+    );
+    request.setTimeout(timeoutMs, () =>
+      request.destroy(new Error("Front Desk image request timed out"))
+    );
+    request.once("error", reject);
+    request.end();
+  });
+}
+
 async function requestHostStream(
   port: number,
   host: string,
@@ -1427,13 +1465,13 @@ test(
     await t.test(
       "a real loopback ComfyUI image completes through the Worker, Durable Object, and local agent",
       {
-        timeout: 90_000,
+        timeout: 240_000,
         skip:
           process.env.RUN_CLOUDFLARE_LOCAL_COMFYUI_IMAGE_INT !== "1"
             ? "Set RUN_CLOUDFLARE_LOCAL_COMFYUI_IMAGE_INT=1 to run real loopback image generation."
             : false,
       },
-      async () => {
+      async (imageTest) => {
         const comfyUrl = process.env.OMNIROUTE_LOCAL_COMFYUI_URL ?? "http://127.0.0.1:8188";
         const comfyCustomer = await provisionCustomer("real-comfy-image", true, ["comfyui:image"]);
         const runnerConfig = {
@@ -1477,7 +1515,7 @@ test(
             height: 64,
             steps: 1,
             cfg: 1,
-            seed: 42,
+            seed: Number.parseInt(randomUUID().slice(0, 8), 16),
           },
         });
         assert.equal(jobResponse.response.status, 202, JSON.stringify(jobResponse.body));
@@ -1521,6 +1559,166 @@ test(
         const bytes = new Uint8Array(await imageResponse.arrayBuffer());
         assert.ok(bytes.byteLength > 8, "the returned image must contain pixel data");
         assert.deepEqual(Array.from(bytes.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
+
+        await imageTest.test(
+          "Front Desk serves the real local image through its tenant-resolved Worker routes",
+          {
+            timeout: 120_000,
+            skip: !process.env.FRONT_DESK_REPO
+              ? "Set FRONT_DESK_REPO to run the Front Desk-to-real-ComfyUI integration."
+              : false,
+          },
+          async (frontDeskTest) => {
+            const frontDeskRepo = path.resolve(process.env.FRONT_DESK_REPO!);
+            const host = "tenant-real-comfy.frontdesk.test";
+            const registered = await requestJson(`${baseUrl}/__cloud/v1/tenant-hosts`, {
+              token: adminToken,
+              body: { tenantId: comfyCustomer.tenantId, hostname: host },
+            });
+            assert.equal(registered.response.status, 201, JSON.stringify(registered.body));
+
+            const frontDeskTempDir = await mkdtemp(path.join(tempDir, "front-desk-comfy-image-"));
+            const frontDeskHome = path.join(frontDeskTempDir, "home");
+            await mkdir(frontDeskHome, { recursive: true });
+            for (const filename of [
+              "server.js",
+              "omnirouteConfig.js",
+              "businessProfileClient.js",
+              "leadStore.js",
+              "chatRateLimit.js",
+            ]) {
+              await copyFile(
+                path.join(frontDeskRepo, filename),
+                path.join(frontDeskTempDir, filename)
+              );
+            }
+            await writeFile(path.join(frontDeskTempDir, "leads.json"), "[]\n", { mode: 0o600 });
+
+            const frontDeskPort = await getUnusedPort();
+            const customerKeyEnv = "FRONT_DESK_REAL_COMFY_KEY";
+            const dashboardTokenEnv = "FRONT_DESK_REAL_COMFY_DASHBOARD";
+            const frontDeskTenants = [
+              {
+                tenantId: comfyCustomer.tenantId,
+                dashboardTokenEnv,
+                gateway: {
+                  baseUrl,
+                  customerApiKeyEnv: customerKeyEnv,
+                  deviceId: comfyCustomer.deviceId,
+                  ollamaModel: "integration-test",
+                  imageGeneration: { width: 256, height: 256, steps: 1, cfg: 1 },
+                },
+                business: {
+                  name: "Real ComfyUI Front Desk Integration",
+                  description: "Isolated image-job test",
+                  hours: "Always",
+                  services: [],
+                  assistant: {
+                    name: "Image assistant",
+                    tone: "helpful",
+                    handoff: "Offer a follow-up.",
+                  },
+                },
+              },
+            ];
+            const frontDeskChild = spawn(process.execPath, ["server.js"], {
+              cwd: frontDeskTempDir,
+              env: {
+                PATH: process.env.PATH ?? "",
+                HOME: frontDeskHome,
+                NODE_ENV: "test",
+                NO_COLOR: "1",
+                PORT: String(frontDeskPort),
+                FRONT_DESK_HOST_REGISTRY_URL: baseUrl,
+                FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
+                [customerKeyEnv]: comfyCustomer.customerKey,
+                [dashboardTokenEnv]: "local-real-comfy-dashboard-token",
+              },
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let frontDeskOutput = "";
+            const appendFrontDeskOutput = (chunk: Buffer) => {
+              frontDeskOutput = `${frontDeskOutput}${chunk.toString("utf8")}`.slice(-10_000);
+            };
+            frontDeskChild.stdout?.on("data", appendFrontDeskOutput);
+            frontDeskChild.stderr?.on("data", appendFrontDeskOutput);
+            frontDeskTest.after(async () => {
+              await stopWorker(frontDeskChild);
+              await rm(frontDeskTempDir, { recursive: true, force: true });
+            });
+
+            let ready = false;
+            const readyDeadline = Date.now() + 10_000;
+            while (Date.now() < readyDeadline) {
+              if (frontDeskChild.exitCode !== null) {
+                assert.fail(`Front Desk exited before readiness:\n${frontDeskOutput}`);
+              }
+              try {
+                const health = await requestHostJson(frontDeskPort, host, "/api/health");
+                if (health.status === 200) {
+                  ready = true;
+                  break;
+                }
+              } catch {
+                // Wait for the isolated Front Desk fixture to start.
+              }
+              await delay(50);
+            }
+            assert.equal(ready, true, `Front Desk did not become ready:\n${frontDeskOutput}`);
+
+            const created = await requestHostJson(frontDeskPort, host, "/api/image-jobs", {
+              prompt: "a small red apple on a white background",
+              negativePrompt: "blurry, distorted",
+            });
+            assert.equal(created.status, 202, JSON.stringify(created.body));
+            assert.equal(created.body.status, "queued");
+            const frontDeskJobId = String(created.body.jobId);
+            assert.match(frontDeskJobId, /^[a-f0-9-]{36}$/i);
+
+            const cycle = await runLocalAgentGatewayCycle(
+              runnerConfig,
+              runnerDependencies,
+              session
+            );
+            session = cycle.session;
+            assert.equal(cycle.processed, 1, "Local Agent should execute the Front Desk image job");
+
+            let frontDeskStatus: Record<string, unknown> = {};
+            const statusDeadline = Date.now() + 10_000;
+            while (Date.now() < statusDeadline) {
+              const response = await requestHostJson(
+                frontDeskPort,
+                host,
+                `/api/image-jobs/${frontDeskJobId}`
+              );
+              assert.equal(response.status, 200, JSON.stringify(response.body));
+              frontDeskStatus = response.body;
+              if (["succeeded", "failed"].includes(String(frontDeskStatus.status))) break;
+              await delay(100);
+            }
+            assert.equal(frontDeskStatus.status, "succeeded", JSON.stringify(frontDeskStatus));
+            assert.equal(frontDeskStatus.imageAvailable, true);
+
+            const frontDeskImage = await requestHostBytes(
+              frontDeskPort,
+              host,
+              `/api/image-jobs/${frontDeskJobId}/image`
+            );
+            assert.equal(frontDeskImage.status, 200);
+            assert.equal(frontDeskImage.headers["content-type"], "image/png");
+            assert.equal(frontDeskImage.headers["x-content-type-options"], "nosniff");
+            assert.deepEqual(
+              Array.from(frontDeskImage.body.subarray(0, 8)),
+              [137, 80, 78, 71, 13, 10, 26, 10]
+            );
+            assert.ok(frontDeskImage.body.byteLength > 8);
+            assert.equal(
+              JSON.stringify(created.body).includes(comfyCustomer.customerKey),
+              false,
+              "Front Desk image-job responses must not expose the tenant API key"
+            );
+          }
+        );
       }
     );
 

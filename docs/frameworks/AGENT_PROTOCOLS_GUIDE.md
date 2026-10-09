@@ -165,31 +165,54 @@ See [CLOUD_AGENT.md](./CLOUD_AGENT.md) for the `CloudAgentBase` contract, per-ag
 ## 4. Customer Local Agent
 
 The customer Local Agent is an outbound-only device connection for customer-managed
-Ollama, ComfyUI, and MCP capabilities. A tenant owner or admin API key creates a
-five-minute pairing code at `POST /__gateway/v1/customer/local-agent/pairings` with
-an empty JSON object. The CLI reads that one-time code from a hidden terminal prompt
-or stdin and exchanges it at `POST /__gateway/v1/device/pair`. The Worker consumes
-the code once, derives the tenant from the issuing membership, and returns a new
-device ID and credential with `Cache-Control: no-store`.
+Ollama, ComfyUI, and configured MCP capabilities. A tenant owner or admin creates a
+five-minute pairing code by sending an empty JSON object to
+`POST /__gateway/v1/customer/local-agent/pairings` with a tenant customer API key as
+Bearer authorization. This endpoint is available only while Local AI is enabled for
+the tenant. The CLI reads the one-time code from a hidden terminal prompt or stdin
+and exchanges it at `POST /__gateway/v1/device/pair`. The Worker consumes the code
+once, derives the tenant from the issuing membership, and returns a new device ID
+and credential with `Cache-Control: no-store`.
 
-Pair and start the agent with:
+Issue a code as an owner or admin, then pair the agent. Do not put either key or code
+on the command line. The pairing endpoint returns the code once; give it directly to
+the operator at the machine being paired:
 
 ```bash
+curl -X POST https://connect.example.test/__gateway/v1/customer/local-agent/pairings \
+  -H "Authorization: Bearer $OMNIROUTE_CUSTOMER_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{}'
+
 omniroute local-agent pair --gateway-url https://connect.example.test
 omniroute local-agent run
 ```
 
-Pairing saves the device ID and credential in
-`~/.config/omniroute/local-agent.json` with POSIX mode `0600`. Linux/macOS service
-installation can then read that saved configuration. Existing explicit environment
-variables for `local-agent run` remain supported. Windows pairing is currently
-unsupported; configure the device ID and credential through the existing environment
-variables on that platform.
+Pairing saves the gateway URL, device ID, and credential for the current user. On
+Linux and macOS, the file is `~/.config/omniroute/local-agent.json` with POSIX mode
+`0600`. On Windows, the credential is saved in Windows Credential Manager through
+the optional `keytar` dependency; `%APPDATA%/OmniRoute/local-agent.json` contains
+only the gateway URL and device ID. Windows pairing and config-backed service
+installation require the optional dependency to be installed.
+
+After pairing, `omniroute local-agent run` reads the saved settings. To install and
+start a per-user service, run `omniroute local-agent service install`. Linux uses
+the current user's systemd service and a mode-`0600` environment file. macOS uses a
+current-user LaunchAgent with an owner-only property list. Windows uses a
+current-user Task Scheduler task and Windows Credential Manager. Service lifecycle
+commands are `service start`, `service stop`, `service status`, and
+`service uninstall`. Uninstall removes the managed service definition and its
+service-specific settings file (Linux environment file, macOS property list, or
+Windows scheduled task). It does not remove the paired configuration or credential
+from `local-agent.json` / Windows Credential Manager, and it does not revoke the
+cloud device. Revoke the device through the cloud device-management API when access
+must be disabled.
 
 Only owner/admin roles can issue codes; member/viewer roles are denied. Pairing codes
 are stored and audited only by SHA-256 digest, rate-limited, single-use, and removed
 after expiry. See `src/cloud/gatewayCustomerHttpApi.ts`, `src/cloud/gatewayHttpApi.ts`,
-and `bin/cli/commands/local-agent.mjs` for the current route and CLI behavior.
+`bin/cli/commands/local-agent.mjs`, and the platform service modules under
+`bin/cli/localAgent*.mjs` for the current route, CLI, and service behavior.
 
 ## Comparison: A2A vs Cloud Agents
 

@@ -103,10 +103,11 @@ by removing the guard.
 
 ## Shiryu Local Agent
 
-The Local Agent makes outbound HTTPS requests to the connector gateway and discovers
-only the Ollama and ComfyUI services configured on the customer machine. It does not
-open an inbound port. A one-time device credential is read from an environment
-variable and is never accepted as a command-line argument:
+The Local Agent makes outbound requests to the connector gateway and discovers
+customer-configured Ollama, ComfyUI, and optional MCP services. It does not open an
+inbound port. Pair it once with a short-lived code, then run it from the saved
+per-user configuration. The device credential is never accepted as a command-line
+argument.
 
 Check local services before pairing. This command contacts only the configured local
 services and does not require a gateway URL, device ID, or credential:
@@ -118,31 +119,70 @@ omniroute local-agent check
 It reports service reachability, discovered model counts, and advertised capabilities.
 It exits unsuccessfully when none of the configured local services is reachable. Ollama
 and ComfyUI default to their loopback ports; override them with `--ollama-url` or
-`--comfyui-url` when needed.
+`--comfyui-url` when needed. The check does not pair or contact the gateway.
+
+A tenant owner or admin issues a five-minute code by calling the customer gateway
+endpoint with a tenant customer API key. Local AI must be enabled for that tenant.
+The endpoint returns the code once; member and viewer keys cannot issue one:
 
 ```bash
-omniroute local-agent run \
-  --gateway-url https://connect.shiryu.org \
-  --device-id DEVICE_ID \
-  --credential-env SHIRYU_LOCAL_AGENT_CREDENTIAL
+curl -X POST https://connect.shiryu.org/__gateway/v1/customer/local-agent/pairings \
+  -H "Authorization: Bearer $OMNIROUTE_CUSTOMER_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{}'
 ```
 
-The gateway URL and device ID can instead come from
-`SHIRYU_LOCAL_AGENT_GATEWAY_URL` and `SHIRYU_LOCAL_AGENT_DEVICE_ID`. Optional local
-service URLs use `SHIRYU_LOCAL_AGENT_OLLAMA_URL` and
-`SHIRYU_LOCAL_AGENT_COMFYUI_URL`. To install the per-user service, export the
-one-time credential and the required configuration variables, then run
-`omniroute local-agent service install`. Linux uses the current user's systemd
-session and stores the credential in `~/.config/omniroute/local-agent.env` with
-owner-only permissions. macOS uses the current user's launchd session and stores
-the credential in `~/Library/LaunchAgents/com.omniroute.local-agent.plist`, also
-with owner-only permissions. Re-running install updates and restarts the service.
-Remove the service and stored credential with
-`omniroute local-agent service uninstall`.
-Use `omniroute local-agent service start`, `stop`, and `status` to control or inspect the
-current user's managed service. On Linux, status reports systemd's active/inactive state; on
-macOS, it reports whether the LaunchAgent is loaded in the current user's GUI domain; Windows
-reports the Task Scheduler state.
+On the machine that will run the agent, enter that code at the hidden prompt:
+
+```bash
+omniroute local-agent pair --gateway-url https://connect.shiryu.org
+```
+
+The code is read from hidden terminal input or standard input and is not placed in
+the command arguments. Pairing saves the gateway URL, device ID, and credential for
+the current user. Linux and macOS store them in
+`~/.config/omniroute/local-agent.json` with POSIX mode `0600`. Windows stores the
+credential in Windows Credential Manager via the optional `keytar` package; its
+`%APPDATA%/OmniRoute/local-agent.json` contains only the gateway URL and device ID.
+Windows pairing and config-backed service installation require `keytar` to be
+available. The pairing flow uses HTTPS for remote gateways; plain HTTP is accepted
+only for `localhost`, `127.0.0.1`, and `[::1]`.
+
+After pairing, no credential or device-ID arguments are needed to run the agent:
+
+```bash
+omniroute local-agent run
+```
+
+To install and start a per-user service using the saved pairing, run:
+
+```bash
+omniroute local-agent service install
+```
+
+Linux uses the current user's systemd service and stores service environment settings,
+including the credential, in `~/.config/omniroute/local-agent.env` with mode `0600`.
+macOS uses a LaunchAgent in the current user's GUI domain and stores its environment
+settings in `~/Library/LaunchAgents/com.omniroute.local-agent.plist` with owner-only
+permissions. Windows uses a current-user Task Scheduler task; the credential remains
+in Windows Credential Manager and its non-secret config is under `%APPDATA%`. Re-running
+install updates and starts the managed service.
+
+Use `omniroute local-agent service start`, `stop`, and `status` to control or inspect
+the current user's managed service. On Linux, status reports systemd's active/inactive
+state; on macOS, it reports whether the LaunchAgent is loaded in the current user's GUI
+domain; on Windows, it reports the Task Scheduler state. `service uninstall` removes
+the managed service definition and its service-specific settings file (the Linux
+environment file, macOS property list, or Windows scheduled task). It does not
+remove the paired configuration or credential from `local-agent.json` / Windows
+Credential Manager, and it does not revoke the cloud device. Revoke a paired device
+through cloud device management to disable its access.
+
+For managed or scripted runs, the gateway URL and device ID can instead come from
+`SHIRYU_LOCAL_AGENT_GATEWAY_URL` and `SHIRYU_LOCAL_AGENT_DEVICE_ID`; the default
+credential environment variable is `SHIRYU_LOCAL_AGENT_CREDENTIAL`, selected with
+`--credential-env`. Optional local service URLs use
+`SHIRYU_LOCAL_AGENT_OLLAMA_URL` and `SHIRYU_LOCAL_AGENT_COMFYUI_URL`.
 
 For local development, the gateway URL may use plain HTTP only when its host is
 `localhost`, `127.0.0.1`, or `[::1]`. Remote gateway URLs must use HTTPS.
