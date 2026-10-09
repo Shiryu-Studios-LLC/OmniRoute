@@ -146,6 +146,12 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
   }
 
   async all<U = T>(): Promise<{ results: U[]; success: boolean }> {
+    if (this.sql.includes("FROM cloud_maintenance_runs")) {
+      return {
+        results: this.database.maintenanceRuns.slice(0, Number(this.values[0])) as U[],
+        success: true,
+      };
+    }
     if (this.sql.includes("INSERT INTO cloud_rate_limits")) {
       const [tenantId, bucketHash, nowMs, windowMs, limit] = this.values;
       const key = `${tenantId}:${bucketHash}`;
@@ -327,6 +333,24 @@ class TestD1 implements CloudDb {
   readonly rateCounts = new Map<string, number>();
   readonly auditRows: unknown[][] = [];
   readonly usageRows: Record<string, unknown>[] = [];
+  readonly maintenanceRuns = [
+    {
+      id: 2,
+      task_key: "expired-oidc-artifacts",
+      started_at_ms: 20_000,
+      finished_at_ms: 20_025,
+      duration_ms: 25,
+      outcome: "succeeded",
+    },
+    {
+      id: 1,
+      task_key: "expired-rate-limits",
+      started_at_ms: 10_000,
+      finished_at_ms: 10_040,
+      duration_ms: 40,
+      outcome: "failed",
+    },
+  ];
 
   prepare<T = unknown>(sql: string) {
     return new Statement<T>(this, sql);
@@ -374,6 +398,38 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
     request("/__cloud/v1/tenants/tenant-a", "wrong-token")
   );
   assert.equal(response.status, 401);
+});
+
+test("maintenance run history is bounded and readable only by the platform admin", async () => {
+  const db = new TestD1();
+  const app = runtime(db, undefined, undefined, "test-cloud-maintenance-secret");
+  const response = await app.fetch(request("/__cloud/v1/tenants/maintenance/runs?limit=1"));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    runs: [
+      {
+        id: 2,
+        taskKey: "expired-oidc-artifacts",
+        startedAtMs: 20_000,
+        finishedAtMs: 20_025,
+        durationMs: 25,
+        outcome: "succeeded",
+      },
+    ],
+  });
+
+  const maintenanceOnly = await app.fetch(
+    request("/__cloud/v1/tenants/maintenance/runs", "test-cloud-maintenance-secret")
+  );
+  assert.equal(maintenanceOnly.status, 401);
+  assert.equal(
+    (await app.fetch(request("/__cloud/v1/tenants/maintenance/runs?limit=101"))).status,
+    400
+  );
+  assert.equal(
+    (await app.fetch(request("/__cloud/v1/tenants/maintenance/runs?tenant=customer-a"))).status,
+    400
+  );
 });
 
 test("maintenance identity requires an owner to provision and cannot access cloud CRUD", async () => {

@@ -112,6 +112,18 @@ Complete the existing `multi-tenant` foundation:
 
 **Exit:** customer, admin, and maintenance authorization tests pass.
 
+**Current OIDC bootstrap:** BYO OIDC per tenant is the long-term direction. A
+platform admin can issue or reissue a short-lived, one-use claim only for an
+active tenant with enabled OIDC and no active owner. The Worker stores only the
+claim digest. Redemption starts the tenant's configured OIDC flow; after the
+existing issuer, signature, audience, nonce, and PKCE checks pass, D1 atomically
+consumes the claim and creates the first owner, exact issuer/subject link, and
+audit row. OIDC issuer configuration remains platform-admin-managed until
+customer-controlled issuer setup has safe outbound resolution and recovery
+controls. The platform-admin path remains the break-glass recovery path.
+Migration `0020_cloud_tenant_oidc_owner_claims.sql` must be applied before
+issuing or redeeming claims.
+
 ### 5. MCP cloud runtime
 
 - Tenant-scope MCP servers and credentials.
@@ -121,6 +133,15 @@ Complete the existing `multi-tenant` foundation:
 - Ensure MCP execution cannot cross tenant boundaries.
 
 **Exit:** tenant A cannot discover, connect to, or invoke tenant B MCP resources.
+
+The Worker now has a D1-backed tenant MCP management registry at
+`/__cloud/v1/customer/mcp-servers`. Owner/admin customer API keys can manage
+tenant-owned configuration only when the tenant has opted into MCP. Credentials
+are encrypted at rest and omitted from responses and audit records. This slice
+does not connect to, discover, or invoke saved endpoints; cloud invocation
+remains disabled until the dedicated controlled-egress proxy described below
+exists and passes staging validation. Migration
+`0019_cloud_tenant_mcp_servers.sql` must be applied before using the registry.
 
 #### Egress decision (2026-10-08)
 
@@ -195,6 +216,12 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Provision Front Desk branding/configuration.
 - Support suspend/revoke/delete lifecycle.
 
+First-owner onboarding now has a platform-admin-issued, digest-only, one-use
+OIDC claim flow. It is available only when the tenant has an enabled issuer and
+no active owner; acceptance creates the first owner, identity link, and audit
+record atomically. OIDC issuer configuration and provisioning of provider/MCP
+defaults and Front Desk branding still require further onboarding work.
+
 **Exit:** a new tenant can be created without manually editing server files.
 
 ### 8. Shiryu Local Agent
@@ -253,6 +280,14 @@ Evaluate and use Cloudflare primitives only where needed:
 - R2 only where object/blob storage is appropriate.
 
 Do not move local process management into Workers.
+
+The scheduled Worker records cleanup-task start/end times, duration, and
+success/failure in D1. Records contain only static task identifiers and are
+pruned in bounded batches after 30 days. Ledger failures do not prevent cleanup
+tasks or replace their failure result. A bounded read endpoint is restricted
+to the platform-admin token; maintenance credentials cannot read the ledger.
+Migration `0021_cloud_maintenance_runs.sql` must be applied before scheduled
+maintenance telemetry is enabled.
 
 ### 12. Bundle and feature isolation
 

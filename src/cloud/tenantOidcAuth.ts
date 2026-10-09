@@ -20,6 +20,12 @@ import {
 } from "./tenantMembershipInvitations";
 import { listCloudTenantPortalMembers } from "./tenantMembershipManagement";
 import { CLOUD_CUSTOMER_PORTAL_PATH } from "./customerPortal";
+import {
+  acceptCloudTenantOidcOwnerClaim,
+  getPendingCloudTenantOidcOwnerClaim,
+  getPendingCloudTenantOidcOwnerClaimByHash,
+  hashCloudTenantOidcOwnerClaim,
+} from "./tenantOidcOwnerClaims";
 
 export const CLOUD_TENANT_OIDC_LOGIN_PATH = "/__cloud/auth/oidc/login";
 export const CLOUD_TENANT_OIDC_CALLBACK_PATH = "/__cloud/auth/oidc/callback";
@@ -28,6 +34,7 @@ export const CLOUD_TENANT_OIDC_LOGOUT_PATH = "/__cloud/auth/logout";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH = "/__cloud/auth/members/invitations";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
   "/__cloud/auth/oidc/invitations/redeem";
+export const CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH = "/__cloud/auth/oidc/owner/claim";
 export const CLOUD_TENANT_MEMBERS_PATH = "/__cloud/auth/members";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
@@ -56,6 +63,7 @@ interface OidcLoginStateRow {
   expires_at_ms: number;
   consumed_at_ms: number | null;
   invitation_hash: string | null;
+  owner_bootstrap_hash: string | null;
 }
 
 interface OidcSessionRow {
@@ -332,7 +340,7 @@ async function startLogin(
   if (!tenant || tenant.kind !== "customer" || !tenant.isActive) {
     return json({ error: "OIDC login unavailable" }, 404);
   }
-  return startLoginForTenant(request, options, origin, nowMs, tenant.id, null, false);
+  return startLoginForTenant(request, options, origin, nowMs, tenant.id, null, null, false);
 }
 
 async function startLoginForTenant(
@@ -342,6 +350,7 @@ async function startLoginForTenant(
   nowMs: number,
   tenantId: string,
   invitationHash: string | null,
+  ownerBootstrapHash: string | null,
   returnAuthorizationUrl: boolean
 ): Promise<Response> {
   const db = options.db;
@@ -381,8 +390,9 @@ async function startLoginForTenant(
         `INSERT INTO cloud_tenant_oidc_login_states
            (state_hash, tenant_id, issuer, client_id, redirect_uri, authorization_endpoint,
             token_endpoint, jwks_uri, signing_algorithms_json, nonce_hash,
-            code_verifier_encrypted, created_at_ms, expires_at_ms, invitation_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            code_verifier_encrypted, created_at_ms, expires_at_ms, invitation_hash,
+            owner_bootstrap_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         stateHash,
@@ -398,7 +408,8 @@ async function startLoginForTenant(
         verifierEnvelope,
         nowMs,
         nowMs + CLOUD_TENANT_OIDC_STATE_TTL_MS,
-        invitationHash
+        invitationHash,
+        ownerBootstrapHash
       )
       .run();
     const authorizationUrl = new URL(metadata.authorizationEndpoint);
@@ -637,6 +648,34 @@ async function callback(
         membershipId: accepted.membershipId,
         principalId: accepted.principalId,
         role: invitation.role,
+        createdAt: new Date(nowMs).toISOString(),
+      };
+    } else if (consumed.owner_bootstrap_hash) {
+      const claim = await getPendingCloudTenantOidcOwnerClaim(db, {
+        tenantId: consumed.tenant_id,
+        codeHash: consumed.owner_bootstrap_hash,
+        nowMs,
+      });
+      if (!claim || claim.issuer !== consumed.issuer) {
+        throw new Error("First-owner claim is unavailable");
+      }
+      const accepted = await acceptCloudTenantOidcOwnerClaim(db, {
+        tenantId: consumed.tenant_id,
+        codeHash: consumed.owner_bootstrap_hash,
+        claim,
+        issuer: consumed.issuer,
+        subject: payload.sub,
+        nowMs,
+      });
+      if (!accepted) throw new Error("First-owner claim is unavailable");
+      identity = {
+        id: accepted.identityId,
+        tenantId: consumed.tenant_id,
+        issuer: consumed.issuer,
+        subject: payload.sub,
+        membershipId: accepted.membershipId,
+        principalId: accepted.principalId,
+        role: "owner",
         createdAt: new Date(nowMs).toISOString(),
       };
     } else {
@@ -1086,7 +1125,58 @@ async function redeemMembershipInvitation(
   const codeHash = await sha256(body.code);
   const invitation = await getPendingCloudTenantMembershipInvitation(db, codeHash, nowMs);
   if (!invitation) return json({ error: "Invitation is invalid or expired" }, 400);
-  return startLoginForTenant(request, options, origin, nowMs, invitation.tenantId, codeHash, true);
+  return startLoginForTenant(
+    request,
+    options,
+    origin,
+    nowMs,
+    invitation.tenantId,
+    codeHash,
+    null,
+    true
+  );
+}
+
+async function redeemFirstOwnerClaim(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "First-owner claim service unavailable" }, 503);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBounded(new Response(request.body), 2048);
+  } catch {
+    return json({ error: "Invalid request body" }, 400);
+  }
+  if (
+    !isRecord(body) ||
+    Object.keys(body).length !== 1 ||
+    typeof body.code !== "string" ||
+    !TOKEN_PATTERN.test(body.code)
+  ) {
+    return json({ error: "Invalid first-owner claim" }, 400);
+  }
+  const limit = await consumeCloudRateLimit(db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-oidc-owner-claim:${cloudflareClientIpBucket(request) ?? "unknown"}`,
+    limit: 10,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!limit.allowed) return json({ error: "First-owner claim rate limit exceeded" }, 429);
+  const codeHash = await hashCloudTenantOidcOwnerClaim(body.code);
+  const claim = await getPendingCloudTenantOidcOwnerClaimByHash(db, codeHash, nowMs);
+  if (!claim) return json({ error: "First-owner claim is invalid or expired" }, 400);
+  return startLoginForTenant(request, options, origin, nowMs, claim.tenantId, null, codeHash, true);
 }
 
 /** Called only by the Cloud runtime for the isolated OIDC auth paths. */
@@ -1103,6 +1193,7 @@ export async function handleCloudTenantOidcAuthRequest(
   const isMemberItem = pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`);
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
+  const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
   if (
     !isLogin &&
     !isCallback &&
@@ -1111,12 +1202,17 @@ export async function handleCloudTenantOidcAuthRequest(
     !isMembers &&
     !isMemberItem &&
     !isCreateInvitation &&
-    !isRedeemInvitation
+    !isRedeemInvitation &&
+    !isRedeemOwnerClaim
   ) {
     return null;
   }
   const expectedMethod =
-    isCreateInvitation || isRedeemInvitation || isLogout ? "POST" : isMemberItem ? "PATCH" : "GET";
+    isCreateInvitation || isRedeemInvitation || isRedeemOwnerClaim || isLogout
+      ? "POST"
+      : isMemberItem
+        ? "PATCH"
+        : "GET";
   if (request.method !== expectedMethod) {
     return json({ error: "Method not allowed" }, 405, { Allow: expectedMethod });
   }
@@ -1135,6 +1231,7 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isCallback) return callback(request, options, origin, nowMs);
   if (isCreateInvitation) return createMembershipInvitation(request, options, origin, nowMs);
   if (isRedeemInvitation) return redeemMembershipInvitation(request, options, origin, nowMs);
+  if (isRedeemOwnerClaim) return redeemFirstOwnerClaim(request, options, origin, nowMs);
   if (isLogout) return logoutSession(request, options, origin, nowMs);
   if (isMembers) return listMemberships(request, options, nowMs);
   if (isMemberItem) {

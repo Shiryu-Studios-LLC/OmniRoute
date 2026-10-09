@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -92,6 +93,9 @@ async function makeDb() {
     "0003_cloud_platform_tenant.sql",
     "0005_cloud_customer_identity.sql",
     "0015_cloud_tenant_oidc.sql",
+    "0016_cloud_tenant_oidc_sessions.sql",
+    "0018_cloud_tenant_membership_invitations.sql",
+    "0020_cloud_tenant_oidc_owner_claims.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -300,6 +304,88 @@ test("Cloud OIDC admin API encrypts secrets and binds exact identities to tenant
   });
   assert.equal(memberLink.status, 404);
   assert.equal(ownerB.tenantId, "customer-b");
+});
+
+test("first-owner claims require the platform admin, enabled OIDC, and no existing owner", async () => {
+  const { db, ownerA } = await makeDb();
+  const configured = await call(db, "customer-a/oidc", "PUT", {
+    issuer: "https://id.example.com/tenant-a",
+    clientId: "client-a",
+    clientSecret: "private-client-secret",
+    isEnabled: true,
+  });
+  assert.equal(configured.status, 201);
+
+  const path = "https://worker.example/__cloud/v1/tenants/customer-a/oidc/owner-claims";
+  const unauthenticated = await handleCloudApiRequest(new Request(path, { method: "POST" }), {
+    db,
+    adminToken: ADMIN_TOKEN,
+    now: () => new Date(NOW),
+  });
+  assert.equal(unauthenticated.status, 401);
+
+  const maintenance = await handleCloudApiRequest(
+    new Request(path, {
+      method: "POST",
+      headers: { Authorization: "Bearer maintenance-token" },
+    }),
+    {
+      db,
+      adminToken: ADMIN_TOKEN,
+      maintenanceToken: "maintenance-token",
+      now: () => new Date(NOW),
+    }
+  );
+  assert.equal(maintenance.status, 401, "maintenance credentials cannot enroll a customer owner");
+
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET is_active = 0 WHERE tenant_id = ? AND id = ?")
+    .bind("customer-a", ownerA.id)
+    .run();
+  const issued = await call(db, "customer-a/oidc/owner-claims", "POST");
+  assert.equal(issued.status, 201);
+  const firstClaim = (await issued.json()) as {
+    code: string;
+    expiresAt: string;
+    redeemPath: string;
+  };
+  assert.equal(firstClaim.redeemPath, "/__cloud/auth/oidc/owner/claim");
+  assert.equal(Date.parse(firstClaim.expiresAt), Date.parse(NOW) + 15 * 60 * 1000);
+  const stored = db.db
+    .prepare(
+      "SELECT code_hash, issuer, expires_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
+    )
+    .get("customer-a") as { code_hash: string; issuer: string; expires_at_ms: number };
+  assert.equal(stored.code_hash, createHash("sha256").update(firstClaim.code).digest("hex"));
+  assert.equal(stored.issuer, "https://id.example.com/tenant-a");
+  assert.equal(stored.expires_at_ms, Date.parse(firstClaim.expiresAt));
+
+  const reissued = await call(db, "customer-a/oidc/owner-claims", "POST");
+  assert.equal(reissued.status, 201);
+  const replacement = (await reissued.json()) as { code: string };
+  assert.notEqual(replacement.code, firstClaim.code);
+  assert.equal(
+    db.db
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
+      .get("customer-a")?.count,
+    1,
+    "reissue replaces the old pending code"
+  );
+  assert.equal(
+    db.db
+      .prepare("SELECT code_hash FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
+      .get("customer-a")?.code_hash,
+    createHash("sha256").update(replacement.code).digest("hex")
+  );
+
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET is_active = 1 WHERE tenant_id = ? AND id = ?")
+    .bind("customer-a", ownerA.id)
+    .run();
+  const ownerExists = await call(db, "customer-a/oidc/owner-claims", "POST");
+  assert.equal(ownerExists.status, 409);
+  const noConfig = await call(db, "customer-b/oidc/owner-claims", "POST");
+  assert.equal(noConfig.status, 409);
 });
 
 test("Cloud OIDC config changes clear old issuer links and deletion clears the tenant config", async () => {

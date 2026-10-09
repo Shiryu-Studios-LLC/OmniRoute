@@ -13,7 +13,7 @@ import {
   issueCloudCustomerApiKey,
   updateCloudCustomerMembership,
 } from "../../src/cloud/customerIdentity";
-import { createCloudCustomerTenant } from "../../src/cloud/tenants";
+import { CLOUD_PLATFORM_TENANT_ID, createCloudCustomerTenant } from "../../src/cloud/tenants";
 import { addCloudTenantOidcIdentity, setCloudTenantOidcConfig } from "../../src/cloud/tenantOidc";
 import {
   CLOUD_TENANT_OIDC_CALLBACK_PATH,
@@ -24,10 +24,19 @@ import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
   CLOUD_TENANT_MEMBERS_PATH,
+  CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
+  handleCloudTenantOidcAuthRequest,
 } from "../../src/cloud/tenantOidcAuth";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 import { CLOUD_CUSTOMER_PORTAL_PATH } from "../../src/cloud/customerPortal";
+import {
+  acceptCloudTenantOidcOwnerClaim,
+  createCloudTenantOidcOwnerClaimCode,
+  getPendingCloudTenantOidcOwnerClaim,
+  issueCloudTenantOidcOwnerClaim,
+  CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS,
+} from "../../src/cloud/tenantOidcOwnerClaims";
 
 const ISSUER = "https://identity.example.test";
 const ORIGIN = "https://cloud.example.test";
@@ -149,6 +158,29 @@ class FailingAuditCloudDb implements CloudDb {
   }
 }
 
+class SerializingCloudDb implements CloudDb {
+  private tail: Promise<void> = Promise.resolve();
+
+  constructor(private readonly inner: CloudDb) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    return this.inner.prepare<T>(sql);
+  }
+
+  batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    const operation = this.tail.then(() => this.inner.batch(statements));
+    this.tail = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    return operation;
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.inner.exec(sql);
+  }
+}
+
 async function setup() {
   const db = new SqliteCloudDb();
   for (const name of [
@@ -159,6 +191,7 @@ async function setup() {
     "0015_cloud_tenant_oidc.sql",
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
+    "0020_cloud_tenant_oidc_owner_claims.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -188,6 +221,18 @@ async function setup() {
   return { db, tenant, membership, identity };
 }
 
+test("cloud runtime dispatches the first-owner claim redemption route", async () => {
+  const { db } = await unownedTenant();
+  const response = await runtime(db).fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: "invalid" }),
+    })
+  );
+  assert.equal(response.status, 400);
+});
+
 function getCookieValue(response: Response, name: string): string {
   const cookies = response.headers.getSetCookie();
   const cookie = cookies.find((value) => value.startsWith(`${name}=`));
@@ -206,6 +251,91 @@ function runtime(db: CloudDb, fetcher: typeof fetch = fetch) {
     now: () => new Date(NOW),
     fetcher,
   });
+}
+
+async function issueOwnerClaim(db: CloudDb, tenantId: string, nowMs = NOW) {
+  const { code, codeHash } = await createCloudTenantOidcOwnerClaimCode();
+  const expiresAtMs = nowMs + CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS;
+  const result = await issueCloudTenantOidcOwnerClaim(db, {
+    tenantId,
+    code,
+    codeHash,
+    nowMs,
+    expiresAtMs,
+    audit: {
+      id: crypto.randomUUID(),
+      tenantId: CLOUD_PLATFORM_TENANT_ID,
+      timestamp: new Date(nowMs).toISOString(),
+      action: "customer.oidc.owner.bootstrap.issued",
+      actor: "cloud-admin",
+      target: tenantId,
+      resourceType: "customer-oidc-owner-claim",
+      status: "success",
+      metadata: { tenantId },
+    },
+  });
+  assert.ok(result);
+  return { code, codeHash, expiresAtMs };
+}
+
+async function unownedTenant() {
+  const state = await setup();
+  await state.db
+    .prepare("DELETE FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+    .bind(state.tenant.id)
+    .run();
+  return state;
+}
+
+function oidcAuth(db: CloudDb, fetcher: typeof fetch, nowMs = NOW) {
+  return (request: Request) =>
+    handleCloudTenantOidcAuthRequest(request, {
+      db,
+      publicOrigin: ORIGIN,
+      environment: "production",
+      credentialEncryptionKey: ENCRYPTION_KEY,
+      now: () => nowMs,
+      fetcher,
+    });
+}
+
+async function redeemOwnerCode(
+  db: CloudDb,
+  code: string,
+  fetcher: typeof fetch,
+  nowMs = NOW,
+  app = oidcAuth(db, fetcher, nowMs)
+) {
+  const redeem = await app(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    })
+  );
+  return { app, redeem };
+}
+
+async function finishOidcLogin(
+  app: (request: Request) => Promise<Response | null>,
+  login: Response,
+  state: { nonce?: string; tokenRequests: URLSearchParams[] }
+): Promise<Response> {
+  const loginBody = (await login.json()) as { authorizationUrl: string };
+  const authorization = new URL(loginBody.authorizationUrl);
+  state.nonce = authorization.searchParams.get("nonce") ?? undefined;
+  const stateToken = authorization.searchParams.get("state")!;
+  return (await app(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=owner-code&state=${encodeURIComponent(stateToken)}`,
+      {
+        headers: {
+          Origin: ORIGIN,
+          Cookie: `omni_oidc_state=${getCookieValue(login, "omni_oidc_state")}`,
+        },
+      }
+    )
+  ))!;
 }
 
 async function makeProvider(
@@ -397,6 +527,264 @@ test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an
     })
   );
   assert.equal(revoked.status, 401);
+});
+
+test("first-owner claim creates one owner only after verified OIDC and cannot be replayed", async () => {
+  const { db, tenant } = await unownedTenant();
+  const claim = await issueOwnerClaim(db, tenant.id);
+  const stored = db.raw
+    .prepare(
+      "SELECT code_hash, issuer, consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
+    )
+    .get(tenant.id) as { code_hash: string; issuer: string; consumed_at_ms: number | null };
+  assert.equal(stored.code_hash, createHash("sha256").update(claim.code).digest("hex"));
+  assert.equal(stored.issuer, ISSUER);
+  assert.equal(stored.consumed_at_ms, null);
+
+  const state: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const fetcher = await makeProvider(state, { subject: "initial-owner-subject" });
+  const { app, redeem } = await redeemOwnerCode(db, claim.code, fetcher);
+  assert.equal(redeem.status, 200);
+  assert.equal(
+    redeem.headers.get("location"),
+    null,
+    "claim code must not be placed in a redirect URL"
+  );
+  assert.equal(JSON.stringify(await redeem.clone().json()).includes(claim.code), false);
+
+  const accepted = await finishOidcLogin(app, redeem, state);
+  assert.equal(accepted.status, 303);
+  const owner = db.raw
+    .prepare(
+      `SELECT membership.id, membership.principal_id, membership.role,
+              identity.issuer, identity.subject
+         FROM cloud_customer_memberships AS membership
+         JOIN cloud_tenant_oidc_identities AS identity
+           ON identity.tenant_id = membership.tenant_id AND identity.membership_id = membership.id
+        WHERE membership.tenant_id = ? AND membership.role = 'owner' AND membership.is_active = 1`
+    )
+    .get(tenant.id) as
+    { id: string; principal_id: string; role: string; issuer: string; subject: string } | undefined;
+  assert.ok(owner);
+  assert.match(owner.principal_id, /^oidc-/);
+  assert.equal(owner.issuer, ISSUER);
+  assert.equal(owner.subject, "initial-owner-subject");
+  assert.equal(
+    db.raw
+      .prepare("SELECT consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
+      .get(tenant.id)?.consumed_at_ms,
+    NOW
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'owner' AND is_active = 1"
+      )
+      .get(tenant.id)?.count,
+    1
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.oidc.owner.bootstrap.accepted'"
+      )
+      .get(tenant.id)?.count,
+    1
+  );
+
+  const replay = await app(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: claim.code }),
+    })
+  );
+  assert.equal(replay?.status, 400);
+});
+
+test("first-owner claim expires, binds issuer and tenant, and rejects an owner added during login", async () => {
+  const { db, tenant } = await unownedTenant();
+  const expiredClaim = await issueOwnerClaim(db, tenant.id);
+  const expiredState: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const expiredFetcher = await makeProvider(expiredState);
+  const expiredApp = oidcAuth(db, expiredFetcher, expiredClaim.expiresAtMs + 1);
+  const expired = await expiredApp(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH}`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: expiredClaim.code }),
+    })
+  );
+  assert.equal(expired?.status, 400);
+
+  const wrongTenant = await createCloudCustomerTenant(db, {
+    id: "customer-oidc-other",
+    name: "Other customer",
+    slug: "other-customer",
+  });
+  await setCloudTenantOidcConfig(db, ENCRYPTION_KEY, {
+    tenantId: wrongTenant.id,
+    issuer: ISSUER,
+    clientId: "omni-client",
+    clientSecret: "client-secret-test",
+    isEnabled: true,
+  });
+  const pending = await getPendingCloudTenantOidcOwnerClaim(db, {
+    tenantId: tenant.id,
+    codeHash: expiredClaim.codeHash,
+    nowMs: NOW,
+  });
+  assert.ok(pending);
+  const tenantMismatch = await acceptCloudTenantOidcOwnerClaim(db, {
+    tenantId: wrongTenant.id,
+    codeHash: expiredClaim.codeHash,
+    claim: pending,
+    issuer: ISSUER,
+    subject: "initial-owner-subject",
+    nowMs: NOW,
+  });
+  assert.equal(tenantMismatch, null);
+
+  const issuerClaim = await issueOwnerClaim(db, tenant.id);
+  const issuerState: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const issuerFetcher = await makeProvider(issuerState, { issuer: "https://attacker.example" });
+  const issuerFlow = await redeemOwnerCode(db, issuerClaim.code, issuerFetcher);
+  assert.equal(issuerFlow.redeem.status, 200);
+  const wrongIssuer = await finishOidcLogin(issuerFlow.app, issuerFlow.redeem, issuerState);
+  assert.equal(wrongIssuer.status, 401);
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'owner' AND is_active = 1"
+      )
+      .get(tenant.id)?.count,
+    0
+  );
+
+  const raceClaim = await issueOwnerClaim(db, tenant.id);
+  const raceState: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const raceFetcher = await makeProvider(raceState, { subject: "claim-race-subject" });
+  const raceFlow = await redeemOwnerCode(db, raceClaim.code, raceFetcher);
+  assert.equal(raceFlow.redeem.status, 200);
+  const member = db.raw
+    .prepare(
+      "SELECT id FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'member' LIMIT 1"
+    )
+    .get(tenant.id) as { id: string };
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, member.id)
+    .run();
+  const ownerWonRace = await finishOidcLogin(raceFlow.app, raceFlow.redeem, raceState);
+  assert.equal(ownerWonRace.status, 401);
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'owner' AND is_active = 1"
+      )
+      .get(tenant.id)?.count,
+    1
+  );
+  assert.equal(
+    db.raw
+      .prepare("SELECT consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
+      .get(tenant.id)?.consumed_at_ms,
+    null,
+    "a claim must not be consumed when another owner wins the race"
+  );
+});
+
+test("first-owner claim acceptance rolls back claim, owner, identity, and audit together", async () => {
+  const { db, tenant } = await unownedTenant();
+  const claim = await issueOwnerClaim(db, tenant.id);
+  const state: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const fetcher = await makeProvider(state, { subject: "rollback-owner-subject" });
+  const flow = await redeemOwnerCode(db, claim.code, fetcher);
+  assert.equal(flow.redeem.status, 200);
+  const failingCallback = oidcAuth(new FailingAuditCloudDb(db), fetcher);
+  const rejected = await finishOidcLogin(failingCallback, flow.redeem, state);
+  assert.equal(rejected.status, 401);
+  assert.equal(
+    db.raw
+      .prepare("SELECT consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
+      .get(tenant.id)?.consumed_at_ms,
+    null
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'owner'"
+      )
+      .get(tenant.id)?.count,
+    0
+  );
+  assert.equal(
+    db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+      .get(tenant.id)?.count,
+    0
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.oidc.owner.bootstrap.accepted'"
+      )
+      .get(tenant.id)?.count,
+    0
+  );
+});
+
+test("concurrent first-owner callbacks serialize so exactly one claim creates an owner", async () => {
+  const { db, tenant } = await unownedTenant();
+  const claimResult = await issueOwnerClaim(db, tenant.id);
+  const claim = await getPendingCloudTenantOidcOwnerClaim(db, {
+    tenantId: tenant.id,
+    codeHash: claimResult.codeHash,
+    nowMs: NOW,
+  });
+  assert.ok(claim);
+  const serializedDb = new SerializingCloudDb(db);
+  const results = await Promise.all([
+    acceptCloudTenantOidcOwnerClaim(serializedDb, {
+      tenantId: tenant.id,
+      codeHash: claimResult.codeHash,
+      claim,
+      issuer: ISSUER,
+      subject: "concurrent-owner-a",
+      nowMs: NOW,
+    }),
+    acceptCloudTenantOidcOwnerClaim(serializedDb, {
+      tenantId: tenant.id,
+      codeHash: claimResult.codeHash,
+      claim,
+      issuer: ISSUER,
+      subject: "concurrent-owner-b",
+      nowMs: NOW,
+    }),
+  ]);
+  assert.equal(results.filter(Boolean).length, 1);
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'owner' AND is_active = 1"
+      )
+      .get(tenant.id)?.count,
+    1
+  );
+  assert.equal(
+    db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+      .get(tenant.id)?.count,
+    1
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.oidc.owner.bootstrap.accepted'"
+      )
+      .get(tenant.id)?.count,
+    1
+  );
 });
 
 test("tenant OIDC logout revokes only the caller session, expires its cookie, and blocks introspection", async () => {

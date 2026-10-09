@@ -61,6 +61,15 @@ import {
   listCloudTenantOidcIdentities,
   setCloudTenantOidcConfig,
 } from "./tenantOidc";
+import {
+  CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS,
+  createCloudTenantOidcOwnerClaimCode,
+  issueCloudTenantOidcOwnerClaim,
+} from "./tenantOidcOwnerClaims";
+import {
+  CLOUD_MAINTENANCE_RUNS_MAX_PAGE_SIZE,
+  listCloudMaintenanceRuns,
+} from "./maintenanceRunLedger";
 
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
@@ -455,6 +464,8 @@ export async function handleCloudApiRequest(
     (segments.length === 2 &&
       segments[1] === "status" &&
       (request.method === "GET" || request.method === "POST"));
+  const isMaintenanceRunsPath =
+    segments.length === 2 && segments[0] === "maintenance" && segments[1] === "runs";
   const isMaintenanceToken =
     maintenanceRoute && !!options.maintenanceToken && authorized(request, options.maintenanceToken);
   const isAdminToken = !!options.adminToken && authorized(request, options.adminToken);
@@ -469,6 +480,38 @@ export async function handleCloudApiRequest(
   const now = options.now ?? (() => new Date());
 
   try {
+    if (isMaintenanceRunsPath) {
+      if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+      if (!isAdminToken) return json({ error: "Unauthorized" }, 401);
+      const platformTenant = await getCloudTenantById(db, CLOUD_PLATFORM_TENANT_ID);
+      if (platformTenant?.kind !== "platform_admin" || !platformTenant.isActive) {
+        return json({ error: "Cloud platform tenant is not configured" }, 503);
+      }
+      const query = new URL(request.url).searchParams;
+      if ([...query.keys()].some((key) => key !== "limit") || query.getAll("limit").length > 1) {
+        return json({ error: "Unsupported query parameters" }, 400);
+      }
+      const rawLimit = query.get("limit");
+      const limit = rawLimit === null ? 50 : Number(rawLimit);
+      if (
+        (rawLimit !== null && !/^\d{1,3}$/.test(rawLimit)) ||
+        !Number.isInteger(limit) ||
+        limit < 1 ||
+        limit > CLOUD_MAINTENANCE_RUNS_MAX_PAGE_SIZE
+      ) {
+        return json({ error: "limit is out of range" }, 400);
+      }
+      const rateLimit = await consumeCloudRateLimit(db, {
+        tenantId: CLOUD_PLATFORM_TENANT_ID,
+        bucketKey: "cloud-admin-api",
+        limit: options.adminRateLimit?.limit ?? 300,
+        windowMs: options.adminRateLimit?.windowMs ?? 60_000,
+        nowMs: now().getTime(),
+      });
+      if (!rateLimit.allowed) return json({ error: "Cloud API rate limit exceeded" }, 429);
+      return json({ runs: await listCloudMaintenanceRuns(db, limit) });
+    }
+
     // Customer identity provisioning is a platform-admin control-plane action.
     // The global admin token authorizes these management calls but is never
     // accepted or mapped as a customer API key identity.
@@ -490,7 +533,11 @@ export async function handleCloudApiRequest(
       (segments.length === 4 &&
         segments[1] === "oidc" &&
         segments[2] === "identities" &&
-        request.method === "DELETE");
+        request.method === "DELETE") ||
+      (segments.length === 3 &&
+        segments[1] === "oidc" &&
+        segments[2] === "owner-claims" &&
+        request.method === "POST");
     if (isCustomerIdentityPath) {
       const [tenantId, collection, resourceId] = segments;
       if (!validId(tenantId) || (resourceId !== undefined && !validId(resourceId))) {
@@ -600,6 +647,53 @@ export async function handleCloudApiRequest(
             await recordAudit("customer.oidc.config.delete", tenantId, "success");
             return json({ deleted: true });
           }
+        }
+
+        if (segments.length === 3 && resourceId === "owner-claims" && request.method === "POST") {
+          // A maintenance token can manage infrastructure, but only the platform admin may
+          // bootstrap a customer identity or rotate its one-use owner claim.
+          if (!isAdminToken) return json({ error: "Unauthorized" }, 401);
+          const { code, codeHash } = await createCloudTenantOidcOwnerClaimCode();
+          const nowMs = now().getTime();
+          const expiresAtMs = nowMs + CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS;
+          let claim;
+          try {
+            claim = await issueCloudTenantOidcOwnerClaim(db, {
+              tenantId,
+              code,
+              codeHash,
+              nowMs,
+              expiresAtMs,
+              audit: {
+                id: crypto.randomUUID(),
+                tenantId: CLOUD_PLATFORM_TENANT_ID,
+                timestamp,
+                action: "customer.oidc.owner.bootstrap.issued",
+                actor: "cloud-admin",
+                target: tenantId,
+                resourceType: "customer-oidc-owner-claim",
+                status: "success",
+                requestId: requestId && requestId.length <= 512 ? requestId : null,
+                metadata: { tenantId, expiresAt: new Date(expiresAtMs).toISOString() },
+              },
+            });
+          } catch {
+            return json({ error: "First-owner claim could not be issued" }, 503);
+          }
+          if (!claim) {
+            return json(
+              { error: "Tenant must have enabled OIDC and no active owner to issue a claim" },
+              409
+            );
+          }
+          return json(
+            {
+              code: claim.code,
+              expiresAt: new Date(claim.expiresAtMs).toISOString(),
+              redeemPath: "/__cloud/auth/oidc/owner/claim",
+            },
+            201
+          );
         }
 
         if (segments.length === 3 && resourceId === "identities") {

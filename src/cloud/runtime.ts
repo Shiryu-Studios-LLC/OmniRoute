@@ -11,11 +11,13 @@ import {
   CLOUD_CUSTOMER_ONBOARDING_PATH,
   handleCloudCustomerOnboardingRequest,
 } from "./tenantOnboardingHttpApi";
+import { CLOUD_CUSTOMER_MCP_SERVERS_PATH, handleCloudTenantMcpRequest } from "./tenantMcpHttpApi";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
   CLOUD_TENANT_MEMBERS_PATH,
+  CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   CLOUD_TENANT_OIDC_LOGOUT_PATH,
   CLOUD_TENANT_OIDC_CALLBACK_PATH,
   CLOUD_TENANT_OIDC_LOGIN_PATH,
@@ -51,6 +53,10 @@ export interface CloudRuntimeOptions {
   cloudInferenceRequestBodyTimeoutMs?: number;
   cloudInferenceCountTimeoutMs?: number;
   cloudInferenceGenerationTimeoutMs?: number;
+  customerMcpRateLimit?: { limit: number; windowMs: number };
+  customerMcpAuthFailureRateLimit?: { limit: number; windowMs: number };
+  customerMcpAuthFailureFallbackRateLimit?: { limit: number; windowMs: number };
+  customerMcpRequestBodyTimeoutMs?: number;
   fetcher?: typeof fetch;
   gatewayConnectRateLimit?: { limit: number; windowMs: number };
   gatewayConnectFallbackRateLimit?: { limit: number; windowMs: number };
@@ -108,6 +114,29 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       }
 
       if (
+        url.pathname === CLOUD_CUSTOMER_MCP_SERVERS_PATH ||
+        url.pathname.startsWith(`${CLOUD_CUSTOMER_MCP_SERVERS_PATH}/`)
+      ) {
+        try {
+          const response = await handleCloudTenantMcpRequest(request, {
+            db: options.env?.DB,
+            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            now,
+            tenantRateLimit: options.customerMcpRateLimit,
+            failedKeyRateLimit: options.customerMcpAuthFailureRateLimit,
+            failedKeyFallbackRateLimit: options.customerMcpAuthFailureFallbackRateLimit,
+            bodyReadTimeoutMs: options.customerMcpRequestBodyTimeoutMs,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Customer MCP configuration could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (
         url.pathname === CLOUD_TENANT_OIDC_LOGIN_PATH ||
         url.pathname === CLOUD_TENANT_OIDC_CALLBACK_PATH ||
         url.pathname === CLOUD_TENANT_OIDC_SESSION_PATH ||
@@ -115,7 +144,8 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         url.pathname === CLOUD_TENANT_MEMBERS_PATH ||
         url.pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`) ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH ||
-        url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH
+        url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH ||
+        url.pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH
       ) {
         try {
           const response = await handleCloudTenantOidcAuthRequest(request, {
