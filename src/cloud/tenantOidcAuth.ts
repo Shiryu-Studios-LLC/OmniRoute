@@ -4,6 +4,7 @@ import { encryptCloudCredential, decryptCloudCredential } from "./credentialEncr
 import {
   CloudMembershipConflictError,
   CloudLastActiveOwnerError,
+  CloudCustomerApiKeyPortalAuthorizationError,
   getCloudCustomerMembership,
   issueCloudCustomerApiKey,
   revokeCloudCustomerApiKey,
@@ -1463,6 +1464,10 @@ async function createPortalApiKey(
       tenantId: session.tenant_id,
       membershipId: session.membership_id,
       expiresAt,
+      portalAuthorization: {
+        sessionTokenHash: session.session_token_hash,
+        nowMs,
+      },
       now: timestamp,
       audit: {
         id: crypto.randomUUID(),
@@ -1482,6 +1487,9 @@ async function createPortalApiKey(
       201
     );
   } catch (error) {
+    if (error instanceof CloudCustomerApiKeyPortalAuthorizationError) {
+      return json({ error: "Owner or admin session required" }, 403);
+    }
     if (error instanceof TypeError || error instanceof RangeError) {
       return json({ error: "Invalid API key expiry" }, 400);
     }
@@ -1513,6 +1521,10 @@ async function revokePortalApiKey(
     tenantId: session.tenant_id,
     apiKeyId,
     membershipId: session.membership_id,
+    portalAuthorization: {
+      sessionTokenHash: session.session_token_hash,
+      nowMs,
+    },
     now: timestamp,
     audit: {
       id: crypto.randomUUID(),

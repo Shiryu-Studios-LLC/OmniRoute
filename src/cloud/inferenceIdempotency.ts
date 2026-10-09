@@ -77,6 +77,16 @@ function decodeRequestHashSecret(secret: string): Uint8Array {
   return bytes;
 }
 
+export function isCloudInferenceIdempotencySecret(secret: string | undefined): boolean {
+  if (secret === undefined) return false;
+  try {
+    decodeRequestHashSecret(secret);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function scopedHmac(
   secret: Uint8Array,
   purpose: string,

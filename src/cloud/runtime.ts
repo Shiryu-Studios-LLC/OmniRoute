@@ -1,5 +1,7 @@
 import type { CloudDb } from "./db";
-import { handleCloudApiRequest } from "./httpApi";
+import { handleCloudApiRequest, isDeploymentToken } from "./httpApi";
+import { isCloudCredentialEncryptionKey } from "./credentialEncryption";
+import { isCloudInferenceIdempotencySecret } from "./inferenceIdempotency";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
@@ -94,6 +96,29 @@ export interface CloudRuntimeOptions {
 
 export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
   const now = options.now ?? (() => new Date());
+  const env = options.env;
+  const requireDeploymentConfiguration =
+    env?.OMNIROUTE_ENV === "staging" || env?.OMNIROUTE_ENV === "production";
+
+  const configurationStatus = (): "ok" | "unconfigured" | "error" => {
+    const adminToken = env?.OMNIROUTE_CLOUD_ADMIN_TOKEN;
+    const maintenanceToken = env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN;
+    const credentialEncryptionKey = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY;
+    const idempotencyKey = env?.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY;
+    if (!adminToken || !maintenanceToken || !credentialEncryptionKey || !idempotencyKey) {
+      return "unconfigured";
+    }
+    if (
+      !isDeploymentToken(adminToken) ||
+      !isDeploymentToken(maintenanceToken) ||
+      !isCloudCredentialEncryptionKey(credentialEncryptionKey) ||
+      !isCloudInferenceIdempotencySecret(idempotencyKey) ||
+      new Set([adminToken, maintenanceToken, credentialEncryptionKey, idempotencyKey]).size !== 4
+    ) {
+      return "error";
+    }
+    return "ok";
+  };
 
   return {
     async fetch(request: Request): Promise<Response> {
@@ -251,12 +276,15 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       }
 
       if (request.method === "GET" && url.pathname === "/__cloud/readiness") {
+        const configuration = requireDeploymentConfiguration ? configurationStatus() : null;
         const checks: {
           database: "ok" | "unconfigured" | "error";
           gateway: "ok" | "unconfigured" | "error";
+          configuration?: "ok" | "unconfigured" | "error";
         } = {
           database: "unconfigured",
           gateway: "unconfigured",
+          ...(configuration !== null ? { configuration } : {}),
         };
 
         if (options.env?.DB) {
@@ -278,7 +306,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           }
         }
 
-        const ready = checks.database === "ok" && checks.gateway === "ok";
+        const ready =
+          checks.database === "ok" &&
+          checks.gateway === "ok" &&
+          (configuration === null || configuration === "ok");
         return Response.json(
           {
             status: ready ? "ready" : "not_ready",

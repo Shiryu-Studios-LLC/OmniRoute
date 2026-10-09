@@ -408,6 +408,103 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
   assert.equal(response.status, 401);
 });
 
+test("staging readiness requires valid cloud runtime secrets without exposing their values", async () => {
+  const sessions = {
+    idFromName: (name: string) => name,
+    get: () => ({ checkReadiness: async () => undefined }),
+  } as never;
+  const adminToken = "valid-admin-token-0123456789012345";
+  const maintenanceToken = "valid-maintenance-token-0123456789";
+  const encryptionKey = Buffer.alloc(32, 7).toString("base64");
+  const idempotencyKey = Buffer.alloc(32, 8).toString("base64");
+  const readinessRequest = () =>
+    new Request("https://omniroute.test/__cloud/readiness", { method: "GET" });
+
+  const missingRuntimeSecrets = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+    },
+  });
+  const missingResponse = await missingRuntimeSecrets.fetch(readinessRequest());
+  assert.equal(missingResponse.status, 503);
+  const missingBody = (await missingResponse.json()) as {
+    status: string;
+    checks: Record<string, string>;
+  };
+  assert.equal(missingBody.status, "not_ready");
+  assert.deepEqual(missingBody.checks, {
+    database: "ok",
+    gateway: "ok",
+    configuration: "unconfigured",
+  });
+  assert.doesNotMatch(JSON.stringify(missingBody), /valid-admin|valid-maintenance|secret|key/i);
+
+  const malformedSecret = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "production",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: "malformed-encryption-key",
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
+    },
+  });
+  const malformedResponse = await malformedSecret.fetch(readinessRequest());
+  assert.equal(malformedResponse.status, 503);
+  const malformedBody = (await malformedResponse.json()) as {
+    checks: Record<string, string>;
+  };
+  assert.equal(malformedBody.checks.configuration, "error");
+  assert.doesNotMatch(JSON.stringify(malformedBody), /malformed-encryption-key/i);
+
+  const configuredRuntime = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
+    },
+  });
+  const configuredResponse = await configuredRuntime.fetch(readinessRequest());
+  assert.equal(configuredResponse.status, 200);
+  const configuredBody = (await configuredResponse.json()) as {
+    status: string;
+    checks: Record<string, string>;
+  };
+  assert.equal(configuredBody.status, "ready");
+  assert.deepEqual(configuredBody.checks, {
+    database: "ok",
+    gateway: "ok",
+    configuration: "ok",
+  });
+
+  const reusedSecretRuntime = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: encryptionKey,
+      OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
+      OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: idempotencyKey,
+    },
+  });
+  const reusedSecretResponse = await reusedSecretRuntime.fetch(readinessRequest());
+  assert.equal(reusedSecretResponse.status, 503);
+  const reusedSecretBody = (await reusedSecretResponse.json()) as {
+    checks: Record<string, string>;
+  };
+  assert.equal(reusedSecretBody.checks.configuration, "error");
+});
+
 test("staging and production cloud admin tokens must meet the deployment secret policy", async () => {
   const weakTokenDb = new TestD1();
   const weakTokenRuntime = createCloudRuntime({

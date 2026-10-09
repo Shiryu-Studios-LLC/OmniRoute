@@ -24,6 +24,18 @@ export interface IssuedCloudCustomerApiKey {
   expiresAt: string | null;
 }
 
+export interface CloudCustomerApiKeyPortalAuthorization {
+  sessionTokenHash: string;
+  nowMs: number;
+}
+
+export class CloudCustomerApiKeyPortalAuthorizationError extends Error {
+  constructor() {
+    super("Customer API key portal authorization is no longer valid");
+    this.name = "CloudCustomerApiKeyPortalAuthorizationError";
+  }
+}
+
 export interface CloudCustomerMembership {
   id: string;
   tenantId: string;
@@ -302,6 +314,7 @@ export async function issueCloudCustomerApiKey(
     tenantId: string;
     membershipId: string;
     expiresAt?: string | null;
+    portalAuthorization?: CloudCustomerApiKeyPortalAuthorization;
     audit?: CloudComplianceAuditInput;
     now?: string;
   }
@@ -331,13 +344,52 @@ export async function issueCloudCustomerApiKey(
 
   const token = createToken();
   const id = crypto.randomUUID();
-  const insert = db
-    .prepare(
-      `INSERT INTO cloud_customer_api_keys
-         (id, tenant_id, membership_id, key_hash, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    )
-    .bind(id, input.tenantId, input.membershipId, await hashToken(token), now, expiresAt);
+  const insert = input.portalAuthorization
+    ? db
+        .prepare(
+          `INSERT INTO cloud_customer_api_keys
+             (id, tenant_id, membership_id, key_hash, created_at, expires_at)
+           SELECT ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (
+              SELECT 1
+                FROM cloud_tenant_oidc_sessions AS session
+                JOIN tenants AS tenant ON tenant.id = session.tenant_id
+                  AND tenant.kind = 'customer' AND tenant.is_active = 1
+                JOIN cloud_customer_memberships AS membership
+                  ON membership.tenant_id = session.tenant_id
+                 AND membership.id = session.membership_id
+                 AND membership.is_active = 1 AND membership.role IN ('owner', 'admin')
+                JOIN cloud_tenant_oidc_identities AS identity
+                  ON identity.tenant_id = session.tenant_id
+                 AND identity.id = session.identity_id
+                 AND identity.membership_id = session.membership_id
+                JOIN cloud_tenant_oidc_configs AS config
+                  ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
+                 AND config.is_enabled = 1
+               WHERE session.token_hash = ? AND session.tenant_id = ?
+                 AND session.membership_id = ? AND session.revoked_at_ms IS NULL
+                 AND session.expires_at_ms > ?
+            )`
+        )
+        .bind(
+          id,
+          input.tenantId,
+          input.membershipId,
+          await hashToken(token),
+          now,
+          expiresAt,
+          input.portalAuthorization.sessionTokenHash,
+          input.tenantId,
+          input.membershipId,
+          input.portalAuthorization.nowMs
+        )
+    : db
+        .prepare(
+          `INSERT INTO cloud_customer_api_keys
+             (id, tenant_id, membership_id, key_hash, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .bind(id, input.tenantId, input.membershipId, await hashToken(token), now, expiresAt);
   const results = input.audit
     ? await db.batch([
         insert,
@@ -355,7 +407,13 @@ export async function issueCloudCustomerApiKey(
     throw new Error("Customer API key could not be issued");
   }
   const insertResult = results[0] as { meta?: { changes?: unknown } };
-  if (insertResult.meta?.changes !== undefined && Number(insertResult.meta.changes) !== 1) {
+  if (
+    (input.portalAuthorization && Number(insertResult.meta?.changes) !== 1) ||
+    (insertResult.meta?.changes !== undefined && Number(insertResult.meta.changes) !== 1)
+  ) {
+    if (input.portalAuthorization && Number(insertResult.meta?.changes) !== 1) {
+      throw new CloudCustomerApiKeyPortalAuthorizationError();
+    }
     throw new Error("Customer API key could not be issued");
   }
   return {
@@ -375,6 +433,7 @@ export async function revokeCloudCustomerApiKey(
     tenantId: string;
     apiKeyId: string;
     membershipId?: string;
+    portalAuthorization?: CloudCustomerApiKeyPortalAuthorization;
     audit?: CloudComplianceAuditInput;
     now?: string;
   }
@@ -382,19 +441,57 @@ export async function revokeCloudCustomerApiKey(
   requireId(input.tenantId, "tenantId");
   requireId(input.apiKeyId, "apiKeyId");
   if (input.membershipId !== undefined) requireId(input.membershipId, "membershipId");
-  const update = db
-    .prepare(
-      `UPDATE cloud_customer_api_keys SET revoked_at = ?
-        WHERE tenant_id = ? AND id = ? AND revoked_at IS NULL
-          AND (? IS NULL OR membership_id = ?)`
-    )
-    .bind(
-      input.now ?? new Date().toISOString(),
-      input.tenantId,
-      input.apiKeyId,
-      input.membershipId ?? null,
-      input.membershipId ?? null
-    );
+  const update = input.portalAuthorization
+    ? db
+        .prepare(
+          `UPDATE cloud_customer_api_keys SET revoked_at = ?
+            WHERE tenant_id = ? AND id = ? AND revoked_at IS NULL
+              AND (? IS NULL OR membership_id = ?)
+              AND EXISTS (
+                SELECT 1
+                  FROM cloud_tenant_oidc_sessions AS session
+                  JOIN tenants AS tenant ON tenant.id = session.tenant_id
+                    AND tenant.kind = 'customer' AND tenant.is_active = 1
+                  JOIN cloud_customer_memberships AS membership
+                    ON membership.tenant_id = session.tenant_id
+                   AND membership.id = session.membership_id
+                   AND membership.is_active = 1 AND membership.role IN ('owner', 'admin')
+                  JOIN cloud_tenant_oidc_identities AS identity
+                    ON identity.tenant_id = session.tenant_id
+                   AND identity.id = session.identity_id
+                   AND identity.membership_id = session.membership_id
+                  JOIN cloud_tenant_oidc_configs AS config
+                    ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
+                   AND config.is_enabled = 1
+                 WHERE session.token_hash = ? AND session.tenant_id = ?
+                   AND session.membership_id = ? AND session.revoked_at_ms IS NULL
+                   AND session.expires_at_ms > ?
+              )`
+        )
+        .bind(
+          input.now ?? new Date().toISOString(),
+          input.tenantId,
+          input.apiKeyId,
+          input.membershipId ?? null,
+          input.membershipId ?? null,
+          input.portalAuthorization.sessionTokenHash,
+          input.tenantId,
+          input.membershipId,
+          input.portalAuthorization.nowMs
+        )
+    : db
+        .prepare(
+          `UPDATE cloud_customer_api_keys SET revoked_at = ?
+            WHERE tenant_id = ? AND id = ? AND revoked_at IS NULL
+              AND (? IS NULL OR membership_id = ?)`
+        )
+        .bind(
+          input.now ?? new Date().toISOString(),
+          input.tenantId,
+          input.apiKeyId,
+          input.membershipId ?? null,
+          input.membershipId ?? null
+        );
   const results = input.audit
     ? await db.batch([
         update,

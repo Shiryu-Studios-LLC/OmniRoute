@@ -259,6 +259,74 @@ class RevokeOidcSessionBeforeSettingsBatchCloudDb implements CloudDb {
   }
 }
 
+class PortalApiKeyAuthorizationRaceStatement<T = unknown> implements CloudDbStatement<T> {
+  constructor(private readonly inner: CloudDbStatement<T>) {}
+
+  bind(...values: unknown[]): CloudDbStatement<T> {
+    return new PortalApiKeyAuthorizationRaceStatement(this.inner.bind(...values));
+  }
+
+  first<U = T>(column?: string): Promise<U | null> {
+    return this.inner.first<U>(column);
+  }
+
+  all<U = T>(): Promise<{ results: U[]; success: boolean; meta?: Record<string, unknown> }> {
+    return this.inner.all<U>();
+  }
+
+  run(): Promise<{ success: boolean; meta?: Record<string, unknown> }> {
+    return this.inner.run();
+  }
+
+  unwrap(): CloudDbStatement<T> {
+    return this.inner;
+  }
+}
+
+class RevokeOidcSessionBeforePortalApiKeyBatchCloudDb implements CloudDb {
+  triggered = false;
+
+  constructor(
+    private readonly inner: CloudDb,
+    private readonly membershipId: string,
+    private readonly revokedAtMs: number
+  ) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    const statement = this.inner.prepare<T>(sql);
+    return /^\s*(?:INSERT INTO cloud_customer_api_keys|UPDATE cloud_customer_api_keys SET revoked_at)\b/i.test(
+      sql
+    )
+      ? new PortalApiKeyAuthorizationRaceStatement(statement)
+      : statement;
+  }
+
+  async batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    if (
+      !this.triggered &&
+      statements.some((statement) => statement instanceof PortalApiKeyAuthorizationRaceStatement)
+    ) {
+      this.triggered = true;
+      await this.inner
+        .prepare(
+          `UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ?
+            WHERE membership_id = ? AND revoked_at_ms IS NULL`
+        )
+        .bind(this.revokedAtMs, this.membershipId)
+        .run();
+    }
+    return this.inner.batch(
+      statements.map((statement) =>
+        statement instanceof PortalApiKeyAuthorizationRaceStatement ? statement.unwrap() : statement
+      )
+    );
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.inner.exec(sql);
+  }
+}
+
 async function setup() {
   const db = new SqliteCloudDb();
   for (const name of [
@@ -1266,6 +1334,82 @@ test("MCP settings batch rejects a session revoked after portal authorization re
     .bind(tenant.id)
     .first();
   assert.equal(audit?.count, 0, "unauthorized settings writes must not create success audits");
+});
+
+test("API-key issue and revoke batches reject sessions revoked after portal authorization", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const existingKey = await issueCloudCustomerApiKey(db, {
+    tenantId: tenant.id,
+    membershipId: membership.id,
+  });
+  const headers = {
+    Origin: ORIGIN,
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+    "Content-Type": "application/json",
+  };
+  const issueDb = new RevokeOidcSessionBeforePortalApiKeyBatchCloudDb(db, membership.id, NOW);
+  const issue = await runtime(issueDb).fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ expiresAt: null }),
+    })
+  );
+  assert.equal(issueDb.triggered, true);
+  assert.equal(issue.status, 403);
+  assert.equal(
+    db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_customer_api_keys WHERE tenant_id = ?")
+      .get(tenant.id)?.count,
+    1,
+    "a session revoked before the insert batch must not issue another key"
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        `SELECT COUNT(*) AS count FROM cloud_compliance_audit
+          WHERE tenant_id = ? AND action = 'customer.api_key.portal.create'`
+      )
+      .get(tenant.id)?.count,
+    0,
+    "rejected key issuance must not write a success audit"
+  );
+
+  const secondPortal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const revokeDb = new RevokeOidcSessionBeforePortalApiKeyBatchCloudDb(db, membership.id, NOW);
+  const revoke = await runtime(revokeDb).fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_API_KEYS_PATH}/${existingKey.id}`, {
+      method: "DELETE",
+      headers: {
+        ...headers,
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${secondPortal.cookie}`,
+      },
+    })
+  );
+  assert.equal(revokeDb.triggered, true);
+  assert.equal(revoke.status, 404);
+  assert.equal(
+    db.raw
+      .prepare("SELECT revoked_at FROM cloud_customer_api_keys WHERE id = ?")
+      .get(existingKey.id)?.revoked_at,
+    null,
+    "a session revoked before the update batch must not revoke a key"
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        `SELECT COUNT(*) AS count FROM cloud_compliance_audit
+          WHERE tenant_id = ? AND action = 'customer.api_key.portal.revoke'`
+      )
+      .get(tenant.id)?.count,
+    0,
+    "rejected key revocation must not write a success audit"
+  );
 });
 
 test("provider connection portal enforces owner sessions and reuses encrypted fixed-contract API operations", async () => {

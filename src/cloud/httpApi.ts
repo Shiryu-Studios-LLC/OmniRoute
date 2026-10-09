@@ -1653,6 +1653,6 @@ export async function handleCloudApiRequest(
   }
 }
 
-function isDeploymentToken(value: string): boolean {
+export function isDeploymentToken(value: string): boolean {
   return /^[A-Za-z0-9._~+/=-]{32,512}$/.test(value);
 }

@@ -42,6 +42,15 @@ function decodeWrappingKey(secret: string | undefined): Uint8Array {
   }
 }
 
+export function isCloudCredentialEncryptionKey(secret: string | undefined): boolean {
+  try {
+    decodeWrappingKey(secret);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

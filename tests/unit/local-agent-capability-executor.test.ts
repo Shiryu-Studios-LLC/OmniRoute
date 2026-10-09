@@ -140,9 +140,15 @@ test("polls a bounded ComfyUI workflow and retrieves its completed image output"
           historyCalls += 1;
           return Response.json(
             historyCalls === 1
-              ? {}
+              ? {
+                  job_123: {
+                    status: { completed: false, status_str: "running" },
+                    outputs: { "3": { images: [] } },
+                  },
+                }
               : {
                   job_123: {
+                    status: { completed: true, status_str: "success" },
                     outputs: {
                       "9": {
                         images: [{ filename: "result.png", subfolder: "", type: "output" }],
@@ -244,12 +250,13 @@ test("rejects unsafe ComfyUI output metadata and image payloads above the gatewa
         if (url.pathname.endsWith("/prompt")) return Response.json({ prompt_id: "job_123" });
         return Response.json({
           job_123: {
+            status: { completed: true, status_str: "success" },
             outputs: { "9": { images: [{ filename: "../x.png", subfolder: "", type: "output" }] } },
           },
         });
       },
     }),
-    /no safe image output metadata/
+    /completed without safe image output metadata/
   );
 
   await assert.rejects(
@@ -274,6 +281,36 @@ test("rejects unsafe ComfyUI output metadata and image payloads above the gatewa
     }),
     /exceeds the size limit/
   );
+});
+
+test("surfaces a ComfyUI workflow error instead of polling until timeout", async () => {
+  const requestedPaths: string[] = [];
+  await assert.rejects(
+    executeLocalCapability(
+      { comfyUiUrl: "http://127.0.0.1:8188" },
+      discovery,
+      {
+        capability: "comfyui:image",
+        payload: { workflow: { "1": { class_type: "SaveImage" } } },
+      },
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        fetch: async (input) => {
+          const url = new URL(String(input));
+          requestedPaths.push(url.pathname);
+          if (url.pathname.endsWith("/prompt")) return Response.json({ prompt_id: "job_123" });
+          return Response.json({
+            job_123: {
+              status: { completed: true, status_str: "error" },
+              outputs: {},
+            },
+          });
+        },
+      }
+    ),
+    /workflow execution failed/
+  );
+  assert.deepEqual(requestedPaths, ["/prompt", "/history/job_123"]);
 });
 
 test("projects oversized Ollama output below the gateway result limit", async () => {

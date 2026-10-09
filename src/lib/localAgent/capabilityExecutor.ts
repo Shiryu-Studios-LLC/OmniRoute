@@ -201,7 +201,7 @@ function comfyUiOutputFiles(history: Record<string, unknown>, promptId: string) 
       if (images.length >= MAX_COMFYUI_IMAGES) return images;
     }
   }
-  return images;
+  return images.length > 0 ? images : null;
 }
 
 async function fetchComfyUiImage(
@@ -268,10 +268,17 @@ async function runComfyUiImageWorkflow(
         dependencies.resolveHost
       )
     );
+    const historyEntry = history ? record(history[promptId]) : null;
     outputFiles = history ? comfyUiOutputFiles(history, promptId) : null;
-    if (outputFiles) {
-      if (!outputFiles.length) throw new Error("ComfyUI returned no safe image output metadata");
+    if (outputFiles?.length) {
       break;
+    }
+    const status = record(historyEntry?.status);
+    if (status?.status_str === "error") {
+      throw new Error("ComfyUI workflow execution failed");
+    }
+    if (status?.completed === true) {
+      throw new Error("ComfyUI completed without safe image output metadata");
     }
     await new Promise((resolve) => setTimeout(resolve, COMFYUI_POLL_INTERVAL_MS));
   }

@@ -411,6 +411,20 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         revokedAt: null,
       };
       await options.coordinator.putSession(session);
+      // Pairing revocation and credential rotation update D1 before invalidating
+      // the Durable Object session. Re-read the authoritative device record
+      // after opening the session so a connect that raced with that sequence
+      // cannot leave a usable session behind after revocation/rotation.
+      const currentDevice = await getActiveDevice(device.id);
+      if (
+        !currentDevice ||
+        currentDevice.revokedAt ||
+        currentDevice.tenantId !== device.tenantId ||
+        !digestEqual(currentDevice.credentialHash, suppliedHash)
+      ) {
+        await options.coordinator.revokeSession(device.id, new Date(now()).toISOString());
+        return null;
+      }
       return {
         sessionId: session.sessionId,
         deviceId: device.id,

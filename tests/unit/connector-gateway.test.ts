@@ -255,6 +255,35 @@ test("revocation immediately blocks an established device session", async () => 
   );
 });
 
+test("connect racing with credential rotation revokes the session it just created", async () => {
+  const credential = "agent-credential-race";
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_race",
+      tenantId: "tenant_race",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama.chat"],
+      revokedAt: null,
+    },
+  ]);
+  const originalGetDevice = adapters.directory.getDevice.bind(adapters.directory);
+  let reads = 0;
+  adapters.directory.getDevice = async (deviceId) => {
+    reads += 1;
+    const device = await originalGetDevice(deviceId);
+    if (reads < 2 || !device) return device;
+    return { ...device, credentialHash: await sha256Hex("rotated-credential") };
+  };
+  const gateway = createConnectorGateway({
+    ...adapters,
+    createId: () => "session_race",
+    createToken: () => "session-token-race",
+  });
+
+  assert.equal(await gateway.connect("device_race", credential), null);
+  assert.equal(adapters.sessions.get("device_race")?.revokedAt !== null, true);
+});
+
 test("invalid lease bounds are rejected before creating gateway sessions", () => {
   const adapters = createMemoryAdapters([]);
   assert.throws(() => createConnectorGateway({ ...adapters, leaseMs: 1 }), /lease/);
