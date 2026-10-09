@@ -646,6 +646,7 @@ test(
         for (const filename of [
           "server.js",
           "omnirouteConfig.js",
+          "businessProfileClient.js",
           "leadStore.js",
           "chatRateLimit.js",
         ]) {
@@ -890,6 +891,7 @@ test(
         for (const filename of [
           "server.js",
           "omnirouteConfig.js",
+          "businessProfileClient.js",
           "leadStore.js",
           "chatRateLimit.js",
         ]) {
