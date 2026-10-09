@@ -884,7 +884,7 @@ test("MCP portal reuses encrypted CRUD with session-bound tenant authorization a
   assert.equal(publicNoKey.status, 401);
 });
 
-test("onboarding readiness portal returns only nine tenant-scoped booleans to owner/admin sessions", async () => {
+test("onboarding readiness portal returns tenant-scoped booleans to owner/admin sessions", async () => {
   const { db, tenant, membership } = await setup();
   await db
     .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
@@ -911,6 +911,7 @@ test("onboarding readiness portal returns only nine tenant-scoped booleans to ow
     [
       "activeOwner",
       "activeProviderConnection",
+      "activeMcpServer",
       "businessProfileConfigured",
       "enabledInferenceEntitlement",
       "localAiEnabled",

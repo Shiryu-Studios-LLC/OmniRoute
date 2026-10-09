@@ -104,6 +104,7 @@ async function migratedDb(): Promise<SqliteCloudDb> {
     "0016_cloud_tenant_oidc_sessions.sql",
     "0017_cloud_gateway_pairings.sql",
     "0018_cloud_tenant_membership_invitations.sql",
+    "0019_cloud_tenant_mcp_servers.sql",
     "0023_cloud_tenant_business_profiles.sql",
     "0024_cloud_tenant_business_profile_configuration.sql",
   ]) {
@@ -239,6 +240,22 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       )
       .bind("onboarding-device-b", customerB.tenant.id, "b".repeat(64), TEST_NOW)
       .run();
+    await db
+      .prepare(
+        `INSERT INTO cloud_tenant_mcp_servers (
+           id, tenant_id, name, transport, endpoint, credential_encrypted, is_active, created_at, updated_at
+         ) VALUES (?, ?, ?, 'streamable_http', ?, ?, 1, ?, ?)`
+      )
+      .bind(
+        "onboarding-mcp-b",
+        customerB.tenant.id,
+        "Customer B MCP",
+        "https://mcp.customer-b.example/mcp",
+        "encrypted-mcp-secret",
+        TEST_NOW,
+        TEST_NOW
+      )
+      .run();
 
     const options = { db, now: () => new Date(TEST_NOW_MS) };
     const runtime = createCloudRuntime({ env: { DB: db }, ...options });
@@ -256,6 +273,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       registeredDevice: false,
       localAiEnabled: true,
       mcpEnabled: false,
+      activeMcpServer: false,
     });
 
     const profileResponse = await runtime.fetch(
@@ -309,11 +327,13 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       registeredDevice: true,
       localAiEnabled: true,
       mcpEnabled: true,
+      activeMcpServer: true,
     });
 
     for (const status of [statusA, statusB]) {
       assert.ok(Object.values(status).every((value) => typeof value === "boolean"));
       assert.deepEqual(Object.keys(status).sort(), [
+        "activeMcpServer",
         "activeOwner",
         "activeProviderConnection",
         "businessProfileConfigured",
@@ -333,6 +353,8 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       "identity.customer-b.example",
       "customer-b-client-id",
       "encrypted-customer-b-client-secret",
+      "mcp.customer-b.example",
+      "encrypted-mcp-secret",
       "provider-secret",
       "onboarding-device-b",
       "b".repeat(64),

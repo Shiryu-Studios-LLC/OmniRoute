@@ -18,6 +18,7 @@ interface OnboardingStatusRow {
   registered_device: number;
   local_ai_enabled: number;
   mcp_enabled: number;
+  active_mcp_server: number;
 }
 
 export interface CloudCustomerOnboardingReadiness {
@@ -30,6 +31,7 @@ export interface CloudCustomerOnboardingReadiness {
   registeredDevice: boolean;
   localAiEnabled: boolean;
   mcpEnabled: boolean;
+  activeMcpServer: boolean;
 }
 
 export interface CloudCustomerOnboardingApiOptions {
@@ -45,7 +47,7 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
 }
 
-/** Read the existing nine boolean flags for one trusted, already-authorized tenant identity. */
+/** Read tenant-scoped boolean flags for one trusted, already-authorized tenant identity. */
 export async function getCloudCustomerOnboardingReadiness(
   db: CloudDb,
   tenantId: string
@@ -81,7 +83,11 @@ export async function getCloudCustomerOnboardingReadiness(
             WHERE d.tenant_id = t.id AND d.revoked_at IS NULL
          ) AS registered_device,
          s.local_ai_enabled,
-         s.mcp_enabled
+         s.mcp_enabled,
+         EXISTS (
+           SELECT 1 FROM cloud_tenant_mcp_servers m
+            WHERE m.tenant_id = t.id AND m.is_active = 1
+         ) AS active_mcp_server
        FROM tenants t
        JOIN cloud_tenant_settings s ON s.tenant_id = t.id
       WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
@@ -100,6 +106,7 @@ export async function getCloudCustomerOnboardingReadiness(
     registeredDevice: row.registered_device === 1,
     localAiEnabled: row.local_ai_enabled === 1,
     mcpEnabled: row.mcp_enabled === 1,
+    activeMcpServer: row.active_mcp_server === 1,
   };
 }
 

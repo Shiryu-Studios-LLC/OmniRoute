@@ -15,6 +15,7 @@ interface StoredRun {
 class MaintenanceDb implements CloudDb {
   readonly runs: StoredRun[] = [];
   failWrites = false;
+  failRetention = false;
 
   prepare<T = unknown>(sql: string): CloudDbStatement<T> {
     let values: unknown[] = [];
@@ -42,6 +43,7 @@ class MaintenanceDb implements CloudDb {
           return { success: true, meta: { changes: 1 } };
         }
         if (sql.includes("DELETE FROM cloud_maintenance_runs")) {
+          if (thisDb.failRetention) throw new Error("sensitive D1 retention details");
           const cutoff = Number(values[0]);
           const limit = Number(values[1]);
           const expired = thisDb.runs
@@ -270,4 +272,57 @@ test("maintenance ledger storage failures do not prevent tasks or hide cleanup f
     logs.some(({ message }) => message.includes("sensitive")),
     false
   );
+});
+
+test("maintenance retention failure is logged without hiding task failures", async () => {
+  const db = new MaintenanceDb();
+  db.failRetention = true;
+  const completed: string[] = [];
+  const logs: Array<{ message: string; task: string }> = [];
+
+  await assert.rejects(
+    runCloudMaintenanceTasks(
+      [
+        {
+          name: "expired-rate-limits",
+          async run() {
+            completed.push("expired-rate-limits");
+          },
+        },
+        {
+          name: "stale-inference-reservations",
+          async run() {
+            completed.push("stale-inference-reservations");
+            throw new Error("sensitive cleanup query details");
+          },
+        },
+      ],
+      {
+        error(message, details) {
+          logs.push({ message, task: details.task });
+        },
+      },
+      { db, now: () => 40 * 24 * 60 * 60 * 1000 }
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "Cloud maintenance tasks failed: stale-inference-reservations");
+      assert.equal(error.message.includes("sensitive"), false);
+      return true;
+    }
+  );
+
+  assert.deepEqual(completed, ["expired-rate-limits", "stale-inference-reservations"]);
+  assert.deepEqual(
+    db.runs.map(({ task, outcome }) => ({ task, outcome })),
+    [
+      { task: "expired-rate-limits", outcome: "succeeded" },
+      { task: "stale-inference-reservations", outcome: "failed" },
+    ]
+  );
+  assert.deepEqual(logs, [
+    { message: "Cloud maintenance task failed", task: "stale-inference-reservations" },
+    { message: "Cloud maintenance telemetry retention failed", task: "expired-maintenance-runs" },
+  ]);
+  assert.equal(JSON.stringify(logs).includes("sensitive"), false);
 });

@@ -340,6 +340,7 @@ const PORTAL_SCRIPT = `
       ["registeredDevice", "Local Agent device registered"],
       ["localAiEnabled", "Local AI enabled"],
       ["mcpEnabled", "MCP enabled"],
+      ["activeMcpServer", "MCP server configured"],
     ];
     const list = byId("onboarding-readiness");
     list.replaceChildren();

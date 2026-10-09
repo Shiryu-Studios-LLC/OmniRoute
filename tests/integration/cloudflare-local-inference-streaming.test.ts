@@ -267,7 +267,7 @@ test(
           stdio: ["ignore", "pipe", "pipe"],
         }
       );
-    const child = startWorker();
+    let child = startWorker();
     let output = "";
     const appendOutput = (chunk: Buffer) => {
       output = `${output}${chunk.toString("utf8")}`.slice(-30_000);
@@ -428,6 +428,14 @@ test(
       String(audits[0]?.metadata_json).includes("hello from the local inference integration"),
       false
     );
+
+    // The idempotency record and streamed transcript live in D1, so a Worker
+    // restart must not turn a completed request into a second provider call.
+    await stopWorker(child);
+    child = startWorker();
+    child.stdout?.on("data", appendOutput);
+    child.stderr?.on("data", appendOutput);
+    await waitForWorker(baseUrl, child, () => output);
 
     const replayResponse = await inferenceRequest();
     assert.equal(replayResponse.status, 200);
