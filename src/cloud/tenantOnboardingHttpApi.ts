@@ -19,6 +19,7 @@ interface OnboardingStatusRow {
   local_ai_enabled: number;
   mcp_enabled: number;
   active_mcp_server: number;
+  frontdesk_configured: number;
 }
 
 export interface CloudCustomerOnboardingReadiness {
@@ -32,6 +33,7 @@ export interface CloudCustomerOnboardingReadiness {
   localAiEnabled: boolean;
   mcpEnabled: boolean;
   activeMcpServer: boolean;
+  frontDeskConfigured: boolean;
 }
 
 export interface CloudCustomerOnboardingApiOptions {
@@ -87,7 +89,13 @@ export async function getCloudCustomerOnboardingReadiness(
          EXISTS (
            SELECT 1 FROM cloud_tenant_mcp_servers m
             WHERE m.tenant_id = t.id AND m.is_active = 1
-         ) AS active_mcp_server
+         ) AS active_mcp_server,
+         EXISTS (
+           SELECT 1 FROM cloud_frontdesk_configs f
+           JOIN cloud_verified_customer_hosts h
+             ON h.hostname = f.hostname AND h.tenant_id = f.tenant_id
+            WHERE f.tenant_id = t.id
+         ) AS frontdesk_configured
        FROM tenants t
        JOIN cloud_tenant_settings s ON s.tenant_id = t.id
       WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
@@ -107,6 +115,7 @@ export async function getCloudCustomerOnboardingReadiness(
     localAiEnabled: row.local_ai_enabled === 1,
     mcpEnabled: row.mcp_enabled === 1,
     activeMcpServer: row.active_mcp_server === 1,
+    frontDeskConfigured: row.frontdesk_configured === 1,
   };
 }
 

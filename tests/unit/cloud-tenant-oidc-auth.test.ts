@@ -342,10 +342,12 @@ async function setup() {
     "0018_cloud_tenant_membership_invitations.sql",
     "0019_cloud_tenant_mcp_servers.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
+    "0025_verified_customer_hosts.sql",
     "0022_provider_execution_contract.sql",
     "0023_cloud_tenant_business_profiles.sql",
     "0024_cloud_tenant_business_profile_configuration.sql",
     "0026_revoke_customer_oidc_sessions_on_membership_change.sql",
+    "0028_cloud_frontdesk_configs.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -916,6 +918,7 @@ test("onboarding readiness portal returns tenant-scoped booleans to owner/admin 
       "activeMcpServer",
       "businessProfileConfigured",
       "enabledInferenceEntitlement",
+      "frontDeskConfigured",
       "localAiEnabled",
       "mcpEnabled",
       "oidcConfigured",
@@ -927,6 +930,7 @@ test("onboarding readiness portal returns tenant-scoped booleans to owner/admin 
   assert.equal(readiness.activeOwner, true);
   assert.equal(readiness.localAiEnabled, true);
   assert.equal(readiness.mcpEnabled, true);
+  assert.equal(readiness.frontDeskConfigured, false);
   assert.equal(readiness.enabledInferenceEntitlement, false);
   assert.doesNotMatch(text, new RegExp(`${tenant.id}|${tenant.slug}|${ISSUER}|${ENCRYPTION_KEY}`));
 

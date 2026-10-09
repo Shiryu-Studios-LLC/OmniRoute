@@ -37,6 +37,7 @@ import {
   handleCloudCustomerProviderPortalRequest,
 } from "./customerProviderHttpApi";
 import { handleCloudTenantMcpPortalRequest } from "./tenantMcpHttpApi";
+import { handleCloudFrontDeskConfigPortalRequest } from "./frontDeskConfigHttpApi";
 import { getCloudCustomerOnboardingReadiness } from "./tenantOnboardingHttpApi";
 import {
   invalidateCloudTenantDeviceSessions,
@@ -67,6 +68,7 @@ export const CLOUD_TENANT_MCP_SERVERS_PATH = "/__cloud/auth/mcp-servers";
 export const CLOUD_TENANT_ONBOARDING_PATH = "/__cloud/auth/onboarding";
 export const CLOUD_TENANT_MCP_SETTINGS_PATH = "/__cloud/auth/mcp-settings";
 export const CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH = "/__cloud/auth/local-ai-settings";
+export const CLOUD_TENANT_FRONT_DESK_PATH = "/__cloud/auth/front-desk";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -1028,6 +1030,35 @@ async function customerMcpServersPortal(
   return response ?? json({ error: "Not found" }, 404);
 }
 
+async function customerFrontDeskConfigPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  if (request.method !== "GET" && request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const response = await handleCloudFrontDeskConfigPortalRequest(
+    request,
+    {
+      db: options.db,
+      credentialEncryptionKey: options.credentialEncryptionKey,
+      now: () => new Date(nowMs),
+    },
+    {
+      tenantId: session.tenant_id,
+      principalId: session.principal_id,
+      membershipId: session.membership_id,
+      role: session.role,
+      sessionTokenHash: session.session_token_hash,
+    }
+  );
+  return response ?? json({ error: "Not found" }, 404);
+}
+
 async function customerOnboardingReadinessPortal(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1724,6 +1755,9 @@ export async function handleCloudTenantOidcAuthRequest(
   const isMcpServers =
     pathname === CLOUD_TENANT_MCP_SERVERS_PATH ||
     pathname.startsWith(`${CLOUD_TENANT_MCP_SERVERS_PATH}/`);
+  const isFrontDesk =
+    pathname === CLOUD_TENANT_FRONT_DESK_PATH ||
+    pathname.startsWith(`${CLOUD_TENANT_FRONT_DESK_PATH}/`);
   const isOnboarding = pathname === CLOUD_TENANT_ONBOARDING_PATH;
   const isMcpSettings = pathname === CLOUD_TENANT_MCP_SETTINGS_PATH;
   const isLocalAiSettings = pathname === CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH;
@@ -1742,6 +1776,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isBusinessProfile &&
     !isProviderConnections &&
     !isMcpServers &&
+    !isFrontDesk &&
     !isOnboarding &&
     !isMcpSettings &&
     !isLocalAiSettings &&
@@ -1769,13 +1804,15 @@ export async function handleCloudTenantOidcAuthRequest(
           ? ["GET", "POST", "PATCH", "DELETE"]
           : isMcpServers
             ? ["GET", "POST", "PUT", "DELETE"]
-            : isOnboarding
-              ? ["GET"]
-              : isMcpSettings
-                ? ["PUT"]
-                : isLocalAiSettings
+            : isFrontDesk
+              ? ["GET", "PUT", "DELETE"]
+              : isOnboarding
+                ? ["GET"]
+                : isMcpSettings
                   ? ["PUT"]
-                  : [expectedMethod];
+                  : isLocalAiSettings
+                    ? ["PUT"]
+                    : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1792,6 +1829,7 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isProviderConnections)
     return customerProviderConnectionsPortal(request, options, origin, nowMs);
   if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
+  if (isFrontDesk) return customerFrontDeskConfigPortal(request, options, origin, nowMs);
   if (isOnboarding) return customerOnboardingReadinessPortal(request, options, nowMs);
   if (isMcpSettings) return customerMcpSettingsPortal(request, options, origin, nowMs);
   if (isLocalAiSettings) return customerLocalAiSettingsPortal(request, options, origin, nowMs);

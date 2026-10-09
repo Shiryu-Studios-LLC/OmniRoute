@@ -341,6 +341,7 @@ const PORTAL_SCRIPT = `
       ["localAiEnabled", "Local AI enabled"],
       ["mcpEnabled", "MCP enabled"],
       ["activeMcpServer", "MCP server configured"],
+      ["frontDeskConfigured", "Front Desk host configured"],
     ];
     const list = byId("onboarding-readiness");
     list.replaceChildren();
@@ -354,6 +355,132 @@ const PORTAL_SCRIPT = `
     }
     return data;
   };
+
+  const loadFrontDeskConfig = async () => {
+    const data = await api("/__cloud/auth/front-desk");
+    if (!Array.isArray(data.hosts) || !Array.isArray(data.devices)) {
+      throw new Error("Invalid Front Desk setup response");
+    }
+    const hostSelect = byId("front-desk-host");
+    const selected = hostSelect.value;
+    hostSelect.replaceChildren();
+    for (const host of data.hosts) {
+      if (!host || typeof host.hostname !== "string" || typeof host.configured !== "boolean") continue;
+      const option = node("option", host.hostname + (host.configured ? " · configured" : ""));
+      option.value = host.hostname;
+      hostSelect.append(option);
+    }
+    const devices = data.devices.filter((device) => device && typeof device.id === "string" &&
+      Array.isArray(device.capabilities) && device.capabilities.every((item) => typeof item === "string"));
+    const capabilityByDevice = new Map(devices.map((device) => [device.id, device.capabilities]));
+    const deviceSelect = byId("front-desk-device");
+    deviceSelect.replaceChildren();
+    for (const device of devices) {
+      const models = device.capabilities.filter((item) => item.startsWith("ollama:chat:"))
+        .map((item) => item.slice("ollama:chat:".length));
+      for (const model of models) {
+        const option = node("option", device.id + " · " + model);
+        option.value = JSON.stringify({ id: device.id, model });
+        deviceSelect.append(option);
+      }
+    }
+    const configByHost = new Map(data.hosts.map((host) => [host.hostname, host]));
+    hostSelect.value = configByHost.has(selected) ? selected : hostSelect.options[0]?.value || "";
+    const fill = () => {
+      const host = configByHost.get(hostSelect.value);
+      const gateway = host && host.gateway;
+      byId("front-desk-configured").textContent = host && host.configured
+        ? "Credentials are saved and will never be displayed here. Enter new values only to replace them."
+        : "Choose a verified host, then enter the customer API key and gateway details.";
+      byId("remove-front-desk-config").disabled = !host?.configured;
+      if (!gateway) {
+        byId("front-desk-base-url").value = "";
+        byId("front-desk-customer-key").value = "";
+        byId("front-desk-dashboard-token").value = "";
+        byId("front-desk-image-enabled").checked = false;
+        byId("front-desk-image-checkpoint").value = "";
+        return;
+      }
+      byId("front-desk-base-url").value = gateway.baseUrl || "";
+      const match = devices.flatMap((device) => device.capabilities
+        .filter((item) => item === "ollama:chat:" + gateway.ollamaModel)
+        .map(() => JSON.stringify({ id: device.id, model: gateway.ollamaModel })))[0];
+      if (match) deviceSelect.value = match;
+      byId("front-desk-image-enabled").checked = Boolean(gateway.imageGeneration);
+      byId("front-desk-image-checkpoint").value = gateway.imageGeneration?.checkpoint || "";
+    };
+    const updateImageCapability = () => {
+      let selection = null;
+      try { selection = JSON.parse(deviceSelect.value || "null"); } catch {}
+      const capabilities = selection ? capabilityByDevice.get(selection.id) || [] : [];
+      const supported = capabilities.includes("comfyui:image");
+      byId("front-desk-image-enabled").disabled = !supported;
+      if (!supported) byId("front-desk-image-enabled").checked = false;
+      byId("front-desk-image-help").textContent = supported
+        ? "This device advertises image generation."
+        : "Image generation requires a registered device with ComfyUI capability.";
+    };
+    hostSelect.onchange = fill;
+    deviceSelect.onchange = updateImageCapability;
+    fill();
+    updateImageCapability();
+    byId("front-desk-device-help").textContent = devices.length
+      ? "Only active tenant devices with an Ollama chat capability are listed."
+      : "No active Ollama-capable Local Agent is registered yet.";
+  };
+
+  byId("front-desk-config-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("save-front-desk-config");
+    button.disabled = true;
+    try {
+      const selection = JSON.parse(byId("front-desk-device").value || "null");
+      if (!selection) throw new Error("Register an active Ollama-capable Local Agent first.");
+      const imageGeneration = byId("front-desk-image-enabled").checked
+        ? { checkpoint: byId("front-desk-image-checkpoint").value || null, width: 1024, height: 1024, steps: 25, cfg: 7 }
+        : null;
+      await api("/__cloud/auth/front-desk", {
+        method: "PUT",
+        body: JSON.stringify({
+          hostname: byId("front-desk-host").value,
+          customerApiKey: byId("front-desk-customer-key").value,
+          dashboardToken: byId("front-desk-dashboard-token").value,
+          gateway: {
+            baseUrl: byId("front-desk-base-url").value,
+            deviceId: selection.id,
+            ollamaModel: selection.model,
+            imageGeneration,
+          },
+        }),
+      });
+      byId("front-desk-customer-key").value = "";
+      byId("front-desk-dashboard-token").value = "";
+      setStatus("Front Desk setup saved. Secret values are never displayed.");
+      await loadFrontDeskConfig();
+      await loadOnboardingReadiness();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Front Desk setup could not be saved.", true);
+    } finally {
+      byId("front-desk-customer-key").value = "";
+      byId("front-desk-dashboard-token").value = "";
+      button.disabled = false;
+    }
+  });
+
+  byId("remove-front-desk-config").addEventListener("click", async () => {
+    const hostname = byId("front-desk-host").value;
+    if (!hostname) return;
+    const button = byId("remove-front-desk-config");
+    button.disabled = true;
+    try {
+      await api("/__cloud/auth/front-desk/" + encodeURIComponent(hostname), { method: "DELETE" });
+      setStatus("Front Desk configuration removed.");
+      await loadFrontDeskConfig();
+      await loadOnboardingReadiness();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Front Desk config could not be removed.", true);
+    } finally { button.disabled = false; }
+  });
 
   byId("local-ai-opt-in-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -641,11 +768,17 @@ const PORTAL_SCRIPT = `
         byId("provider-connection-panel").hidden = false;
         byId("local-ai-settings-panel").hidden = false;
         byId("mcp-settings-panel").hidden = false;
+        byId("front-desk-config-panel").hidden = false;
         byId("onboarding-readiness-panel").hidden = false;
         try {
           await loadBusinessProfile();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "Could not load business profile.", true);
+        }
+        try {
+          await loadFrontDeskConfig();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load Front Desk setup.", true);
         }
         try {
           await loadProviderConnections();
@@ -839,6 +972,31 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <label for="mcp-server-credential">Credential (optional)</label>
           <input id="mcp-server-credential" type="password" autocomplete="new-password" maxlength="8192">
           <button id="create-mcp-server" type="submit">Add MCP server</button>
+        </form>
+      </section>
+      <section id="front-desk-config-panel" hidden>
+        <h2>Front Desk setup</h2>
+        <p>Configure an already verified customer host. Host ownership verification and domain registration are managed by a platform admin.</p>
+        <p id="front-desk-configured" aria-live="polite"></p>
+        <form id="front-desk-config-form">
+          <label for="front-desk-host">Verified customer host</label>
+          <select id="front-desk-host" required></select>
+          <label for="front-desk-customer-key">Customer owner/admin API key</label>
+          <input id="front-desk-customer-key" type="password" autocomplete="new-password" maxlength="128" required>
+          <label for="front-desk-dashboard-token">Front Desk dashboard token</label>
+          <input id="front-desk-dashboard-token" type="password" autocomplete="new-password" minlength="32" maxlength="256" required>
+          <label for="front-desk-base-url">Local Agent gateway URL</label>
+          <input id="front-desk-base-url" type="url" maxlength="2048" required>
+          <label for="front-desk-device">Active Local Agent and model</label>
+          <select id="front-desk-device" required></select>
+          <p id="front-desk-device-help"></p>
+          <label for="front-desk-image-enabled">Enable image generation for this gateway</label>
+          <input id="front-desk-image-enabled" type="checkbox">
+          <p id="front-desk-image-help"></p>
+          <label for="front-desk-image-checkpoint">Image checkpoint (optional)</label>
+          <input id="front-desk-image-checkpoint" maxlength="128">
+          <button id="save-front-desk-config" type="submit">Save Front Desk setup</button>
+          <button id="remove-front-desk-config" type="button">Remove this host setup</button>
         </form>
       </section>
       <section id="onboarding-readiness-panel" hidden>

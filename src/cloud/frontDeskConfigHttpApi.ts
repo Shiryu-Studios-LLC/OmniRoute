@@ -7,15 +7,21 @@ import {
   isCloudCredentialEnvelope,
   isCloudCredentialEncryptionKey,
 } from "./credentialEncryption";
-import { getCloudGatewayDevice } from "./gatewayDevices";
+import { getCloudGatewayDevice, listCloudGatewayDevices } from "./gatewayDevices";
+import { consumeCloudRateLimit } from "./rateLimit";
 import {
   getCloudFrontDeskConfig,
   listCloudFrontDeskConfigs,
   prepareDeleteCloudFrontDeskConfig,
   prepareUpsertCloudFrontDeskConfig,
+  type CloudFrontDeskPortalAuthorization,
   type CloudFrontDeskConfig,
 } from "./frontDeskConfigs";
-import { getAdminVerifiedCustomerHost, normalizeCustomerHostname } from "./tenantHosts";
+import {
+  getAdminVerifiedCustomerHost,
+  listAdminVerifiedCustomerHosts,
+  normalizeCustomerHostname,
+} from "./tenantHosts";
 import { getCloudTenantById, CLOUD_PLATFORM_TENANT_ID } from "./tenants";
 
 export const CLOUD_FRONT_DESK_CONFIG_PATH = "/__cloud/v1/front-desk/config";
@@ -35,6 +41,14 @@ export interface CloudFrontDeskConfigApiOptions {
   credentialEncryptionKey?: string;
   now?: () => Date;
   bodyReadTimeoutMs?: number;
+}
+
+export interface CloudFrontDeskConfigPortalIdentity {
+  tenantId: string;
+  principalId: string;
+  membershipId: string;
+  role: "owner" | "admin" | "member" | "viewer";
+  sessionTokenHash: string;
 }
 
 interface GatewayConfigInput {
@@ -284,6 +298,209 @@ function queryHostname(request: Request): string | null {
   const hostname = url.searchParams.get("hostname") ?? "";
   if (hostname.length > 260) return null;
   return normalizeCustomerHostname(hostname);
+}
+
+/** Owner/admin OIDC portal surface; the OIDC wrapper must enforce session and same-origin checks. */
+export async function handleCloudFrontDeskConfigPortalRequest(
+  request: Request,
+  options: CloudFrontDeskConfigApiOptions,
+  identity: CloudFrontDeskConfigPortalIdentity
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (
+    url.pathname !== "/__cloud/auth/front-desk" &&
+    !url.pathname.startsWith("/__cloud/auth/front-desk/")
+  ) {
+    return null;
+  }
+  if (url.search !== "") return json({ error: "Query parameters are not supported" }, 400);
+  if (!options.db) return json({ error: "Front Desk setup is unavailable" }, 503);
+  if (identity.role !== "owner" && identity.role !== "admin") {
+    return json({ error: "Owner or admin membership is required" }, 403);
+  }
+  const allowed = url.pathname === "/__cloud/auth/front-desk" ? ["GET", "PUT"] : ["DELETE"];
+  if (!allowed.includes(request.method)) return json({ error: "Method not allowed" }, 405);
+
+  const db = options.db;
+  const now = options.now ?? (() => new Date());
+  const nowDate = now();
+  const portalAuthorization: CloudFrontDeskPortalAuthorization = {
+    tenantId: identity.tenantId,
+    membershipId: identity.membershipId,
+    sessionTokenHash: identity.sessionTokenHash,
+    nowMs: nowDate.getTime(),
+  };
+  try {
+    const limit = await consumeCloudRateLimit(db, {
+      tenantId: identity.tenantId,
+      bucketKey: `customer-frontdesk-portal:${identity.membershipId}`,
+      limit: 30,
+      windowMs: 60_000,
+      nowMs: nowDate.getTime(),
+    });
+    if (!limit.allowed) return json({ error: "Front Desk setup rate limit exceeded" }, 429);
+
+    if (request.method === "GET") {
+      const [hosts, configs, devices] = await Promise.all([
+        listAdminVerifiedCustomerHosts(db, identity.tenantId),
+        listCloudFrontDeskConfigs(db, identity.tenantId),
+        listCloudGatewayDevices(db, identity.tenantId),
+      ]);
+      const configByHostname = new Map(configs.map((config) => [config.hostname, config]));
+      return json({
+        devices: devices
+          .filter((device) => device.revokedAt === null)
+          .map(({ id, capabilities, serviceHealth }) => ({ id, capabilities, serviceHealth })),
+        hosts: hosts.map((host) => {
+          const config = configByHostname.get(host.hostname);
+          return {
+            hostname: host.hostname,
+            configured: Boolean(config),
+            ...(config ? publicConfig(config) : {}),
+          };
+        }),
+      });
+    }
+
+    if (request.method === "DELETE") {
+      let hostname: string;
+      try {
+        hostname = decodeURIComponent(url.pathname.slice("/__cloud/auth/front-desk/".length));
+      } catch {
+        return json({ error: "Invalid hostname" }, 400);
+      }
+      if (hostname.includes("/") || normalizeCustomerHostname(hostname) !== hostname) {
+        return json({ error: "Invalid hostname" }, 400);
+      }
+      const timestamp = now().toISOString();
+      const deletion = prepareDeleteCloudFrontDeskConfig(db, hostname, portalAuthorization);
+      const audit = prepareCloudComplianceAuditInsert(
+        db,
+        {
+          id: crypto.randomUUID(),
+          tenantId: identity.tenantId,
+          timestamp,
+          action: "customer.frontdesk.config.delete",
+          actor: `membership:${identity.membershipId}`,
+          target: hostname,
+          resourceType: "front-desk-config",
+          status: "success",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: { principalId: identity.principalId },
+        },
+        { requirePreviousStatementChange: true }
+      ).statement;
+      const results = await db.batch([deletion, audit]);
+      const changes = Number(
+        (results[0] as { meta?: { changes?: unknown } } | undefined)?.meta?.changes
+      );
+      if (changes !== 1 || results.some((result) => !result || !result.success)) {
+        return json({ error: "Front Desk config could not be removed" }, changes === 0 ? 404 : 503);
+      }
+      return json({ removed: true });
+    }
+
+    if (!isCloudCredentialEncryptionKey(options.credentialEncryptionKey)) {
+      return json({ error: "Cloud credential encryption is unavailable" }, 503);
+    }
+    const value = await readJsonBody(request, options.bodyReadTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS);
+    const input = value ? parseConfigInput(value) : null;
+    if (!input) return json({ error: "Invalid Front Desk tenant config" }, 400);
+    const registration = await getAdminVerifiedCustomerHost(db, input.hostname);
+    if (!registration || registration.tenantId !== identity.tenantId) {
+      return json({ error: "Customer host is not available to this tenant" }, 404);
+    }
+    const apiKeyIdentity = await authenticateCloudCustomerApiKey(
+      db,
+      input.customerApiKey,
+      now().toISOString()
+    );
+    if (
+      !apiKeyIdentity ||
+      apiKeyIdentity.tenantId !== identity.tenantId ||
+      (apiKeyIdentity.role !== "owner" && apiKeyIdentity.role !== "admin")
+    ) {
+      return json({ error: "Customer API key is not authorized for this host" }, 403);
+    }
+    const device = await getCloudGatewayDevice(db, input.gateway.deviceId);
+    if (
+      !device ||
+      device.tenantId !== identity.tenantId ||
+      device.revokedAt !== null ||
+      !device.capabilities.includes(`ollama:chat:${input.gateway.ollamaModel}`) ||
+      (input.gateway.imageGeneration !== null && !device.capabilities.includes("comfyui:image"))
+    ) {
+      return json({ error: "Gateway device is not authorized for this tenant config" }, 403);
+    }
+    const timestamp = now().toISOString();
+    const [customerApiKeyEncrypted, dashboardTokenEncrypted] = await Promise.all([
+      encryptCloudCredential(
+        input.customerApiKey,
+        options.credentialEncryptionKey,
+        configContext(identity.tenantId, input.hostname, "customer_api_key")
+      ),
+      encryptCloudCredential(
+        input.dashboardToken,
+        options.credentialEncryptionKey,
+        configContext(identity.tenantId, input.hostname, "dashboard_token")
+      ),
+    ]);
+    const upsert = prepareUpsertCloudFrontDeskConfig(
+      db,
+      {
+        hostname: input.hostname,
+        tenantId: identity.tenantId,
+        customerApiKeyEncrypted,
+        dashboardTokenEncrypted,
+        gatewayBaseUrl: input.gateway.baseUrl,
+        deviceId: input.gateway.deviceId,
+        ollamaModel: input.gateway.ollamaModel,
+        imageGenerationJson:
+          input.gateway.imageGeneration === null
+            ? null
+            : JSON.stringify(input.gateway.imageGeneration),
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+      portalAuthorization
+    );
+    const audit = prepareCloudComplianceAuditInsert(
+      db,
+      {
+        id: crypto.randomUUID(),
+        tenantId: identity.tenantId,
+        timestamp,
+        action: "customer.frontdesk.config.write",
+        actor: `membership:${identity.membershipId}`,
+        target: input.hostname,
+        resourceType: "front-desk-config",
+        status: "success",
+        requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+        metadata: {
+          principalId: identity.principalId,
+          deviceId: input.gateway.deviceId,
+          capabilities: [
+            `ollama:chat:${input.gateway.ollamaModel}`,
+            ...(input.gateway.imageGeneration ? ["comfyui:image"] : []),
+          ],
+        },
+      },
+      { requirePreviousStatementChange: true }
+    ).statement;
+    const results = await db.batch([upsert, audit]);
+    const changes = Number(
+      (results[0] as { meta?: { changes?: unknown } } | undefined)?.meta?.changes
+    );
+    if (changes !== 1 || results.some((result) => !result || !result.success)) {
+      return json({ error: "Front Desk config could not be saved" }, 503);
+    }
+    const saved = await getCloudFrontDeskConfig(db, input.hostname);
+    return saved
+      ? json({ config: publicConfig(saved) })
+      : json({ error: "Save could not be confirmed" }, 503);
+  } catch {
+    return json({ error: "Front Desk setup could not be completed" }, 503);
+  }
 }
 
 export async function handleCloudFrontDeskConfigRequest(

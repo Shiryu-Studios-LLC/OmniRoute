@@ -107,6 +107,8 @@ async function migratedDb(): Promise<SqliteCloudDb> {
     "0019_cloud_tenant_mcp_servers.sql",
     "0023_cloud_tenant_business_profiles.sql",
     "0024_cloud_tenant_business_profile_configuration.sql",
+    "0025_verified_customer_hosts.sql",
+    "0028_cloud_frontdesk_configs.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
@@ -274,6 +276,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       localAiEnabled: true,
       mcpEnabled: false,
       activeMcpServer: false,
+      frontDeskConfigured: false,
     });
 
     const profileResponse = await runtime.fetch(
@@ -328,6 +331,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       localAiEnabled: true,
       mcpEnabled: true,
       activeMcpServer: true,
+      frontDeskConfigured: false,
     });
 
     for (const status of [statusA, statusB]) {
@@ -338,6 +342,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
         "activeProviderConnection",
         "businessProfileConfigured",
         "enabledInferenceEntitlement",
+        "frontDeskConfigured",
         "localAiEnabled",
         "mcpEnabled",
         "oidcConfigured",

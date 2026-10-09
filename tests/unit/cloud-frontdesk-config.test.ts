@@ -5,7 +5,10 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
 import { provisionCloudCustomer } from "../../src/cloud/provisioning";
-import { revokeCloudCustomerApiKey } from "../../src/cloud/customerIdentity";
+import {
+  createCloudCustomerMembership,
+  revokeCloudCustomerApiKey,
+} from "../../src/cloud/customerIdentity";
 import { registerCloudGatewayDevice } from "../../src/cloud/gatewayDevices";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 import { registerAdminVerifiedCustomerHost } from "../../src/cloud/tenantHosts";
@@ -87,6 +90,8 @@ async function fixture() {
     "0005_cloud_customer_identity.sql",
     "0007_gateway_device_service_health.sql",
     "0008_cloud_tenant_settings.sql",
+    "0015_cloud_tenant_oidc.sql",
+    "0016_cloud_tenant_oidc_sessions.sql",
     "0025_verified_customer_hosts.sql",
     "0028_cloud_frontdesk_configs.sql",
   ]) {
@@ -135,6 +140,7 @@ async function fixture() {
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
       OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: IDEMPOTENCY_KEY,
       OMNIROUTE_FRONT_DESK_CONFIG_TOKEN: SERVICE_TOKEN,
+      OMNIROUTE_CLOUD_PUBLIC_ORIGIN: "https://cloud.test",
     },
     now: () => new Date(NOW),
   });
@@ -255,3 +261,196 @@ test("Front Desk config writes, service retrieval, and admin listing isolate ten
     db.db.close();
   }
 });
+
+test("customer Front Desk portal is tenant scoped, owner/admin only, redacted, and feeds service retrieval", async () => {
+  const { db, tenantA, tenantB, deviceB, runtime, configBody } = await fixture();
+  const sessionToken = "frontdesk-portal-session-token-01234567890123456789";
+  const memberToken = "frontdesk-member-session-token-012345678901234567890";
+  const hashToken = async (token: string) => {
+    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+    return Array.from(new Uint8Array(hash), (part) => part.toString(16).padStart(2, "0")).join("");
+  };
+  const addOidcSession = async (
+    tenant: typeof tenantA,
+    membershipId: string,
+    token: string,
+    identityId: string,
+    subject: string
+  ) => {
+    const issuer = `https://${tenant.tenant.slug}.identity.example.test`;
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO cloud_tenant_oidc_configs
+         (tenant_id, issuer, client_id, client_secret_encrypted, scopes_json, is_enabled, created_at, updated_at)
+       VALUES (?, ?, 'client', 'enc:v1:test', '["openid"]', 1, ?, ?)`
+      )
+      .bind(tenant.tenant.id, issuer, NOW, NOW)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_identities
+         (id, tenant_id, issuer, subject, membership_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(identityId, tenant.tenant.id, issuer, subject, membershipId, NOW)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_sessions
+         (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        await hashToken(token),
+        tenant.tenant.id,
+        membershipId,
+        identityId,
+        Date.parse(NOW),
+        Date.parse(NOW) + 3_600_000
+      )
+      .run();
+  };
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenantA.tenant.id,
+    principalId: "frontdesk-tenant-a-member",
+    role: "member",
+    now: NOW,
+  });
+  await addOidcSession(
+    tenantA,
+    tenantA.ownerMembership.id,
+    sessionToken,
+    "frontdesk-owner-id",
+    "owner-subject"
+  );
+  await addOidcSession(tenantA, member.id, memberToken, "frontdesk-member-id", "member-subject");
+
+  const call = (path: string, token: string, init: { method?: string; body?: unknown } = {}) =>
+    runtime.fetch(
+      new Request(`https://cloud.test${path}`, {
+        method: init.method ?? "GET",
+        headers: {
+          Cookie: `omni_customer_session=${token}`,
+          ...(init.body === undefined
+            ? {}
+            : { Origin: "https://cloud.test", "Content-Type": "application/json" }),
+        },
+        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      })
+    );
+  try {
+    const listed = await call("/__cloud/auth/front-desk", sessionToken);
+    const listedBody = (await listed.json()) as { hosts: Array<{ hostname: string }> };
+    assert.equal(listed.status, 200);
+    assert.deepEqual(
+      listedBody.hosts.map((host) => host.hostname),
+      ["front-a.example.test"]
+    );
+
+    const memberDenied = await call("/__cloud/auth/front-desk", memberToken, {
+      method: "PUT",
+      body: configBody("front-a.example.test", tenantA.ownerApiKey.token, "frontdesk-device-a"),
+    });
+    assert.equal(memberDenied.status, 403);
+
+    const crossTenant = await call("/__cloud/auth/front-desk", sessionToken, {
+      method: "PUT",
+      body: configBody("front-b.example.test", tenantB.ownerApiKey.token, deviceB.id),
+    });
+    assert.equal(crossTenant.status, 404);
+
+    const saved = await call("/__cloud/auth/front-desk", sessionToken, {
+      method: "PUT",
+      body: configBody("front-a.example.test", tenantA.ownerApiKey.token, "frontdesk-device-a"),
+    });
+    const savedText = await saved.text();
+    assert.equal(saved.status, 200, savedText);
+    assert.match(savedText, /"hasCustomerApiKey":true/);
+    assert.match(savedText, /"hasDashboardToken":true/);
+    assert.doesNotMatch(savedText, new RegExp(tenantA.ownerApiKey.token));
+    assert.doesNotMatch(savedText, new RegExp(DASHBOARD_SECRET));
+
+    const serviceRead = await callService(runtime, "front-a.example.test", SERVICE_TOKEN);
+    const serviceText = await serviceRead.text();
+    assert.equal(serviceRead.status, 200, serviceText);
+    assert.match(serviceText, new RegExp(tenantA.ownerApiKey.token));
+    assert.match(serviceText, new RegExp(DASHBOARD_SECRET));
+
+    const missingOrigin = await runtime.fetch(
+      new Request("https://cloud.test/__cloud/auth/front-desk", {
+        method: "PUT",
+        headers: {
+          Cookie: `omni_customer_session=${sessionToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(
+          configBody("front-a.example.test", tenantA.ownerApiKey.token, "frontdesk-device-a")
+        ),
+      })
+    );
+    assert.equal(missingOrigin.status, 403);
+
+    await db
+      .prepare("UPDATE cloud_gateway_devices SET revoked_at = ? WHERE id = ?")
+      .bind(NOW, "frontdesk-device-a")
+      .run();
+    const revokedDeviceSave = await call("/__cloud/auth/front-desk", sessionToken, {
+      method: "PUT",
+      body: configBody("front-a.example.test", tenantA.ownerApiKey.token, "frontdesk-device-a"),
+    });
+    assert.equal(revokedDeviceSave.status, 403);
+
+    const audits = await db
+      .prepare<{
+        action: string;
+        actor: string;
+        details_json: string | null;
+        metadata_json: string | null;
+      }>(
+        `SELECT action, actor, details_json, metadata_json FROM cloud_compliance_audit
+        WHERE action = 'customer.frontdesk.config.write'`
+      )
+      .all();
+    assert.equal(audits.results.length, 1);
+    assert.equal(audits.results[0].actor, `membership:${tenantA.ownerMembership.id}`);
+    assert.doesNotMatch(JSON.stringify(audits.results[0]), new RegExp(tenantA.ownerApiKey.token));
+    assert.doesNotMatch(JSON.stringify(audits.results[0]), new RegExp(DASHBOARD_SECRET));
+
+    const deleted = await runtime.fetch(
+      new Request("https://cloud.test/__cloud/auth/front-desk/front-a.example.test", {
+        method: "DELETE",
+        headers: {
+          Cookie: `omni_customer_session=${sessionToken}`,
+          Origin: "https://cloud.test",
+        },
+      })
+    );
+    assert.equal(deleted.status, 200, await deleted.clone().text());
+    const afterDelete = await callService(runtime, "front-a.example.test", SERVICE_TOKEN);
+    assert.equal(afterDelete.status, 404);
+
+    await db
+      .prepare("UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ? WHERE token_hash = ?")
+      .bind(Date.parse(NOW), await hashToken(sessionToken))
+      .run();
+    const afterRevocation = await call("/__cloud/auth/front-desk", sessionToken, {
+      method: "PUT",
+      body: configBody("front-a.example.test", tenantA.ownerApiKey.token, "frontdesk-device-a"),
+    });
+    assert.equal(afterRevocation.status, 403);
+  } finally {
+    db.db.close();
+  }
+});
+
+async function callService(
+  runtime: ReturnType<typeof createCloudRuntime>,
+  hostname: string,
+  token: string
+) {
+  return runtime.fetch(
+    new Request(`https://cloud.test/__cloud/v1/front-desk/config?hostname=${hostname}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+  );
+}

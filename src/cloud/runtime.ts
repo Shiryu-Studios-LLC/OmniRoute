@@ -300,6 +300,8 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         url.pathname === CLOUD_TENANT_ONBOARDING_PATH ||
         url.pathname === CLOUD_TENANT_MCP_SETTINGS_PATH ||
         url.pathname === CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH ||
+        url.pathname === "/__cloud/auth/front-desk" ||
+        url.pathname.startsWith("/__cloud/auth/front-desk/") ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH ||
         url.pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH

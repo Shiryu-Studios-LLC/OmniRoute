@@ -27,6 +27,13 @@ export interface CloudFrontDeskConfigUpsertInput {
   updatedAt: string;
 }
 
+export interface CloudFrontDeskPortalAuthorization {
+  tenantId: string;
+  membershipId: string;
+  sessionTokenHash: string;
+  nowMs: number;
+}
+
 interface FrontDeskConfigRow {
   hostname: string;
   tenant_id: string;
@@ -96,7 +103,8 @@ export async function listCloudFrontDeskConfigs(
 
 export function prepareUpsertCloudFrontDeskConfig(
   db: CloudDb,
-  input: CloudFrontDeskConfigUpsertInput
+  input: CloudFrontDeskConfigUpsertInput,
+  portalAuthorization?: CloudFrontDeskPortalAuthorization
 ): CloudDbStatement {
   const hostname = normalizeCustomerHostname(input.hostname);
   if (!hostname) throw new TypeError("Invalid customer hostname");
@@ -108,7 +116,9 @@ export function prepareUpsertCloudFrontDeskConfig(
           created_at, updated_at)
        SELECT h.hostname, h.tenant_id, ?, ?, ?, ?, ?, ?, ?, ?
          FROM cloud_verified_customer_hosts h
+         JOIN tenants t ON t.id = h.tenant_id AND t.kind = 'customer' AND t.is_active = 1
         WHERE h.hostname = ? AND h.tenant_id = ?
+          ${portalAuthorization ? `AND ${portalSessionPredicate()}` : ""}
        ON CONFLICT(hostname) DO UPDATE SET
          customer_api_key_encrypted = excluded.customer_api_key_encrypted,
          dashboard_token_encrypted = excluded.dashboard_token_encrypted,
@@ -129,7 +139,8 @@ export function prepareUpsertCloudFrontDeskConfig(
       input.createdAt,
       input.updatedAt,
       hostname,
-      input.tenantId
+      input.tenantId,
+      ...(portalAuthorization ? portalSessionBindings(portalAuthorization) : [])
     );
 }
 
@@ -143,11 +154,49 @@ export async function upsertCloudFrontDeskConfig(
 
 export function prepareDeleteCloudFrontDeskConfig(
   db: CloudDb,
-  hostnameValue: string
+  hostnameValue: string,
+  portalAuthorization?: CloudFrontDeskPortalAuthorization
 ): CloudDbStatement {
   const hostname = normalizeCustomerHostname(hostnameValue);
   if (!hostname) throw new TypeError("Invalid customer hostname");
-  return db.prepare("DELETE FROM cloud_frontdesk_configs WHERE hostname = ?").bind(hostname);
+  return db
+    .prepare(
+      `DELETE FROM cloud_frontdesk_configs
+        WHERE hostname = ? ${portalAuthorization ? "AND tenant_id = ? AND " + portalSessionPredicate() : ""}`
+    )
+    .bind(
+      hostname,
+      ...(portalAuthorization
+        ? [portalAuthorization.tenantId, ...portalSessionBindings(portalAuthorization)]
+        : [])
+    );
+}
+
+function portalSessionPredicate(): string {
+  return `EXISTS (
+    SELECT 1
+      FROM cloud_tenant_oidc_sessions s
+      JOIN cloud_customer_memberships m
+        ON m.tenant_id = s.tenant_id AND m.id = s.membership_id
+      JOIN cloud_tenant_oidc_identities i
+        ON i.tenant_id = s.tenant_id AND i.id = s.identity_id
+       AND i.membership_id = s.membership_id
+      JOIN cloud_tenant_oidc_configs c
+        ON c.tenant_id = i.tenant_id AND c.issuer = i.issuer AND c.is_enabled = 1
+      JOIN tenants t ON t.id = s.tenant_id AND t.kind = 'customer' AND t.is_active = 1
+     WHERE s.token_hash = ? AND s.tenant_id = ? AND s.membership_id = ?
+       AND s.revoked_at_ms IS NULL AND s.expires_at_ms > ?
+       AND m.is_active = 1 AND m.role IN ('owner', 'admin')
+  )`;
+}
+
+function portalSessionBindings(authorization: CloudFrontDeskPortalAuthorization): unknown[] {
+  return [
+    authorization.sessionTokenHash,
+    authorization.tenantId,
+    authorization.membershipId,
+    authorization.nowMs,
+  ];
 }
 
 export async function deleteCloudFrontDeskConfig(
