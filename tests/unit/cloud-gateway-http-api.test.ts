@@ -604,6 +604,458 @@ test("D1 device registration and Worker v1 connect/heartbeat/poll/result stay de
   }
 });
 
+test("customer stream invocation emits ordered SSE, applies one-event backpressure, and conflicts on replay", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const key = await customerKey(fixture, "tenant-a", "owner");
+    const { transport, session } = await registerOnlineDevice(fixture, "tenant-a", "device-stream");
+    const idempotencyKey = "stream-idempotency-key-01";
+    const response = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-stream",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 5_000,
+          stream: true,
+        },
+        idempotencyKey
+      )
+    );
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /^text\/event-stream/);
+    const queued = await transport.poll(session!);
+    assert.equal(queued?.length, 1);
+    assert.equal((queued?.[0] as (typeof queued)[0] & { stream?: boolean })?.stream, true);
+
+    async function submit(sequence: number, event: unknown): Promise<Response> {
+      return fixture.fetch(
+        new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            version: 1,
+            deviceId: session!.deviceId,
+            sessionToken: session!.sessionToken,
+            requestId: queued![0]!.requestId,
+            sequence,
+            event,
+          }),
+        })
+      );
+    }
+
+    const reader = response.body!.getReader();
+    const deltaPost = submit(0, { type: "delta", data: { content: "hello" } });
+    const delta = await reader.read();
+    assert.equal(
+      new TextDecoder().decode(delta.value),
+      'data: {"sequence":0,"type":"delta","data":{"content":"hello"}}\n\n'
+    );
+    assert.equal(
+      (await deltaPost).status,
+      200,
+      "device event is acknowledged only after the SSE consumer pulls it"
+    );
+
+    const usagePost = submit(1, { type: "usage", data: { promptTokens: 2, completionTokens: 1 } });
+    const usage = await reader.read();
+    assert.match(new TextDecoder().decode(usage.value), /"sequence":1,"type":"usage"/);
+    assert.equal((await usagePost).status, 200);
+
+    const donePost = submit(2, { type: "done", data: {} });
+    const done = await reader.read();
+    assert.match(new TextDecoder().decode(done.value), /"sequence":2,"type":"done"/);
+    assert.equal((await donePost).status, 200);
+    assert.equal((await reader.read()).done, true);
+
+    const replay = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-stream",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 5_000,
+          stream: true,
+        },
+        idempotencyKey
+      )
+    );
+    assert.equal(replay.status, 409);
+    assert.deepEqual(await replay.json(), { error: "Streaming invocations cannot be replayed" });
+    assert.equal((await transport.poll(session!))?.length, 0, "replay never re-enqueues a stream");
+    const auditRows = fixture.d1.db
+      .prepare(
+        "SELECT status FROM cloud_compliance_audit WHERE tenant_id = 'tenant-a' AND action = 'gateway.customer.invoke' ORDER BY rowid"
+      )
+      .all() as Array<{ status: string }>;
+    assert.deepEqual(
+      auditRows.map((row) => row.status),
+      ["attempted", "success"]
+    );
+    const usageRows = fixture.d1.db
+      .prepare(
+        "SELECT provider, model, api_key_id, tokens_input, tokens_output, service_tier, status FROM cloud_usage_history WHERE tenant_id = 'tenant-a'"
+      )
+      .all() as Array<{
+      provider: string;
+      model: string;
+      api_key_id: string;
+      tokens_input: number;
+      tokens_output: number;
+      service_tier: string;
+      status: string;
+    }>;
+    assert.deepEqual(
+      usageRows.map((row) => ({ ...row })),
+      [
+        {
+          provider: "ollama",
+          model: "qwen-local",
+          api_key_id: key.id,
+          tokens_input: 2,
+          tokens_output: 1,
+          service_tier: "customer-managed",
+          status: "success",
+        },
+      ]
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("stream read timeout emits a safe terminal event and records a final unavailable audit", async () => {
+  const fixture = createRuntimeFixture({ currentClock: true });
+  try {
+    const key = await customerKey(fixture, "tenant-a", "owner");
+    const { transport, session } = await registerOnlineDevice(
+      fixture,
+      "tenant-a",
+      "device-timeout"
+    );
+    const response = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-timeout",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 200,
+          stream: true,
+        },
+        "stream-read-timeout-key-1"
+      )
+    );
+    assert.equal(response.status, 200);
+    await transport.poll(session!);
+    const reader = response.body!.getReader();
+    const timeoutFrame = await reader.read();
+    assert.match(new TextDecoder().decode(timeoutFrame.value), /"type":"error"/);
+    assert.equal((await reader.read()).done, true);
+    const audits = fixture.d1.db
+      .prepare(
+        "SELECT status FROM cloud_compliance_audit WHERE tenant_id = 'tenant-a' AND action = 'gateway.customer.invoke' ORDER BY rowid"
+      )
+      .all() as Array<{ status: string }>;
+    assert.deepEqual(
+      audits.map((row) => row.status),
+      ["attempted", "unavailable"]
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("stream acknowledgment failure emits a sequenced error and records unavailable audit", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const key = await customerKey(fixture, "tenant-a", "owner");
+    const { transport, session } = await registerOnlineDevice(
+      fixture,
+      "tenant-a",
+      "device-ack-failure"
+    );
+    const response = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-ack-failure",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 5_000,
+          stream: true,
+        },
+        "stream-ack-failure-key-1"
+      )
+    );
+    const request = (await transport.poll(session!))![0]!;
+    const coordinator = fixture.sessions.get(session!.deviceId);
+    coordinator.acknowledgeStreamEvent = async () => false;
+    const eventPost = fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: session!.deviceId,
+          sessionToken: session!.sessionToken,
+          requestId: request.requestId,
+          sequence: 0,
+          event: { type: "delta", data: { content: "partial" } },
+        }),
+      })
+    );
+    const reader = response.body!.getReader();
+    assert.match(new TextDecoder().decode((await reader.read()).value), /"type":"delta"/);
+    assert.equal((await eventPost).status, 409, "failed acknowledgment tells the device to stop");
+    assert.equal(
+      new TextDecoder().decode((await reader.read()).value),
+      'data: {"sequence":1,"type":"error","data":{"code":"capability_execution_failed"}}\n\n'
+    );
+    assert.equal((await reader.read()).done, true);
+    const audits = fixture.d1.db
+      .prepare(
+        "SELECT status FROM cloud_compliance_audit WHERE tenant_id = 'tenant-a' AND action = 'gateway.customer.invoke' ORDER BY rowid"
+      )
+      .all() as Array<{ status: string }>;
+    assert.deepEqual(
+      audits.map((row) => row.status),
+      ["attempted", "unavailable"]
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("stream usage is recorded only after a successful done event", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const key = await customerKey(fixture, "tenant-a", "owner");
+    const { transport, session } = await registerOnlineDevice(
+      fixture,
+      "tenant-a",
+      "device-error-after-usage"
+    );
+    const response = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-error-after-usage",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 5_000,
+          stream: true,
+        },
+        "stream-usage-before-error-1"
+      )
+    );
+    const request = (await transport.poll(session!))![0]!;
+    const reader = response.body!.getReader();
+    const postEvent = (sequence: number, event: unknown) =>
+      fixture.fetch(
+        new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            version: 1,
+            deviceId: session!.deviceId,
+            sessionToken: session!.sessionToken,
+            requestId: request.requestId,
+            sequence,
+            event,
+          }),
+        })
+      );
+    const usagePost = postEvent(0, {
+      type: "usage",
+      data: { promptTokens: 3, completionTokens: 4 },
+    });
+    assert.match(new TextDecoder().decode((await reader.read()).value), /"type":"usage"/);
+    assert.equal((await usagePost).status, 200);
+    const errorPost = postEvent(1, {
+      type: "error",
+      data: { code: "capability_execution_failed" },
+    });
+    assert.match(new TextDecoder().decode((await reader.read()).value), /"type":"error"/);
+    assert.equal((await errorPost).status, 200);
+    assert.equal((await reader.read()).done, true);
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare("SELECT COUNT(*) AS count FROM cloud_usage_history WHERE tenant_id = 'tenant-a'")
+          .get() as { count: number }
+      ).count,
+      0,
+      "a usage event from an incomplete stream must not be recorded as a successful invocation"
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("stream usage write failure emits error instead of presenting done", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const key = await customerKey(fixture, "tenant-a", "owner");
+    const { transport, session } = await registerOnlineDevice(
+      fixture,
+      "tenant-a",
+      "device-usage-write-failure"
+    );
+    const response = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-usage-write-failure",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 5_000,
+          stream: true,
+        },
+        "stream-usage-write-failure-key-1"
+      )
+    );
+    const request = (await transport.poll(session!))![0]!;
+    fixture.d1.db.exec(
+      `CREATE TRIGGER reject_cloud_usage BEFORE INSERT ON cloud_usage_history
+       BEGIN SELECT RAISE(FAIL, 'usage insert rejected'); END;`
+    );
+    const postEvent = (sequence: number, event: unknown) =>
+      fixture.fetch(
+        new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            version: 1,
+            deviceId: session!.deviceId,
+            sessionToken: session!.sessionToken,
+            requestId: request.requestId,
+            sequence,
+            event,
+          }),
+        })
+      );
+    const reader = response.body!.getReader();
+    const usagePost = postEvent(0, {
+      type: "usage",
+      data: { promptTokens: 3, completionTokens: 4 },
+    });
+    assert.match(new TextDecoder().decode((await reader.read()).value), /"type":"usage"/);
+    assert.equal((await usagePost).status, 200);
+    const donePost = postEvent(1, { type: "done", data: {} });
+    const terminal = new TextDecoder().decode((await reader.read()).value);
+    assert.equal(
+      terminal,
+      'data: {"sequence":1,"type":"error","data":{"code":"capability_execution_failed"}}\n\n'
+    );
+    assert.equal((await donePost).status, 409, "accounting failure cancels the device stream");
+    assert.equal((await reader.read()).done, true);
+    assert.equal(
+      (
+        fixture.d1.db
+          .prepare("SELECT COUNT(*) AS count FROM cloud_usage_history WHERE tenant_id = 'tenant-a'")
+          .get() as { count: number }
+      ).count,
+      0
+    );
+    const audits = fixture.d1.db
+      .prepare(
+        "SELECT status FROM cloud_compliance_audit WHERE tenant_id = 'tenant-a' AND action = 'gateway.customer.invoke' ORDER BY rowid"
+      )
+      .all() as Array<{ status: string }>;
+    assert.deepEqual(
+      audits.map((row) => row.status),
+      ["attempted", "unavailable"]
+    );
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("stream event endpoint enforces event bounds, authenticated session, and request cancellation", async () => {
+  const fixture = createRuntimeFixture();
+  try {
+    const key = await customerKey(fixture, "tenant-a", "owner");
+    const { transport, session } = await registerOnlineDevice(fixture, "tenant-a", "device-cancel");
+    const response = await fixture.fetch(
+      invokeRequest(
+        key.token,
+        {
+          deviceId: "device-cancel",
+          capability: "ollama:chat:qwen-local",
+          payload: { messages: [{ role: "user", content: "hello" }] },
+          timeoutMs: 5_000,
+          stream: true,
+        },
+        "stream-cancellation-key-1"
+      )
+    );
+    const request = (await transport.poll(session!))![0]!;
+    const oversized = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: session!.deviceId,
+          sessionToken: session!.sessionToken,
+          requestId: request.requestId,
+          sequence: 0,
+          event: { type: "delta", data: { content: "x".repeat(9 * 1024) } },
+        }),
+      })
+    );
+    assert.equal(oversized.status, 413);
+
+    const reader = response.body!.getReader();
+    const pending = fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: session!.deviceId,
+          sessionToken: session!.sessionToken,
+          requestId: request.requestId,
+          sequence: 0,
+          event: { type: "delta", data: { content: "wait" } },
+        }),
+      })
+    );
+    await reader.cancel();
+    assert.equal((await pending).status, 409, "client disconnect cancels an unconsumed event");
+    const canceledAudit = fixture.d1.db
+      .prepare(
+        "SELECT status FROM cloud_compliance_audit WHERE tenant_id = 'tenant-a' AND action = 'gateway.customer.invoke' ORDER BY rowid"
+      )
+      .all() as Array<{ status: string }>;
+    assert.deepEqual(
+      canceledAudit.map((row) => row.status),
+      ["attempted", "cancelled"]
+    );
+    const stale = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/stream-event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          version: 1,
+          deviceId: session!.deviceId,
+          sessionToken: "z".repeat(43),
+          requestId: request.requestId,
+          sequence: 0,
+          event: { type: "delta", data: { content: "late" } },
+        }),
+      })
+    );
+    assert.equal(stale.status, 401);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
 test("Worker device requests reject tenant overrides, cross-device credentials, and revoked sessions", async () => {
   const fixture = createRuntimeFixture();
   try {
@@ -810,6 +1262,31 @@ test("HTTP Local Agent transport rejects non-HTTPS remote gateway URLs and overs
     ),
     /exceeds the size limit/
   );
+});
+
+test("stream event transport uses the longer acknowledgment deadline for slow readers", async () => {
+  const transport = createHttpLocalAgentGatewayTransport("https://gateway.example.test", {
+    requestTimeoutMs: 100,
+    streamEventTimeoutMs: 500,
+    fetch: async (input) => {
+      assert.match(String(input), /\/__gateway\/v1\/device\/stream-event$/);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return Response.json({ version: 1, accepted: true });
+    },
+  });
+  const accepted = await transport.submitStreamEvent(
+    {
+      sessionId: "session",
+      deviceId: "device",
+      tenantId: "tenant",
+      sessionToken: "a".repeat(43),
+      leaseExpiresAt: "2026-10-08T12:01:00Z",
+    },
+    "request",
+    0,
+    { type: "delta", data: { content: "hello" } }
+  );
+  assert.equal(accepted, true);
 });
 
 test("Worker rejects an oversized body without relying on Content-Length", async () => {

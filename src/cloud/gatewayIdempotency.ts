@@ -147,7 +147,7 @@ export async function claimGatewayIdempotency(
   input: {
     key: string;
     scope: GatewayIdempotencyScope;
-    operation: { deviceId: string; capability: string; payload: unknown };
+    operation: { deviceId: string; capability: string; payload: unknown; stream?: true };
     requestId: string;
     claimToken: string;
     nowMs: number;
@@ -168,6 +168,7 @@ export async function claimGatewayIdempotency(
       deviceId: input.operation.deviceId,
       capability: input.operation.capability,
       payload: input.operation.payload,
+      ...(input.operation.stream ? { stream: true } : {}),
     })
   );
 

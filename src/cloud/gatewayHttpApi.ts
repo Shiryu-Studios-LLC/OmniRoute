@@ -14,6 +14,8 @@ const DEFAULT_DEVICE_RATE_LIMITS = {
   heartbeat: { limit: 90, windowMs: 60_000 },
   poll: { limit: 180, windowMs: 60_000 },
   result: { limit: 60, windowMs: 60_000 },
+  streamEvent: { limit: 600, windowMs: 60_000 },
+  streamCancel: { limit: 60, windowMs: 60_000 },
 } as const;
 const DEFAULT_CONNECT_RATE_LIMIT = { limit: 300, windowMs: 60_000 };
 const DEFAULT_CONNECT_FALLBACK_RATE_LIMIT = { limit: 1_200, windowMs: 60_000 };
@@ -125,6 +127,15 @@ export function coordinatorFromNamespace(
       stub(args[0]).getRequest(...args),
     deleteRequest: (...args: Parameters<GatewayCoordinatorStub["deleteRequest"]>) =>
       stub(args[0]).deleteRequest(...args),
+    submitStreamEvent: (...args: Parameters<GatewayCoordinatorStub["submitStreamEvent"]>) =>
+      stub(args[0]).submitStreamEvent(...args),
+    peekStreamEvent: (...args: Parameters<GatewayCoordinatorStub["peekStreamEvent"]>) =>
+      stub(args[0]).peekStreamEvent(...args),
+    acknowledgeStreamEvent: (
+      ...args: Parameters<GatewayCoordinatorStub["acknowledgeStreamEvent"]>
+    ) => stub(args[0]).acknowledgeStreamEvent(...args),
+    cancelStream: (...args: Parameters<GatewayCoordinatorStub["cancelStream"]>) =>
+      stub(args[0]).cancelStream(...args),
   };
 }
 
@@ -280,7 +291,11 @@ export async function handleGatewayDeviceRequest(
       ? ["capabilities", "serviceHealth"]
       : path === `${PREFIX}/result`
         ? ["requestId", "result"]
-        : [];
+        : path === `${PREFIX}/stream-event`
+          ? ["requestId", "sequence", "event"]
+          : path === `${PREFIX}/stream-cancel`
+            ? ["requestId"]
+            : [];
   const session = sessionFrom(body, additionalKeys);
   if (!session) return json({ error: "Invalid device session request" }, 400);
 
@@ -384,6 +399,63 @@ export async function handleGatewayDeviceRequest(
     return accepted
       ? json({ version: VERSION, accepted: true })
       : json({ error: "Device result was rejected" }, 409);
+  }
+
+  if (path === `${PREFIX}/stream-event`) {
+    if (
+      !exactKeys(body, ["version", "deviceId", "sessionToken", "requestId", "sequence", "event"]) ||
+      typeof body.requestId !== "string" ||
+      !REQUEST_ID.test(body.requestId) ||
+      !Number.isSafeInteger(body.sequence) ||
+      Number(body.sequence) < 0 ||
+      Number(body.sequence) > 100_000
+    ) {
+      return json({ error: "Invalid stream event request" }, 400);
+    }
+    let eventBytes: number;
+    try {
+      eventBytes = new TextEncoder().encode(JSON.stringify(body.event)).byteLength;
+    } catch {
+      return json({ error: "Invalid stream event" }, 400);
+    }
+    if (eventBytes > 8 * 1024) return json({ error: "Stream event exceeds the size limit" }, 413);
+    const authenticated = await gateway.authenticateSession(session.deviceId, session.sessionToken);
+    if (!authenticated) return json({ error: "Device session is unavailable" }, 401);
+    const limited = await checkSessionRateLimit(
+      { ...authenticated, deviceId: session.deviceId },
+      "streamEvent"
+    );
+    if (limited) return limited;
+    const accepted = await gateway.submitDeviceStreamEvent({
+      ...session,
+      requestId: body.requestId,
+      sequence: Number(body.sequence),
+      event: body.event,
+    });
+    return accepted
+      ? json({ version: VERSION, accepted: true })
+      : json({ version: VERSION, accepted: false, cancelled: true }, 409);
+  }
+
+  if (path === `${PREFIX}/stream-cancel`) {
+    if (
+      !exactKeys(body, ["version", "deviceId", "sessionToken", "requestId"]) ||
+      typeof body.requestId !== "string" ||
+      !REQUEST_ID.test(body.requestId)
+    ) {
+      return json({ error: "Invalid stream cancellation request" }, 400);
+    }
+    const authenticated = await gateway.authenticateSession(session.deviceId, session.sessionToken);
+    if (!authenticated) return json({ error: "Device session is unavailable" }, 401);
+    const limited = await checkSessionRateLimit(
+      { ...authenticated, deviceId: session.deviceId },
+      "streamCancel"
+    );
+    if (limited) return limited;
+    const accepted = await gateway.cancelDeviceStream({ ...session, requestId: body.requestId });
+    return accepted
+      ? json({ version: VERSION, accepted: true })
+      : json({ error: "Stream cancellation was rejected" }, 409);
   }
 
   return json({ error: "Not found" }, 404);

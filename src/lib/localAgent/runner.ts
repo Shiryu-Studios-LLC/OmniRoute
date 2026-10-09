@@ -5,13 +5,14 @@ import {
   type LocalDiscoveryResult,
 } from "./localDiscovery";
 import { LOCAL_AGENT_HEARTBEAT_PATH, signLocalAgentHeartbeat } from "./protocol";
-import { executeLocalCapability } from "./capabilityExecutor";
+import { executeLocalCapability, executeLocalCapabilityStream } from "./capabilityExecutor";
 import type { LocalMcpDependencies } from "./localMcp";
 import {
   LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
   type LocalAgentGatewayRequest,
   type LocalAgentGatewayResult,
   type LocalAgentGatewaySession,
+  type LocalAgentGatewayStreamEvent,
   type LocalAgentGatewayTransport,
 } from "./gatewayProtocol";
 
@@ -42,10 +43,19 @@ export interface LocalAgentRunnerDependencies {
 
 export interface LocalAgentGatewayRunnerDependencies extends LocalAgentRunnerDependencies {
   gateway: LocalAgentGatewayTransport;
+  abortSignal?: AbortSignal;
   execute?: (
     request: LocalAgentGatewayRequest,
     discovery: LocalDiscoveryResult
   ) => Promise<unknown>;
+  executeStream?: (
+    request: LocalAgentGatewayRequest,
+    discovery: LocalDiscoveryResult,
+    signal: AbortSignal,
+    emit: (
+      event: Extract<LocalAgentGatewayStreamEvent, { type: "delta" | "usage" }>
+    ) => Promise<void>
+  ) => Promise<void>;
 }
 
 export interface LocalAgentGatewayCycleResult {
@@ -213,6 +223,83 @@ export async function runLocalAgentGatewayCycle(
     };
     if (Date.parse(request.expiresAt) <= (dependencies.now ?? Date.now)()) continue;
 
+    if (request.stream === true) {
+      if (
+        !request.capability.startsWith("ollama:chat:") ||
+        !dependencies.gateway.submitStreamEvent
+      ) {
+        throw new Error("Local agent gateway streaming is unavailable");
+      }
+      const remainingMs = Date.parse(request.expiresAt) - (dependencies.now ?? Date.now)();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), Math.min(120_000, remainingMs));
+      const abortFromRunner = () => controller.abort();
+      dependencies.abortSignal?.addEventListener("abort", abortFromRunner, { once: true });
+      if (dependencies.abortSignal?.aborted) controller.abort();
+      let sequence = 0;
+      const submit = async (event: LocalAgentGatewayStreamEvent) => {
+        if (controller.signal.aborted) throw new Error("Local agent stream was canceled");
+        const pending = dependencies.gateway.submitStreamEvent!(
+          session!,
+          request.requestId,
+          sequence,
+          event
+        );
+        let onAbort: (() => void) | undefined;
+        const aborted = new Promise<boolean>((resolve) => {
+          onAbort = () => resolve(false);
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          if (controller.signal.aborted) onAbort();
+        });
+        let accepted: boolean;
+        try {
+          accepted = await Promise.race([pending, aborted]);
+        } finally {
+          if (onAbort) controller.signal.removeEventListener("abort", onAbort);
+        }
+        if (!accepted) {
+          controller.abort();
+          throw new Error("Local agent gateway canceled the stream");
+        }
+        sequence += 1;
+      };
+      try {
+        const emit = async (
+          event: Extract<LocalAgentGatewayStreamEvent, { type: "delta" | "usage" }>
+        ) => submit(event);
+        if (dependencies.executeStream) {
+          await dependencies.executeStream(request, discovery, controller.signal, emit);
+        } else {
+          await executeLocalCapabilityStream(
+            {
+              ollamaUrl: config.ollamaUrl,
+              comfyUiUrl: config.comfyUiUrl,
+              mcpServers: config.mcpServers,
+            },
+            discovery,
+            request,
+            { fetch: dependencies.fetch, mcp: dependencies.mcp, signal: controller.signal, emit }
+          );
+        }
+        await submit({ type: "done", data: {} });
+      } catch {
+        if (!controller.signal.aborted) {
+          await submit({
+            type: "error",
+            data: { code: "capability_execution_failed" },
+          }).catch(() => undefined);
+        }
+        if (controller.signal.aborted) {
+          await dependencies.gateway.cancelStream?.(session, request.requestId).catch(() => false);
+        }
+      } finally {
+        clearTimeout(timeout);
+        dependencies.abortSignal?.removeEventListener("abort", abortFromRunner);
+      }
+      processed += 1;
+      continue;
+    }
+
     let outcome: LocalAgentGatewayResult["outcome"];
     try {
       const value = dependencies.execute
@@ -306,7 +393,11 @@ export async function runLocalAgentWithGateway(
   let session: LocalAgentGatewaySession | undefined;
   while (!signal.aborted) {
     try {
-      const cycle = await runLocalAgentGatewayCycle(config, dependencies, session);
+      const cycle = await runLocalAgentGatewayCycle(
+        config,
+        { ...dependencies, abortSignal: signal },
+        session
+      );
       session = cycle.session;
       failureCount = 0;
       await sleep(interval, signal);

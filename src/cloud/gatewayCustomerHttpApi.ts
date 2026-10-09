@@ -251,7 +251,7 @@ export async function handleGatewayCustomerRequest(
 
   const body = await readBody(request);
   if (!body) return json({ error: "Invalid or oversized JSON body" }, 400);
-  const allowedFields = ["deviceId", "capability", "payload", "timeoutMs"];
+  const allowedFields = ["deviceId", "capability", "payload", "timeoutMs", "stream"];
   if (Object.keys(body).some((key) => !allowedFields.includes(key))) {
     return json({ error: "Unsupported invocation fields" }, 400);
   }
@@ -272,6 +272,13 @@ export async function handleGatewayCustomerRequest(
     timeoutMs > 30_000
   ) {
     return json({ error: "timeoutMs must be between 100 and 30000" }, 400);
+  }
+  if (body.stream !== undefined && typeof body.stream !== "boolean") {
+    return json({ error: "stream must be a boolean" }, 400);
+  }
+  const stream = body.stream === true;
+  if (stream && !body.capability.startsWith("ollama:chat:")) {
+    return json({ error: "Streaming is supported only for Ollama chat capabilities" }, 400);
   }
   if (identity.role === "viewer") {
     try {
@@ -325,6 +332,7 @@ export async function handleGatewayCustomerRequest(
         deviceId: body.deviceId,
         capability: body.capability,
         payload: body.payload,
+        ...(stream ? { stream: true } : {}),
       },
       requestId: proposedRequestId,
       claimToken,
@@ -347,10 +355,18 @@ export async function handleGatewayCustomerRequest(
     if (!device || device.tenantId !== identity.tenantId)
       return json({ error: "Device not found" }, 404);
     if (device.revokedAt) return json({ error: "Device is unavailable" }, 503);
+    if (stream) return json({ error: "Streaming invocations cannot be replayed" }, 409);
     return json(idempotency.response, idempotency.status);
   }
   if (idempotency.kind === "in_progress") {
-    return json({ error: "Invocation with this Idempotency-Key is in progress" }, 409);
+    return json(
+      {
+        error: stream
+          ? "Streaming invocation is already claimed"
+          : "Invocation with this Idempotency-Key is in progress",
+      },
+      409
+    );
   }
   const claim = idempotency.claim;
   const releaseClaim = async () => {
@@ -430,6 +446,253 @@ export async function handleGatewayCustomerRequest(
     now: options.now,
     wait: options.wait,
   });
+  if (stream) {
+    // A stream cannot be safely replayed from the unary JSON idempotency cache.
+    // Complete the key with a stable conflict marker before queueing any work.
+    // The first claimant continues below; every duplicate receives this 409.
+    try {
+      const reserved = await completeGatewayIdempotency(
+        db,
+        claim,
+        claimToken,
+        { error: "Streaming invocations cannot be replayed" },
+        409,
+        options.now?.() ?? Date.now()
+      );
+      if (reserved.kind !== "replay")
+        return json({ error: "Invocation idempotency storage is unavailable" }, 503);
+    } catch {
+      return json({ error: "Invocation idempotency storage is unavailable" }, 503);
+    }
+    let streamAuditFinalized = false;
+    const auditStreamEnd = async (status: string) => {
+      if (streamAuditFinalized) return;
+      try {
+        await appendCloudComplianceAudit(db, {
+          id: crypto.randomUUID(),
+          ...auditBase,
+          timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+          action: "gateway.customer.invoke",
+          status,
+        });
+        streamAuditFinalized = true;
+      } catch {
+        // The attempted audit remains durable; never expose backend details in an SSE response.
+      }
+    };
+    let started: Awaited<ReturnType<typeof gateway.startCapabilityStream>>;
+    try {
+      started = await gateway.startCapabilityStream({
+        tenantId: identity.tenantId,
+        deviceId: body.deviceId,
+        capability: body.capability,
+        payload: body.payload,
+        timeoutMs,
+        requestId: claim.requestId,
+        requestCreatedAt: claim.createdAt,
+        requestExpiresAt: new Date(
+          Math.min(Date.parse(claim.expiresAt), (options.now?.() ?? Date.now()) + timeoutMs)
+        ).toISOString(),
+        stream: true,
+      });
+    } catch {
+      await auditStreamEnd("unavailable");
+      return json({ error: "Gateway invocation is unavailable" }, 503);
+    }
+    if (!started.ok) {
+      await auditStreamEnd(started.reason);
+      const status =
+        started.reason === "tenant_mismatch"
+          ? 404
+          : started.reason === "capability_unavailable"
+            ? 409
+            : started.reason === "timeout"
+              ? 504
+              : started.reason === "queue_full"
+                ? 429
+                : 503;
+      return json(
+        {
+          error:
+            started.reason === "tenant_mismatch"
+              ? "Device not found"
+              : started.reason === "capability_unavailable"
+                ? "Capability is unavailable"
+                : started.reason === "timeout"
+                  ? "Invocation timed out"
+                  : started.reason === "queue_full"
+                    ? "Device request queue is full"
+                    : "Device is unavailable",
+        },
+        status
+      );
+    }
+    let sequence = 0;
+    let cancelled = false;
+    let pendingUsage: { promptTokens: number; completionTokens: number } | undefined;
+    const invocationStartedAt = performance.now();
+    const encoder = new TextEncoder();
+    const encodeStreamError = (errorSequence: number) =>
+      encoder.encode(
+        `data: ${JSON.stringify({ sequence: errorSequence, type: "error", data: { code: "capability_execution_failed" } })}\n\n`
+      );
+    const bodyStream = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          if (cancelled) return;
+          const event = await gateway.readCapabilityStreamEvent({
+            tenantId: identity.tenantId,
+            deviceId: body.deviceId as string,
+            requestId: started.requestId,
+            sequence,
+          });
+          if (!event) {
+            try {
+              controller.enqueue(encodeStreamError(sequence));
+            } catch {
+              // The consumer may have disconnected while the read was pending.
+            }
+            await gateway.cancelCapabilityStream({
+              tenantId: identity.tenantId,
+              deviceId: body.deviceId as string,
+              requestId: started.requestId,
+            });
+            await auditStreamEnd("unavailable");
+            controller.close();
+            return;
+          }
+          const eventSequence = sequence;
+          sequence += 1;
+          if (event.type === "usage") {
+            const promptTokens = event.data.promptTokens;
+            const completionTokens = event.data.completionTokens;
+            if (
+              !Number.isSafeInteger(promptTokens) ||
+              promptTokens < 0 ||
+              !Number.isSafeInteger(completionTokens) ||
+              completionTokens < 0
+            ) {
+              try {
+                controller.enqueue(encodeStreamError(eventSequence));
+              } catch {
+                // The consumer may have disconnected before the event was consumed.
+              }
+              await gateway.cancelCapabilityStream({
+                tenantId: identity.tenantId,
+                deviceId: body.deviceId as string,
+                requestId: started.requestId,
+              });
+              await auditStreamEnd("unavailable");
+              cancelled = true;
+              controller.close();
+              return;
+            }
+            pendingUsage = { promptTokens, completionTokens };
+          }
+          if (event.type === "done" && pendingUsage) {
+            try {
+              const priorUsage = await db
+                .prepare(
+                  "SELECT id FROM cloud_usage_history WHERE tenant_id = ? AND id = ? LIMIT 1"
+                )
+                .bind(identity.tenantId, started.requestId)
+                .first<{ id: string }>();
+              if (!priorUsage) {
+                await appendCloudUsageRecord(db, {
+                  id: started.requestId,
+                  tenantId: identity.tenantId,
+                  provider: "ollama",
+                  model: body.capability.slice("ollama:chat:".length),
+                  apiKeyId: identity.apiKeyId,
+                  tokensInput: pendingUsage.promptTokens,
+                  tokensOutput: pendingUsage.completionTokens,
+                  serviceTier: "customer-managed",
+                  status: "success",
+                  success: true,
+                  latencyMs: Math.max(0, Math.round(performance.now() - invocationStartedAt)),
+                  endpoint: PATH,
+                  timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+                });
+              }
+            } catch {
+              await gateway.cancelCapabilityStream({
+                tenantId: identity.tenantId,
+                deviceId: body.deviceId as string,
+                requestId: started.requestId,
+              });
+              await auditStreamEnd("unavailable");
+              try {
+                controller.enqueue(encodeStreamError(eventSequence));
+              } catch {
+                // The consumer may have disconnected while usage accounting was pending.
+              }
+              cancelled = true;
+              controller.close();
+              return;
+            }
+          }
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          } catch {
+            cancelled = true;
+            await gateway.cancelCapabilityStream({
+              tenantId: identity.tenantId,
+              deviceId: body.deviceId as string,
+              requestId: started.requestId,
+            });
+            await auditStreamEnd("cancelled");
+            return;
+          }
+          const acknowledged = await gateway.acknowledgeCapabilityStreamEvent({
+            tenantId: identity.tenantId,
+            deviceId: body.deviceId as string,
+            requestId: started.requestId,
+            sequence: event.sequence,
+          });
+          if (!acknowledged) {
+            if (!cancelled) {
+              try {
+                controller.enqueue(encodeStreamError(sequence));
+              } catch {
+                // The consumer may have disconnected after the event was enqueued.
+              }
+            }
+            cancelled = true;
+            await gateway.cancelCapabilityStream({
+              tenantId: identity.tenantId,
+              deviceId: body.deviceId as string,
+              requestId: started.requestId,
+            });
+            await auditStreamEnd("unavailable");
+            controller.close();
+            return;
+          }
+          if (event.type === "done" || event.type === "error") {
+            controller.close();
+            await auditStreamEnd(event.type === "done" ? "success" : "unavailable");
+          }
+        },
+        async cancel() {
+          cancelled = true;
+          await gateway.cancelCapabilityStream({
+            tenantId: identity.tenantId,
+            deviceId: body.deviceId as string,
+            requestId: started.requestId,
+          });
+          await auditStreamEnd("cancelled");
+        },
+      },
+      { highWaterMark: 0 }
+    );
+    return new Response(bodyStream, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-store, no-transform",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
   const invocationStartedAt = performance.now();
   let result: Awaited<ReturnType<typeof gateway.requestCapability>>;
   try {

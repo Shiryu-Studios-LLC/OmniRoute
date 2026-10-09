@@ -14,6 +14,10 @@ import {
   setCloudInferenceEntitlement,
   setCloudInferenceMonthlyBudget,
 } from "../../src/cloud/inferencePolicy";
+import {
+  CLOUD_INFERENCE_COUNT_URL,
+  CLOUD_INFERENCE_RESPONSE_URL,
+} from "../../src/cloud/inferenceCustomerHttpApi";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 
 class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
@@ -194,7 +198,7 @@ function upstream(): typeof fetch {
       new URL(url).pathname,
       url.endsWith("input_tokens") ? "/v1/responses/input_tokens" : "/v1/responses"
     );
-    assert.equal((init as RequestInit).redirect, "error");
+    assert.equal((init as RequestInit).redirect, "manual");
     assert.equal(
       new Headers((init as RequestInit).headers).get("authorization"),
       `Bearer ${OPENAI_KEY}`
@@ -350,6 +354,110 @@ test("streaming inference settles terminal usage before done and replays the exa
       "stream and non-stream operations have different fingerprints"
     );
     assert.equal(calls, 2);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("unary inference rejects a generation redirect without reading its body or following Location", async () => {
+  const f = await fixture();
+  try {
+    const requestedUrls: string[] = [];
+    let redirectBodyCancelled = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      requestedUrls.push(String(input));
+      assert.equal((init as RequestInit).redirect, "manual");
+      if (String(input) === CLOUD_INFERENCE_COUNT_URL) {
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      }
+      assert.equal(String(input), CLOUD_INFERENCE_RESPONSE_URL);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("redirect body must not be read"));
+          },
+          cancel() {
+            redirectBodyCancelled = true;
+          },
+        }),
+        { status: 302, headers: { Location: "https://redirect.example/collect" } }
+      );
+    };
+    const response = await f
+      .runtime(fetcher)
+      .fetch(request(f.issued.token, "idempotency-unary-redirect"));
+    assert.equal(response.status, 502);
+    assert.equal((await response.text()).includes("redirect body must not be read"), false);
+    assert.equal(redirectBodyCancelled, true);
+    assert.deepEqual(requestedUrls, [CLOUD_INFERENCE_COUNT_URL, CLOUD_INFERENCE_RESPONSE_URL]);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("streaming inference rejects a generation redirect without reading its body or following Location", async () => {
+  const f = await fixture();
+  try {
+    const requestedUrls: string[] = [];
+    let redirectBodyCancelled = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      requestedUrls.push(String(input));
+      assert.equal((init as RequestInit).redirect, "manual");
+      if (String(input) === CLOUD_INFERENCE_COUNT_URL) {
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      }
+      assert.equal(String(input), CLOUD_INFERENCE_RESPONSE_URL);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("redirect body must not be read"));
+          },
+          cancel() {
+            redirectBodyCancelled = true;
+          },
+        }),
+        { status: 302, headers: { Location: "https://redirect.example/collect" } }
+      );
+    };
+    const response = await f
+      .runtime(fetcher)
+      .fetch(request(f.issued.token, "idempotency-stream-redirect", "hello", true));
+    assert.equal(response.status, 502);
+    assert.equal((await response.text()).includes("redirect body must not be read"), false);
+    assert.equal(redirectBodyCancelled, true);
+    assert.deepEqual(requestedUrls, [CLOUD_INFERENCE_COUNT_URL, CLOUD_INFERENCE_RESPONSE_URL]);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("token-count preflight rejects a redirect without reading its body or following Location", async () => {
+  const f = await fixture();
+  try {
+    const requestedUrls: string[] = [];
+    let redirectBodyCancelled = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      requestedUrls.push(String(input));
+      assert.equal((init as RequestInit).redirect, "manual");
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("redirect body must not be read"));
+          },
+          cancel() {
+            redirectBodyCancelled = true;
+          },
+        }),
+        { status: 302, headers: { Location: "https://redirect.example/collect" } }
+      );
+    };
+    const response = await f
+      .runtime(fetcher)
+      .fetch(request(f.issued.token, "idempotency-count-redirect"));
+    assert.equal(response.status, 502);
+    assert.equal((await response.text()).includes("redirect body must not be read"), false);
+    assert.equal(redirectBodyCancelled, true);
+    assert.deepEqual(requestedUrls, [CLOUD_INFERENCE_COUNT_URL]);
   } finally {
     f.db.db.close();
   }

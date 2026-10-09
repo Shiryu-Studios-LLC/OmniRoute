@@ -227,3 +227,97 @@ test("versioned transport maps directly onto the connector gateway primitives", 
     ],
   ]);
 });
+
+test("streaming gateway cycle submits ordered events one at a time and terminates", async () => {
+  const submissions: Array<{ sequence: number; event: unknown }> = [];
+  const request: Omit<LocalAgentGatewayRequest, "version"> = {
+    requestId: "stream-123",
+    capability: "ollama:chat:local",
+    payload: { messages: [{ role: "user", content: "hello" }] },
+    expiresAt: "2026-10-08T12:01:00.000Z",
+    stream: true,
+  };
+  const cycle = await runLocalAgentGatewayCycle(
+    config,
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+        services: [],
+      }),
+      fetch: async () => Response.json({ accepted: true }),
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => [request],
+        submitResult: async () => false,
+        submitStreamEvent: async (_session, _requestId, sequence, event) => {
+          submissions.push({ sequence, event });
+          return true;
+        },
+      },
+      executeStream: async (_request, _discovery, signal, emit) => {
+        assert.equal(signal.aborted, false);
+        await emit({ type: "delta", data: { content: "hi" } });
+        await emit({ type: "usage", data: { promptTokens: 3, completionTokens: 1 } });
+      },
+    },
+    session
+  );
+  assert.equal(cycle.processed, 1);
+  assert.deepEqual(submissions, [
+    { sequence: 0, event: { type: "delta", data: { content: "hi" } } },
+    { sequence: 1, event: { type: "usage", data: { promptTokens: 3, completionTokens: 1 } } },
+    { sequence: 2, event: { type: "done", data: {} } },
+  ]);
+});
+
+test("runner shutdown cancels a stream while device event acknowledgment is pending", async () => {
+  const controller = new AbortController();
+  let canceled = 0;
+  const cyclePromise = runLocalAgentGatewayCycle(
+    config,
+    {
+      abortSignal: controller.signal,
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+        services: [],
+      }),
+      fetch: async () => Response.json({ accepted: true }),
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => [
+          {
+            requestId: "stream-cancel",
+            capability: "ollama:chat:local",
+            payload: {},
+            expiresAt: "2026-10-08T12:01:00.000Z",
+            stream: true,
+          },
+        ],
+        submitResult: async () => false,
+        submitStreamEvent: async () => new Promise<boolean>(() => undefined),
+        cancelStream: async () => {
+          canceled += 1;
+          return true;
+        },
+      },
+      executeStream: async (_request, _discovery, signal, emit) => {
+        setTimeout(() => controller.abort(), 5);
+        await emit({ type: "delta", data: { content: "waiting" } });
+        assert.equal(signal.aborted, true);
+      },
+    },
+    session
+  );
+  const cycle = await Promise.race([
+    cyclePromise,
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("cycle hung")), 250)
+    ),
+  ]);
+  assert.equal(cycle.processed, 1);
+  assert.equal(canceled, 1);
+});

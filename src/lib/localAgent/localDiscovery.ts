@@ -83,10 +83,19 @@ async function validateLocalEndpoint(
 }
 
 async function requestJson(fetcher: typeof fetch, url: URL, init?: RequestInit): Promise<unknown> {
+  return requestJsonWithTimeout(fetcher, url, init, REQUEST_TIMEOUT_MS);
+}
+
+async function requestJsonWithTimeout(
+  fetcher: typeof fetch,
+  url: URL,
+  init: RequestInit | undefined,
+  timeoutMs: number
+): Promise<unknown> {
   const response = await fetcher(url, {
     ...init,
     redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(`Local service returned HTTP ${response.status}`);
   const advertisedLength = Number(response.headers.get("content-length"));
@@ -127,13 +136,41 @@ export async function requestLocalServiceJson(
   path: string,
   fetcher: typeof fetch,
   resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost,
-  init?: RequestInit
+  init?: RequestInit,
+  timeoutMs = REQUEST_TIMEOUT_MS
 ): Promise<unknown> {
   if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
     throw new Error("Local service path is invalid");
   }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
+    throw new Error("Local service timeout must be between 1 and 30000 milliseconds");
+  }
   const base = await validateLocalEndpoint(rawUrl, resolveHost);
-  return requestJson(fetcher, appendPath(base, path), init);
+  return requestJsonWithTimeout(fetcher, appendPath(base, path), init, timeoutMs);
+}
+
+/** Open a streamed response from a configured local service after the same SSRF checks. */
+export async function requestLocalServiceStream(
+  rawUrl: string,
+  path: string,
+  fetcher: typeof fetch,
+  resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost,
+  init?: RequestInit
+): Promise<Response> {
+  if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
+    throw new Error("Local service path is invalid");
+  }
+  const base = await validateLocalEndpoint(rawUrl, resolveHost);
+  const response = await fetcher(appendPath(base, path), {
+    ...init,
+    redirect: "error",
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`Local service returned HTTP ${response.status}`);
+  }
+  if (!response.body) throw new Error("Local service returned an empty response");
+  return response;
 }
 
 /** Fetch a small binary result from a configured local service with a hard byte cap. */

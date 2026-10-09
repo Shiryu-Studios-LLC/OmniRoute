@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { executeLocalCapability } from "../../src/lib/localAgent/capabilityExecutor";
+import {
+  executeLocalCapability,
+  executeLocalCapabilityStream,
+} from "../../src/lib/localAgent/capabilityExecutor";
 import type { LocalDiscoveryResult } from "../../src/lib/localAgent/localDiscovery";
 
 const discovery: LocalDiscoveryResult = {
@@ -42,6 +45,78 @@ test("dispatches discovered Ollama chat to the fixed local API with the capabili
     stream: false,
   });
   assert.deepEqual(result, { message: { role: "assistant", content: "hi" }, done: true });
+});
+
+test("Ollama chat execution uses the bounded gateway-sized request timeout", async () => {
+  const originalTimeout = AbortSignal.timeout;
+  const timeoutValues: number[] = [];
+  AbortSignal.timeout = ((milliseconds: number) => {
+    timeoutValues.push(milliseconds);
+    return originalTimeout(milliseconds);
+  }) as typeof AbortSignal.timeout;
+  try {
+    await executeLocalCapability(
+      { ollamaUrl: "http://127.0.0.1:11434" },
+      discovery,
+      {
+        capability: "ollama:chat:qwen2.5:7b",
+        payload: { messages: [{ role: "user", content: "hello" }] },
+      },
+      {
+        resolveHost: async () => ["127.0.0.1"],
+        fetch: async () => Response.json({ message: { role: "assistant", content: "hi" } }),
+      }
+    );
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+  assert.deepEqual(timeoutValues, [25_000]);
+});
+
+test("streams bounded Ollama chat deltas and usage from NDJSON", async () => {
+  let requestedBody: Record<string, unknown> | null = null;
+  const emitted: unknown[] = [];
+  const encoder = new TextEncoder();
+  await executeLocalCapabilityStream(
+    { ollamaUrl: "http://127.0.0.1:11434" },
+    discovery,
+    {
+      capability: "ollama:chat:qwen2.5:7b",
+      payload: { messages: [{ role: "user", content: "hello" }] },
+    },
+    {
+      resolveHost: async () => ["127.0.0.1"],
+      signal: new AbortController().signal,
+      emit: async (event) => emitted.push(event),
+      fetch: async (_input, init) => {
+        requestedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode('{"message":{"content":"hel"},"done":false}\n'));
+              controller.enqueue(
+                encoder.encode(
+                  '{"message":{"content":"lo"},"done":true,"prompt_eval_count":4,"eval_count":2}\n'
+                )
+              );
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "application/x-ndjson" } }
+        );
+      },
+    }
+  );
+  assert.deepEqual(requestedBody, {
+    messages: [{ role: "user", content: "hello" }],
+    model: "qwen2.5:7b",
+    stream: true,
+  });
+  assert.deepEqual(emitted, [
+    { type: "delta", data: { content: "hel" } },
+    { type: "delta", data: { content: "lo" } },
+    { type: "usage", data: { promptTokens: 4, completionTokens: 2 } },
+  ]);
 });
 
 test("polls a bounded ComfyUI workflow and retrieves its completed image output", async () => {

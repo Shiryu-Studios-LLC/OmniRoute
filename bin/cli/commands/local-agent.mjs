@@ -18,6 +18,19 @@ import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { installLocalAgentSystemd, uninstallLocalAgentSystemd } from "../localAgentSystemd.mjs";
 import { installLocalAgentLaunchd, uninstallLocalAgentLaunchd } from "../localAgentLaunchd.mjs";
+import {
+  getLocalAgentWindowsTaskStatus,
+  installLocalAgentWindowsTask,
+  startLocalAgentWindowsTask,
+  stopLocalAgentWindowsTask,
+  uninstallLocalAgentWindowsTask,
+} from "../localAgentWindowsTask.mjs";
+import {
+  deleteLocalAgentCredential,
+  loadLocalAgentCredentialStore,
+  readLocalAgentCredential,
+  saveLocalAgentCredential,
+} from "../localAgentWindowsCredentials.mjs";
 
 const DEFAULT_CREDENTIAL_ENV = "SHIRYU_LOCAL_AGENT_CREDENTIAL";
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -25,7 +38,13 @@ const CREDENTIAL_ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const DEVICE_CREDENTIAL_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
-function configPath(home = homedir()) {
+function isMissingWindowsKeytar(error) {
+  return typeof error?.message === "string" && error.message.includes("optional keytar package");
+}
+
+function configPath(home = homedir(), platform = process.platform) {
+  if (platform === "win32")
+    return join(home, "AppData", "Roaming", "OmniRoute", "local-agent.json");
   return join(realpathSync(home), ".config", "omniroute", "local-agent.json");
 }
 
@@ -33,8 +52,38 @@ function currentUid() {
   return typeof process.getuid === "function" ? process.getuid() : userInfo().uid;
 }
 
-function readPairedConfig(home = homedir()) {
-  if (process.platform === "win32") return null;
+function readWindowsPairedConfig(home = homedir()) {
+  const filePath = configPath(home, "win32");
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error("Could not safely inspect the Windows Local Agent config.");
+  }
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new Error("Refusing to read an unsafe Windows Local Agent config.");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, "utf8"));
+  } catch {
+    throw new Error("Windows Local Agent config is invalid.");
+  }
+  if (
+    parsed?.managedBy !== "OmniRoute Local Agent" ||
+    parsed?.credentialStorage !== "windows-credential-manager" ||
+    typeof parsed.gatewayUrl !== "string" ||
+    typeof parsed.deviceId !== "string" ||
+    Object.hasOwn(parsed, "credential")
+  ) {
+    throw new Error("Refusing an unmanaged or plaintext Windows Local Agent config.");
+  }
+  return parsed;
+}
+
+function readPairedConfig(home = homedir(), platform = process.platform) {
+  if (platform === "win32") return readWindowsPairedConfig(home);
   const canonicalHome = realpathSync(home);
   const ownerUid = currentUid();
   let directory = canonicalHome;
@@ -94,11 +143,6 @@ function readPairedConfig(home = homedir()) {
 }
 
 function ensurePrivatePairingDirectory(home) {
-  if (process.platform === "win32") {
-    throw new Error(
-      "Local Agent pairing is not supported on Windows; configure the credential manually"
-    );
-  }
   const canonicalHome = realpathSync(home);
   const ownerUid = currentUid();
   const homeStats = lstatSync(canonicalHome);
@@ -127,7 +171,8 @@ function ensurePrivatePairingDirectory(home) {
   return canonicalHome;
 }
 
-function writePairedConfig(config, home = homedir()) {
+function writePairedConfig(config, home = homedir(), platform = process.platform) {
+  if (platform === "win32") throw new Error("Windows pairing config must use Credential Manager.");
   const canonicalHome = ensurePrivatePairingDirectory(home);
   const filePath = configPath(canonicalHome);
   try {
@@ -161,6 +206,80 @@ function writePairedConfig(config, home = homedir()) {
   } finally {
     if (fd !== undefined) closeSync(fd);
     rmSync(temporaryPath, { force: true });
+  }
+}
+
+function writeWindowsPairedConfig(config, home = homedir()) {
+  const filePath = configPath(home, "win32");
+  const directory = join(home, "AppData", "Roaming", "OmniRoute");
+  mkdirSync(directory, { recursive: true });
+  try {
+    const stats = lstatSync(filePath);
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      throw new Error("Refusing to replace an unsafe Windows Local Agent config.");
+    }
+    const existing = JSON.parse(readFileSync(filePath, "utf8"));
+    if (existing?.managedBy !== "OmniRoute Local Agent") {
+      throw new Error("Refusing to replace an unmanaged Windows Local Agent config.");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  try {
+    writeFileSync(
+      temporaryPath,
+      `${JSON.stringify(
+        {
+          managedBy: "OmniRoute Local Agent",
+          credentialStorage: "windows-credential-manager",
+          ...config,
+        },
+        null,
+        2
+      )}\n`,
+      { flag: "wx" }
+    );
+    renameSync(temporaryPath, filePath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+export async function saveWindowsLocalAgentConfig(config, { home = homedir(), keytarLoader } = {}) {
+  const keytar = await loadLocalAgentCredentialStore(keytarLoader);
+  let previousCredential;
+  try {
+    previousCredential = await keytar.getPassword("omniroute-local-agent", config.deviceId);
+  } catch {
+    throw new Error(
+      "Could not read the existing Local Agent credential from Windows Credential Manager."
+    );
+  }
+  await saveLocalAgentCredential(keytar, config.deviceId, config.credential);
+  try {
+    writeWindowsPairedConfig(
+      {
+        gatewayUrl: config.gatewayUrl,
+        deviceId: config.deviceId,
+        ollamaUrl: config.ollamaUrl,
+        comfyUiUrl: config.comfyUiUrl,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        mcpServers: config.mcpServers ?? [],
+      },
+      home
+    );
+  } catch (error) {
+    try {
+      if (previousCredential === null) {
+        await keytar.deletePassword("omniroute-local-agent", config.deviceId);
+      } else {
+        await keytar.setPassword("omniroute-local-agent", config.deviceId, previousCredential);
+      }
+    } catch {
+      // Preserve the config-write error; credential storage never falls back to disk.
+    }
+    throw error;
   }
 }
 
@@ -208,13 +327,12 @@ export async function pairLocalAgentCommand(
     fetcher = globalThis.fetch,
     home = env.HOME || homedir(),
     readCode = readPairingCode,
+    platform = process.platform,
+    keytarLoader,
   } = {}
 ) {
-  if (process.platform === "win32") {
-    throw new Error(
-      "Local Agent pairing is not supported on Windows; configure the credential manually"
-    );
-  }
+  const credentialStore =
+    platform === "win32" ? await loadLocalAgentCredentialStore(keytarLoader) : null;
   const gatewayUrl = parseGatewayUrl(
     requiredValue(options.gatewayUrl, env.SHIRYU_LOCAL_AGENT_GATEWAY_URL, "gateway URL")
   );
@@ -252,9 +370,27 @@ export async function pairLocalAgentCommand(
   ) {
     throw new Error("Local Agent pairing could not be completed");
   }
-  const filePath = configPath(home);
-  writePairedConfig({ gatewayUrl, deviceId: body.deviceId, credential: body.credential }, home);
-  stdout.write(`Local Agent paired as ${body.deviceId}. Credential saved to ${filePath}.\n`);
+  const filePath = configPath(home, platform);
+  if (platform === "win32") {
+    await saveLocalAgentCredential(credentialStore, body.deviceId, body.credential);
+    try {
+      writeWindowsPairedConfig({ gatewayUrl, deviceId: body.deviceId }, home);
+    } catch (error) {
+      try {
+        await deleteLocalAgentCredential(credentialStore, body.deviceId);
+      } catch {
+        // Preserve the config-write error; no credential is written to disk.
+      }
+      throw error;
+    }
+  } else {
+    writePairedConfig({ gatewayUrl, deviceId: body.deviceId, credential: body.credential }, home);
+  }
+  stdout.write(
+    platform === "win32"
+      ? `Local Agent paired as ${body.deviceId}. Credential saved in Windows Credential Manager; config saved to ${filePath}.\n`
+      : `Local Agent paired as ${body.deviceId}. Credential saved to ${filePath}.\n`
+  );
   return { deviceId: body.deviceId, configPath: filePath };
 }
 
@@ -408,9 +544,44 @@ export function resolveLocalAgentConfig(options = {}, env = process.env) {
       env.SHIRYU_LOCAL_AGENT_COMFYUI_URL,
       "ComfyUI URL"
     ),
-    mcpServers: parseMcpServers(env.SHIRYU_LOCAL_AGENT_MCP_SERVERS),
+    mcpServers: options.mcpServers ?? parseMcpServers(env.SHIRYU_LOCAL_AGENT_MCP_SERVERS),
     ...(heartbeatIntervalMs === undefined ? {} : { heartbeatIntervalMs }),
   };
+}
+
+export async function resolveLocalAgentConfigAsync(
+  options = {},
+  env = process.env,
+  { platform = process.platform, home = env.HOME || homedir(), keytarLoader } = {}
+) {
+  if (platform !== "win32") return resolveLocalAgentConfig(options, env);
+  const credentialEnv = options.credentialEnv || DEFAULT_CREDENTIAL_ENV;
+  if (!CREDENTIAL_ENV_PATTERN.test(credentialEnv)) {
+    throw new Error("Invalid Local Agent credential environment variable name");
+  }
+  const paired = readWindowsPairedConfig(home);
+  const gatewayUrl = requiredValue(
+    options.gatewayUrl,
+    env.SHIRYU_LOCAL_AGENT_GATEWAY_URL ?? paired?.gatewayUrl,
+    "gateway URL"
+  );
+  const deviceId = requiredValue(
+    options.deviceId,
+    env.SHIRYU_LOCAL_AGENT_DEVICE_ID ?? paired?.deviceId,
+    "device ID"
+  );
+  let credential = env[credentialEnv];
+  if (!credential) {
+    if (!paired || paired.deviceId !== deviceId) {
+      throw new Error(`Set a valid one-time device credential in ${credentialEnv}`);
+    }
+    const keytar = await loadLocalAgentCredentialStore(keytarLoader);
+    credential = await readLocalAgentCredential(keytar, deviceId);
+  }
+  return resolveLocalAgentConfig(
+    { ...paired, ...options, gatewayUrl, deviceId },
+    { ...env, [credentialEnv]: credential }
+  );
 }
 
 async function runGatewayAgent(config, signal) {
@@ -427,22 +598,34 @@ async function runGatewayAgent(config, signal) {
 /** Run one outbound-only agent process, stopping cleanly when the OS signals it. */
 export async function runLocalAgentCommand(
   options = {},
-  { env = process.env, signalTarget = process, runAgent = runGatewayAgent } = {}
+  {
+    env = process.env,
+    signalTarget = process,
+    runAgent = runGatewayAgent,
+    platform = process.platform,
+    keytarLoader,
+  } = {}
 ) {
-  const config = resolveLocalAgentConfig(options, env);
+  const resolvedConfig = platform === "win32" ? null : resolveLocalAgentConfig(options, env);
   const controller = new AbortController();
   const shutdown = () => controller.abort();
   signalTarget.once("SIGINT", shutdown);
   signalTarget.once("SIGTERM", shutdown);
   try {
-    await runAgent(config, controller.signal);
+    const config =
+      resolvedConfig ??
+      (await resolveLocalAgentConfigAsync(options, env, { platform, keytarLoader }));
+    if (!controller.signal.aborted) await runAgent(config, controller.signal);
   } finally {
     signalTarget.removeListener("SIGINT", shutdown);
     signalTarget.removeListener("SIGTERM", shutdown);
   }
 }
 
-export function registerLocalAgent(program) {
+export function registerLocalAgent(
+  program,
+  { platform = process.platform, keytarLoader, home = homedir() } = {}
+) {
   const localAgent = program
     .command("local-agent")
     .description("Manage a tenant-registered outbound Local Agent");
@@ -454,8 +637,12 @@ export function registerLocalAgent(program) {
     .action(async (options) => {
       try {
         await pairLocalAgentCommand(options);
-      } catch {
-        process.stderr.write("Local Agent pairing failed; check the gateway and pairing code.\n");
+      } catch (error) {
+        process.stderr.write(
+          isMissingWindowsKeytar(error)
+            ? `${error.message}\n`
+            : "Local Agent pairing failed; check the gateway and pairing code.\n"
+        );
         process.exitCode = 1;
       }
     });
@@ -479,20 +666,24 @@ export function registerLocalAgent(program) {
     .action(async (options) => {
       try {
         await runLocalAgentCommand(options);
-      } catch {
+      } catch (error) {
         // Errors from network or capability execution can contain request data. Keep the
         // process diagnostic generic and never print device credentials or request payloads.
-        process.stderr.write("Local Agent stopped after a configuration or runtime error.\n");
+        process.stderr.write(
+          isMissingWindowsKeytar(error)
+            ? `${error.message}\n`
+            : "Local Agent stopped after a configuration or runtime error.\n"
+        );
         process.exitCode = 1;
       }
     });
 
   const service = localAgent
     .command("service")
-    .description("Install or remove the per-user Local Agent service");
+    .description("Manage the per-user Local Agent service");
   const install = service
     .command("install")
-    .description("Install and start a protected Linux systemd or macOS launchd user service")
+    .description("Install and start a per-user systemd, launchd, or Windows Task Scheduler service")
     .option("--gateway-url <url>", "HTTPS gateway base URL (or SHIRYU_LOCAL_AGENT_GATEWAY_URL)")
     .option("--device-id <id>", "Registered device ID (or SHIRYU_LOCAL_AGENT_DEVICE_ID)")
     .option(
@@ -508,15 +699,28 @@ export function registerLocalAgent(program) {
     );
   install.action(async (options) => {
     try {
-      const config = resolveLocalAgentConfig(options);
-      const installed =
-        process.platform === "darwin"
-          ? installLocalAgentLaunchd(config)
-          : installLocalAgentSystemd(config);
+      const config = await resolveLocalAgentConfigAsync(options, process.env, {
+        platform,
+        home,
+        keytarLoader,
+      });
+      let installed;
+      if (platform === "win32") {
+        await saveWindowsLocalAgentConfig(config, { home, keytarLoader });
+        installed = installLocalAgentWindowsTask(config, { platform });
+      } else if (platform === "darwin") {
+        installed = installLocalAgentLaunchd(config);
+      } else if (platform === "linux") {
+        installed = installLocalAgentSystemd(config);
+      } else {
+        throw new Error("Local Agent service management is not supported on this platform.");
+      }
       process.stdout.write(`Local Agent service installed: ${installed.serviceName}\n`);
-    } catch {
+    } catch (error) {
       process.stderr.write(
-        "Local Agent service install failed; check systemd or launchd and configuration.\n"
+        isMissingWindowsKeytar(error)
+          ? `${error.message}\n`
+          : "Local Agent service install failed; check the platform service manager and configuration.\n"
       );
       process.exitCode = 1;
     }
@@ -527,10 +731,11 @@ export function registerLocalAgent(program) {
     .description("Stop and remove the installed Local Agent user service")
     .action(() => {
       try {
-        const removed =
-          process.platform === "darwin"
-            ? uninstallLocalAgentLaunchd()
-            : uninstallLocalAgentSystemd();
+        let removed;
+        if (platform === "win32") removed = uninstallLocalAgentWindowsTask({ platform });
+        else if (platform === "darwin") removed = uninstallLocalAgentLaunchd();
+        else if (platform === "linux") removed = uninstallLocalAgentSystemd();
+        else throw new Error("Local Agent service management is not supported on this platform.");
         process.stdout.write(
           removed ? "Local Agent service removed.\n" : "Local Agent service is not installed.\n"
         );
@@ -541,4 +746,46 @@ export function registerLocalAgent(program) {
         process.exitCode = 1;
       }
     });
+
+  if (platform === "win32") {
+    for (const [name, operation] of [
+      ["start", "start"],
+      ["stop", "stop"],
+      ["status", "status"],
+    ]) {
+      service
+        .command(name)
+        .description(
+          `${name[0].toUpperCase()}${name.slice(1)} the Windows per-user Local Agent task`
+        )
+        .action(() => {
+          try {
+            const result =
+              operation === "start"
+                ? startLocalAgentWindowsTask({ platform })
+                : operation === "stop"
+                  ? stopLocalAgentWindowsTask({ platform })
+                  : getLocalAgentWindowsTaskStatus({ platform });
+            if (operation === "status") {
+              process.stdout.write(
+                result.installed
+                  ? `Local Agent task: ${result.state}\n`
+                  : "Local Agent task is not installed.\n"
+              );
+            } else {
+              process.stdout.write(
+                result
+                  ? `Local Agent task ${operation} requested.\n`
+                  : "Local Agent task is not installed.\n"
+              );
+            }
+          } catch {
+            process.stderr.write(
+              `Local Agent task ${operation} failed; existing configuration was preserved.\n`
+            );
+            process.exitCode = 1;
+          }
+        });
+    }
+  }
 }

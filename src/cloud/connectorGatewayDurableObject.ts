@@ -1,5 +1,6 @@
 import type {
   GatewayCoordinator,
+  GatewayCapabilityStreamEnvelope,
   GatewayDeviceRequest,
   GatewaySessionRecord,
 } from "./connectorGateway.ts";
@@ -59,6 +60,34 @@ export interface GatewayCoordinatorStub {
     now: string
   ): Promise<GatewayDeviceRequest | null>;
   deleteRequest(deviceId: string, requestId: string): Promise<void>;
+  submitStreamEvent(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    event: string,
+    now: string
+  ): Promise<boolean>;
+  peekStreamEvent(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    now: string
+  ): Promise<GatewayCapabilityStreamEnvelope | null>;
+  acknowledgeStreamEvent(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    now: string
+  ): Promise<boolean>;
+  cancelStream(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    now: string
+  ): Promise<boolean>;
 }
 
 const IDENTITY_KEY = "gateway:device-id";
@@ -73,6 +102,9 @@ const MAX_REQUEST_QUEUE_BYTES = 1_500_000;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_STREAM_EVENT_BYTES = 8 * 1024;
+const MAX_STREAM_EVENTS = 256;
+const MAX_STREAM_OUTPUT_BYTES = 128 * 1024;
 
 function isTimestamp(value: unknown): value is string {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
@@ -122,8 +154,39 @@ function isRequestRecord(value: unknown): value is GatewayDeviceRequest {
     (request.status === "pending" ||
       request.status === "delivered" ||
       request.status === "complete") &&
-    (request.result === undefined || resultBytes <= MAX_REQUEST_BYTES)
+    (request.result === undefined || resultBytes <= MAX_REQUEST_BYTES) &&
+    (request.stream === undefined || request.stream === true) &&
+    (request.streamNextSequence === undefined ||
+      (Number.isSafeInteger(request.streamNextSequence) && request.streamNextSequence >= 0)) &&
+    (request.streamAcknowledgedSequence === undefined ||
+      (Number.isSafeInteger(request.streamAcknowledgedSequence) &&
+        request.streamAcknowledgedSequence >= -1)) &&
+    (request.streamPendingEvent === undefined ||
+      new TextEncoder().encode(request.streamPendingEvent).byteLength <= MAX_STREAM_EVENT_BYTES) &&
+    (request.streamCancelled === undefined || request.streamCancelled === true) &&
+    (request.streamTerminal === undefined || request.streamTerminal === true) &&
+    (request.streamEventCount === undefined ||
+      (Number.isSafeInteger(request.streamEventCount) &&
+        request.streamEventCount >= 0 &&
+        request.streamEventCount <= MAX_STREAM_EVENTS)) &&
+    (request.streamTotalEventBytes === undefined ||
+      (Number.isSafeInteger(request.streamTotalEventBytes) &&
+        request.streamTotalEventBytes >= 0 &&
+        request.streamTotalEventBytes <= MAX_STREAM_OUTPUT_BYTES)) &&
+    (request.streamUsageSequence === undefined ||
+      (Number.isSafeInteger(request.streamUsageSequence) && request.streamUsageSequence >= 0)) &&
+    (request.stream !== true ||
+      (request.streamNextSequence !== undefined &&
+        request.streamAcknowledgedSequence !== undefined &&
+        request.streamEventCount !== undefined &&
+        request.streamTotalEventBytes !== undefined))
   );
+}
+
+function isTerminalStreamEvent(event: unknown): boolean {
+  if (event === null || typeof event !== "object" || Array.isArray(event)) return false;
+  const type = (event as { type?: unknown }).type;
+  return type === "done" || type === "error";
 }
 
 function requestQueueFits(requests: GatewayDeviceRequest[]): boolean {
@@ -336,6 +399,241 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     });
   }
 
+  async submitStreamEvent(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    event: string,
+    now: string
+  ): Promise<boolean> {
+    assertDeviceId(deviceId);
+    if (
+      !SESSION_ID_PATTERN.test(requestId) ||
+      !SESSION_ID_PATTERN.test(sessionId) ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0 ||
+      sequence > 100_000 ||
+      new TextEncoder().encode(event).byteLength > MAX_STREAM_EVENT_BYTES
+    )
+      return false;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event) as unknown;
+    } catch {
+      return false;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    return this.state.storage.transaction(async (transaction) => {
+      await this.assertBound(transaction, deviceId);
+      const session = await transaction.get<unknown>(SESSION_KEY);
+      if (
+        !isSessionRecord(session) ||
+        session.deviceId !== deviceId ||
+        session.sessionId !== sessionId ||
+        session.revokedAt !== null ||
+        Date.parse(session.leaseExpiresAt) <= Date.parse(now)
+      )
+        return false;
+      const rows = await this.readRequests(transaction);
+      const index = rows.findIndex(
+        (row) => row.requestId === requestId && row.sessionId === sessionId
+      );
+      if (index < 0) return false;
+      const request = rows[index]!;
+      if (
+        !request.stream ||
+        request.streamCancelled ||
+        Date.parse(request.expiresAt) <= Date.parse(now)
+      )
+        return false;
+      const acknowledged = request.streamAcknowledgedSequence ?? -1;
+      if (sequence <= acknowledged) return true;
+      if (
+        request.status !== "delivered" ||
+        request.streamTerminal ||
+        sequence !== request.streamNextSequence ||
+        request.streamPendingEvent !== undefined
+      )
+        return false;
+      const eventBytes = new TextEncoder().encode(event).byteLength;
+      const eventCount = request.streamEventCount ?? 0;
+      const totalBytes = request.streamTotalEventBytes ?? 0;
+      const isUsage = (parsed as { type?: unknown }).type === "usage";
+      if (
+        eventCount >= MAX_STREAM_EVENTS ||
+        totalBytes + eventBytes > MAX_STREAM_OUTPUT_BYTES ||
+        (isUsage && request.streamUsageSequence !== undefined)
+      ) {
+        const updated = [...rows];
+        updated[index] = {
+          ...request,
+          streamCancelled: true,
+          streamPendingEvent: undefined,
+        };
+        await transaction.put(REQUESTS_KEY, updated);
+        return false;
+      }
+      const updated = [...rows];
+      updated[index] = {
+        ...request,
+        streamPendingEvent: event,
+        streamEventCount: eventCount + 1,
+        streamTotalEventBytes: totalBytes + eventBytes,
+        ...(isUsage ? { streamUsageSequence: sequence } : {}),
+        ...(isTerminalStreamEvent(parsed) ? { streamTerminal: true as const } : {}),
+      };
+      if (!requestQueueFits(updated)) return false;
+      await transaction.put(REQUESTS_KEY, updated);
+      return true;
+    });
+  }
+
+  async peekStreamEvent(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    now: string
+  ): Promise<GatewayCapabilityStreamEnvelope | null> {
+    assertDeviceId(deviceId);
+    if (
+      !SESSION_ID_PATTERN.test(requestId) ||
+      !SESSION_ID_PATTERN.test(sessionId) ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0
+    )
+      return null;
+    return this.state.storage.transaction(async (transaction) => {
+      await this.assertBound(transaction, deviceId);
+      const session = await transaction.get<unknown>(SESSION_KEY);
+      if (
+        !isSessionRecord(session) ||
+        session.deviceId !== deviceId ||
+        session.sessionId !== sessionId ||
+        session.revokedAt !== null ||
+        Date.parse(session.leaseExpiresAt) <= Date.parse(now)
+      )
+        return null;
+      const rows = await this.readRequests(transaction);
+      const index = rows.findIndex(
+        (row) => row.requestId === requestId && row.sessionId === sessionId
+      );
+      if (index < 0) return null;
+      const request = rows[index]!;
+      if (
+        !request.stream ||
+        request.streamCancelled ||
+        Date.parse(request.expiresAt) <= Date.parse(now) ||
+        request.streamNextSequence !== sequence ||
+        !request.streamPendingEvent
+      )
+        return null;
+      let event: unknown;
+      try {
+        event = JSON.parse(request.streamPendingEvent) as unknown;
+      } catch {
+        return null;
+      }
+      if (event === null || typeof event !== "object" || Array.isArray(event)) return null;
+      return { sequence, ...(event as object) } as GatewayCapabilityStreamEnvelope;
+    });
+  }
+
+  async acknowledgeStreamEvent(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    now: string
+  ): Promise<boolean> {
+    assertDeviceId(deviceId);
+    if (
+      !SESSION_ID_PATTERN.test(requestId) ||
+      !SESSION_ID_PATTERN.test(sessionId) ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0
+    )
+      return false;
+    return this.state.storage.transaction(async (transaction) => {
+      await this.assertBound(transaction, deviceId);
+      const session = await transaction.get<unknown>(SESSION_KEY);
+      if (
+        !isSessionRecord(session) ||
+        session.deviceId !== deviceId ||
+        session.sessionId !== sessionId ||
+        session.revokedAt !== null ||
+        Date.parse(session.leaseExpiresAt) <= Date.parse(now)
+      )
+        return false;
+      const rows = await this.readRequests(transaction);
+      const index = rows.findIndex(
+        (row) => row.requestId === requestId && row.sessionId === sessionId
+      );
+      if (index < 0) return false;
+      const request = rows[index]!;
+      if (
+        !request.stream ||
+        request.streamCancelled ||
+        Date.parse(request.expiresAt) <= Date.parse(now)
+      )
+        return false;
+      if ((request.streamAcknowledgedSequence ?? -1) >= sequence) return true;
+      if (request.streamNextSequence !== sequence || !request.streamPendingEvent) return false;
+      let event: unknown;
+      try {
+        event = JSON.parse(request.streamPendingEvent) as unknown;
+      } catch {
+        return false;
+      }
+      const updated = [...rows];
+      updated[index] = {
+        ...request,
+        ...(isTerminalStreamEvent(event) ? { status: "complete" as const } : {}),
+        streamPendingEvent: undefined,
+        streamAcknowledgedSequence: sequence,
+        streamNextSequence: sequence + 1,
+      };
+      await transaction.put(REQUESTS_KEY, updated);
+      return true;
+    });
+  }
+
+  async cancelStream(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    now: string
+  ): Promise<boolean> {
+    assertDeviceId(deviceId);
+    if (!SESSION_ID_PATTERN.test(requestId) || !SESSION_ID_PATTERN.test(sessionId)) return false;
+    return this.state.storage.transaction(async (transaction) => {
+      await this.assertBound(transaction, deviceId);
+      const session = await transaction.get<unknown>(SESSION_KEY);
+      if (
+        !isSessionRecord(session) ||
+        session.deviceId !== deviceId ||
+        session.sessionId !== sessionId ||
+        session.revokedAt !== null ||
+        Date.parse(session.leaseExpiresAt) <= Date.parse(now)
+      )
+        return false;
+      const rows = await this.readRequests(transaction);
+      const index = rows.findIndex(
+        (row) =>
+          row.requestId === requestId &&
+          row.sessionId === sessionId &&
+          row.stream === true &&
+          Date.parse(row.expiresAt) > Date.parse(now)
+      );
+      if (index < 0) return false;
+      const updated = [...rows];
+      updated[index] = { ...updated[index]!, streamCancelled: true, streamPendingEvent: undefined };
+      await transaction.put(REQUESTS_KEY, updated);
+      return true;
+    });
+  }
+
   async getRequest(
     deviceId: string,
     requestId: string,
@@ -462,6 +760,28 @@ export class DurableObjectGatewayCoordinator implements GatewayCoordinator {
 
   deleteRequest(deviceId: string, requestId: string): Promise<void> {
     return this.forDevice(deviceId).deleteRequest(deviceId, requestId);
+  }
+
+  submitStreamEvent(
+    ...args: Parameters<GatewayCoordinatorStub["submitStreamEvent"]>
+  ): Promise<boolean> {
+    return this.forDevice(args[0]).submitStreamEvent(...args);
+  }
+
+  peekStreamEvent(
+    ...args: Parameters<GatewayCoordinatorStub["peekStreamEvent"]>
+  ): Promise<GatewayCapabilityStreamEnvelope | null> {
+    return this.forDevice(args[0]).peekStreamEvent(...args);
+  }
+
+  acknowledgeStreamEvent(
+    ...args: Parameters<GatewayCoordinatorStub["acknowledgeStreamEvent"]>
+  ): Promise<boolean> {
+    return this.forDevice(args[0]).acknowledgeStreamEvent(...args);
+  }
+
+  cancelStream(...args: Parameters<GatewayCoordinatorStub["cancelStream"]>): Promise<boolean> {
+    return this.forDevice(args[0]).cancelStream(...args);
   }
 
   private forDevice(deviceId: string): GatewayCoordinatorStub {

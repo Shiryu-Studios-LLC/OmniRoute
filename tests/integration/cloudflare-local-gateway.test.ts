@@ -119,6 +119,64 @@ async function requestHostJson(
   });
 }
 
+async function requestHostStream(
+  port: number,
+  host: string,
+  pathname: string,
+  body: unknown,
+  timeoutMs = 40_000
+): Promise<{ status: number; contentType: string; body: string }> {
+  const serializedBody = JSON.stringify(body);
+  return await new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: pathname,
+        method: "POST",
+        headers: {
+          host,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(serializedBody),
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        response.on("data", (chunk: Buffer | string) => {
+          const buffer = Buffer.from(chunk);
+          totalBytes += buffer.byteLength;
+          if (totalBytes > 128 * 1024) {
+            request.destroy(new Error("Front Desk stream exceeded 128 KiB"));
+            return;
+          }
+          chunks.push(buffer);
+        });
+        response.on("end", () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            contentType: String(response.headers["content-type"] ?? ""),
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      }
+    );
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("Front Desk stream timed out")));
+    request.once("error", reject);
+    request.end(serializedBody);
+  });
+}
+
+function parseOpenAiSseFrames(stream: string): string[] {
+  return stream.split(/\r?\n\r?\n/).flatMap((frame) => {
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart());
+    return data.length > 0 ? [data.join("\n")] : [];
+  });
+}
+
 async function startComfyUiFixture(): Promise<{ baseUrl: string; close: () => Promise<void> }> {
   const server = http.createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -232,7 +290,7 @@ async function runLocalOllamaChat(
         num_predict: limits.maxTokens,
       },
     }),
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(90_000),
   });
   const responseText = await response.text();
   assert.ok(Buffer.byteLength(responseText) <= 128 * 1024, "Ollama chat response exceeds 128 KiB");
@@ -795,7 +853,7 @@ test(
     await t.test(
       "Front Desk completes a local Ollama model chat through the Worker and Durable Object",
       {
-        timeout: 90_000,
+        timeout: 180_000,
         skip:
           process.env.RUN_CLOUDFLARE_LOCAL_OLLAMA_INT !== "1"
             ? "Set RUN_CLOUDFLARE_LOCAL_OLLAMA_INT=1 to run the loopback-only Ollama integration."
@@ -974,7 +1032,6 @@ test(
           ],
         });
         const frontDeskResponse = await chatRequest;
-        await stopWorker(agentChild);
         assert.equal(
           frontDeskResponse.status,
           200,
@@ -996,6 +1053,61 @@ test(
           false,
           "Front Desk chat response must not expose the local tenant API key"
         );
+
+        const streamedResponse = await requestHostStream(
+          frontDeskPort,
+          frontDeskHost,
+          "/api/chat",
+          {
+            messages: [{ role: "user", content: "Reply with one short word." }],
+            stream: true,
+          }
+        );
+        assert.equal(
+          streamedResponse.status,
+          200,
+          `Front Desk should return the local model stream: ${streamedResponse.body.slice(0, 500)}. Local Agent output: ${agentOutput}`
+        );
+        assert.match(streamedResponse.contentType, /text\/event-stream/i);
+        const frames = parseOpenAiSseFrames(streamedResponse.body);
+        assert.equal(frames.at(-1), "[DONE]", "OpenAI SSE stream should end with [DONE]");
+        const contentDeltas = frames
+          .filter((frame) => frame !== "[DONE]")
+          .map((frame) => {
+            const chunk: unknown = JSON.parse(frame);
+            assert.ok(chunk !== null && typeof chunk === "object");
+            const choices = (chunk as { choices?: unknown }).choices;
+            assert.ok(
+              Array.isArray(choices),
+              `Expected an OpenAI chat chunk: ${frame.slice(0, 500)}`
+            );
+            if (choices.length === 0) {
+              assert.ok(
+                (chunk as { usage?: unknown }).usage !== undefined,
+                `An empty choices array is valid only for a usage chunk: ${frame.slice(0, 500)}`
+              );
+              return "";
+            }
+            return choices
+              .map((choice) => {
+                const delta = (choice as { delta?: unknown }).delta;
+                assert.ok(delta !== null && typeof delta === "object");
+                const content = (delta as { content?: unknown }).content;
+                return typeof content === "string" ? content : "";
+              })
+              .join("");
+          })
+          .join("");
+        assert.ok(
+          contentDeltas.trim().length > 0,
+          "OpenAI SSE stream should include a content delta"
+        );
+        assert.equal(
+          streamedResponse.body.includes(ollamaCustomer.customerKey),
+          false,
+          "Front Desk stream must not expose the local tenant API key"
+        );
+        await stopWorker(agentChild);
       }
     );
 

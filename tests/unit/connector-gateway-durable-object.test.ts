@@ -228,6 +228,410 @@ test("Durable Object request queue binds delivery and results to the active tena
   assert.equal(await coordinator.enqueueRequest("device_A", largeRequest), false);
 });
 
+test("Durable Object stream queue allows one ordered event and acknowledges only on consume", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const request: GatewayDeviceRequest = {
+    requestId: "stream_request_1",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama:chat:qwen-local",
+    payload: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:00:30.000Z",
+    status: "pending",
+    stream: true,
+    streamNextSequence: 0,
+    streamAcknowledgedSequence: -1,
+    streamEventCount: 0,
+    streamTotalEventBytes: 0,
+  };
+  assert.equal(await coordinator.enqueueRequest("device_A", request), true);
+  assert.equal(
+    (await coordinator.takeRequests("device_A", "session_A", request.createdAt))[0]?.stream,
+    true
+  );
+
+  const delta = JSON.stringify({ type: "delta", data: { content: "hello" } });
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      delta,
+      request.createdAt
+    ),
+    true
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      1,
+      delta,
+      request.createdAt
+    ),
+    false,
+    "the producer cannot queue a second event before the consumer takes the first"
+  );
+  const consumed = await coordinator.peekStreamEvent!(
+    "device_A",
+    "session_A",
+    request.requestId,
+    0,
+    request.createdAt
+  );
+  assert.deepEqual(consumed, { sequence: 0, type: "delta", data: { content: "hello" } });
+  assert.equal(
+    (await coordinator.getRequest("device_A", request.requestId, request.createdAt))
+      ?.streamAcknowledgedSequence,
+    -1,
+    "reading a pending event does not acknowledge it"
+  );
+  assert.equal(
+    await coordinator.acknowledgeStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      request.createdAt
+    ),
+    true
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      delta,
+      request.createdAt
+    ),
+    true,
+    "retrying an acknowledged sequence is idempotent"
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      2,
+      delta,
+      request.createdAt
+    ),
+    false
+  );
+
+  const done = JSON.stringify({ type: "done", data: {} });
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      1,
+      done,
+      request.createdAt
+    ),
+    true
+  );
+  assert.deepEqual(
+    await coordinator.peekStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      1,
+      request.createdAt
+    ),
+    { sequence: 1, type: "done", data: {} }
+  );
+  assert.equal(
+    await coordinator.acknowledgeStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      1,
+      request.createdAt
+    ),
+    true
+  );
+  assert.equal(
+    (await coordinator.getRequest("device_A", request.requestId, request.createdAt))?.status,
+    "complete"
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      2,
+      delta,
+      request.createdAt
+    ),
+    false
+  );
+});
+
+test("Durable Object stream cancellation clears a pending event and blocks stale session writes", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const request: GatewayDeviceRequest = {
+    requestId: "stream_request_cancel",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama:chat:qwen-local",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:00:30.000Z",
+    status: "pending",
+    stream: true,
+    streamNextSequence: 0,
+    streamAcknowledgedSequence: -1,
+    streamEventCount: 0,
+    streamTotalEventBytes: 0,
+  };
+  await coordinator.enqueueRequest("device_A", request);
+  await coordinator.takeRequests("device_A", "session_A", request.createdAt);
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      JSON.stringify({ type: "delta", data: { content: "pending" } }),
+      request.createdAt
+    ),
+    true
+  );
+  assert.equal(
+    await coordinator.cancelStream!("device_A", "session_A", request.requestId, request.createdAt),
+    true
+  );
+  assert.equal(
+    await coordinator.peekStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      request.createdAt
+    ),
+    null
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      JSON.stringify({ type: "delta", data: { content: "late" } }),
+      request.createdAt
+    ),
+    false
+  );
+  assert.equal(
+    await coordinator.cancelStream!(
+      "device_A",
+      "stale_session",
+      request.requestId,
+      request.createdAt
+    ),
+    false
+  );
+});
+
+test("Durable Object cancels streams that exceed aggregate bytes or event count", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const makeStreamRequest = (requestId: string): GatewayDeviceRequest => ({
+    requestId,
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama:chat:qwen-local",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:00:30.000Z",
+    status: "pending",
+    stream: true,
+    streamNextSequence: 0,
+    streamAcknowledgedSequence: -1,
+    streamEventCount: 0,
+    streamTotalEventBytes: 0,
+  });
+  const bytesRequest = makeStreamRequest("stream_bytes_cap");
+  await coordinator.enqueueRequest("device_A", bytesRequest);
+  await coordinator.takeRequests("device_A", "session_A", bytesRequest.createdAt);
+  const largeEvent = JSON.stringify({ type: "delta", data: { content: "x".repeat(7_900) } });
+  const exactEventBytes = new TextEncoder().encode(largeEvent).byteLength;
+  assert.ok(exactEventBytes <= 8 * 1024);
+  for (let sequence = 0; sequence < 16; sequence += 1) {
+    assert.equal(
+      await coordinator.submitStreamEvent!(
+        "device_A",
+        "session_A",
+        bytesRequest.requestId,
+        sequence,
+        largeEvent,
+        bytesRequest.createdAt
+      ),
+      true
+    );
+    assert.equal(
+      await coordinator.acknowledgeStreamEvent!(
+        "device_A",
+        "session_A",
+        bytesRequest.requestId,
+        sequence,
+        bytesRequest.createdAt
+      ),
+      true
+    );
+  }
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      bytesRequest.requestId,
+      16,
+      largeEvent,
+      bytesRequest.createdAt
+    ),
+    false,
+    "aggregate output bytes above 128 KiB cancel the stream"
+  );
+  const bytesState = await coordinator.getRequest(
+    "device_A",
+    bytesRequest.requestId,
+    bytesRequest.createdAt
+  );
+  assert.equal(bytesState?.streamCancelled, true);
+  assert.equal(bytesState?.streamTotalEventBytes, exactEventBytes * 16);
+
+  const countRequest = makeStreamRequest("stream_events_cap");
+  await coordinator.enqueueRequest("device_A", countRequest);
+  await coordinator.takeRequests("device_A", "session_A", countRequest.createdAt);
+  const smallEvent = JSON.stringify({ type: "delta", data: { content: "x" } });
+  for (let sequence = 0; sequence < 256; sequence += 1) {
+    assert.equal(
+      await coordinator.submitStreamEvent!(
+        "device_A",
+        "session_A",
+        countRequest.requestId,
+        sequence,
+        smallEvent,
+        countRequest.createdAt
+      ),
+      true
+    );
+    assert.equal(
+      await coordinator.acknowledgeStreamEvent!(
+        "device_A",
+        "session_A",
+        countRequest.requestId,
+        sequence,
+        countRequest.createdAt
+      ),
+      true
+    );
+  }
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      countRequest.requestId,
+      256,
+      smallEvent,
+      countRequest.createdAt
+    ),
+    false,
+    "the 257th output event cancels the stream"
+  );
+  const countState = await coordinator.getRequest(
+    "device_A",
+    countRequest.requestId,
+    countRequest.createdAt
+  );
+  assert.equal(countState?.streamCancelled, true);
+  assert.equal(countState?.streamEventCount, 256);
+});
+
+test("Durable Object accepts only one usage event in the contiguous stream sequence", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const request: GatewayDeviceRequest = {
+    requestId: "stream_usage_once",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama:chat:qwen-local",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:00:30.000Z",
+    status: "pending",
+    stream: true,
+    streamNextSequence: 0,
+    streamAcknowledgedSequence: -1,
+    streamEventCount: 0,
+    streamTotalEventBytes: 0,
+  };
+  await coordinator.enqueueRequest("device_A", request);
+  await coordinator.takeRequests("device_A", "session_A", request.createdAt);
+  const usage = JSON.stringify({ type: "usage", data: { promptTokens: 2, completionTokens: 3 } });
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      1,
+      usage,
+      request.createdAt
+    ),
+    false,
+    "out-of-order usage events are rejected"
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      usage,
+      request.createdAt
+    ),
+    true
+  );
+  assert.equal(
+    await coordinator.acknowledgeStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      0,
+      request.createdAt
+    ),
+    true
+  );
+  assert.equal(
+    await coordinator.submitStreamEvent!(
+      "device_A",
+      "session_A",
+      request.requestId,
+      1,
+      usage,
+      request.createdAt
+    ),
+    false,
+    "a second usage event cancels the compromised stream"
+  );
+  assert.equal(
+    (await coordinator.getRequest("device_A", request.requestId, request.createdAt))
+      ?.streamCancelled,
+    true
+  );
+});
+
 test("completed idempotent results do not consume the pending queue capacity", async () => {
   const { namespace } = makeNamespace();
   const coordinator = new DurableObjectGatewayCoordinator(namespace);

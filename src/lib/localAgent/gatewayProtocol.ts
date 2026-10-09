@@ -7,7 +7,14 @@ export interface LocalAgentGatewayRequest {
   capability: string;
   payload: unknown;
   expiresAt: string;
+  stream?: true;
 }
+
+export type LocalAgentGatewayStreamEvent =
+  | { type: "delta"; data: { content: string } }
+  | { type: "usage"; data: { promptTokens: number; completionTokens: number } }
+  | { type: "done"; data: Record<string, never> }
+  | { type: "error"; data: { code: "capability_execution_failed" } };
 
 export type LocalAgentGatewayOutcome =
   { ok: true; value: unknown } | { ok: false; error: { code: "capability_execution_failed" } };
@@ -40,6 +47,13 @@ export interface LocalAgentGatewayTransport {
     session: LocalAgentGatewaySession,
     result: LocalAgentGatewayResult
   ): Promise<boolean>;
+  submitStreamEvent?(
+    session: LocalAgentGatewaySession,
+    requestId: string,
+    sequence: number,
+    event: LocalAgentGatewayStreamEvent
+  ): Promise<boolean>;
+  cancelStream?(session: LocalAgentGatewaySession, requestId: string): Promise<boolean>;
 }
 
 /** Structural contract implemented by createConnectorGateway(). */
@@ -61,6 +75,18 @@ export interface ConnectorGatewayPort {
     sessionToken: string;
     requestId: string;
     result: unknown;
+  }): Promise<boolean>;
+  submitDeviceStreamEvent?(input: {
+    deviceId: string;
+    sessionToken: string;
+    requestId: string;
+    sequence: number;
+    event: LocalAgentGatewayStreamEvent;
+  }): Promise<boolean>;
+  cancelDeviceStream?(input: {
+    deviceId: string;
+    sessionToken: string;
+    requestId: string;
   }): Promise<boolean>;
 }
 
@@ -88,5 +114,19 @@ export function createConnectorGatewayTransport(
           outcome: result.outcome,
         },
       }),
+    submitStreamEvent: (session, requestId, sequence, event) =>
+      gateway.submitDeviceStreamEvent?.({
+        deviceId: session.deviceId,
+        sessionToken: session.sessionToken,
+        requestId,
+        sequence,
+        event,
+      }) ?? Promise.resolve(false),
+    cancelStream: (session, requestId) =>
+      gateway.cancelDeviceStream?.({
+        deviceId: session.deviceId,
+        sessionToken: session.sessionToken,
+        requestId,
+      }) ?? Promise.resolve(false),
   };
 }

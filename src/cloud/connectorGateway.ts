@@ -38,6 +38,25 @@ export interface GatewayDeviceRequest {
   expiresAt: string;
   status: "pending" | "delivered" | "complete";
   result?: string;
+  stream?: true;
+  streamNextSequence?: number;
+  streamAcknowledgedSequence?: number;
+  streamPendingEvent?: string;
+  streamCancelled?: true;
+  streamTerminal?: true;
+  streamEventCount?: number;
+  streamTotalEventBytes?: number;
+  streamUsageSequence?: number;
+}
+
+export type GatewayCapabilityStreamEvent =
+  | { type: "delta"; data: { content: string } }
+  | { type: "usage"; data: { promptTokens: number; completionTokens: number } }
+  | { type: "done"; data: Record<string, never> }
+  | { type: "error"; data: { code: "capability_execution_failed" } };
+
+export interface GatewayCapabilityStreamEnvelope extends GatewayCapabilityStreamEvent {
+  sequence: number;
 }
 
 export interface GatewayDeviceDirectory {
@@ -87,6 +106,34 @@ export interface GatewayCoordinator {
     now: string
   ): Promise<GatewayDeviceRequest | null>;
   deleteRequest(deviceId: string, requestId: string): Promise<void>;
+  submitStreamEvent?(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    event: string,
+    now: string
+  ): Promise<boolean>;
+  peekStreamEvent?(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    now: string
+  ): Promise<GatewayCapabilityStreamEnvelope | null>;
+  acknowledgeStreamEvent?(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    sequence: number,
+    now: string
+  ): Promise<boolean>;
+  cancelStream?(
+    deviceId: string,
+    sessionId: string,
+    requestId: string,
+    now: string
+  ): Promise<boolean>;
 }
 
 export interface ConnectorGatewayOptions {
@@ -112,6 +159,7 @@ export interface GatewayRequestInput {
   requestCreatedAt?: string;
   /** Retain a retryable request/result until this bounded idempotency expiry. */
   requestExpiresAt?: string;
+  stream?: true;
 }
 
 export interface GatewayDeviceRequestEnvelope {
@@ -119,10 +167,60 @@ export interface GatewayDeviceRequestEnvelope {
   capability: string;
   payload: unknown;
   expiresAt: string;
+  stream?: true;
 }
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_REQUEST_TIMEOUT_MS = 30_000;
+export const MAX_GATEWAY_STREAM_EVENT_BYTES = 8 * 1024;
+
+function validStreamEvent(value: unknown): value is GatewayCapabilityStreamEvent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const event = value as Record<string, unknown>;
+  const data = event.data;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
+  const fields = Object.keys(data as Record<string, unknown>);
+  if (event.type === "delta") {
+    return (
+      fields.length === 1 &&
+      fields[0] === "content" &&
+      typeof (data as { content?: unknown }).content === "string"
+    );
+  }
+  if (event.type === "usage") {
+    const usage = data as { promptTokens?: unknown; completionTokens?: unknown };
+    return (
+      fields.length === 2 &&
+      fields.includes("promptTokens") &&
+      fields.includes("completionTokens") &&
+      Number.isSafeInteger(usage.promptTokens) &&
+      Number(usage.promptTokens) >= 0 &&
+      Number.isSafeInteger(usage.completionTokens) &&
+      Number(usage.completionTokens) >= 0
+    );
+  }
+  if (event.type === "done") return fields.length === 0;
+  if (event.type === "error") {
+    return (
+      fields.length === 1 &&
+      fields[0] === "code" &&
+      (data as { code?: unknown }).code === "capability_execution_failed"
+    );
+  }
+  return false;
+}
+
+function serializeStreamEvent(value: unknown): string | null {
+  if (!validStreamEvent(value)) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    return new TextEncoder().encode(serialized).byteLength <= MAX_GATEWAY_STREAM_EVENT_BYTES
+      ? serialized
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 function serializeBounded(value: unknown, label: string): string {
   let serialized: string;
@@ -175,6 +273,19 @@ export type GatewayDeviceHealthResult =
 
 export type GatewayRequestResult =
   | { ok: true; requestId: string; result: unknown }
+  | {
+      ok: false;
+      reason:
+        | "tenant_mismatch"
+        | "revoked"
+        | "offline"
+        | "capability_unavailable"
+        | "timeout"
+        | "queue_full";
+    };
+
+export type GatewayStreamStartResult =
+  | { ok: true; requestId: string; expiresAt: string }
   | {
       ok: false;
       reason:
@@ -475,6 +586,15 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         createdAt,
         expiresAt,
         status: "pending",
+        ...(input.stream
+          ? {
+              stream: true as const,
+              streamNextSequence: 0,
+              streamAcknowledgedSequence: -1,
+              streamEventCount: 0,
+              streamTotalEventBytes: 0,
+            }
+          : {}),
       };
       let storedRequest: GatewayDeviceRequest | null = null;
       if (input.requestId) {
@@ -589,7 +709,271 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         capability: request.capability,
         payload: JSON.parse(request.payload) as unknown,
         expiresAt: request.expiresAt,
+        ...(request.stream ? { stream: true as const } : {}),
       }));
+    },
+
+    /** Starts one bounded Ollama stream; its consumer must advance events to release the device. */
+    async startCapabilityStream(input: GatewayRequestInput): Promise<GatewayStreamStartResult> {
+      const timeoutMs = input.timeoutMs ?? 15_000;
+      if (
+        !input.stream ||
+        !input.capability.startsWith("ollama:chat:") ||
+        !Number.isSafeInteger(timeoutMs) ||
+        timeoutMs < 100 ||
+        timeoutMs > MAX_REQUEST_TIMEOUT_MS
+      ) {
+        throw new Error("Invalid gateway stream request");
+      }
+      const payload = serializeBounded(input.payload, "Gateway request");
+      const requestId = input.requestId ?? createRequestId();
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId))
+        throw new Error("Gateway request identity is invalid");
+      const authorization = await this.authorizeCapability(input);
+      if (!authorization.ok) return authorization;
+      const timestamp = now();
+      const createdAt = input.requestCreatedAt ?? new Date(timestamp).toISOString();
+      const expiresAt = input.requestExpiresAt ?? new Date(timestamp + timeoutMs).toISOString();
+      if (
+        !Number.isFinite(Date.parse(createdAt)) ||
+        Date.parse(createdAt) > timestamp ||
+        !Number.isFinite(Date.parse(expiresAt)) ||
+        Date.parse(expiresAt) <= timestamp ||
+        Date.parse(expiresAt) - timestamp > 15 * 60_000
+      )
+        throw new Error("Gateway request expiry must be within 15 minutes");
+      const existing = await options.coordinator.getRequest(
+        input.deviceId,
+        requestId,
+        new Date(timestamp).toISOString()
+      );
+      if (existing) return { ok: false, reason: "queue_full" };
+      const request: GatewayDeviceRequest = {
+        requestId,
+        tenantId: input.tenantId,
+        sessionId: authorization.target.sessionId,
+        capability: authorization.target.capability,
+        payload,
+        createdAt,
+        expiresAt,
+        status: "pending",
+        stream: true,
+        streamNextSequence: 0,
+        streamAcknowledgedSequence: -1,
+        streamEventCount: 0,
+        streamTotalEventBytes: 0,
+      };
+      if (!(await options.coordinator.enqueueRequest(input.deviceId, request)))
+        return { ok: false, reason: "queue_full" };
+      return { ok: true, requestId, expiresAt };
+    },
+
+    async submitDeviceStreamEvent(input: {
+      deviceId: string;
+      sessionToken: string;
+      requestId: string;
+      sequence: number;
+      event: unknown;
+    }): Promise<boolean> {
+      const serialized = serializeStreamEvent(input.event);
+      if (
+        !serialized ||
+        !Number.isSafeInteger(input.sequence) ||
+        input.sequence < 0 ||
+        input.sequence > 100_000
+      )
+        return false;
+      const requestBeforeSubmit = await options.coordinator.getRequest(
+        input.deviceId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
+      if (!requestBeforeSubmit || !requestBeforeSubmit.stream) return false;
+      const deadline = Math.min(
+        now() + MAX_REQUEST_TIMEOUT_MS,
+        Date.parse(requestBeforeSubmit.expiresAt)
+      );
+      while (now() < deadline) {
+        const authenticated = await authenticateDeviceSession(input.deviceId, input.sessionToken);
+        if (!authenticated || !options.coordinator.submitStreamEvent) return false;
+        const submitted = await options.coordinator.submitStreamEvent(
+          input.deviceId,
+          authenticated.session.sessionId,
+          input.requestId,
+          input.sequence,
+          serialized,
+          new Date(now()).toISOString()
+        );
+        if (!submitted) {
+          const request = await options.coordinator.getRequest(
+            input.deviceId,
+            input.requestId,
+            new Date(now()).toISOString()
+          );
+          if (
+            request.streamAcknowledgedSequence !== undefined &&
+            request.streamAcknowledgedSequence >= input.sequence
+          )
+            return true;
+          if (!request || request.streamCancelled || request.status === "complete") return false;
+          await wait(Math.min(50, Math.max(1, deadline - now())));
+          continue;
+        }
+        while (now() < deadline) {
+          const current = await authenticateDeviceSession(input.deviceId, input.sessionToken);
+          if (!current || current.session.sessionId !== authenticated.session.sessionId)
+            return false;
+          const request = await options.coordinator.getRequest(
+            input.deviceId,
+            input.requestId,
+            new Date(now()).toISOString()
+          );
+          if (!request) return false;
+          if (
+            request.streamAcknowledgedSequence !== undefined &&
+            request.streamAcknowledgedSequence >= input.sequence
+          )
+            return true;
+          if (request.streamCancelled || request.status === "complete") return false;
+          await wait(Math.min(50, Math.max(1, deadline - now())));
+        }
+      }
+      return false;
+    },
+
+    async readCapabilityStreamEvent(input: {
+      tenantId: string;
+      deviceId: string;
+      requestId: string;
+      sequence: number;
+    }): Promise<GatewayCapabilityStreamEnvelope | null> {
+      const initial = await options.coordinator.getRequest(
+        input.deviceId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
+      if (!initial || initial.tenantId !== input.tenantId || !initial.stream) return null;
+      const deadline = Date.parse(initial.expiresAt);
+      while (now() < deadline) {
+        // Stream requests carry their precise model capability; read it from the durable request.
+        const request = await options.coordinator.getRequest(
+          input.deviceId,
+          input.requestId,
+          new Date(now()).toISOString()
+        );
+        if (
+          !request ||
+          request.tenantId !== input.tenantId ||
+          !request.stream ||
+          request.streamCancelled
+        )
+          return null;
+        const active = await this.authorizeCapability({
+          tenantId: input.tenantId,
+          deviceId: input.deviceId,
+          capability: request.capability,
+        });
+        if (!active.ok || active.target.sessionId !== request.sessionId) return null;
+        if (options.coordinator.peekStreamEvent) {
+          const event = await options.coordinator.peekStreamEvent(
+            input.deviceId,
+            request.sessionId,
+            input.requestId,
+            input.sequence,
+            new Date(now()).toISOString()
+          );
+          if (event) return event;
+        }
+        if (request.streamTerminal && !request.streamPendingEvent) return null;
+        await wait(Math.min(100, Math.max(1, deadline - now())));
+      }
+      return null;
+    },
+
+    async acknowledgeCapabilityStreamEvent(input: {
+      tenantId: string;
+      deviceId: string;
+      requestId: string;
+      sequence: number;
+    }): Promise<boolean> {
+      const request = await options.coordinator.getRequest(
+        input.deviceId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
+      if (
+        !request ||
+        request.tenantId !== input.tenantId ||
+        !request.stream ||
+        !options.coordinator.acknowledgeStreamEvent
+      )
+        return false;
+      const active = await this.authorizeCapability({
+        tenantId: input.tenantId,
+        deviceId: input.deviceId,
+        capability: request.capability,
+      });
+      if (!active.ok || active.target.sessionId !== request.sessionId) return false;
+      return options.coordinator.acknowledgeStreamEvent(
+        input.deviceId,
+        request.sessionId,
+        input.requestId,
+        input.sequence,
+        new Date(now()).toISOString()
+      );
+    },
+
+    async cancelCapabilityStream(input: {
+      tenantId: string;
+      deviceId: string;
+      requestId: string;
+    }): Promise<boolean> {
+      const request = await options.coordinator.getRequest(
+        input.deviceId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
+      if (
+        !request ||
+        request.tenantId !== input.tenantId ||
+        !request.stream ||
+        !options.coordinator.cancelStream
+      )
+        return false;
+      const active = await this.authorizeCapability({
+        tenantId: input.tenantId,
+        deviceId: input.deviceId,
+        capability: request.capability,
+      });
+      if (!active.ok || active.target.sessionId !== request.sessionId) return false;
+      return options.coordinator.cancelStream(
+        input.deviceId,
+        request.sessionId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
+    },
+
+    async cancelDeviceStream(input: {
+      deviceId: string;
+      sessionToken: string;
+      requestId: string;
+    }): Promise<boolean> {
+      const authenticated = await authenticateDeviceSession(input.deviceId, input.sessionToken);
+      if (!authenticated || !options.coordinator.cancelStream) return false;
+      const request = await options.coordinator.getRequest(
+        input.deviceId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
+      if (!request || request.sessionId !== authenticated.session.sessionId || !request.stream)
+        return false;
+      return options.coordinator.cancelStream(
+        input.deviceId,
+        authenticated.session.sessionId,
+        input.requestId,
+        new Date(now()).toISOString()
+      );
     },
 
     /** Device-side response primitive; results are tied to the delivering session. */

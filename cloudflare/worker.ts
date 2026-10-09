@@ -73,6 +73,22 @@ export class GatewaySessionObject extends DurableObject<CloudflareEnv> {
   deleteRequest(...args: Parameters<GatewayCoordinatorStub["deleteRequest"]>) {
     return this.coordinator.deleteRequest(...args);
   }
+
+  submitStreamEvent(...args: Parameters<GatewayCoordinatorStub["submitStreamEvent"]>) {
+    return this.coordinator.submitStreamEvent(...args);
+  }
+
+  peekStreamEvent(...args: Parameters<GatewayCoordinatorStub["peekStreamEvent"]>) {
+    return this.coordinator.peekStreamEvent(...args);
+  }
+
+  acknowledgeStreamEvent(...args: Parameters<GatewayCoordinatorStub["acknowledgeStreamEvent"]>) {
+    return this.coordinator.acknowledgeStreamEvent(...args);
+  }
+
+  cancelStream(...args: Parameters<GatewayCoordinatorStub["cancelStream"]>) {
+    return this.coordinator.cancelStream(...args);
+  }
 }
 
 const worker = {

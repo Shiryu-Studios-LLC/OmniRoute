@@ -3,6 +3,7 @@ import {
   type LocalAgentGatewayRequest,
   type LocalAgentGatewayResult,
   type LocalAgentGatewaySession,
+  type LocalAgentGatewayStreamEvent,
   type LocalAgentGatewayTransport,
 } from "./gatewayProtocol";
 
@@ -10,14 +11,42 @@ const BASE_PATH = "/__gateway/v1/device";
 const MAX_REQUEST_BYTES = 80 * 1024;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
+const STREAM_EVENT_TIMEOUT_MS = 35_000;
 
 export interface HttpGatewayTransportOptions {
   fetch: typeof fetch;
   requestTimeoutMs?: number;
+  streamEventTimeoutMs?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validStreamEvent(value: LocalAgentGatewayStreamEvent): boolean {
+  if (!isRecord(value) || !isRecord(value.data)) return false;
+  if (value.type === "delta") {
+    return (
+      Object.keys(value.data).length === 1 &&
+      typeof value.data.content === "string" &&
+      new TextEncoder().encode(value.data.content).byteLength <= 4096
+    );
+  }
+  if (value.type === "usage") {
+    return (
+      Object.keys(value.data).length === 2 &&
+      Number.isSafeInteger(value.data.promptTokens) &&
+      Number(value.data.promptTokens) >= 0 &&
+      Number.isSafeInteger(value.data.completionTokens) &&
+      Number(value.data.completionTokens) >= 0
+    );
+  }
+  if (value.type === "done") return Object.keys(value.data).length === 0;
+  return (
+    value.type === "error" &&
+    Object.keys(value.data).length === 1 &&
+    value.data.code === "capability_execution_failed"
+  );
 }
 
 function gatewayBaseUrl(rawUrl: string): URL {
@@ -76,8 +105,20 @@ export function createHttpLocalAgentGatewayTransport(
   if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 60_000) {
     throw new Error("Invalid Local Agent gateway request timeout");
   }
+  const streamEventTimeout = options.streamEventTimeoutMs ?? STREAM_EVENT_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(streamEventTimeout) ||
+    streamEventTimeout < 100 ||
+    streamEventTimeout > 120_000
+  ) {
+    throw new Error("Invalid Local Agent gateway stream event timeout");
+  }
 
-  async function post(path: string, body: unknown): Promise<{ status: number; body: unknown }> {
+  async function post(
+    path: string,
+    body: unknown,
+    requestTimeout = timeout
+  ): Promise<{ status: number; body: unknown }> {
     const serialized = JSON.stringify(body);
     if (new TextEncoder().encode(serialized).byteLength > MAX_REQUEST_BYTES) {
       throw new Error("Local Agent gateway request exceeds the size limit");
@@ -86,7 +127,7 @@ export function createHttpLocalAgentGatewayTransport(
     const response = await options.fetch(url, {
       method: "POST",
       redirect: "error",
-      signal: AbortSignal.timeout(timeout),
+      signal: AbortSignal.timeout(requestTimeout),
       headers: { "content-type": "application/json", accept: "application/json" },
       body: serialized,
     });
@@ -164,7 +205,8 @@ export function createHttpLocalAgentGatewayTransport(
           value.capability.length < 1 ||
           value.capability.length > 128 ||
           typeof value.expiresAt !== "string" ||
-          !Number.isFinite(Date.parse(value.expiresAt))
+          !Number.isFinite(Date.parse(value.expiresAt)) ||
+          (value.stream !== undefined && value.stream !== true)
         ) {
           throw new Error("Local Agent gateway returned an invalid request envelope");
         }
@@ -176,6 +218,7 @@ export function createHttpLocalAgentGatewayTransport(
           capability: value.capability,
           payload: value.payload,
           expiresAt: value.expiresAt,
+          ...(value.stream === true ? { stream: true as const } : {}),
         });
       }
       return requests;
@@ -187,6 +230,54 @@ export function createHttpLocalAgentGatewayTransport(
         sessionToken: session.sessionToken,
         requestId: result.requestId,
         result: { version: result.version, outcome: result.outcome },
+      });
+      return (
+        response.status === 200 &&
+        isRecord(response.body) &&
+        response.body.version === LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION &&
+        response.body.accepted === true
+      );
+    },
+    async submitStreamEvent(
+      session: LocalAgentGatewaySession,
+      requestId: string,
+      sequence: number,
+      event: LocalAgentGatewayStreamEvent
+    ) {
+      if (
+        !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) ||
+        !Number.isSafeInteger(sequence) ||
+        sequence < 0 ||
+        !validStreamEvent(event) ||
+        new TextEncoder().encode(JSON.stringify(event)).byteLength > 8 * 1024
+      ) {
+        return false;
+      }
+      const response = await post(
+        "stream-event",
+        {
+          version: LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
+          deviceId: session.deviceId,
+          sessionToken: session.sessionToken,
+          requestId,
+          sequence,
+          event,
+        },
+        streamEventTimeout
+      );
+      return (
+        response.status === 200 &&
+        isRecord(response.body) &&
+        response.body.version === LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION &&
+        response.body.accepted === true
+      );
+    },
+    async cancelStream(session: LocalAgentGatewaySession, requestId: string) {
+      const response = await post("stream-cancel", {
+        version: LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
+        deviceId: session.deviceId,
+        sessionToken: session.sessionToken,
+        requestId,
       });
       return (
         response.status === 200 &&

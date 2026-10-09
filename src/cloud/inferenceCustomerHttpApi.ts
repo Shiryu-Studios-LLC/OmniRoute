@@ -286,8 +286,12 @@ async function fetchTimedBody(
         response = await fetcher(url, {
           ...init,
           signal: controller.signal,
-          redirect: "error",
+          redirect: "manual",
         });
+        if (response.status >= 300 && response.status <= 399) {
+          await response.body?.cancel().catch(() => undefined);
+          return { response, body: null };
+        }
         const body = await readBoundedResponse(response, maxBytes);
         return { response, body };
       })(),
@@ -490,7 +494,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
           stream: true,
         }),
         signal: controller.signal,
-        redirect: "error",
+        redirect: "manual",
       }),
       timeout,
     ]);
@@ -514,7 +518,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
     }
     return failedResponse("Inference outcome is unavailable and will not be retried", 504);
   }
-  if (!response.ok || !response.body) {
+  if ((response.status >= 300 && response.status <= 399) || !response.ok || !response.body) {
     clearTimeout(timer);
     await response.body?.cancel().catch(() => undefined);
     try {

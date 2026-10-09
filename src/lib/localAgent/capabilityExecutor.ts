@@ -1,6 +1,7 @@
 import {
   requestLocalServiceBytes,
   requestLocalServiceJson,
+  requestLocalServiceStream,
   type LocalDiscoveryConfig,
   type LocalDiscoveryResult,
 } from "./localDiscovery";
@@ -10,9 +11,14 @@ import {
   type LocalMcpDependencies,
   validateLocalMcpServers,
 } from "./localMcp";
+import type { LocalAgentGatewayStreamEvent } from "./gatewayProtocol";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_GATEWAY_RESULT_BYTES = 56 * 1024;
+const MAX_STREAM_OUTPUT_BYTES = 128 * 1024;
+const MAX_STREAM_LINE_BYTES = 64 * 1024;
+const STREAM_DELTA_BYTES = 4 * 1024;
+const OLLAMA_CHAT_TIMEOUT_MS = 25_000;
 const MAX_COMFYUI_IMAGES = 2;
 const COMFYUI_POLL_TIMEOUT_MS = 18_000;
 const COMFYUI_POLL_INTERVAL_MS = 400;
@@ -27,6 +33,13 @@ export interface LocalCapabilityExecutorDependencies {
   fetch: typeof fetch;
   resolveHost?: (hostname: string) => Promise<string[]>;
   mcp?: LocalMcpDependencies;
+}
+
+export interface LocalCapabilityStreamDependencies extends LocalCapabilityExecutorDependencies {
+  signal: AbortSignal;
+  emit: (
+    event: Extract<LocalAgentGatewayStreamEvent, { type: "delta" | "usage" }>
+  ) => Promise<void>;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -306,7 +319,8 @@ export async function executeLocalCapability(
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...payload, model, stream: false }),
-      }
+      },
+      OLLAMA_CHAT_TIMEOUT_MS
     );
     const chatResponse = record(response);
     if (!chatResponse) throw new Error("Ollama returned an invalid chat response");
@@ -341,4 +355,131 @@ export async function executeLocalCapability(
   }
 
   throw new Error("Local capability is unsupported");
+}
+
+/** Stream only advertised Ollama chat capabilities through bounded normalized events. */
+export async function executeLocalCapabilityStream(
+  config: LocalDiscoveryConfig,
+  discovery: LocalDiscoveryResult,
+  request: LocalCapabilityRequest,
+  dependencies: LocalCapabilityStreamDependencies
+): Promise<void> {
+  const serializedPayload = boundedJson(request.payload);
+  const chatPrefix = "ollama:chat:";
+  if (!request.capability.startsWith(chatPrefix)) {
+    throw new Error("Streaming is supported only for local Ollama chat capabilities");
+  }
+  if (!discovery.heartbeat.capabilities.includes(request.capability)) {
+    throw new Error("Local capability is unavailable");
+  }
+  const model = request.capability.slice(chatPrefix.length);
+  if (!model || model.length > 128 || !config.ollamaUrl) {
+    throw new Error("Ollama chat capability is unavailable");
+  }
+  const payload = validateOllamaChatPayload(JSON.parse(serializedPayload) as unknown);
+  if (payload.tools !== undefined) {
+    throw new Error("Streaming Ollama tool calls are not supported");
+  }
+  const response = await requestLocalServiceStream(
+    config.ollamaUrl,
+    "/api/chat",
+    dependencies.fetch,
+    dependencies.resolveHost,
+    {
+      method: "POST",
+      signal: dependencies.signal,
+      headers: { "content-type": "application/json", accept: "application/x-ndjson" },
+      body: JSON.stringify({ ...payload, model, stream: true }),
+    }
+  );
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let outputBytes = 0;
+  let usage: { promptTokens: number; completionTokens: number } | null = null;
+  let terminalSeen = false;
+
+  const consumeLine = async (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    if (new TextEncoder().encode(trimmed).byteLength > MAX_STREAM_LINE_BYTES) {
+      throw new Error("Ollama stream line exceeds the size limit");
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(trimmed) as unknown;
+    } catch {
+      throw new Error("Ollama returned an invalid chat stream");
+    }
+    const row = record(value);
+    if (!row) throw new Error("Ollama returned an invalid chat stream");
+    if (row.error !== undefined) throw new Error("Ollama chat stream failed");
+    const message = record(row.message);
+    if (message?.tool_calls !== undefined) {
+      throw new Error("Streaming Ollama tool calls are not supported");
+    }
+    if (typeof message?.content === "string" && message.content.length > 0) {
+      const bytes = new TextEncoder().encode(message.content);
+      outputBytes += bytes.byteLength;
+      if (outputBytes > MAX_STREAM_OUTPUT_BYTES) {
+        throw new Error("Ollama stream output exceeds the size limit");
+      }
+      let part = "";
+      let partBytes = 0;
+      for (const character of message.content) {
+        const characterBytes = new TextEncoder().encode(character).byteLength;
+        if (partBytes + characterBytes > STREAM_DELTA_BYTES && part) {
+          await dependencies.emit({ type: "delta", data: { content: part } });
+          part = "";
+          partBytes = 0;
+        }
+        part += character;
+        partBytes += characterBytes;
+      }
+      if (part) await dependencies.emit({ type: "delta", data: { content: part } });
+    }
+    if (row.done === true) {
+      terminalSeen = true;
+      const promptTokens = row.prompt_eval_count;
+      const completionTokens = row.eval_count;
+      if (
+        typeof promptTokens === "number" &&
+        Number.isSafeInteger(promptTokens) &&
+        promptTokens >= 0 &&
+        typeof completionTokens === "number" &&
+        Number.isSafeInteger(completionTokens) &&
+        completionTokens >= 0
+      ) {
+        usage = { promptTokens, completionTokens };
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      if (dependencies.signal.aborted) throw new Error("Ollama stream was canceled");
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      if (new TextEncoder().encode(pending).byteLength > MAX_STREAM_LINE_BYTES * 2) {
+        throw new Error("Ollama stream buffer exceeds the size limit");
+      }
+      let newline = pending.indexOf("\n");
+      while (newline >= 0) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        await consumeLine(line);
+        newline = pending.indexOf("\n");
+      }
+    }
+    pending += decoder.decode();
+    if (pending.trim()) await consumeLine(pending);
+    if (!terminalSeen) throw new Error("Ollama stream ended before completion");
+    if (usage) await dependencies.emit({ type: "usage", data: usage });
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
