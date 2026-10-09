@@ -16,6 +16,7 @@ import {
 import { randomBytes } from "node:crypto";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import {
   getLocalAgentSystemdStatus,
   installLocalAgentSystemd,
@@ -43,6 +44,7 @@ import {
   readLocalAgentCredential,
   saveLocalAgentCredential,
 } from "../localAgentWindowsCredentials.mjs";
+import { installLocalAgentOllama } from "../localAgentOllamaInstall.mjs";
 
 const DEFAULT_CREDENTIAL_ENV = "SHIRYU_LOCAL_AGENT_CREDENTIAL";
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -678,6 +680,49 @@ export async function checkLocalAgentCommand(
   };
 }
 
+async function confirmOllamaInstall({
+  yes = false,
+  stdin = process.stdin,
+  stdout = process.stdout,
+} = {}) {
+  if (yes) return true;
+  if (!stdin.isTTY || !stdout.isTTY) {
+    throw new Error(
+      "Run this command in a terminal to confirm, or pass --yes to install explicitly."
+    );
+  }
+  const terminal = createInterface({ input: stdin, output: stdout });
+  try {
+    const answer = await terminal.question(
+      "Download up to 2 GB and install the verified Ollama release into ~/.local, linking ~/.local/bin/ollama? No model will be downloaded. [y/N] "
+    );
+    return /^y(?:es)?$/i.test(answer.trim());
+  } finally {
+    terminal.close();
+  }
+}
+
+/** Install Ollama only after explicit confirmation; this never installs models or system services. */
+export async function installLocalAgentOllamaCommand(
+  options = {},
+  {
+    platform = process.platform,
+    home = homedir(),
+    install = installLocalAgentOllama,
+    stdin = process.stdin,
+    stdout = process.stdout,
+  } = {}
+) {
+  if (!(await confirmOllamaInstall({ yes: options.yes, stdin, stdout }))) {
+    stdout.write("Ollama installation cancelled.\n");
+    return { installed: false };
+  }
+  const result = await install({ platform, home });
+  stdout.write(`Ollama ${result.version} installed at ${result.binary}.\n`);
+  stdout.write("No model was downloaded. Run 'ollama serve' and pull a model when you choose.\n");
+  return { installed: true, ...result };
+}
+
 export function registerLocalAgent(
   program,
   { platform = process.platform, keytarLoader, home = homedir() } = {}
@@ -685,6 +730,23 @@ export function registerLocalAgent(
   const localAgent = program
     .command("local-agent")
     .description("Manage a tenant-registered outbound Local Agent");
+
+  localAgent
+    .command("ollama")
+    .description("Manage the optional local Ollama runtime")
+    .command("install")
+    .description(
+      "Install the official Ollama release into your Linux user account (no model download)"
+    )
+    .option("--yes", "Confirm installation without an interactive prompt")
+    .action(async (options) => {
+      try {
+        await installLocalAgentOllamaCommand(options, { platform, home });
+      } catch (error) {
+        process.stderr.write(`${error?.message || "Ollama installation failed."}\n`);
+        process.exitCode = 1;
+      }
+    });
 
   localAgent
     .command("check")
