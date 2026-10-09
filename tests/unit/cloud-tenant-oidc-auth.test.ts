@@ -345,6 +345,7 @@ async function setup() {
     "0022_provider_execution_contract.sql",
     "0023_cloud_tenant_business_profiles.sql",
     "0024_cloud_tenant_business_profile_configuration.sql",
+    "0026_revoke_customer_oidc_sessions_on_membership_change.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -581,7 +582,7 @@ test("business profile portal is owner/admin session scoped, origin checked, bou
     .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
     .bind(tenant.id, membership.id)
     .run();
-  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  let portal = await createPortalSession(db, tenant.slug, "external-user-17");
   const headers = (extra: Record<string, string> = {}) => ({
     Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
     ...extra,
@@ -653,6 +654,7 @@ test("business profile portal is owner/admin session scoped, origin checked, bou
     .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
     .bind(tenant.id, membership.id)
     .run();
+  portal = await createPortalSession(db, tenant.slug, "external-user-17");
   const adminSaved = await portal.app.fetch(
     new Request(path, {
       method: "PUT",
@@ -1097,7 +1099,7 @@ test("MCP portal opt-in is owner/admin scoped, MCP-only, audited, and does not e
     .prepare("UPDATE cloud_tenant_settings SET local_ai_enabled = 1 WHERE tenant_id = ?")
     .bind(tenant.id)
     .run();
-  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  let portal = await createPortalSession(db, tenant.slug, "external-user-17");
   const path = `${ORIGIN}${CLOUD_TENANT_MCP_SETTINGS_PATH}`;
   const headers = (extra: Record<string, string> = {}) => ({
     Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
@@ -1241,6 +1243,7 @@ test("MCP portal opt-in is owner/admin scoped, MCP-only, audited, and does not e
     .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
     .bind(tenant.id, membership.id)
     .run();
+  portal = await createPortalSession(db, tenant.slug, "external-user-17");
   await db.exec(`CREATE TRIGGER reject_mcp_portal_settings_audit
     BEFORE INSERT ON cloud_compliance_audit
     WHEN NEW.action = 'customer.settings.mcp_portal.update'
@@ -1419,7 +1422,7 @@ test("provider connection portal enforces owner sessions and reuses encrypted fi
     .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
     .bind(tenant.id, membership.id)
     .run();
-  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  let portal = await createPortalSession(db, tenant.slug, "external-user-17");
   const secret = "sk-test-portal-provider-secret";
   const path = `${ORIGIN}${CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH}`;
   const headers = (extra: Record<string, string> = {}) => ({
@@ -1508,6 +1511,7 @@ test("provider connection portal enforces owner sessions and reuses encrypted fi
     .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
     .bind(tenant.id, membership.id)
     .run();
+  portal = await createPortalSession(db, tenant.slug, "external-user-17");
 
   const edited = await portal.app.fetch(
     new Request(`${path}/provider-a`, {
@@ -2592,6 +2596,94 @@ test("OIDC owner member API paginates only its tenant and CAS-updates with key r
   assert.equal(JSON.stringify(audits).includes("external-user-17"), false);
 });
 
+test("membership role edits permanently revoke existing OIDC sessions", async () => {
+  const { db, tenant, membership: owner } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, owner.id)
+    .run();
+  const target = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "membership-session-revocation-target",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "session-revocation-target",
+    membershipId: target.id,
+  });
+  const ownerPortal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const targetPortal = await createPortalSession(db, tenant.slug, "session-revocation-target");
+  const inspect = () =>
+    targetPortal.app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+        headers: {
+          Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${targetPortal.cookie}`,
+        },
+      })
+    );
+  const before = await inspect();
+  assert.equal(before.status, 200);
+
+  const updateMembership = async (role: "member" | "viewer") => {
+    const current = await getCloudCustomerMembership(db, tenant.id, target.id);
+    assert.ok(current);
+    return ownerPortal.app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_MEMBERS_PATH}/${target.id}`, {
+        method: "PATCH",
+        headers: {
+          Origin: ORIGIN,
+          "Content-Type": "application/json",
+          Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${ownerPortal.cookie}`,
+        },
+        body: JSON.stringify({ role, expectedUpdatedAt: current.updatedAt }),
+      })
+    );
+  };
+
+  const demote = await updateMembership("viewer");
+  assert.equal(demote.status, 200, await demote.clone().text());
+  assert.equal((await inspect()).status, 401, "role change revokes the old session immediately");
+
+  const restore = await updateMembership("member");
+  assert.equal(restore.status, 200, await restore.clone().text());
+  assert.equal(
+    (await inspect()).status,
+    401,
+    "restoring the old role must not reactivate the revoked session"
+  );
+
+  const freshPortal = await createPortalSession(db, tenant.slug, "session-revocation-target");
+  const inspectFreshSession = () =>
+    freshPortal.app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+        headers: {
+          Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${freshPortal.cookie}`,
+        },
+      })
+    );
+  const membership = await getCloudCustomerMembership(db, tenant.id, target.id);
+  assert.ok(membership);
+  const staleUpdatedAt = new Date(Date.parse(membership.updatedAt) - 1).toISOString();
+  await assert.rejects(
+    updateCloudCustomerMembership(db, {
+      tenantId: tenant.id,
+      membershipId: target.id,
+      role: membership.role,
+      isActive: membership.isActive,
+      expectedUpdatedAt: staleUpdatedAt,
+      now: membership.updatedAt,
+    }),
+    CloudMembershipConflictError
+  );
+  assert.equal(
+    (await inspectFreshSession()).status,
+    200,
+    "a stale CAS rejection with now equal to the stored updatedAt must not revoke a live session"
+  );
+});
+
 test("OIDC portal owners can issue, list, and revoke only their own API keys", async () => {
   const { db, tenant, membership: owner } = await setup();
   await db
@@ -2822,7 +2914,7 @@ test("OIDC member API restricts admins from owners and preserves the last active
   assert.equal(unchanged?.isActive, true);
 });
 
-test("membership audit failure rolls back the member update and API-key revocation", async () => {
+test("membership audit failure rolls back member, API-key, and OIDC-session revocation", async () => {
   const { db, tenant, membership: owner } = await setup();
   await db
     .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
@@ -2833,6 +2925,17 @@ test("membership audit failure rolls back the member update and API-key revocati
     principalId: "membership-audit-failure-target",
     role: "member",
   });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "membership-audit-failure-target",
+    membershipId: target.id,
+  });
+  const targetPortal = await createPortalSession(
+    db,
+    tenant.slug,
+    "membership-audit-failure-target"
+  );
   const key = await issueCloudCustomerApiKey(db, { tenantId: tenant.id, membershipId: target.id });
   const targetBefore = await getCloudCustomerMembership(db, tenant.id, target.id);
   assert.ok(targetBefore);
@@ -2861,6 +2964,18 @@ test("membership audit failure rolls back the member update and API-key revocati
     })
   );
   assert.equal(response.status, 503);
+  const targetSession = await targetPortal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${targetPortal.cookie}`,
+      },
+    })
+  );
+  assert.equal(
+    targetSession.status,
+    200,
+    "OIDC session revocation must roll back with the rejected membership batch"
+  );
   const unchanged = await getCloudCustomerMembership(db, tenant.id, target.id);
   assert.equal(unchanged?.isActive, true, "membership change must roll back with audit failure");
   const storedKey = db.raw
