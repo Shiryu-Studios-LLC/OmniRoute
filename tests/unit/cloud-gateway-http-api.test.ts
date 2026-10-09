@@ -144,6 +144,7 @@ function createRuntimeFixture(
     };
     gatewayPairingIssueRateLimit?: { limit: number; windowMs: number };
     gatewayPairingExchangeRateLimit?: { limit: number; windowMs: number };
+    gatewayRequestBodyTimeoutMs?: number;
     currentClock?: boolean;
     localAiEnabled?: boolean;
   } = {}
@@ -197,6 +198,7 @@ function createRuntimeFixture(
     gatewayDeviceRateLimits: options.gatewayDeviceRateLimits,
     gatewayPairingIssueRateLimit: options.gatewayPairingIssueRateLimit,
     gatewayPairingExchangeRateLimit: options.gatewayPairingExchangeRateLimit,
+    gatewayRequestBodyTimeoutMs: options.gatewayRequestBodyTimeoutMs,
   });
   const fetch = (input: RequestInfo | URL, init?: RequestInit) =>
     runtime.fetch(input instanceof Request ? input : new Request(input, init));
@@ -1424,6 +1426,33 @@ test("Worker rejects an oversized body without relying on Content-Length", async
     assert.equal(request.headers.get("content-length"), null);
     const response = await fixture.fetch(request);
     assert.equal(response.status, 400);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
+test("Worker cancels a stalled gateway request body after the configured read timeout", async () => {
+  const fixture = createRuntimeFixture({ gatewayRequestBodyTimeoutMs: 5 });
+  let cancelled = false;
+  try {
+    const body = new ReadableStream<Uint8Array>({
+      pull() {},
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const response = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/device/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" })
+    );
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "Invalid or oversized JSON body" });
+    assert.equal(cancelled, true);
   } finally {
     fixture.d1.db.close();
   }

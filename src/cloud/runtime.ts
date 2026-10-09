@@ -92,6 +92,7 @@ export interface CloudRuntimeOptions {
   };
   gatewayPairingExchangeRateLimit?: { limit: number; windowMs: number };
   gatewayPairingIssueRateLimit?: { limit: number; windowMs: number };
+  gatewayRequestBodyTimeoutMs?: number;
 }
 
 export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
@@ -390,6 +391,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             connectFallbackRateLimit: options.gatewayConnectFallbackRateLimit,
             rateLimits: options.gatewayDeviceRateLimits,
             pairingExchangeRateLimit: options.gatewayPairingExchangeRateLimit,
+            bodyReadTimeoutMs: options.gatewayRequestBodyTimeoutMs,
           });
         } catch {
           return Response.json(

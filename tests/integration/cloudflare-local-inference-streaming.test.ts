@@ -330,11 +330,11 @@ test(
     assert.equal(connection.response.status, 201, JSON.stringify(connection.body));
 
     const idempotencyKey = `cloud-local-inference-${crypto.randomUUID()}`;
-    const inferenceRequest = (requestIdempotencyKey = idempotencyKey) =>
+    const inferenceRequest = (requestIdempotencyKey = idempotencyKey, bearerToken = customerKey) =>
       fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${customerKey}`,
+          authorization: `Bearer ${bearerToken}`,
           "content-type": "application/json",
           "idempotency-key": requestIdempotencyKey,
         },
@@ -458,6 +458,102 @@ test(
     assert.equal((finalState.body.reservations as unknown[]).length, 1);
     assert.equal((finalState.body.audits as unknown[]).length, 1);
 
+    // Idempotency identity is tenant-scoped. A second customer can use the
+    // same client key without replaying tenant A's transcript or request ID.
+    const tenantBId = `inference-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+    const tenantB = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
+      token: adminToken,
+      body: {
+        id: tenantBId,
+        name: "Local Inference Integration B",
+        slug: tenantBId,
+        ownerPrincipalId: `principal-${tenantBId}`,
+      },
+    });
+    assert.equal(tenantB.response.status, 201, JSON.stringify(tenantB.body));
+    const customerBKey = String(tenantB.body.ownerApiKey.token);
+    assert.match(customerBKey, /^orc_live_/);
+    const tenantBEntitlement = await requestJson(
+      `${baseUrl}/__cloud/v1/tenants/${tenantBId}/inference-entitlements`,
+      {
+        method: "PUT",
+        token: adminToken,
+        body: {
+          provider: "openai",
+          model,
+          enabled: true,
+          maxInputTokens: 100,
+          maxOutputTokens: 40,
+        },
+      }
+    );
+    assert.equal(tenantBEntitlement.response.status, 200, JSON.stringify(tenantBEntitlement.body));
+    const tenantBBudget = await requestJson(
+      `${baseUrl}/__cloud/v1/tenants/${tenantBId}/inference-budget`,
+      {
+        method: "PUT",
+        token: adminToken,
+        body: { monthlyTokenLimit: 1000 },
+      }
+    );
+    assert.equal(tenantBBudget.response.status, 200, JSON.stringify(tenantBBudget.body));
+    const tenantBConnection = await requestJson(
+      `${baseUrl}/__cloud/v1/tenants/${tenantBId}/provider-connections`,
+      {
+        token: adminToken,
+        body: { id: "mock-openai", provider: "openai", apiKey: mockProviderKey },
+      }
+    );
+    assert.equal(tenantBConnection.response.status, 201, JSON.stringify(tenantBConnection.body));
+
+    const tenantBResponse = await inferenceRequest(idempotencyKey, customerBKey);
+    assert.equal(
+      tenantBResponse.status,
+      200,
+      `tenant B should dispatch its own request for the same idempotency key:\n${await tenantBResponse
+        .clone()
+        .text()}\n${output}`
+    );
+    const tenantBRequestId = tenantBResponse.headers.get("x-request-id");
+    assert.ok(tenantBRequestId);
+    assert.notEqual(tenantBRequestId, requestId);
+    assert.equal(
+      (await tenantBResponse.text()).includes("local mock provider."),
+      true,
+      "tenant B must receive its own provider result instead of tenant A's replay"
+    );
+    const tenantBState = await requestJson(
+      `${baseUrl}/__test/inference/state?tenantId=${encodeURIComponent(tenantBId)}`,
+      { token: adminToken }
+    );
+    assert.equal(tenantBState.response.status, 200);
+    assert.equal((tenantBState.body.usage as unknown[]).length, 1);
+    assert.equal(
+      (tenantBState.body.reservations as Array<Record<string, unknown>>)[0]?.reservation_id,
+      tenantBRequestId
+    );
+    const afterTenantBStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(
+      afterTenantBStats.body.callCount,
+      4,
+      "tenant B should make its own count and generation calls"
+    );
+
+    const tenantAReplayAfterB = await inferenceRequest(idempotencyKey, customerKey);
+    assert.equal(tenantAReplayAfterB.status, 200);
+    assert.equal(tenantAReplayAfterB.headers.get("x-request-id"), requestId);
+    assert.equal(await tenantAReplayAfterB.text(), firstText);
+    const afterTenantAReplayStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(
+      afterTenantAReplayStats.body.callCount,
+      4,
+      "tenant A replay must remain isolated from B"
+    );
+
     const armFailure = spawnSync(
       process.execPath,
       [
@@ -498,7 +594,7 @@ test(
     });
     assert.equal(
       afterFailureStats.body.callCount,
-      4,
+      6,
       "count and failed generation each dispatch once"
     );
     assert.equal(afterFailureStats.body.lastError, "simulated upstream generation failure");
@@ -508,7 +604,7 @@ test(
     const afterFailedReplayStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
       token: adminToken,
     });
-    assert.equal(afterFailedReplayStats.body.callCount, 4, "failure replay must not call upstream");
+    assert.equal(afterFailedReplayStats.body.callCount, 6, "failure replay must not call upstream");
 
     const recoveredKey = `cloud-local-inference-recovery-${crypto.randomUUID()}`;
     const recoveredResponse = await inferenceRequest(recoveredKey);
@@ -525,7 +621,7 @@ test(
     });
     assert.equal(
       recoveredStats.body.callCount,
-      6,
+      8,
       "recovery should dispatch one count and generation"
     );
     assert.equal(recoveredStats.body.lastError, null);

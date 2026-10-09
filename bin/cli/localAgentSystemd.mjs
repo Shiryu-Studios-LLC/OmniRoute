@@ -1,6 +1,7 @@
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -8,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +35,52 @@ function paths(home) {
     serviceDir,
     unitFile: join(serviceDir, SERVICE_NAME),
   };
+}
+
+function currentUid() {
+  return typeof process.getuid === "function" ? process.getuid() : userInfo().uid;
+}
+
+function ensureDirectory(directory, { privateDirectory = false } = {}) {
+  try {
+    mkdirSync(directory, { mode: privateDirectory ? 0o700 : 0o755 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  const stats = lstatSync(directory);
+  if (
+    !stats.isDirectory() ||
+    stats.isSymbolicLink() ||
+    stats.uid !== currentUid() ||
+    (!privateDirectory && (stats.mode & 0o022) !== 0)
+  ) {
+    throw new Error("Local Agent systemd directories must be current-user-owned and private");
+  }
+  if (privateDirectory) chmodSync(directory, 0o700);
+}
+
+function readManagedFile(filePath, { secret = false } = {}) {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (
+    !stats.isFile() ||
+    stats.isSymbolicLink() ||
+    stats.nlink !== 1 ||
+    stats.uid !== currentUid() ||
+    (secret && (stats.mode & 0o077) !== 0)
+  ) {
+    throw new Error(
+      secret
+        ? "Local Agent systemd credential file must be current-user-owned with mode 0600"
+        : "Local Agent systemd unit must be a current-user-owned regular file"
+    );
+  }
+  return readFileSync(filePath, "utf8");
 }
 
 function quoteExecArg(value) {
@@ -101,19 +148,21 @@ export function installLocalAgentSystemd(
   } = {}
 ) {
   if (platform !== "linux") throw new Error("Local Agent service install is supported on Linux");
-  const files = paths(home);
+  const canonicalHome = resolve(home);
+  const files = paths(canonicalHome);
   if (!isAbsolute(nodePath) || !isAbsolute(cliPath) || !isAbsolute(files.envFile)) {
     throw new Error("Local Agent systemd paths must be absolute");
   }
-  mkdirSync(files.configDir, { recursive: true, mode: 0o700 });
-  chmodSync(files.configDir, 0o700);
-  mkdirSync(files.serviceDir, { recursive: true, mode: 0o700 });
-  const priorUnit = existsSync(files.unitFile) ? readFileSync(files.unitFile, "utf8") : null;
+  ensureDirectory(join(canonicalHome, ".config"));
+  ensureDirectory(files.configDir, { privateDirectory: true });
+  ensureDirectory(join(canonicalHome, ".config", "systemd"));
+  ensureDirectory(files.serviceDir);
+  const priorUnit = readManagedFile(files.unitFile);
   if (priorUnit && !priorUnit.startsWith(`${SERVICE_MARKER}\n`)) {
     throw new Error("Refusing to replace an unmanaged Local Agent systemd unit");
   }
 
-  const priorEnv = existsSync(files.envFile) ? readFileSync(files.envFile, "utf8") : null;
+  const priorEnv = readManagedFile(files.envFile, { secret: true });
   if (priorEnv && !priorEnv.startsWith(`${ENV_MARKER}\n`)) {
     throw new Error("Refusing to replace an unmanaged Local Agent environment file");
   }
@@ -185,10 +234,10 @@ export function uninstallLocalAgentSystemd({
   exec = execFileSync,
 } = {}) {
   if (platform !== "linux") throw new Error("Local Agent service uninstall is supported on Linux");
-  const files = paths(home);
+  const files = paths(resolve(home));
   if (!existsSync(files.unitFile)) {
     if (!existsSync(files.envFile)) return false;
-    const orphanEnvironment = readFileSync(files.envFile, "utf8");
+    const orphanEnvironment = readManagedFile(files.envFile, { secret: true });
     if (!orphanEnvironment.startsWith(`${ENV_MARKER}\n`)) {
       throw new Error("Refusing to remove an unmanaged Local Agent environment file");
     }
@@ -205,12 +254,12 @@ export function uninstallLocalAgentSystemd({
     rmSync(files.envFile, { force: true });
     return true;
   }
-  const unit = readFileSync(files.unitFile, "utf8");
+  const unit = readManagedFile(files.unitFile);
   if (!unit.startsWith(`${SERVICE_MARKER}\n`)) {
     throw new Error("Refusing to remove an unmanaged Local Agent systemd unit");
   }
   if (existsSync(files.envFile)) {
-    const environment = readFileSync(files.envFile, "utf8");
+    const environment = readManagedFile(files.envFile, { secret: true });
     if (!environment.startsWith(`${ENV_MARKER}\n`)) {
       throw new Error("Refusing to remove an unmanaged Local Agent environment file");
     }
@@ -227,15 +276,17 @@ export function uninstallLocalAgentSystemd({
 }
 
 function managedSystemdFiles(home) {
-  const files = paths(home);
-  if (!existsSync(files.unitFile)) return null;
-  if (!readFileSync(files.unitFile, "utf8").startsWith(`${SERVICE_MARKER}\n`)) {
+  const files = paths(resolve(home));
+  const unit = readManagedFile(files.unitFile);
+  if (unit === null) return null;
+  if (!unit.startsWith(`${SERVICE_MARKER}\n`)) {
     throw new Error("Refusing to control an unmanaged Local Agent systemd unit");
   }
   if (!existsSync(files.envFile)) {
     throw new Error("Local Agent systemd credential file is missing");
   }
-  if (!readFileSync(files.envFile, "utf8").startsWith(`${ENV_MARKER}\n`)) {
+  const environment = readManagedFile(files.envFile, { secret: true });
+  if (environment === null || !environment.startsWith(`${ENV_MARKER}\n`)) {
     throw new Error("Refusing to control an unmanaged Local Agent environment file");
   }
   return files;

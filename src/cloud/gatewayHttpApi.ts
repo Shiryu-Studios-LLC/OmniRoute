@@ -23,6 +23,7 @@ const DEFAULT_CONNECT_FALLBACK_RATE_LIMIT = { limit: 1_200, windowMs: 60_000 };
 const PREFIX = "/__gateway/v1/device";
 const VERSION = 1;
 const MAX_REQUEST_BYTES = 80 * 1024;
+const DEFAULT_BODY_READ_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const SESSION_TOKEN = /^[A-Za-z0-9_-]{32,128}$/;
@@ -39,6 +40,7 @@ export interface GatewayDeviceHttpApiOptions {
     Record<keyof typeof DEFAULT_DEVICE_RATE_LIMITS, { limit: number; windowMs: number }>
   >;
   pairingExchangeRateLimit?: { limit: number; windowMs: number };
+  bodyReadTimeoutMs?: number;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -63,7 +65,10 @@ function object(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+async function readJson(
+  request: Request,
+  timeoutMs = DEFAULT_BODY_READ_TIMEOUT_MS
+): Promise<Record<string, unknown> | null> {
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) return null;
   const advertisedLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(advertisedLength) && advertisedLength > MAX_REQUEST_BYTES) return null;
@@ -71,19 +76,35 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
+  let cancellationStarted = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cancelReader = () => {
+    if (cancellationStarted) return;
+    cancellationStarted = true;
+    void reader.cancel("request body rejected").catch(() => undefined);
+  };
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      cancelReader();
+      reject(new Error("Gateway request body timed out"));
+    }, timeoutMs);
+  });
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), timeout]);
       if (done) break;
       totalBytes += value.byteLength;
       if (totalBytes > MAX_REQUEST_BYTES) {
-        await reader.cancel();
+        cancelReader();
         return null;
       }
       chunks.push(value);
     }
   } catch {
     return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (!cancellationStarted) reader.releaseLock();
   }
   const bytes = new Uint8Array(totalBytes);
   let offset = 0;
@@ -175,7 +196,7 @@ export async function handleGatewayDeviceRequest(
   if (url.search || request.headers.has("authorization")) {
     return json({ error: "Unsupported gateway request metadata" }, 400);
   }
-  const body = await readJson(request);
+  const body = await readJson(request, options.bodyReadTimeoutMs);
   if (!body) return json({ error: "Invalid or oversized JSON body" }, 400);
   if (path === `${PREFIX}/pair`) {
     if (

@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -252,6 +261,53 @@ test("systemd lifecycle controls reject an unmanaged unit", () => {
     assert.throws(
       () => startLocalAgentSystemd({ home, platform: "linux", exec: () => {} }),
       /unmanaged/
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("systemd install refuses symlinked configuration directories and unit files", () => {
+  const home = createHome();
+  const outside = createHome();
+  try {
+    mkdirSync(join(home, ".config"), { recursive: true });
+    symlinkSync(outside, join(home, ".config", "systemd"));
+    assert.throws(
+      () => installLocalAgentSystemd(serviceConfig(), { home, platform: "linux", exec: () => {} }),
+      /directories must be current-user-owned and private/
+    );
+    assert.equal(statSync(outside).isDirectory(), true);
+    rmSync(join(home, ".config", "systemd"));
+
+    const serviceDir = join(home, ".config", "systemd", "user");
+    mkdirSync(serviceDir, { recursive: true });
+    const target = join(outside, "target.service");
+    writeFileSync(target, "preserve this file");
+    symlinkSync(target, join(serviceDir, "omniroute-local-agent.service"));
+    assert.throws(
+      () => installLocalAgentSystemd(serviceConfig(), { home, platform: "linux", exec: () => {} }),
+      /current-user-owned regular file/
+    );
+    assert.equal(readFileSync(target, "utf8"), "preserve this file");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("systemd status refuses a managed credential file with public permissions", () => {
+  const home = createHome();
+  try {
+    const installed = installLocalAgentSystemd(serviceConfig(), {
+      home,
+      platform: "linux",
+      exec: () => {},
+    });
+    chmodSync(installed.envFile, 0o644);
+    assert.throws(
+      () => getLocalAgentSystemdStatus({ home, platform: "linux", exec: () => {} }),
+      /credential file must be current-user-owned with mode 0600/
     );
   } finally {
     rmSync(home, { recursive: true, force: true });
