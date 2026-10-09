@@ -19,6 +19,7 @@ const expectedTasks = [
   "expired-inference-responses",
   "expired-oidc-artifacts",
   "expired-gateway-image-jobs",
+  "expired-customer-host-challenges",
 ] as const;
 
 async function getUnusedPort(): Promise<number> {
@@ -183,6 +184,41 @@ test(
     );
     assert.equal(seedResult.status, 0, `seeding retention row failed:\n${seedResult.stderr}`);
 
+    const nowMs = Date.now();
+    const challengeSeedResult = spawnSync(
+      process.execPath,
+      [
+        wranglerBin,
+        "d1",
+        "execute",
+        workerName,
+        "--local",
+        "--persist-to",
+        persistDir,
+        "--config",
+        configPath,
+        "--env-file",
+        envPath,
+        "--command",
+        `INSERT INTO tenants (id, name, slug, created_at, updated_at) VALUES ('challenge-tenant', 'Challenge Tenant', 'challenge-tenant', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+INSERT INTO cloud_customer_host_verification_challenges (hostname, tenant_id, challenge_id, token_hash, created_at_ms, expires_at_ms, attempts) VALUES
+('expired.example', 'challenge-tenant', 'expired-challenge', '${"a".repeat(64)}', ${nowMs - 120_000}, ${nowMs - 1}, 0),
+('active.example', 'challenge-tenant', 'active-challenge', '${"b".repeat(64)}', ${nowMs - 1}, ${nowMs + 60_000}, 0);`,
+      ],
+      {
+        cwd: tempDir,
+        env: processEnv,
+        encoding: "utf8",
+        timeout: 60_000,
+        maxBuffer: 4 * 1024 * 1024,
+      }
+    );
+    assert.equal(
+      challengeSeedResult.status,
+      0,
+      `seeding customer-host challenges failed:\n${challengeSeedResult.stdout}\n${challengeSeedResult.stderr}`
+    );
+
     const port = new URL(baseUrl).port;
     const child = spawn(
       process.execPath,
@@ -256,6 +292,46 @@ test(
       runs.some((run) => run.id === staleId),
       false,
       "expired run was retained"
+    );
+
+    const challengeQuery = spawnSync(
+      process.execPath,
+      [
+        wranglerBin,
+        "d1",
+        "execute",
+        workerName,
+        "--local",
+        "--persist-to",
+        persistDir,
+        "--config",
+        configPath,
+        "--env-file",
+        envPath,
+        "--command",
+        "SELECT hostname FROM cloud_customer_host_verification_challenges ORDER BY hostname",
+        "--json",
+      ],
+      {
+        cwd: tempDir,
+        env: processEnv,
+        encoding: "utf8",
+        timeout: 60_000,
+        maxBuffer: 4 * 1024 * 1024,
+      }
+    );
+    assert.equal(
+      challengeQuery.status,
+      0,
+      `querying customer-host challenges failed:\n${challengeQuery.stdout}\n${challengeQuery.stderr}`
+    );
+    const challengeResults = JSON.parse(challengeQuery.stdout) as Array<{
+      results?: Array<{ hostname: string }>;
+    }>;
+    assert.deepEqual(
+      challengeResults.flatMap((result) => result.results ?? []).map((row) => row.hostname),
+      ["active.example"],
+      "scheduled cleanup must delete only expired customer-host challenges"
     );
   }
 );

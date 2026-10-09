@@ -27,6 +27,7 @@ import { CLOUD_CUSTOMER_MCP_SERVERS_PATH, handleCloudTenantMcpRequest } from "./
 import type { CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import { CLOUD_TENANT_HOSTS_PATH, handleCloudTenantHostsRequest } from "./tenantHostsHttpApi";
+import type { CustomerHostTxtResolver } from "./tenantHostDns";
 import {
   CLOUD_FRONT_DESK_CONFIG_PATH,
   CLOUD_FRONT_DESK_CONFIGS_PATH,
@@ -77,6 +78,7 @@ export interface CloudRuntimeEnv {
 export interface CloudRuntimeOptions {
   env?: CloudRuntimeEnv;
   now?: () => Date;
+  customerHostTxtResolver?: CustomerHostTxtResolver;
   adminRateLimit?: { limit: number; windowMs: number };
   customerInvokeRateLimit?: { limit: number; windowMs: number };
   customerImageJobRateLimit?: { limit: number; windowMs: number };
@@ -181,6 +183,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             db: options.env?.DB,
             adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
             now,
+            resolveTxt: options.customerHostTxtResolver,
           });
           if (response) return response;
         } catch {

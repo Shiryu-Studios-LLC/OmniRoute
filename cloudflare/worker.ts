@@ -7,6 +7,7 @@ import { cleanupExpiredCloudRateLimits } from "../src/cloud/rateLimit";
 import { cleanupExpiredCloudGatewayPairings } from "../src/cloud/gatewayPairing";
 import { cleanupExpiredCloudTenantOidcAuthArtifacts } from "../src/cloud/tenantOidcAuth";
 import { cleanupExpiredCloudImageJobs } from "../src/cloud/imageJobs";
+import { cleanupExpiredCloudCustomerHostVerificationChallenges } from "../src/cloud/customerHostVerificationChallenges";
 import type { GatewayImageArtifactBucket } from "../src/cloud/imageJobs";
 import {
   cleanupSettledCloudInferenceReservations,
@@ -148,6 +149,10 @@ const worker = {
           {
             name: "expired-gateway-image-jobs",
             run: () => cleanupExpiredCloudImageJobs(env.DB, env.GATEWAY_ARTIFACTS),
+          },
+          {
+            name: "expired-customer-host-challenges",
+            run: () => cleanupExpiredCloudCustomerHostVerificationChallenges(env.DB),
           },
         ],
         undefined,

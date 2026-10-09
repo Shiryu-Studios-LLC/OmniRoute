@@ -16,6 +16,40 @@ interface HostRow {
   created_at: string;
 }
 
+export interface CloudCustomerHostVerificationChallenge {
+  hostname: string;
+  tenantId: string;
+  challengeId: string;
+  tokenHash: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  attempts: number;
+}
+
+interface HostVerificationChallengeRow {
+  hostname: string;
+  tenant_id: string;
+  challenge_id: string;
+  token_hash: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  attempts: number;
+}
+
+function mapHostVerificationChallenge(
+  row: HostVerificationChallengeRow
+): CloudCustomerHostVerificationChallenge {
+  return {
+    hostname: row.hostname,
+    tenantId: row.tenant_id,
+    challengeId: row.challenge_id,
+    tokenHash: row.token_hash,
+    createdAtMs: row.created_at_ms,
+    expiresAtMs: row.expires_at_ms,
+    attempts: row.attempts,
+  };
+}
+
 function mapHost(row: HostRow): CloudAdminVerifiedCustomerHost {
   return {
     hostname: row.hostname,
@@ -70,6 +104,152 @@ export function prepareAdminVerifiedCustomerHostInsert(
         WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1`
     )
     .bind(hostname, input.verifiedAt, input.verifiedBy, input.verifiedAt, input.tenantId);
+}
+
+export function prepareCustomerHostVerificationChallengeInsert(
+  db: CloudDb,
+  input: {
+    hostname: string;
+    tenantId: string;
+    challengeId: string;
+    tokenHash: string;
+    createdAtMs: number;
+    expiresAtMs: number;
+  }
+) {
+  const hostname = normalizeCustomerHostname(input.hostname);
+  if (!hostname) throw new TypeError("Invalid customer hostname");
+  if (!/^[a-f0-9]{64}$/.test(input.tokenHash)) throw new TypeError("Invalid host challenge hash");
+  if (
+    !Number.isSafeInteger(input.createdAtMs) ||
+    !Number.isSafeInteger(input.expiresAtMs) ||
+    input.expiresAtMs <= input.createdAtMs
+  ) {
+    throw new TypeError("Invalid host challenge expiry");
+  }
+  return db
+    .prepare(
+      `INSERT INTO cloud_customer_host_verification_challenges
+         (hostname, tenant_id, challenge_id, token_hash, created_at_ms, expires_at_ms, attempts)
+       SELECT ?, t.id, ?, ?, ?, ?, 0
+         FROM tenants t
+        WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
+          AND NOT EXISTS (
+            SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = ?
+          )
+       ON CONFLICT(hostname) DO UPDATE SET
+         challenge_id = excluded.challenge_id,
+         token_hash = excluded.token_hash,
+         created_at_ms = excluded.created_at_ms,
+         expires_at_ms = excluded.expires_at_ms,
+         attempts = 0
+       WHERE cloud_customer_host_verification_challenges.tenant_id = excluded.tenant_id
+         AND cloud_customer_host_verification_challenges.expires_at_ms <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = excluded.hostname
+         )`
+    )
+    .bind(
+      hostname,
+      input.challengeId,
+      input.tokenHash,
+      input.createdAtMs,
+      input.expiresAtMs,
+      input.tenantId,
+      hostname,
+      input.createdAtMs
+    );
+}
+
+export async function getCustomerHostVerificationChallenge(
+  db: CloudDb,
+  hostnameValue: string
+): Promise<CloudCustomerHostVerificationChallenge | null> {
+  const hostname = normalizeCustomerHostname(hostnameValue);
+  if (!hostname) return null;
+  const row = await db
+    .prepare<HostVerificationChallengeRow>(
+      `SELECT hostname, tenant_id, challenge_id, token_hash, created_at_ms, expires_at_ms, attempts
+         FROM cloud_customer_host_verification_challenges
+        WHERE hostname = ? LIMIT 1`
+    )
+    .bind(hostname)
+    .first<HostVerificationChallengeRow>();
+  return row ? mapHostVerificationChallenge(row) : null;
+}
+
+export function prepareCustomerHostVerificationAttemptUpdate(
+  db: CloudDb,
+  input: { hostname: string; tenantId: string; challengeId: string; nowMs: number }
+) {
+  return db
+    .prepare(
+      `UPDATE cloud_customer_host_verification_challenges
+          SET attempts = attempts + 1
+        WHERE hostname = ? AND tenant_id = ? AND challenge_id = ?
+          AND expires_at_ms > ? AND attempts < 5`
+    )
+    .bind(input.hostname, input.tenantId, input.challengeId, input.nowMs);
+}
+
+export function prepareDnsVerifiedCustomerHostInsert(
+  db: CloudDb,
+  input: {
+    hostname: string;
+    tenantId: string;
+    challengeId: string;
+    tokenHash: string;
+    verifiedAt: string;
+    nowMs: number;
+  }
+) {
+  return db
+    .prepare(
+      `INSERT INTO cloud_verified_customer_hosts
+         (hostname, tenant_id, verified_at, verified_by, created_at)
+       SELECT c.hostname, c.tenant_id, ?, 'dns-txt', ?
+         FROM cloud_customer_host_verification_challenges c
+         JOIN tenants t ON t.id = c.tenant_id
+        WHERE c.hostname = ? AND c.tenant_id = ? AND c.challenge_id = ?
+          AND c.token_hash = ? AND c.expires_at_ms > ? AND c.attempts < 5
+          AND t.kind = 'customer' AND t.is_active = 1`
+    )
+    .bind(
+      input.verifiedAt,
+      input.verifiedAt,
+      input.hostname,
+      input.tenantId,
+      input.challengeId,
+      input.tokenHash,
+      input.nowMs
+    );
+}
+
+export function prepareCustomerHostVerificationChallengeDelete(
+  db: CloudDb,
+  input: {
+    hostname: string;
+    tenantId: string;
+    challengeId: string;
+    tokenHash: string;
+    nowMs: number;
+  }
+) {
+  return db
+    .prepare(
+      `DELETE FROM cloud_customer_host_verification_challenges
+        WHERE hostname = ? AND tenant_id = ? AND challenge_id = ? AND token_hash = ?
+          AND expires_at_ms > ? AND attempts < 5
+          AND EXISTS (SELECT 1 FROM cloud_verified_customer_hosts h WHERE h.hostname = ?)`
+    )
+    .bind(
+      input.hostname,
+      input.tenantId,
+      input.challengeId,
+      input.tokenHash,
+      input.nowMs,
+      input.hostname
+    );
 }
 
 export async function listAdminVerifiedCustomerHosts(
