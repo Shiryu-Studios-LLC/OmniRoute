@@ -4,6 +4,10 @@ import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
 import {
+  CLOUD_CUSTOMER_BUSINESS_PROFILE_PATH,
+  handleCloudCustomerBusinessProfileRequest,
+} from "./customerBusinessProfileHttpApi";
+import {
   CLOUD_CUSTOMER_PROVIDER_CONNECTIONS_PATH,
   handleCloudCustomerProviderRequest,
 } from "./customerProviderHttpApi";
@@ -105,6 +109,21 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         } catch {
           return Response.json(
             { error: "Customer settings request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (url.pathname === CLOUD_CUSTOMER_BUSINESS_PROFILE_PATH) {
+        try {
+          const response = await handleCloudCustomerBusinessProfileRequest(request, {
+            db: options.env?.DB,
+            now,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Customer business profile request could not be completed" },
             { status: 503, headers: { "Cache-Control": "no-store" } }
           );
         }

@@ -119,7 +119,9 @@ Implemented in this cycle:
 - `open-next.config.ts` establishes the OpenNext deployment adapter for the eventual Next.js integration.
 - Wrangler dry-run measured the isolated boundary at **1.38 KiB upload / 0.60 KiB gzip**.
 
-The full Next.js/OpenNext application build was also exercised. It currently demonstrates the expected Phase 2+ blockers: the existing app graph imports SQLite, filesystem, child-process, MITM, tunnel, and other local-runtime modules. Those are not hidden or polyfilled into the Worker; they remain outside the cloud boundary and must be removed from the production request graph during the next cloud-runtime workstreams.
+The isolated Worker now includes tenant and customer APIs backed by D1, provider credential encryption, customer inference accounting, business profiles, device/gateway state, and scheduled maintenance records. Its latest Wrangler dry run bundles 95 inputs at 538,263 bytes (100,569 bytes gzip); this measures the standalone control plane, not the full OmniRoute application.
+
+The full Next.js/OpenNext application build was reproduced on 2026-10-08. Next compiled and generated all 594 static pages, then OpenNext failed middleware bundling with 103 resolution errors, including `bun:sqlite`, native `keytar`/`koffi` modules, Playwright `chromium-bidi`, a generated TypeScript import, and `@opentelemetry/api`. The run emitted 227 filesystem-tracing warnings and grew `.next` to 7.4 GiB. The full application remains incompatible with Workers until its authorization and persistence graph is replaced with cloud-safe paths and local-only routes/features are isolated.
 
 ## Exit criteria for Phase 0/1
 
@@ -131,4 +133,4 @@ The full Next.js/OpenNext application build was also exercised. It currently dem
 - OpenNext is configured as the initial Next.js integration target without replacing the existing local build.
 - The full Next.js graph remains explicitly tracked as **not yet cloud-compatible** rather than being incorrectly treated as Worker-ready.
 
-The next blocker is the cloud runtime/database boundary: move persistence behind an asynchronous D1-capable interface and progressively detach the request path from local SQLite and OS-only modules.
+The asynchronous D1-capable boundary now exists for the isolated Worker APIs. The remaining Phase 12 blocker is the full Next/OpenNext request graph described above. Phase-by-phase implementation, test, deployment, and acceptance evidence is maintained in [`PHASE_3_TO_15_PROGRESS.md`](./PHASE_3_TO_15_PROGRESS.md) and [`CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md`](./CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md).

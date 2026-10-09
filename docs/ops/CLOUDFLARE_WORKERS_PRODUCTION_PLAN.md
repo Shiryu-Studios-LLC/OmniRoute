@@ -220,6 +220,11 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Provider/model selection is tenant-scoped.
 - Lead/business data remains tenant-scoped.
 - Front Desk communicates with the cloud OmniRoute API rather than the developer machine.
+- Front Desk can opt a tenant into loading its business identity from the owner/admin-protected
+  `/__cloud/v1/customer/business-profile` API. It fetches server-side with that tenant's customer
+  key, validates the returned tenant and bounded public fields, caches per tenant, and falls back
+  to that tenant's static profile on errors. This uses the configured OmniRoute URL and does not
+  expose the customer key in `/business.json`.
 
 **Exit:** two independent customer Front Desks can operate simultaneously against one OmniRoute deployment.
 
@@ -229,17 +234,23 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Create owner/admin membership.
 - Generate tenant-scoped credentials.
 - The platform-admin tenant-create request supports either an owner principal ID from an external verified identity flow (creating the tenant, owner membership, and one-time API key) or explicit `bootstrapMode: "oidc_pending"` (creating the tenant and settings without an owner or key). The latter is followed by platform-admin OIDC configuration and first-owner claim issuance. Both paths have compensating rollback and audit records. The Cloud runtime does not verify real-world identity outside its configured OIDC callback.
-- Configure provider defaults.
+- Configure provider connections through the owner/admin customer API. Current self-service is
+  limited to a fixed OpenAI connection and does not grant inference entitlements.
+- Store and update a tenant-scoped Front Desk business identity through the owner/admin API;
+  Front Desk can opt into reading it from OmniRoute.
 - Configure MCP defaults.
 - Register devices.
-- Provision Front Desk branding/configuration.
+- Provision Front Desk host configuration and branding.
 - Support suspend/revoke/delete lifecycle.
 
 First-owner onboarding now has a platform-admin-issued, digest-only, one-use
 OIDC claim flow. It is available only when the tenant has an enabled issuer and
 no active owner; acceptance creates the first owner, identity link, and audit
-record atomically. OIDC issuer configuration and provisioning of provider/MCP
-defaults and Front Desk branding still require further onboarding work.
+record atomically. Provider self-service currently supports one fixed OpenAI
+contract, and business identity storage is tenant-scoped with an opt-in Front
+Desk consumer. Automated MCP provisioning, arbitrary provider defaults, Front
+Desk host registration/branding, and end-to-end customer onboarding still
+require further work.
 
 **Exit:** a new tenant can be created without manually editing server files.
 
@@ -321,6 +332,15 @@ paths return 404 before any D1 operation. This preserves the isolated control
 plane boundary; it does not provide the missing OpenNext application fallback
 or resolve the Node/SQLite middleware graph documented in the compatibility
 audit.
+
+The latest Worker-only Wrangler dry run bundles 95 inputs (538,263 bytes;
+100,569 bytes gzip) and succeeds. The full
+`npm run cloudflare:open-next:build` run took 12m37: Next compiled and generated
+594 static pages, then OpenNext failed middleware bundling with 103 resolution
+errors, including `bun:sqlite`, native `keytar`/`koffi` modules, Playwright's
+`chromium-bidi`, a generated TypeScript import, and `@opentelemetry/api`. It
+also emitted 227 filesystem-tracing warnings. The standalone Worker dry run
+therefore does not satisfy the full-app production build exit criterion.
 
 **Exit:** production cloud build is reproducible and within size/runtime limits.
 
