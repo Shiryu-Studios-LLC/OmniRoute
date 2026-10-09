@@ -1535,6 +1535,247 @@ test(
     };
 
     await t.test(
+      "concurrent tenant streams preserve backpressure and write usage only to each tenant",
+      async () => {
+        const modelA = "ollama:chat:stream-tenant-a-model";
+        const modelB = "ollama:chat:stream-tenant-b-model";
+        const streamA = await provisionCustomer("stream-a", true, [modelA]);
+        const streamB = await provisionCustomer("stream-b", true, [modelB]);
+        const idempotencyA = `tenant-stream-a-${randomUUID()}`;
+        const idempotencyB = `tenant-stream-b-${randomUUID()}`;
+        const startStream = (customer: typeof streamA, idempotencyKey: string, model: string) =>
+          fetch(`${baseUrl}/__gateway/v1/customer/invoke`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${customer.customerKey}`,
+              "content-type": "application/json",
+              "idempotency-key": idempotencyKey,
+            },
+            body: JSON.stringify({
+              deviceId: customer.deviceId,
+              capability: model,
+              payload: {
+                messages: [{ role: "user", content: `stream for ${customer.tenantId}` }],
+              },
+              timeoutMs: 10_000,
+              stream: true,
+            }),
+            signal: AbortSignal.timeout(15_000),
+          });
+        const [responseA, responseB] = await Promise.all([
+          startStream(streamA, idempotencyA, modelA),
+          startStream(streamB, idempotencyB, modelB),
+        ]);
+        if (responseA.status !== 200) {
+          assert.fail(`Tenant A stream returned ${responseA.status}: ${await responseA.text()}`);
+        }
+        if (responseB.status !== 200) {
+          assert.fail(`Tenant B stream returned ${responseB.status}: ${await responseB.text()}`);
+        }
+        assert.match(responseA.headers.get("content-type") ?? "", /text\/event-stream/i);
+        assert.match(responseB.headers.get("content-type") ?? "", /text\/event-stream/i);
+        assert.ok(responseA.body);
+        assert.ok(responseB.body);
+
+        const pollUntilDelivered = async (customer: typeof streamA) => {
+          const deadline = Date.now() + 5_000;
+          while (Date.now() < deadline) {
+            const requests = await deviceTransport.poll(customer.session!);
+            if (requests?.length) return requests[0]!;
+            await delay(25);
+          }
+          assert.fail(`Streaming invocation did not reach device ${customer.deviceId}`);
+        };
+        const [requestA, requestB] = await Promise.all([
+          pollUntilDelivered(streamA),
+          pollUntilDelivered(streamB),
+        ]);
+        assert.equal(requestA.capability, modelA);
+        assert.equal(requestB.capability, modelB);
+        assert.equal(requestA.stream, true);
+        assert.equal(requestB.stream, true);
+        assert.notEqual(requestA.requestId, requestB.requestId);
+
+        const makeFrameReader = (response: Response) => ({
+          reader: response.body!.getReader(),
+          decoder: new TextDecoder(),
+          buffered: "",
+        });
+        const readFrame = async (state: ReturnType<typeof makeFrameReader>) => {
+          while (!state.buffered.includes("\n\n")) {
+            const chunk = await state.reader.read();
+            if (chunk.done) assert.fail("Stream closed before its next event frame");
+            state.buffered += state.decoder.decode(chunk.value, { stream: true });
+          }
+          const separator = state.buffered.indexOf("\n\n");
+          const frame = state.buffered.slice(0, separator);
+          state.buffered = state.buffered.slice(separator + 2);
+          const data = frame
+            .split(/\r?\n/)
+            .find((line) => line.startsWith("data:"))
+            ?.slice(5)
+            .trimStart();
+          assert.ok(data, `Expected a stream data frame, received: ${frame}`);
+          return JSON.parse(data) as Record<string, unknown>;
+        };
+        const readerA = makeFrameReader(responseA);
+        const readerB = makeFrameReader(responseB);
+        const submitStreamEvent = (
+          customer: typeof streamA,
+          requestId: string,
+          sequence: number,
+          event:
+            | { type: "delta"; data: { content: string } }
+            | { type: "usage"; data: { promptTokens: number; completionTokens: number } }
+            | { type: "done"; data: Record<string, never> }
+        ) => deviceTransport.submitStreamEvent!(customer.session!, requestId, sequence, event);
+
+        let bDeltaSubmitted = false;
+        const bDeltaSubmission = submitStreamEvent(streamB, requestB.requestId, 0, {
+          type: "delta",
+          data: { content: "TENANT_B_ONLY" },
+        }).then((submitted) => {
+          bDeltaSubmitted = submitted;
+        });
+        await delay(100);
+        assert.equal(
+          bDeltaSubmitted,
+          false,
+          "the device submit call must remain backpressured until the stream reader consumes B's delta"
+        );
+        const firstB = await readFrame(readerB);
+        assert.deepEqual(firstB, {
+          sequence: 0,
+          type: "delta",
+          data: { content: "TENANT_B_ONLY" },
+        });
+        await bDeltaSubmission;
+        assert.equal(bDeltaSubmitted, true);
+
+        const deliverEvent = async (
+          customer: typeof streamA,
+          requestId: string,
+          reader: ReturnType<typeof makeFrameReader>,
+          sequence: number,
+          event:
+            | { type: "delta"; data: { content: string } }
+            | { type: "usage"; data: { promptTokens: number; completionTokens: number } }
+            | { type: "done"; data: Record<string, never> }
+        ) => {
+          const submitted = submitStreamEvent(customer, requestId, sequence, event);
+          const frame = await readFrame(reader);
+          assert.equal(await submitted, true);
+          return frame;
+        };
+
+        assert.deepEqual(
+          await deliverEvent(streamB, requestB.requestId, readerB, 1, {
+            type: "usage",
+            data: { promptTokens: 7, completionTokens: 3 },
+          }),
+          {
+            sequence: 1,
+            type: "usage",
+            data: { promptTokens: 7, completionTokens: 3 },
+          }
+        );
+        assert.deepEqual(
+          await deliverEvent(streamB, requestB.requestId, readerB, 2, { type: "done", data: {} }),
+          { sequence: 2, type: "done", data: {} }
+        );
+
+        assert.deepEqual(
+          await deliverEvent(streamA, requestA.requestId, readerA, 0, {
+            type: "delta",
+            data: { content: "TENANT_A_ONLY" },
+          }),
+          { sequence: 0, type: "delta", data: { content: "TENANT_A_ONLY" } }
+        );
+        assert.deepEqual(
+          await deliverEvent(streamA, requestA.requestId, readerA, 1, {
+            type: "usage",
+            data: { promptTokens: 5, completionTokens: 2 },
+          }),
+          { sequence: 1, type: "usage", data: { promptTokens: 5, completionTokens: 2 } }
+        );
+        assert.deepEqual(
+          await deliverEvent(streamA, requestA.requestId, readerA, 2, { type: "done", data: {} }),
+          { sequence: 2, type: "done", data: {} }
+        );
+
+        const runWrangler = spawnSync(
+          process.execPath,
+          [
+            wranglerBin,
+            "d1",
+            "execute",
+            workerName,
+            "--local",
+            "--persist-to",
+            persistDir,
+            "--config",
+            wranglerConfigPath,
+            "--env-file",
+            safeEnvPath,
+            "--yes",
+            "--json",
+            "--command",
+            `SELECT id, tenant_id, model, tokens_input, tokens_output FROM cloud_usage_history WHERE id IN ('${requestA.requestId}', '${requestB.requestId}') ORDER BY tenant_id;`,
+          ],
+          {
+            cwd: tempDir,
+            env: {
+              PATH: process.env.PATH ?? "",
+              HOME: homeDir,
+              TMPDIR: tempDir,
+              NODE_ENV: "test",
+              NO_COLOR: "1",
+              CI: "1",
+            },
+            encoding: "utf8",
+            timeout: 30_000,
+            maxBuffer: 4 * 1024 * 1024,
+          }
+        );
+        assert.equal(
+          runWrangler.status,
+          0,
+          `D1 usage query failed:\n${runWrangler.stdout}\n${runWrangler.stderr}`
+        );
+        const usageResults = JSON.parse(runWrangler.stdout) as Array<{
+          results?: Array<Record<string, unknown>>;
+        }>;
+        const usageRows = usageResults.flatMap((result) => result.results ?? []);
+        assert.deepEqual(
+          usageRows.map(({ id, tenant_id, model, tokens_input, tokens_output }) => ({
+            id,
+            tenant_id,
+            model,
+            tokens_input,
+            tokens_output,
+          })),
+          [
+            {
+              id: requestA.requestId,
+              tenant_id: streamA.tenantId,
+              model: modelA.slice("ollama:chat:".length),
+              tokens_input: 5,
+              tokens_output: 2,
+            },
+            {
+              id: requestB.requestId,
+              tenant_id: streamB.tenantId,
+              model: modelB.slice("ollama:chat:".length),
+              tokens_input: 7,
+              tokens_output: 3,
+            },
+          ]
+        );
+        await Promise.all([readerA.reader.cancel(), readerB.reader.cancel()]);
+      }
+    );
+
+    await t.test(
       "tenant-local device catalogs reject another tenant's advertised model",
       async () => {
         const modelA = "ollama:chat:tenant-a-model";
