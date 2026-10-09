@@ -288,21 +288,15 @@ test(
     const tenantId = `inference-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
     const tenant = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
       token: adminToken,
-      body: { id: tenantId, name: "Local Inference Integration", slug: tenantId },
+      body: {
+        id: tenantId,
+        name: "Local Inference Integration",
+        slug: tenantId,
+        ownerPrincipalId: `principal-${tenantId}`,
+      },
     });
     assert.equal(tenant.response.status, 201, JSON.stringify(tenant.body));
-    const membership = await requestJson(`${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships`, {
-      token: adminToken,
-      body: { principalId: `principal-${tenantId}`, role: "owner" },
-    });
-    assert.equal(membership.response.status, 201, JSON.stringify(membership.body));
-    const membershipId = String(membership.body.id);
-    const issuedKey = await requestJson(
-      `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships/${membershipId}/api-keys`,
-      { token: adminToken, body: {} }
-    );
-    assert.equal(issuedKey.response.status, 201, JSON.stringify(issuedKey.body));
-    const customerKey = String(issuedKey.body.token);
+    const customerKey = String(tenant.body.ownerApiKey.token);
     assert.match(customerKey, /^orc_live_/);
 
     const entitlement = await requestJson(

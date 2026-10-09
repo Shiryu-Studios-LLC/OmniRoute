@@ -236,6 +236,43 @@ test("platform admin can provision a tenant, owner membership, and one-time key 
   }
 });
 
+test("platform tenant creation rejects requests without a verified owner principal", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer platform-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-without-owner",
+          name: "Unowned Customer",
+          slug: "unowned-customer",
+        }),
+      }),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(
+      await d1.prepare("SELECT id FROM tenants WHERE id = 'tenant-without-owner'").first(),
+      null
+    );
+    assert.equal(
+      (
+        await d1
+          .prepare("SELECT id FROM cloud_compliance_audit WHERE action = 'customer.provision'")
+          .all()
+      ).results.length,
+      0
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
 test("customer provisioning compensates tenant and owner writes when key issuance fails", async () => {
   const { d1, now } = await fixture();
   try {

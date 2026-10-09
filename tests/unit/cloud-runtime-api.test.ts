@@ -176,8 +176,25 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
       return { results: rows as U[], success: true };
     }
     if (this.sql.startsWith("SELECT * FROM cloud_usage_history")) {
+      let valueIndex = 1;
+      const providerIndex = this.sql.includes("provider = ?") ? valueIndex++ : -1;
+      const fromIndex = this.sql.includes("timestamp >= ?") ? valueIndex++ : -1;
+      const toIndex = this.sql.includes("timestamp <= ?") ? valueIndex++ : -1;
+      const beforeIndex = this.sql.includes("(timestamp < ? OR (timestamp = ? AND id < ?))")
+        ? valueIndex
+        : -1;
       const rows = this.database.usageRows
         .filter((row) => row.tenant_id === this.values[0])
+        .filter((row) => providerIndex < 0 || row.provider === this.values[providerIndex])
+        .filter((row) => fromIndex < 0 || String(row.timestamp) >= String(this.values[fromIndex]))
+        .filter((row) => toIndex < 0 || String(row.timestamp) <= String(this.values[toIndex]))
+        .filter(
+          (row) =>
+            beforeIndex < 0 ||
+            String(row.timestamp) < String(this.values[beforeIndex]) ||
+            (String(row.timestamp) === String(this.values[beforeIndex + 1]) &&
+              String(row.id) < String(this.values[beforeIndex + 2]))
+        )
         .sort(
           (left, right) =>
             String(right.timestamp).localeCompare(String(left.timestamp)) ||
@@ -359,7 +376,7 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
   assert.equal(response.status, 401);
 });
 
-test("maintenance identity can provision and inspect tenant lifecycle but cannot access cloud CRUD", async () => {
+test("maintenance identity requires an owner to provision and cannot access cloud CRUD", async () => {
   const db = new TestD1();
   const app = runtime(db, undefined, undefined, "test-cloud-maintenance-secret");
   const provision = await app.fetch(
@@ -369,10 +386,14 @@ test("maintenance identity can provision and inspect tenant lifecycle but cannot
         Authorization: "Bearer test-cloud-maintenance-secret",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ id: "tenant-maintained", name: "Maintained", slug: "maintained" }),
+      body: JSON.stringify({
+        id: "tenant-maintained",
+        name: "Maintained",
+        slug: "maintained",
+      }),
     })
   );
-  assert.equal(provision.status, 201);
+  assert.equal(provision.status, 400);
   assert.equal(db.auditRows[0][4], "cloud-maintenance");
 
   const lifecycle = await app.fetch(
@@ -711,6 +732,45 @@ test("cloud usage API writes and reads tenant-scoped D1 history", async () => {
   assert.equal(badLimit.status, 400);
   const badDate = await app.fetch(request("/__cloud/v1/tenants/tenant-a/usage?from=not-a-date"));
   assert.equal(badDate.status, 400);
+});
+
+test("cloud usage API exposes a stable timestamp and id cursor", async () => {
+  const db = new TestD1();
+  const app = runtime(db);
+  const timestamp = "2026-10-08T12:00:00.000Z";
+  for (const id of ["usage-a", "usage-b", "usage-c"]) {
+    const response = await app.fetch(
+      new Request("https://omniroute.test/__cloud/v1/tenants/tenant-a/usage", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${adminToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ id, timestamp }),
+      })
+    );
+    assert.equal(response.status, 201);
+  }
+
+  const page = await app.fetch(
+    request(
+      `/__cloud/v1/tenants/tenant-a/usage?limit=2&beforeTimestamp=${encodeURIComponent(timestamp)}&beforeId=usage-c`
+    )
+  );
+  assert.equal(page.status, 200);
+  assert.deepEqual(
+    ((await page.json()) as Array<Record<string, unknown>>).map((row) => row.id),
+    ["usage-b", "usage-a"]
+  );
+
+  const partialCursor = await app.fetch(
+    request(`/__cloud/v1/tenants/tenant-a/usage?beforeTimestamp=${encodeURIComponent(timestamp)}`)
+  );
+  assert.equal(partialCursor.status, 400);
+  const invalidCursor = await app.fetch(
+    request(`/__cloud/v1/tenants/tenant-a/usage?beforeTimestamp=not-a-date&beforeId=usage-c`)
+  );
+  assert.equal(invalidCursor.status, 400);
 });
 
 test("tenant creation accounting fails closed when the platform row is not platform-admin", async () => {

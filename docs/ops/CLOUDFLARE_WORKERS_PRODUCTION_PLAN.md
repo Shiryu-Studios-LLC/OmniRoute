@@ -154,7 +154,7 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Create customer tenant.
 - Create owner/admin membership.
 - Generate tenant-scoped credentials.
-- The platform-admin tenant-create request can include an owner principal ID from an external verified identity flow; it then creates the tenant, owner membership, and one-time API key with compensating rollback and an audit record.
+- The platform-admin tenant-create request requires an owner principal ID from an external verified identity flow; it creates the tenant, owner membership, and one-time API key with compensating rollback and an audit record. The Cloud runtime does not verify the owner's real-world identity itself.
 - Configure provider defaults.
 - Configure MCP defaults.
 - Register devices.

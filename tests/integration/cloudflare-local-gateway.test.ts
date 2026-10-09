@@ -516,25 +516,19 @@ test(
       const tenantId = `local-${label}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       const tenantResult = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
         token: adminToken,
-        body: { id: tenantId, name: `Local Integration ${label}`, slug: tenantId },
+        body: {
+          id: tenantId,
+          name: `Local Integration ${label}`,
+          slug: tenantId,
+          ownerPrincipalId: `principal-${tenantId}`,
+        },
       });
       assert.equal(
         tenantResult.response.status,
         201,
         `${label} tenant provisioning failed: ${JSON.stringify(tenantResult.body)}\n${output}`
       );
-      const membershipResult = await requestJson(
-        `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships`,
-        { token: adminToken, body: { principalId: `principal-${tenantId}`, role: "owner" } }
-      );
-      assert.equal(membershipResult.response.status, 201);
-      const membershipId = String(membershipResult.body.id);
-      const keyResult = await requestJson(
-        `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships/${membershipId}/api-keys`,
-        { token: adminToken, body: {} }
-      );
-      assert.equal(keyResult.response.status, 201);
-      const customerKey = String(keyResult.body.token);
+      const customerKey = String(tenantResult.body.ownerApiKey.token);
       assert.match(customerKey, /^orc_live_/);
 
       const deviceId = `device-${randomUUID().replaceAll("-", "").slice(0, 20)}`;

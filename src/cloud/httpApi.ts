@@ -17,7 +17,6 @@ import {
 import type { CloudDb } from "./db";
 import {
   CLOUD_PLATFORM_TENANT_ID,
-  createCloudCustomerTenant,
   getCloudTenantById,
   setCloudCustomerTenantActive,
 } from "./tenants";
@@ -985,54 +984,42 @@ export async function handleCloudApiRequest(
       if (typeof body.slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(body.slug)) {
         throw new ApiError(400, "Invalid slug");
       }
-      if (
-        body.ownerPrincipalId !== undefined &&
-        (typeof body.ownerPrincipalId !== "string" || !validId(body.ownerPrincipalId))
-      ) {
-        throw new ApiError(400, "Invalid ownerPrincipalId");
+      if (typeof body.ownerPrincipalId !== "string" || !validId(body.ownerPrincipalId)) {
+        throw new ApiError(400, "An ownerPrincipalId from a trusted identity flow is required");
       }
-      if (typeof body.ownerPrincipalId === "string") {
-        const provisioned = await provisionCloudCustomer(db, {
-          id: body.id,
-          name: body.name.trim(),
-          slug: body.slug,
-          ownerPrincipalId: body.ownerPrincipalId,
-          now: now().toISOString(),
-        });
-        try {
-          await appendCloudComplianceAudit(db, {
-            id: crypto.randomUUID(),
-            tenantId: CLOUD_PLATFORM_TENANT_ID,
-            timestamp: now().toISOString(),
-            action: "customer.provision",
-            actor: auditActor,
-            target: provisioned.tenant.id,
-            resourceType: "customer-tenant",
-            status: "success",
-            requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
-            metadata: {
-              slug: provisioned.tenant.slug,
-              membershipId: provisioned.ownerMembership.id,
-              apiKeyId: provisioned.ownerApiKey.id,
-            },
-          });
-        } catch {
-          try {
-            await rollbackCloudCustomerProvisioning(db, provisioned.tenant.id);
-          } catch {
-            return json({ error: "Customer provisioning rollback could not be confirmed" }, 503);
-          }
-          return json({ error: "Customer provisioning audit could not be completed" }, 503);
-        }
-        return json(provisioned, 201);
-      }
-      const tenant = await createCloudCustomerTenant(db, {
+      const provisioned = await provisionCloudCustomer(db, {
         id: body.id,
         name: body.name.trim(),
         slug: body.slug,
+        ownerPrincipalId: body.ownerPrincipalId,
         now: now().toISOString(),
       });
-      return json(tenant, 201);
+      try {
+        await appendCloudComplianceAudit(db, {
+          id: crypto.randomUUID(),
+          tenantId: CLOUD_PLATFORM_TENANT_ID,
+          timestamp: now().toISOString(),
+          action: "customer.provision",
+          actor: auditActor,
+          target: provisioned.tenant.id,
+          resourceType: "customer-tenant",
+          status: "success",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: {
+            slug: provisioned.tenant.slug,
+            membershipId: provisioned.ownerMembership.id,
+            apiKeyId: provisioned.ownerApiKey.id,
+          },
+        });
+      } catch {
+        try {
+          await rollbackCloudCustomerProvisioning(db, provisioned.tenant.id);
+        } catch {
+          return json({ error: "Customer provisioning rollback could not be confirmed" }, 503);
+        }
+        return json({ error: "Customer provisioning audit could not be completed" }, 503);
+      }
+      return json(provisioned, 201);
     }
 
     if (segments.length === 0) return json({ error: "Not found" }, 404);
@@ -1453,8 +1440,24 @@ export async function handleCloudApiRequest(
         const provider = url.searchParams.get("provider") ?? undefined;
         const from = url.searchParams.get("from") ?? undefined;
         const to = url.searchParams.get("to") ?? undefined;
+        const beforeTimestamp = url.searchParams.get("beforeTimestamp");
+        const beforeId = url.searchParams.get("beforeId");
+        if ((beforeTimestamp === null) !== (beforeId === null)) {
+          throw new ApiError(400, "beforeTimestamp and beforeId must be provided together");
+        }
         try {
-          return json(await listCloudUsageRecords(db, tenantId, { provider, from, to, limit }));
+          return json(
+            await listCloudUsageRecords(db, tenantId, {
+              provider,
+              from,
+              to,
+              limit,
+              before:
+                beforeTimestamp !== null && beforeId !== null
+                  ? { timestamp: beforeTimestamp, id: beforeId }
+                  : undefined,
+            })
+          );
         } catch (error) {
           if (error instanceof TypeError || error instanceof RangeError) {
             throw new ApiError(400, error.message);
