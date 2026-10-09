@@ -193,6 +193,72 @@ class SerializingCloudDb implements CloudDb {
   }
 }
 
+class SettingsAuthorizationRaceStatement<T = unknown> implements CloudDbStatement<T> {
+  constructor(private readonly inner: CloudDbStatement<T>) {}
+
+  bind(...values: unknown[]): CloudDbStatement<T> {
+    return new SettingsAuthorizationRaceStatement(this.inner.bind(...values));
+  }
+
+  first<U = T>(column?: string): Promise<U | null> {
+    return this.inner.first<U>(column);
+  }
+
+  all<U = T>(): Promise<{ results: U[]; success: boolean; meta?: Record<string, unknown> }> {
+    return this.inner.all<U>();
+  }
+
+  run(): Promise<{ success: boolean; meta?: Record<string, unknown> }> {
+    return this.inner.run();
+  }
+
+  unwrap(): CloudDbStatement<T> {
+    return this.inner;
+  }
+}
+
+class RevokeOidcSessionBeforeSettingsBatchCloudDb implements CloudDb {
+  triggered = false;
+
+  constructor(
+    private readonly inner: CloudDb,
+    private readonly membershipId: string,
+    private readonly revokedAtMs: number
+  ) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    const statement = this.inner.prepare<T>(sql);
+    return /^\s*UPDATE cloud_tenant_settings SET\b/i.test(sql)
+      ? new SettingsAuthorizationRaceStatement(statement)
+      : statement;
+  }
+
+  async batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    if (
+      !this.triggered &&
+      statements.some((statement) => statement instanceof SettingsAuthorizationRaceStatement)
+    ) {
+      this.triggered = true;
+      await this.inner
+        .prepare(
+          `UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ?
+            WHERE membership_id = ? AND revoked_at_ms IS NULL`
+        )
+        .bind(this.revokedAtMs, this.membershipId)
+        .run();
+    }
+    return this.inner.batch(
+      statements.map((statement) =>
+        statement instanceof SettingsAuthorizationRaceStatement ? statement.unwrap() : statement
+      )
+    );
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.inner.exec(sql);
+  }
+}
+
 async function setup() {
   const db = new SqliteCloudDb();
   for (const name of [
@@ -1160,6 +1226,46 @@ test("MCP portal opt-in is owner/admin scoped, MCP-only, audited, and does not e
         JSON.stringify(row.metadata_json) === JSON.stringify('{"mcpEnabled":false}')
     )
   );
+});
+
+test("MCP settings batch rejects a session revoked after portal authorization resolves", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const raceDb = new RevokeOidcSessionBeforeSettingsBatchCloudDb(db, membership.id, NOW);
+  const response = await runtime(raceDb).fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MCP_SETTINGS_PATH}`, {
+      method: "PUT",
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ mcpEnabled: true }),
+    })
+  );
+
+  assert.equal(raceDb.triggered, true, "revoke the session after resolveSession and before batch");
+  assert.equal(response.status, 403);
+  const settings = await db
+    .prepare<{ local_ai_enabled: number; mcp_enabled: number }>(
+      "SELECT local_ai_enabled, mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+  assert.equal(settings?.local_ai_enabled, 0);
+  assert.equal(settings?.mcp_enabled, 0, "revoked session must not change tenant settings");
+  const audit = await db
+    .prepare<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM cloud_compliance_audit
+        WHERE tenant_id = ? AND action = 'customer.settings.mcp_portal.update'`
+    )
+    .bind(tenant.id)
+    .first();
+  assert.equal(audit?.count, 0, "unauthorized settings writes must not create success audits");
 });
 
 test("provider connection portal enforces owner sessions and reuses encrypted fixed-contract API operations", async () => {
