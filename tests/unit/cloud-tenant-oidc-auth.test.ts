@@ -25,6 +25,7 @@ import {
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
   CLOUD_TENANT_MEMBERS_PATH,
   CLOUD_TENANT_API_KEYS_PATH,
+  CLOUD_TENANT_BUSINESS_PROFILE_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -193,6 +194,8 @@ async function setup() {
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
+    "0023_cloud_tenant_business_profiles.sql",
+    "0024_cloud_tenant_business_profile_configuration.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -409,6 +412,155 @@ async function createPortalSession(
   assert.equal(callback.status, 303);
   return { app, cookie: getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE) };
 }
+
+test("business profile portal is owner/admin session scoped, origin checked, bounded, and audited without profile text", async () => {
+  const { db, tenant, membership } = await setup();
+  const otherTenant = await createCloudCustomerTenant(db, {
+    id: "customer-oidc-other",
+    name: "Other Tenant",
+    slug: "other-tenant",
+  });
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const headers = (extra: Record<string, string> = {}) => ({
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+    ...extra,
+  });
+  const path = `${ORIGIN}${CLOUD_TENANT_BUSINESS_PROFILE_PATH}`;
+  const read = await portal.app.fetch(new Request(path, { headers: headers() }));
+  assert.equal(read.status, 200, await read.clone().text());
+  const initial = (await read.json()) as { name: string; tenantId: string };
+  assert.equal(initial.tenantId, tenant.id);
+  assert.equal(initial.name, tenant.name);
+
+  const profile = {
+    name: "Confidential Shop Name",
+    description: "Private customer-facing description",
+    hours: "Weekdays",
+    services: [{ name: "Private service", price: "$10" }],
+    assistant: { name: "Front Desk", tone: "Friendly", handoff: "Call our private line" },
+  };
+  const badOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: "https://attacker.example", "Content-Type": "application/json" }),
+      body: JSON.stringify(profile),
+    })
+  );
+  assert.equal(badOrigin.status, 403);
+  const missingOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(profile),
+    })
+  );
+  assert.equal(missingOrigin.status, 403);
+  const wrongContentType = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/jsonp" }),
+      body: JSON.stringify(profile),
+    })
+  );
+  assert.equal(wrongContentType.status, 415);
+  const invalid = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...profile, unexpected: "reject" }),
+    })
+  );
+  assert.equal(invalid.status, 400);
+  const tooLarge = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...profile, description: "x".repeat(25_000) }),
+    })
+  );
+  assert.equal(tooLarge.status, 400);
+  const saved = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify(profile),
+    })
+  );
+  assert.equal(saved.status, 200);
+  assert.equal(((await saved.json()) as { name: string }).name, profile.name);
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const adminSaved = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...profile, name: "Admin Configured Business" }),
+    })
+  );
+  assert.equal(adminSaved.status, 200);
+  const failingApp = runtime(new FailingAuditCloudDb(db));
+  const failedAuditWrite = await failingApp.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...profile, name: "Must Roll Back" }),
+    })
+  );
+  assert.equal(failedAuditWrite.status, 503);
+  const afterFailedAudit = await db
+    .prepare("SELECT name FROM cloud_tenant_business_profiles WHERE tenant_id = ?")
+    .bind(tenant.id)
+    .first<{ name: string }>();
+  assert.equal(afterFailedAudit?.name, "Admin Configured Business");
+
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "profile-member",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "profile-member-subject",
+    membershipId: member.id,
+  });
+  const memberPortal = await createPortalSession(db, tenant.slug, "profile-member-subject");
+  const denied = await memberPortal.app.fetch(
+    new Request(path, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${memberPortal.cookie}` },
+    })
+  );
+  assert.equal(denied.status, 403);
+  const unauthenticated = await portal.app.fetch(new Request(path));
+  assert.equal(unauthenticated.status, 403);
+
+  const auditRows = await db
+    .prepare(
+      "SELECT action, actor, metadata_json FROM cloud_compliance_audit WHERE action = 'customer.business_profile.portal.update'"
+    )
+    .all<{ action: string; actor: string; metadata_json: string }>();
+  assert.equal(auditRows.results.length, 2);
+  const audit = auditRows.results[0];
+  assert.equal(audit?.action, "customer.business_profile.portal.update");
+  assert.equal(audit?.actor, `membership:${membership.id}`);
+  assert.deepEqual(JSON.parse(audit!.metadata_json), { serviceCount: 1 });
+  assert.doesNotMatch(audit!.metadata_json, /Confidential|Private|Front Desk|Call our/);
+  const profileB = await db
+    .prepare("SELECT name FROM cloud_tenant_business_profiles WHERE tenant_id = ?")
+    .bind(otherTenant.id)
+    .first<{ name: string }>();
+  assert.equal(
+    profileB?.name,
+    otherTenant.name,
+    "the session cannot modify another tenant profile"
+  );
+});
 
 test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an isolated revocable session", async () => {
   const { db, tenant, membership } = await setup();

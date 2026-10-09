@@ -37,6 +37,8 @@ test("Cloud Worker serves the customer portal with nonce CSP and safe DOM render
   assert.match(html, /__cloud\/auth\/oidc\/invitations\/redeem/);
   assert.match(html, /__cloud\/auth\/logout/);
   assert.match(html, /__cloud\/auth\/api-keys/);
+  assert.match(html, /__cloud\/auth\/business-profile/);
+  assert.match(html, /business-profile-panel/);
   assert.match(html, /api-key-panel/);
   assert.match(html, /expiresAt:/);
   assert.match(html, /method: "DELETE"/);

@@ -65,7 +65,7 @@ export async function updateCloudCustomerBusinessProfile(
   input: {
     tenantId: string;
     membershipId: string;
-    apiKeyId: string;
+    apiKeyId?: string;
     profile: Omit<CloudCustomerBusinessProfile, "tenantId" | "createdAt" | "updatedAt">;
     updatedAt: string;
     audit: CloudComplianceAuditInput;
@@ -82,15 +82,17 @@ export async function updateCloudCustomerBusinessProfile(
           WHERE tenant_id = ?
             AND EXISTS (
               SELECT 1 FROM cloud_customer_memberships m
-              JOIN cloud_customer_api_keys k
-                ON k.tenant_id = m.tenant_id AND k.membership_id = m.id
               JOIN tenants t ON t.id = m.tenant_id
               WHERE m.tenant_id = cloud_tenant_business_profiles.tenant_id
                 AND m.id = ? AND m.is_active = 1 AND m.role IN ('owner', 'admin')
-                AND k.id = ? AND k.revoked_at IS NULL
-                AND (k.expires_at IS NULL OR k.expires_at > ?)
                 AND t.kind = 'customer' AND t.is_active = 1
-            )`
+            )
+            AND (? IS NULL OR EXISTS (
+              SELECT 1 FROM cloud_customer_api_keys k
+              WHERE k.tenant_id = cloud_tenant_business_profiles.tenant_id
+                AND k.membership_id = ? AND k.id = ? AND k.revoked_at IS NULL
+                AND (k.expires_at IS NULL OR k.expires_at > ?)
+            ))`
       )
       .bind(
         profile.name,
@@ -104,7 +106,9 @@ export async function updateCloudCustomerBusinessProfile(
         input.updatedAt,
         input.tenantId,
         input.membershipId,
-        input.apiKeyId,
+        input.apiKeyId ?? null,
+        input.membershipId,
+        input.apiKeyId ?? null,
         input.updatedAt
       ),
     prepareCloudComplianceAuditInsert(db, input.audit, {

@@ -37,6 +37,7 @@ const PORTAL_SCRIPT = `
   const nextButton = byId("next-page");
   const apiKeyList = byId("api-keys");
   const apiKeyResult = byId("api-key-result");
+  const serviceList = byId("business-services");
   let newlyIssuedToken = null;
   let nextCursor = null;
 
@@ -50,6 +51,71 @@ const PORTAL_SCRIPT = `
     newlyIssuedToken = null;
     apiKeyResult.replaceChildren();
   };
+
+  const addService = (service = { name: "", price: "" }) => {
+    if (serviceList.children.length >= 30) return setStatus("You can add up to 30 services.", true);
+    const row = node("li");
+    row.className = "service-row";
+    const nameLabel = node("label", "Service name");
+    const name = node("input");
+    name.maxLength = 100;
+    name.required = true;
+    name.value = typeof service.name === "string" ? service.name : "";
+    nameLabel.append(name);
+    const priceLabel = node("label", "Price");
+    const price = node("input");
+    price.maxLength = 60;
+    price.value = typeof service.price === "string" ? service.price : "";
+    priceLabel.append(price);
+    const remove = node("button", "Remove service");
+    remove.type = "button";
+    remove.addEventListener("click", () => row.remove());
+    row.append(nameLabel, priceLabel, remove);
+    serviceList.append(row);
+  };
+
+  const loadBusinessProfile = async () => {
+    const profile = await api("/__cloud/auth/business-profile");
+    for (const [id, value] of [
+      ["business-name", profile.name], ["business-description", profile.description],
+      ["business-hours", profile.hours], ["assistant-name", profile.assistant?.name],
+      ["assistant-tone", profile.assistant?.tone], ["assistant-handoff", profile.assistant?.handoff],
+    ]) {
+      if (typeof value === "string") byId(id).value = value;
+    }
+    serviceList.replaceChildren();
+    if (Array.isArray(profile.services)) {
+      for (const service of profile.services) addService(service);
+    }
+  };
+
+  byId("add-business-service").addEventListener("click", () => addService());
+  byId("business-profile-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("save-business-profile");
+    button.disabled = true;
+    const services = Array.from(serviceList.children, (row) => {
+      const inputs = row.querySelectorAll("input");
+      return { name: inputs[0].value, price: inputs[1].value };
+    });
+    const body = {
+      name: byId("business-name").value,
+      description: byId("business-description").value,
+      hours: byId("business-hours").value,
+      services,
+      assistant: {
+        name: byId("assistant-name").value,
+        tone: byId("assistant-tone").value,
+        handoff: byId("assistant-handoff").value,
+      },
+    };
+    try {
+      await api("/__cloud/auth/business-profile", { method: "PUT", body: JSON.stringify(body) });
+      setStatus("Business profile saved.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Business profile could not be saved.", true);
+    } finally { button.disabled = false; }
+  });
 
   const loadApiKeys = async () => {
     const data = await api("/__cloud/auth/api-keys");
@@ -288,6 +354,12 @@ const PORTAL_SCRIPT = `
       if (session.membership.role === "owner" || session.membership.role === "admin") {
         byId("api-key-panel").hidden = false;
         byId("manager-panel").hidden = false;
+        byId("business-profile-panel").hidden = false;
+        try {
+          await loadBusinessProfile();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load business profile.", true);
+        }
         try {
           await loadApiKeys();
         } catch (error) {
@@ -331,7 +403,8 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
       body { margin: 0 auto; max-width: 54rem; padding: 2rem 1rem; }
       main { display: grid; gap: 1.5rem; }
       section, .member-row { border: 1px solid #8888; border-radius: .75rem; padding: 1rem; }
-      form, .member-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
+      form, .member-form, .service-row { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
+      textarea { font: inherit; min-width: min(28rem, 80vw); min-height: 4rem; }
       label { display: grid; gap: .25rem; }
       input, select, button { font: inherit; padding: .5rem; }
       button { cursor: pointer; }
@@ -392,6 +465,29 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <button id="issue-invitation" type="submit">Create one-use invitation</button>
         </form>
         <div id="invitation-result" aria-live="polite"></div>
+      </section>
+      <section id="business-profile-panel" hidden>
+        <h2>Business profile</h2>
+        <p>This information is used by your configured customer experience.</p>
+        <form id="business-profile-form">
+          <label for="business-name">Business name</label>
+          <input id="business-name" maxlength="120" required>
+          <label for="business-description">Description</label>
+          <textarea id="business-description" maxlength="1000"></textarea>
+          <label for="business-hours">Hours</label>
+          <input id="business-hours" maxlength="250">
+          <h3>Services</h3>
+          <ul id="business-services"></ul>
+          <button id="add-business-service" type="button">Add service</button>
+          <h3>Assistant</h3>
+          <label for="assistant-name">Assistant name</label>
+          <input id="assistant-name" maxlength="100" required>
+          <label for="assistant-tone">Tone</label>
+          <input id="assistant-tone" maxlength="250" required>
+          <label for="assistant-handoff">When to hand off to a person</label>
+          <textarea id="assistant-handoff" maxlength="1000" required></textarea>
+          <button id="save-business-profile" type="submit">Save business profile</button>
+        </form>
       </section>
     </main>
     <script nonce="${nonce}">${PORTAL_SCRIPT}</script>

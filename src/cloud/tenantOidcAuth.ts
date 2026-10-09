@@ -23,6 +23,11 @@ import {
 import { listCloudTenantPortalMembers } from "./tenantMembershipManagement";
 import { CLOUD_CUSTOMER_PORTAL_PATH } from "./customerPortal";
 import {
+  getCloudCustomerBusinessProfile,
+  updateCloudCustomerBusinessProfile,
+} from "./customerBusinessProfile";
+import { validateCloudCustomerBusinessProfile } from "./customerBusinessProfileHttpApi";
+import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaimByHash,
@@ -39,6 +44,7 @@ export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
 export const CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH = "/__cloud/auth/oidc/owner/claim";
 export const CLOUD_TENANT_MEMBERS_PATH = "/__cloud/auth/members";
 export const CLOUD_TENANT_API_KEYS_PATH = "/__cloud/auth/api-keys";
+export const CLOUD_TENANT_BUSINESS_PROFILE_PATH = "/__cloud/auth/business-profile";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -875,6 +881,70 @@ async function checkMembershipPortalRateLimit(
   return result.allowed;
 }
 
+async function customerBusinessProfilePortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  const db = options.db;
+  if (!db) return json({ error: "Business profile service unavailable" }, 503);
+  if (request.method !== "GET" && request.method !== "PUT") {
+    return json({ error: "Method not allowed" }, 405, { Allow: "GET, PUT" });
+  }
+  if (request.method === "PUT" && request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  const limit = await consumeCloudRateLimit(db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-business-profile-portal:${session.tenant_id}:${session.membership_id}`,
+    limit: request.method === "GET" ? 120 : 30,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!limit.allowed) return json({ error: "Business profile rate limit exceeded" }, 429);
+  if (request.method === "GET") {
+    const profile = await getCloudCustomerBusinessProfile(db, session.tenant_id);
+    return profile ? json(profile) : json({ error: "Business profile unavailable" }, 503);
+  }
+  if (
+    request.headers.get("content-type")?.toLowerCase().split(";", 1)[0]?.trim() !==
+    "application/json"
+  ) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBounded(new Response(request.body), 24 * 1024);
+  } catch {
+    return json({ error: "Invalid business profile body" }, 400);
+  }
+  const profile = validateCloudCustomerBusinessProfile(body);
+  if (!profile) return json({ error: "Invalid business profile" }, 400);
+  const updatedAt = new Date(nowMs).toISOString();
+  const result = await updateCloudCustomerBusinessProfile(db, {
+    tenantId: session.tenant_id,
+    membershipId: session.membership_id,
+    profile,
+    updatedAt,
+    audit: {
+      id: crypto.randomUUID(),
+      tenantId: session.tenant_id,
+      timestamp: updatedAt,
+      action: "customer.business_profile.portal.update",
+      actor: `membership:${session.membership_id}`,
+      target: "tenant-business-profile",
+      resourceType: "customer-business-profile",
+      status: "success",
+      requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+      metadata: { serviceCount: profile.services.length },
+    },
+  });
+  return result ? json(result) : json({ error: "Owner or admin session required" }, 403);
+}
+
 async function listMemberships(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1358,6 +1428,7 @@ export async function handleCloudTenantOidcAuthRequest(
   const isMemberItem = pathname.startsWith(`${CLOUD_TENANT_MEMBERS_PATH}/`);
   const isApiKeyCollection = pathname === CLOUD_TENANT_API_KEYS_PATH;
   const isApiKeyItem = pathname.startsWith(`${CLOUD_TENANT_API_KEYS_PATH}/`);
+  const isBusinessProfile = pathname === CLOUD_TENANT_BUSINESS_PROFILE_PATH;
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1370,6 +1441,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isMemberItem &&
     !isApiKeyCollection &&
     !isApiKeyItem &&
+    !isBusinessProfile &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1377,7 +1449,7 @@ export async function handleCloudTenantOidcAuthRequest(
     return null;
   }
   const expectedMethod =
-    isApiKeyCollection || isApiKeyItem
+    isApiKeyCollection || isApiKeyItem || isBusinessProfile
       ? ""
       : isCreateInvitation || isRedeemInvitation || isRedeemOwnerClaim || isLogout
         ? "POST"
@@ -1388,7 +1460,9 @@ export async function handleCloudTenantOidcAuthRequest(
     ? ["GET", "POST"]
     : isApiKeyItem
       ? ["DELETE"]
-      : [expectedMethod];
+      : isBusinessProfile
+        ? ["GET", "PUT"]
+        : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1401,6 +1475,7 @@ export async function handleCloudTenantOidcAuthRequest(
   }
   const nowMs = options.now?.() ?? Date.now();
   if (!Number.isSafeInteger(nowMs) || nowMs < 0) return json({ error: "Service unavailable" }, 503);
+  if (isBusinessProfile) return customerBusinessProfilePortal(request, options, origin, nowMs);
   if (isLogin) {
     return startLogin(request, options, origin, nowMs);
   }

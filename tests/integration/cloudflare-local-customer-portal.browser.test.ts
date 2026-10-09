@@ -331,6 +331,23 @@ test(
     await page.getByRole("heading", { name: "Chromium Portal Customer" }).waitFor();
     await page.getByText("Your role: owner").waitFor();
     await page.getByText("owner · Active").waitFor();
+    await page.getByLabel("Business name").fill("Browser Configured Business");
+    await page.getByLabel("Description").fill("Tenant-managed profile from the customer portal.");
+    await page.getByLabel("Hours").fill("Weekdays 9 to 5");
+    await page.getByLabel("Assistant name").fill("Portal Assistant");
+    await page.getByLabel("Tone").fill("Warm and concise");
+    await page.getByLabel("When to hand off to a person").fill("Offer a callback.");
+    await page.getByRole("button", { name: "Add service" }).click();
+    await page.getByLabel("Service name").fill("Consultation");
+    await page.getByLabel("Price").fill("$45");
+    await page.getByRole("button", { name: "Save business profile" }).click();
+    await page.getByText("Business profile saved.").waitFor();
+    await page.reload({ waitUntil: "networkidle" });
+    assert.equal(await page.locator("#business-name").inputValue(), "Browser Configured Business");
+    assert.equal(
+      await page.locator("#business-services input").first().inputValue(),
+      "Consultation"
+    );
 
     await page.getByRole("button", { name: "Create API key" }).click();
     await page.getByText("API key created.").waitFor();

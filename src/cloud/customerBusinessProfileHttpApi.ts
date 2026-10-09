@@ -25,7 +25,7 @@ function validText(value: unknown, max: number, required = false): value is stri
   return typeof value === "string" && value.length <= max && (!required || value.trim().length > 0);
 }
 
-function validateProfile(value: unknown) {
+export function validateCloudCustomerBusinessProfile(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const body = value as Record<string, unknown>;
   if (Object.keys(body).sort().join(",") !== "assistant,description,hours,name,services")
@@ -179,7 +179,7 @@ export async function handleCloudCustomerBusinessProfileRequest(
     }
     const body = await readProfile(request);
     if (body instanceof Response) return body;
-    const profile = validateProfile(body);
+    const profile = validateCloudCustomerBusinessProfile(body);
     if (!profile) return json({ error: "Invalid business profile" }, 400);
     const updatedAt = now().toISOString();
     const result = await updateCloudCustomerBusinessProfile(options.db, {
