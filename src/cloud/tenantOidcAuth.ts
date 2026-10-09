@@ -33,6 +33,8 @@ import {
 } from "./customerProviderHttpApi";
 import { handleCloudTenantMcpPortalRequest } from "./tenantMcpHttpApi";
 import { getCloudCustomerOnboardingReadiness } from "./tenantOnboardingHttpApi";
+import { readCloudCustomerSettingsBody } from "./tenantSettingsHttpApi";
+import { updateCloudTenantSettings } from "./tenantSettings";
 import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
@@ -55,6 +57,7 @@ export const CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH =
   CLOUD_CUSTOMER_PROVIDER_PORTAL_CONNECTIONS_PATH;
 export const CLOUD_TENANT_MCP_SERVERS_PATH = "/__cloud/auth/mcp-servers";
 export const CLOUD_TENANT_ONBOARDING_PATH = "/__cloud/auth/onboarding";
+export const CLOUD_TENANT_MCP_SETTINGS_PATH = "/__cloud/auth/mcp-settings";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -1045,6 +1048,80 @@ async function customerOnboardingReadinessPortal(
   }
 }
 
+async function customerMcpSettingsPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
+  if (new URL(request.url).search !== "") {
+    return json({ error: "Query parameters are not supported" }, 400);
+  }
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!options.db) return json({ error: "MCP settings are unavailable" }, 503);
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  const limit = await consumeCloudRateLimit(options.db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-mcp-settings-portal:${session.tenant_id}:${session.membership_id}`,
+    limit: 30,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!limit.allowed) return json({ error: "MCP settings rate limit exceeded" }, 429);
+  if (
+    request.headers.get("content-type")?.toLowerCase().split(";", 1)[0]?.trim() !==
+    "application/json"
+  ) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  const body = await readCloudCustomerSettingsBody(request, 5_000);
+  if (body instanceof Response) return body;
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    Array.isArray(body) ||
+    Object.keys(body).length !== 1 ||
+    typeof (body as Record<string, unknown>).mcpEnabled !== "boolean"
+  ) {
+    return json({ error: "Expected only an mcpEnabled boolean" }, 400);
+  }
+  const mcpEnabled = (body as { mcpEnabled: boolean }).mcpEnabled;
+  const timestamp = new Date(nowMs).toISOString();
+  try {
+    const settings = await updateCloudTenantSettings(options.db, {
+      tenantId: session.tenant_id,
+      membershipId: session.membership_id,
+      authorization: {
+        type: "oidc_session",
+        sessionTokenHash: session.session_token_hash,
+      },
+      mcpEnabled,
+      updatedAt: timestamp,
+      audit: {
+        id: crypto.randomUUID(),
+        tenantId: session.tenant_id,
+        timestamp,
+        action: "customer.settings.mcp_portal.update",
+        actor: `membership:${session.membership_id}`,
+        target: "tenant-mcp-opt-in",
+        resourceType: "customer-setting",
+        status: "success",
+        requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+        metadata: { mcpEnabled },
+      },
+    });
+    return settings
+      ? json({ mcpEnabled: settings.mcpEnabled })
+      : json({ error: "Owner or admin session required" }, 403);
+  } catch {
+    return json({ error: "MCP settings could not be updated" }, 503);
+  }
+}
+
 async function listMemberships(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1536,6 +1613,7 @@ export async function handleCloudTenantOidcAuthRequest(
     pathname === CLOUD_TENANT_MCP_SERVERS_PATH ||
     pathname.startsWith(`${CLOUD_TENANT_MCP_SERVERS_PATH}/`);
   const isOnboarding = pathname === CLOUD_TENANT_ONBOARDING_PATH;
+  const isMcpSettings = pathname === CLOUD_TENANT_MCP_SETTINGS_PATH;
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1552,6 +1630,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isProviderConnections &&
     !isMcpServers &&
     !isOnboarding &&
+    !isMcpSettings &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1578,7 +1657,9 @@ export async function handleCloudTenantOidcAuthRequest(
             ? ["GET", "POST", "PUT", "DELETE"]
             : isOnboarding
               ? ["GET"]
-              : [expectedMethod];
+              : isMcpSettings
+                ? ["PUT"]
+                : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1596,6 +1677,7 @@ export async function handleCloudTenantOidcAuthRequest(
     return customerProviderConnectionsPortal(request, options, origin, nowMs);
   if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
   if (isOnboarding) return customerOnboardingReadinessPortal(request, options, nowMs);
+  if (isMcpSettings) return customerMcpSettingsPortal(request, options, origin, nowMs);
   if (isLogin) {
     return startLogin(request, options, origin, nowMs);
   }

@@ -306,7 +306,7 @@ test(
       safeEnvPath,
       "--yes",
       "--command",
-      `UPDATE cloud_tenant_settings SET mcp_enabled = 1 WHERE tenant_id = ${sqlText(tenantId)}; INSERT INTO cloud_tenant_oidc_sessions (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms) VALUES (${sqlText(tokenHash)}, ${sqlText(tenantId)}, ${sqlText(String(membershipId))}, ${sqlText(String(identityId))}, ${nowMs}, ${expiresAtMs});`,
+      `INSERT INTO cloud_tenant_oidc_sessions (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms) VALUES (${sqlText(tokenHash)}, ${sqlText(tenantId)}, ${sqlText(String(membershipId))}, ${sqlText(String(identityId))}, ${nowMs}, ${expiresAtMs});`,
     ]);
     assert.equal(seedResult.status, 0, `${seedResult.stdout}\n${seedResult.stderr}`);
 
@@ -335,6 +335,13 @@ test(
     await page.getByText(/Inference access is default-deny/).waitFor();
     await page.getByText(/Only a platform admin can configure entitlements/).waitFor();
     assert.equal(await page.locator("#onboarding-readiness li").count(), 9);
+    assert.equal(await page.locator("#mcp-opt-in-enabled").isChecked(), false);
+    assert.equal(await page.locator("#mcp-server-panel").isVisible(), false);
+    const publicSettingsStatus = await page.evaluate(
+      async () =>
+        (await fetch("/__cloud/v1/customer/settings", { credentials: "same-origin" })).status
+    );
+    assert.equal(publicSettingsStatus, 401, "public settings remain bearer-key-only");
     assert.equal(
       (await page.locator("#onboarding-readiness").textContent())?.includes(tenantId),
       false
@@ -406,6 +413,32 @@ test(
     await providerRow.waitFor({ state: "detached" });
     assert.equal(await page.locator("#provider-connections").textContent(), "");
 
+    await page.locator("#mcp-opt-in-enabled").check();
+    await page.getByRole("button", { name: "Save MCP setting" }).click();
+    await page
+      .getByText("MCP configuration enabled. Discovery and invocation remain disabled.")
+      .waitFor();
+    assert.equal(await page.locator("#mcp-server-panel").isVisible(), true);
+    const mcpSettings = runWrangler([
+      "d1",
+      "execute",
+      workerName,
+      "--local",
+      "--persist-to",
+      persistDir,
+      "--config",
+      wranglerConfigPath,
+      "--env-file",
+      safeEnvPath,
+      "--yes",
+      "--json",
+      "--command",
+      `SELECT local_ai_enabled, mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ${sqlText(tenantId)};`,
+    ]);
+    assert.equal(mcpSettings.status, 0, `${mcpSettings.stdout}\n${mcpSettings.stderr}`);
+    assert.match(mcpSettings.stdout, /"local_ai_enabled":\s*0/);
+    assert.match(mcpSettings.stdout, /"mcp_enabled":\s*1/);
+
     const mcpSecret = "mcp-test-browser-credential";
     await page.locator("#mcp-server-name").fill("Browser MCP");
     await page.locator("#mcp-server-endpoint").fill("https://mcp.example.test/mcp");
@@ -443,6 +476,10 @@ test(
     await mcpRow.getByRole("button", { name: "Delete MCP server" }).click();
     await page.getByText("MCP server deleted.").waitFor();
     await mcpRow.waitFor({ state: "detached" });
+    await page.locator("#mcp-opt-in-enabled").uncheck();
+    await page.getByRole("button", { name: "Save MCP setting" }).click();
+    await page.getByText("MCP configuration disabled.").waitFor();
+    assert.equal(await page.locator("#mcp-server-panel").isVisible(), false);
 
     await page.getByRole("button", { name: "Create API key" }).click();
     await page.getByText("API key created.").waitFor();

@@ -28,7 +28,10 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
 }
 
-async function readSettings(request: Request, timeoutMs: number): Promise<unknown> {
+export async function readCloudCustomerSettingsBody(
+  request: Request,
+  timeoutMs: number
+): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) {
     return json({ error: "Expected application/json" }, 415);
   }
@@ -163,7 +166,10 @@ export async function handleCloudCustomerSettingsRequest(
     if (identity.role !== "owner" && identity.role !== "admin") {
       return json({ error: "Owner or admin membership is required" }, 403);
     }
-    const body = await readSettings(request, options.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS);
+    const body = await readCloudCustomerSettingsBody(
+      request,
+      options.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS
+    );
     if (body instanceof Response) return body;
     if (
       typeof body !== "object" ||
@@ -192,7 +198,7 @@ export async function handleCloudCustomerSettingsRequest(
     const settings = await updateCloudTenantSettings(options.db, {
       tenantId: identity.tenantId,
       membershipId: identity.membershipId,
-      apiKeyId: identity.apiKeyId,
+      authorization: { type: "api_key", apiKeyId: identity.apiKeyId },
       localAiEnabled: body.localAiEnabled,
       mcpEnabled: body.mcpEnabled,
       updatedAt: timestamp,

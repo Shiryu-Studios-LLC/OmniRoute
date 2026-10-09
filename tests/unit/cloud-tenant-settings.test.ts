@@ -216,6 +216,11 @@ test("customer settings are tenant-derived, role-gated, and audited atomically",
         })
       );
 
+    assert.equal(
+      (await app.fetch(new Request("https://omniroute.test/__cloud/v1/customer/settings"))).status,
+      401,
+      "the public settings route must still require a customer bearer API key"
+    );
     assert.equal((await get(ownerA.ownerApiKey.token)).status, 200);
     assert.equal(
       (await update(memberKey.token, { localAiEnabled: true, mcpEnabled: false })).status,

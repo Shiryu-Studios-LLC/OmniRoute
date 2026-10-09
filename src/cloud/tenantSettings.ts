@@ -12,6 +12,9 @@ export interface CloudTenantSettings {
   updatedAt: string;
 }
 
+export type CloudTenantSettingsAuthorization =
+  { type: "api_key"; apiKeyId: string } | { type: "oidc_session"; sessionTokenHash: string };
+
 interface CloudTenantSettingsRow {
   tenant_id: string;
   local_ai_enabled: number;
@@ -51,43 +54,68 @@ export async function updateCloudTenantSettings(
   input: {
     tenantId: string;
     membershipId: string;
-    apiKeyId: string;
-    localAiEnabled: boolean;
-    mcpEnabled: boolean;
+    authorization: CloudTenantSettingsAuthorization;
+    localAiEnabled?: boolean;
+    mcpEnabled?: boolean;
     updatedAt: string;
     audit: CloudComplianceAuditInput;
   }
 ): Promise<CloudTenantSettings | null> {
-  if (typeof input.localAiEnabled !== "boolean" || typeof input.mcpEnabled !== "boolean") {
-    throw new TypeError("Tenant feature settings must be booleans");
+  if (
+    (input.localAiEnabled !== undefined && typeof input.localAiEnabled !== "boolean") ||
+    (input.mcpEnabled !== undefined && typeof input.mcpEnabled !== "boolean") ||
+    (input.localAiEnabled === undefined && input.mcpEnabled === undefined)
+  ) {
+    throw new TypeError("At least one tenant feature setting must be a boolean");
   }
+  const assignments: string[] = [];
+  const values: unknown[] = [];
+  if (input.localAiEnabled !== undefined) {
+    assignments.push("local_ai_enabled = ?");
+    values.push(input.localAiEnabled ? 1 : 0);
+  }
+  if (input.mcpEnabled !== undefined) {
+    assignments.push("mcp_enabled = ?");
+    values.push(input.mcpEnabled ? 1 : 0);
+  }
+  assignments.push("updated_at = ?");
+  values.push(input.updatedAt, input.tenantId, input.membershipId);
+  const authorizationClause =
+    input.authorization.type === "oidc_session"
+      ? `EXISTS (
+        SELECT 1 FROM cloud_customer_memberships m
+        JOIN cloud_tenant_oidc_sessions s
+          ON s.tenant_id = m.tenant_id AND s.membership_id = m.id
+        JOIN tenants t ON t.id = m.tenant_id
+        WHERE m.tenant_id = cloud_tenant_settings.tenant_id
+          AND m.id = ? AND m.is_active = 1 AND m.role IN ('owner', 'admin')
+          AND s.token_hash = ? AND s.revoked_at_ms IS NULL AND s.expires_at_ms > ?
+          AND t.kind = 'customer' AND t.is_active = 1
+      )`
+      : `EXISTS (
+        SELECT 1 FROM cloud_customer_memberships m
+        JOIN cloud_customer_api_keys k
+          ON k.tenant_id = m.tenant_id AND k.membership_id = m.id
+        JOIN tenants t ON t.id = m.tenant_id
+        WHERE m.tenant_id = cloud_tenant_settings.tenant_id
+          AND m.id = ? AND m.is_active = 1 AND m.role IN ('owner', 'admin')
+          AND k.id = ? AND k.revoked_at IS NULL
+          AND (k.expires_at IS NULL OR k.expires_at > ?)
+          AND t.kind = 'customer' AND t.is_active = 1
+      )`;
+  values.push(
+    input.authorization.type === "oidc_session"
+      ? input.authorization.sessionTokenHash
+      : input.authorization.apiKeyId,
+    input.authorization.type === "oidc_session" ? Date.parse(input.updatedAt) : input.updatedAt
+  );
   const result = await db.batch([
     db
       .prepare(
-        `UPDATE cloud_tenant_settings
-            SET local_ai_enabled = ?, mcp_enabled = ?, updated_at = ?
-          WHERE tenant_id = ?
-            AND EXISTS (
-              SELECT 1 FROM cloud_customer_memberships m
-              JOIN cloud_customer_api_keys k
-                ON k.tenant_id = m.tenant_id AND k.membership_id = m.id
-              JOIN tenants t ON t.id = m.tenant_id
-              WHERE m.tenant_id = cloud_tenant_settings.tenant_id
-                AND m.id = ? AND m.is_active = 1 AND m.role IN ('owner', 'admin')
-                AND k.id = ? AND k.revoked_at IS NULL
-                AND (k.expires_at IS NULL OR k.expires_at > ?)
-                AND t.kind = 'customer' AND t.is_active = 1
-            )`
+        `UPDATE cloud_tenant_settings SET ${assignments.join(", ")}
+          WHERE tenant_id = ? AND ${authorizationClause}`
       )
-      .bind(
-        input.localAiEnabled ? 1 : 0,
-        input.mcpEnabled ? 1 : 0,
-        input.updatedAt,
-        input.tenantId,
-        input.membershipId,
-        input.apiKeyId,
-        input.updatedAt
-      ),
+      .bind(...values),
     prepareCloudComplianceAuditInsert(db, input.audit, {
       requirePreviousStatementChange: true,
     }).statement,

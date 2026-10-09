@@ -34,6 +34,7 @@ import {
   CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH,
   CLOUD_TENANT_MCP_SERVERS_PATH,
   CLOUD_TENANT_ONBOARDING_PATH,
+  CLOUD_TENANT_MCP_SETTINGS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -854,6 +855,216 @@ test("onboarding readiness portal returns only nine tenant-scoped booleans to ow
     new Request(`${ORIGIN}/__cloud/v1/customer/onboarding`)
   );
   assert.equal(publicWithoutKey.status, 401);
+});
+
+test("MCP portal opt-in is owner/admin scoped, MCP-only, audited, and does not enable invocation", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  await db
+    .prepare("UPDATE cloud_tenant_settings SET local_ai_enabled = 1 WHERE tenant_id = ?")
+    .bind(tenant.id)
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const path = `${ORIGIN}${CLOUD_TENANT_MCP_SETTINGS_PATH}`;
+  const headers = (extra: Record<string, string> = {}) => ({
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+    ...extra,
+  });
+
+  const noOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ mcpEnabled: true }),
+    })
+  );
+  assert.equal(noOrigin.status, 403);
+  const wrongOrigin = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: "https://attacker.example", "Content-Type": "application/json" }),
+      body: JSON.stringify({ mcpEnabled: true }),
+    })
+  );
+  assert.equal(wrongOrigin.status, 403);
+  const extraField = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ mcpEnabled: true, localAiEnabled: false }),
+    })
+  );
+  assert.equal(extraField.status, 400);
+  const enabled = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ mcpEnabled: true }),
+    })
+  );
+  assert.equal(enabled.status, 200, await enabled.clone().text());
+  assert.deepEqual(await enabled.json(), { mcpEnabled: true });
+  const settingsAfterEnable = await db
+    .prepare<{ local_ai_enabled: number; mcp_enabled: number }>(
+      "SELECT local_ai_enabled, mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+  assert.equal(settingsAfterEnable?.local_ai_enabled, 1);
+  assert.equal(settingsAfterEnable?.mcp_enabled, 1);
+
+  const publicNoKey = await portal.app.fetch(new Request(`${ORIGIN}/__cloud/v1/customer/settings`));
+  assert.equal(publicNoKey.status, 401);
+  const created = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MCP_SERVERS_PATH}`, {
+      method: "POST",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        name: "Saved MCP",
+        transport: "streamable_http",
+        endpoint: "https://mcp.example.test/mcp",
+      }),
+    })
+  );
+  assert.equal(created.status, 201, await created.clone().text());
+  const createdBody = (await created.json()) as { server: { id: string } };
+  const discovery = await portal.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_MCP_SERVERS_PATH}/${createdBody.server.id}/tools`, {
+      headers: headers(),
+    })
+  );
+  assert.equal(discovery.status, 503);
+  assert.match(await discovery.text(), /Controlled MCP egress is not enabled/);
+
+  const otherTenant = await createCloudCustomerTenant(db, {
+    id: "customer-mcp-settings-other",
+    name: "Other MCP Settings",
+    slug: "other-mcp-settings",
+  });
+  const otherMembership = await createCloudCustomerMembership(db, {
+    tenantId: otherTenant.id,
+    principalId: "other-mcp-settings-owner",
+    role: "owner",
+  });
+  await setCloudTenantOidcConfig(db, ENCRYPTION_KEY, {
+    tenantId: otherTenant.id,
+    issuer: ISSUER,
+    clientId: "omni-client",
+    clientSecret: "other-secret",
+    isEnabled: true,
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: otherTenant.id,
+    issuer: ISSUER,
+    subject: "other-mcp-settings-subject",
+    membershipId: otherMembership.id,
+  });
+  const otherPortal = await createPortalSession(db, otherTenant.slug, "other-mcp-settings-subject");
+  const tenantOverride = await otherPortal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${otherPortal.cookie}`,
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ mcpEnabled: true, tenantId: tenant.id }),
+    })
+  );
+  assert.equal(tenantOverride.status, 400);
+  const otherStillDisabled = await db
+    .prepare<{ mcp_enabled: number }>(
+      "SELECT mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ?"
+    )
+    .bind(otherTenant.id)
+    .first();
+  assert.equal(otherStillDisabled?.mcp_enabled, 0);
+
+  const member = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "mcp-settings-member",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "mcp-settings-member-subject",
+    membershipId: member.id,
+  });
+  const memberPortal = await createPortalSession(db, tenant.slug, "mcp-settings-member-subject");
+  const denied = await memberPortal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${memberPortal.cookie}`,
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ mcpEnabled: true }),
+    })
+  );
+  assert.equal(denied.status, 403);
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  await db.exec(`CREATE TRIGGER reject_mcp_portal_settings_audit
+    BEFORE INSERT ON cloud_compliance_audit
+    WHEN NEW.action = 'customer.settings.mcp_portal.update'
+    BEGIN SELECT RAISE(ABORT, 'settings audit unavailable'); END;`);
+  const failedAudit = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ mcpEnabled: false }),
+    })
+  );
+  assert.equal(failedAudit.status, 503);
+  const stillEnabled = await db
+    .prepare<{ mcp_enabled: number }>(
+      "SELECT mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+  assert.equal(stillEnabled?.mcp_enabled, 1, "setting change must roll back with audit failure");
+  await db.exec("DROP TRIGGER reject_mcp_portal_settings_audit");
+  const disabled = await portal.app.fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: headers({ Origin: ORIGIN, "Content-Type": "application/json" }),
+      body: JSON.stringify({ mcpEnabled: false }),
+    })
+  );
+  assert.equal(disabled.status, 200);
+  assert.deepEqual(await disabled.json(), { mcpEnabled: false });
+  const settingsAfterDisable = await db
+    .prepare<{ local_ai_enabled: number; mcp_enabled: number }>(
+      "SELECT local_ai_enabled, mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+  assert.equal(settingsAfterDisable?.local_ai_enabled, 1);
+  assert.equal(settingsAfterDisable?.mcp_enabled, 0);
+  const audit = await db
+    .prepare<{ action: string; metadata_json: string | null }>(
+      "SELECT action, metadata_json FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.settings.mcp_portal.update' ORDER BY timestamp, rowid"
+    )
+    .bind(tenant.id)
+    .all();
+  assert.deepEqual(
+    audit.results.map((row) => row.action),
+    ["customer.settings.mcp_portal.update", "customer.settings.mcp_portal.update"]
+  );
+  assert.ok(
+    audit.results.every(
+      (row) =>
+        JSON.stringify(row.metadata_json) === JSON.stringify('{"mcpEnabled":true}') ||
+        JSON.stringify(row.metadata_json) === JSON.stringify('{"mcpEnabled":false}')
+    )
+  );
 });
 
 test("provider connection portal enforces owner sessions and reuses encrypted fixed-contract API operations", async () => {

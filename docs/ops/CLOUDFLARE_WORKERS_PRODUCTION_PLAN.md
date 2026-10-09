@@ -456,6 +456,14 @@ tenant-scoped audit record. This configures feature availability only; it does
 not provision provider credentials, MCP servers, Front Desk branding, or a
 browser-based customer setup flow.
 
+The OIDC customer portal also provides an owner/admin-only MCP opt-in control.
+Its write accepts only the `mcpEnabled` boolean, binds the active session hash
+and current membership role in the D1 update, and audits the setting atomically.
+It leaves `localAiEnabled` unchanged and does not call the Local Agent session
+invalidation path. The public settings endpoint remains bearer API-key-only.
+Enabling MCP permits saved server configuration; discovery and invocation
+remain separately disabled until controlled egress is verified.
+
 Owner/admin customer API keys can read `/__cloud/v1/customer/onboarding` for
 nine tenant-derived boolean flags: active owner, OIDC configured/enabled,
 active provider connection, configured business profile, enabled cloud

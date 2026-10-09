@@ -351,7 +351,32 @@ const PORTAL_SCRIPT = `
       if (note) row.append(node("p", note));
       list.append(row);
     }
+    return data;
   };
+
+  byId("mcp-opt-in-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("save-mcp-opt-in");
+    button.disabled = true;
+    const mcpEnabled = byId("mcp-opt-in-enabled").checked;
+    try {
+      const result = await api("/__cloud/auth/mcp-settings", {
+        method: "PUT", body: JSON.stringify({ mcpEnabled }),
+      });
+      if (result.mcpEnabled !== mcpEnabled) throw new Error("MCP setting could not be confirmed");
+      byId("mcp-server-panel").hidden = !mcpEnabled;
+      if (mcpEnabled) {
+        await loadMcpServers();
+        setStatus("MCP configuration enabled. Discovery and invocation remain disabled.");
+      } else {
+        byId("mcp-servers").replaceChildren();
+        setStatus("MCP configuration disabled.");
+      }
+      await loadOnboardingReadiness();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "MCP setting could not be saved.", true);
+    } finally { button.disabled = false; }
+  });
 
   const loadApiKeys = async () => {
     const data = await api("/__cloud/auth/api-keys");
@@ -592,7 +617,7 @@ const PORTAL_SCRIPT = `
         byId("manager-panel").hidden = false;
         byId("business-profile-panel").hidden = false;
         byId("provider-connection-panel").hidden = false;
-        byId("mcp-server-panel").hidden = false;
+        byId("mcp-settings-panel").hidden = false;
         byId("onboarding-readiness-panel").hidden = false;
         try {
           await loadBusinessProfile();
@@ -605,13 +630,12 @@ const PORTAL_SCRIPT = `
           setStatus(error instanceof Error ? error.message : "Could not load provider connections.", true);
         }
         try {
-          await loadMcpServers();
+          const readiness = await loadOnboardingReadiness();
+          byId("mcp-opt-in-enabled").checked = readiness.mcpEnabled;
+          byId("mcp-server-panel").hidden = !readiness.mcpEnabled;
+          if (readiness.mcpEnabled) await loadMcpServers();
         } catch (error) {
-          setStatus(error instanceof Error ? error.message : "Could not load MCP servers.", true);
-        }
-        try {
-          await loadOnboardingReadiness();
-        } catch (error) {
+          byId("mcp-server-panel").hidden = true;
           setStatus(error instanceof Error ? error.message : "Could not load onboarding readiness.", true);
         }
         try {
@@ -756,6 +780,15 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <label for="provider-api-key">OpenAI API key</label>
           <input id="provider-api-key" type="password" autocomplete="new-password" maxlength="8192" required>
           <button id="create-provider-connection" type="submit">Add OpenAI connection</button>
+        </form>
+      </section>
+      <section id="mcp-settings-panel" hidden>
+        <h2>MCP configuration</h2>
+        <p>This allows your organization to manage saved MCP server settings. It does not enable discovery or tool invocation.</p>
+        <form id="mcp-opt-in-form">
+          <label for="mcp-opt-in-enabled">Allow MCP server configuration</label>
+          <input id="mcp-opt-in-enabled" type="checkbox">
+          <button id="save-mcp-opt-in" type="submit">Save MCP setting</button>
         </form>
       </section>
       <section id="mcp-server-panel" hidden>
