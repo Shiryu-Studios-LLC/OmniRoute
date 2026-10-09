@@ -14,6 +14,7 @@ interface OnboardingStatusRow {
   oidc_enabled: number;
   active_provider_connection: number;
   enabled_inference_entitlement: number;
+  registered_device: number;
   local_ai_enabled: number;
   mcp_enabled: number;
 }
@@ -109,6 +110,10 @@ export async function handleCloudCustomerOnboardingRequest(
              SELECT 1 FROM cloud_inference_entitlements e
               WHERE e.tenant_id = t.id AND e.enabled = 1
            ) AS enabled_inference_entitlement,
+           EXISTS (
+             SELECT 1 FROM cloud_gateway_devices d
+              WHERE d.tenant_id = t.id AND d.revoked_at IS NULL
+           ) AS registered_device,
            s.local_ai_enabled,
            s.mcp_enabled
          FROM tenants t
@@ -125,6 +130,7 @@ export async function handleCloudCustomerOnboardingRequest(
       oidcEnabled: row.oidc_enabled === 1,
       activeProviderConnection: row.active_provider_connection === 1,
       enabledInferenceEntitlement: row.enabled_inference_entitlement === 1,
+      registeredDevice: row.registered_device === 1,
       localAiEnabled: row.local_ai_enabled === 1,
       mcpEnabled: row.mcp_enabled === 1,
     });

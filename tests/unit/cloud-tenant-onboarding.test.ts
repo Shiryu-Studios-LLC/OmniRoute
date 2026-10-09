@@ -164,6 +164,14 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       .run();
     await db
       .prepare(
+        `INSERT INTO cloud_gateway_devices (
+           id, tenant_id, credential_hash, capabilities_json, status, created_at, revoked_at
+         ) VALUES (?, ?, ?, '[]', 'offline', ?, ?)`
+      )
+      .bind("onboarding-device-a-revoked", customerA.tenant.id, "a".repeat(64), TEST_NOW, TEST_NOW)
+      .run();
+    await db
+      .prepare(
         `INSERT INTO cloud_tenant_oidc_configs (
            tenant_id, issuer, client_id, client_secret_encrypted, is_enabled, created_at, updated_at
          ) VALUES (?, ?, ?, ?, 0, ?, ?)`
@@ -221,6 +229,14 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       )
       .bind(customerB.tenant.id)
       .run();
+    await db
+      .prepare(
+        `INSERT INTO cloud_gateway_devices (
+           id, tenant_id, credential_hash, capabilities_json, status, created_at
+         ) VALUES (?, ?, ?, '[]', 'offline', ?)`
+      )
+      .bind("onboarding-device-b", customerB.tenant.id, "b".repeat(64), TEST_NOW)
+      .run();
 
     const options = { db, now: () => new Date(TEST_NOW_MS) };
     const runtime = createCloudRuntime({ env: { DB: db }, ...options });
@@ -234,6 +250,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       oidcEnabled: false,
       activeProviderConnection: false,
       enabledInferenceEntitlement: false,
+      registeredDevice: false,
       localAiEnabled: true,
       mcpEnabled: false,
     });
@@ -261,6 +278,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       oidcEnabled: true,
       activeProviderConnection: true,
       enabledInferenceEntitlement: true,
+      registeredDevice: true,
       localAiEnabled: true,
       mcpEnabled: true,
     });
@@ -275,6 +293,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
         "mcpEnabled",
         "oidcConfigured",
         "oidcEnabled",
+        "registeredDevice",
       ]);
     }
     const responseText = JSON.stringify(statusB);
@@ -286,6 +305,8 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       "customer-b-client-id",
       "encrypted-customer-b-client-secret",
       "provider-secret",
+      "onboarding-device-b",
+      "b".repeat(64),
     ]) {
       assert.equal(responseText.includes(secret), false);
     }

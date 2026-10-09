@@ -212,6 +212,30 @@ test("rejects URL credentials and caps Ollama model enumeration", async () => {
   assert.equal(calls, 33);
 });
 
+test("omits capabilities exceeding the heartbeat field limit without dropping valid models", async () => {
+  const tooLongModel = "m".repeat(80);
+  const result = await discoverLocalCapabilities(
+    { ollamaUrl: "http://127.0.0.1:11434", comfyUiUrl: "http://user:password@127.0.0.1:8188" },
+    {
+      fetch: async (_input, init) =>
+        init?.method === "POST"
+          ? jsonResponse({ capabilities: ["completion"] })
+          : jsonResponse({ models: [{ name: tooLongModel }, { name: "valid-model" }] }),
+    }
+  );
+
+  assert.deepEqual(result.services[0], {
+    service: "ollama",
+    reachable: true,
+    models: [tooLongModel, "valid-model"],
+  });
+  assert.deepEqual(result.heartbeat.capabilities, [
+    "ollama:model:valid-model",
+    "ollama:chat:valid-model",
+  ]);
+  assert.ok(result.heartbeat.capabilities.every((capability) => capability.length <= 80));
+});
+
 test("never infers ComfyUI image generation without required nodes and checkpoints", async () => {
   const result = await discoverLocalCapabilities(
     { ollamaUrl: "http://user:password@127.0.0.1:11434", comfyUiUrl: "http://127.0.0.1:8188" },

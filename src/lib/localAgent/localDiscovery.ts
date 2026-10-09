@@ -12,6 +12,7 @@ import {
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_BINARY_RESPONSE_BYTES = 40 * 1024;
 const MAX_OLLAMA_MODELS = 32;
+const MAX_HEARTBEAT_CAPABILITY_LENGTH = 80;
 const REQUEST_TIMEOUT_MS = 4_000;
 const DEFAULT_LOCAL_ENDPOINTS = {
   ollama: "http://127.0.0.1:11434",
@@ -347,7 +348,12 @@ export async function discoverLocalCapabilities(
   return {
     heartbeat: {
       status: "online",
-      capabilities: [...new Set(capabilities)].slice(0, 64),
+      // Keep discovery aligned with the heartbeat API/database schema. A
+      // single oversized local model or MCP tool name must not invalidate the
+      // complete heartbeat and prevent the device from reconnecting.
+      capabilities: [...new Set(capabilities)]
+        .filter((capability) => capability.length <= MAX_HEARTBEAT_CAPABILITY_LENGTH)
+        .slice(0, 64),
       serviceHealth: {
         ollama: services.find((service) => service.service === "ollama")?.reachable ?? false,
         comfyui: services.find((service) => service.service === "comfyui")?.reachable ?? false,
