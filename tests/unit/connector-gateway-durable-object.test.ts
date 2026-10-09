@@ -228,6 +228,38 @@ test("Durable Object request queue binds delivery and results to the active tena
   assert.equal(await coordinator.enqueueRequest("device_A", largeRequest), false);
 });
 
+test("Durable Object rejects requests whose deadline is not after creation", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const request: GatewayDeviceRequest = {
+    requestId: "expired_at_creation",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:00:00.000Z",
+    status: "pending",
+  };
+
+  assert.equal(await coordinator.enqueueRequest("device_A", request), false);
+  assert.equal(
+    await coordinator.getRequest("device_A", request.requestId, request.createdAt),
+    null,
+    "invalid work must not be retained as a dead queue row"
+  );
+  assert.equal(
+    await coordinator.enqueueRequest("device_A", {
+      ...request,
+      requestId: "valid_deadline",
+      expiresAt: "2026-10-08T12:00:01.000Z",
+    }),
+    true,
+    "rejecting an invalid deadline must leave queue capacity available"
+  );
+});
+
 test("Durable Object stream queue allows one ordered event and acknowledges only on consume", async () => {
   const { namespace } = makeNamespace();
   const coordinator = new DurableObjectGatewayCoordinator(namespace);

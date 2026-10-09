@@ -151,6 +151,7 @@ function isRequestRecord(value: unknown): value is GatewayDeviceRequest {
     payloadBytes <= MAX_REQUEST_BYTES &&
     Number.isFinite(Date.parse(request.createdAt ?? "")) &&
     Number.isFinite(Date.parse(request.expiresAt ?? "")) &&
+    Date.parse(request.expiresAt ?? "") > Date.parse(request.createdAt ?? "") &&
     (request.status === "pending" ||
       request.status === "delivered" ||
       request.status === "complete") &&
