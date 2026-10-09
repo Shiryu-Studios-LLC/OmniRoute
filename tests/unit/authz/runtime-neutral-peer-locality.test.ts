@@ -11,6 +11,16 @@ import {
   isLoopbackHost as isLoopbackServer,
   isPrivateLanHost as isPrivateLanServer,
 } from "../../../src/server/authz/routeGuard.ts";
+import {
+  classifyStampedPeerLocality as classifyStampedPeerShared,
+  resolveStampedPeer as resolveStampedPeerShared,
+  resolveStampedViaProxy as resolveStampedViaProxyShared,
+} from "../../../src/shared/authz/peerStamp.ts";
+import {
+  classifyStampedPeerLocality as classifyStampedPeerServer,
+  resolveStampedPeer as resolveStampedPeerServer,
+  resolveStampedViaProxy as resolveStampedViaProxyServer,
+} from "../../../src/server/authz/peerStamp.ts";
 
 test("shared and server compatibility exports preserve loopback host classification", () => {
   const cases: ReadonlyArray<[string | null, boolean]> = [
@@ -86,5 +96,39 @@ test("shared and server compatibility exports preserve locality tiers and fail-c
 
 test("shared peer locality helper has no Node or framework imports", () => {
   const source = fs.readFileSync("src/shared/authz/peerLocality.ts", "utf8");
+  assert.doesNotMatch(source, /from\s+["'](?:node:|next(?:\/|["']))/);
+});
+
+test("shared and server peer-stamp exports preserve trusted locality behavior", () => {
+  const token = "process-secret-token-abc";
+  const cases: ReadonlyArray<
+    [string | null, string | null, string | undefined, string | null, boolean, string]
+  > = [
+    [`${token}|127.0.0.1`, null, token, "127.0.0.1", false, "loopback"],
+    [`${token}|192.168.0.15`, null, token, "192.168.0.15", false, "lan"],
+    [`${token}|127.0.0.1`, `${token}|1`, token, "127.0.0.1", true, "remote"],
+    ["forged|127.0.0.1", null, token, null, false, "remote"],
+    [`${token}|8.8.8.8`, `${token}|0`, token, "8.8.8.8", false, "remote"],
+  ];
+
+  for (const [
+    peerStamp,
+    proxyStamp,
+    secret,
+    expectedPeer,
+    expectedProxy,
+    expectedLocality,
+  ] of cases) {
+    assert.equal(resolveStampedPeerShared(peerStamp, secret), expectedPeer);
+    assert.equal(resolveStampedPeerServer(peerStamp, secret), expectedPeer);
+    assert.equal(resolveStampedViaProxyShared(proxyStamp, secret), expectedProxy);
+    assert.equal(resolveStampedViaProxyServer(proxyStamp, secret), expectedProxy);
+    assert.equal(classifyStampedPeerShared(peerStamp, proxyStamp, secret), expectedLocality);
+    assert.equal(classifyStampedPeerServer(peerStamp, proxyStamp, secret), expectedLocality);
+  }
+});
+
+test("shared peer-stamp helper has no Node or framework imports", () => {
+  const source = fs.readFileSync("src/shared/authz/peerStamp.ts", "utf8");
   assert.doesNotMatch(source, /from\s+["'](?:node:|next(?:\/|["']))/);
 });
