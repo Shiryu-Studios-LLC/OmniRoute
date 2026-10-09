@@ -290,9 +290,10 @@ Build the customer-side application:
 - Ollama optional installation/configuration.
 - Model discovery and health checks.
 - ComfyUI detection/connection.
+- ComfyUI discovery requests metadata only for the checkpoint loader, sampler, and image saver nodes used by the supported image workflow, rather than downloading the full node catalogue.
 - Local MCP discovery/forwarding.
 - Application-level capability reporting.
-- The CLI supports `omniroute local-agent run` and Linux `service install` / `service uninstall`. The user-level systemd service stores its credential in an owner-only environment file and opens no inbound listener.
+- The CLI supports `omniroute local-agent run` and per-user service `install` / `uninstall` / `start` / `stop` / `status` commands on Linux (systemd), macOS (launchd), and Windows (Task Scheduler). Service credentials use protected OS storage or owner-only files; the agent opens no inbound listener.
 
 The agent may manage `cloudflared` underneath, but Shiryu owns tenant identity and authorization.
 

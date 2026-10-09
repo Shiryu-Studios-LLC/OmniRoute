@@ -183,15 +183,15 @@ async function startComfyUiFixture(): Promise<{ baseUrl: string; close: () => Pr
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = Buffer.concat(chunks).toString("utf8");
-    if (request.url === "/object_info") {
+    if (request.url?.startsWith("/object_info/")) {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          KSampler: {},
-          CheckpointLoaderSimple: { input: { required: { ckpt_name: [["fixture.safetensors"]] } } },
-          SaveImage: {},
-        })
-      );
+      const nodeType = request.url.slice("/object_info/".length);
+      const nodes: Record<string, unknown> = {
+        KSampler: {},
+        CheckpointLoaderSimple: { input: { required: { ckpt_name: [["fixture.safetensors"]] } } },
+        SaveImage: {},
+      };
+      response.end(JSON.stringify({ [nodeType]: nodes[nodeType] }));
       return;
     }
     if (request.url === "/prompt" && request.method === "POST") {
@@ -1261,6 +1261,66 @@ test(
             },
           },
         });
+      }
+    );
+
+    await t.test(
+      "real loopback ComfyUI checkpoints reach the authenticated Worker device directory",
+      {
+        timeout: 90_000,
+        skip:
+          process.env.RUN_CLOUDFLARE_LOCAL_COMFYUI_INT !== "1"
+            ? "Set RUN_CLOUDFLARE_LOCAL_COMFYUI_INT=1 to run the real loopback ComfyUI integration."
+            : false,
+      },
+      async () => {
+        const comfyUrl = process.env.OMNIROUTE_LOCAL_COMFYUI_URL ?? "http://127.0.0.1:8188";
+        const comfyCustomer = await provisionCustomer("real-comfy", true, ["comfyui:image"]);
+        const runnerConfig = {
+          gatewayUrl: baseUrl,
+          deviceId: comfyCustomer.deviceId,
+          credential: comfyCustomer.credential,
+          ollamaUrl: "http://user:password@127.0.0.1:11434",
+          comfyUiUrl: comfyUrl,
+          requestTimeoutMs: 5_000,
+        };
+        const discovery = await discoverLocalCapabilities(runnerConfig, {
+          fetch,
+          resolveHost: async () => ["127.0.0.1"],
+        });
+        assert.ok(
+          discovery.heartbeat.capabilities.includes("comfyui:image"),
+          `loopback ComfyUI must expose an executable image workflow: ${JSON.stringify(discovery)}`
+        );
+        assert.equal(discovery.heartbeat.serviceHealth.comfyui, true);
+        const comfyService = discovery.services.find((service) => service.service === "comfyui");
+        const checkpoints = (comfyService?.models ?? [])
+          .filter((model) => model.startsWith("comfyui:checkpoint:"))
+          .map((model) => model.slice("comfyui:checkpoint:".length));
+        assert.ok(checkpoints.length > 0, "ComfyUI must expose at least one checkpoint");
+        const runnerDependencies = {
+          fetch,
+          resolveHost: async () => ["127.0.0.1"],
+          gateway: deviceTransport,
+        };
+        let session: LocalAgentGatewaySession | undefined;
+        const initialCycle = await runLocalAgentGatewayCycle(
+          runnerConfig,
+          runnerDependencies,
+          session
+        );
+        session = initialCycle.session;
+        assert.equal(initialCycle.processed, 0);
+        const device = await requestJson(
+          `${baseUrl}/__cloud/v1/tenants/${comfyCustomer.tenantId}/gateway-devices/${comfyCustomer.deviceId}`,
+          { token: adminToken }
+        );
+        assert.equal(device.response.status, 200, JSON.stringify(device.body));
+        assert.equal((device.body.serviceHealth as { comfyui?: boolean }).comfyui, true);
+        assert.ok(
+          (device.body.capabilities as string[]).includes("comfyui:image"),
+          "the authenticated device heartbeat must persist the actual ComfyUI capability"
+        );
       }
     );
 

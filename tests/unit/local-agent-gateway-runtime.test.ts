@@ -228,6 +228,105 @@ test("versioned transport maps directly onto the connector gateway primitives", 
   ]);
 });
 
+test("gateway cycle discovers and forwards only a configured Local MCP tool", async () => {
+  let submitted: LocalAgentGatewayResult | null = null;
+  const methods: string[] = [];
+  const mcpServer = {
+    id: "docs",
+    endpoint: "http://127.0.0.1:9911/mcp",
+    tools: [{ name: "read_file" }],
+  };
+  const cycle = await runLocalAgentGatewayCycle(
+    { ...config, mcpServers: [{ id: mcpServer.id, endpoint: mcpServer.endpoint }] },
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      fetch: async (input) =>
+        String(input).startsWith("https://gateway.example.test/")
+          ? Response.json({ accepted: true })
+          : new Response(null, { status: 404 }),
+      mcp: {
+        transport: {
+          async fetch(input, init) {
+            assert.equal(input, mcpServer.endpoint);
+            assert.equal(init.redirect, "manual");
+            const request = JSON.parse(String(init.body)) as {
+              id?: number;
+              method?: string;
+              params?: unknown;
+            };
+            methods.push(String(request.method));
+            if (request.method === "notifications/initialized") {
+              return new Response(null, { status: 202 });
+            }
+            if (request.method === "initialize") {
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: { protocolVersion: "2025-11-25" },
+                },
+                { headers: { "Mcp-Session-Id": "local-session" } }
+              );
+            }
+            if (request.method === "tools/list") {
+              return Response.json({
+                jsonrpc: "2.0",
+                id: request.id,
+                result: { tools: [{ name: "read_file" }] },
+              });
+            }
+            assert.equal(request.method, "tools/call");
+            assert.deepEqual(request.params, {
+              name: "read_file",
+              arguments: { path: "README.md" },
+            });
+            return Response.json({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: { content: [{ type: "text", text: "local result" }] },
+            });
+          },
+        },
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async (_activeSession, capabilities) => {
+          assert.deepEqual(capabilities, ["mcp:docs:read_file"]);
+          return true;
+        },
+        poll: async () => [
+          {
+            requestId: "request-local-mcp",
+            capability: "mcp:docs:read_file",
+            payload: { path: "README.md" },
+            expiresAt: "2026-10-08T12:01:00.000Z",
+          },
+        ],
+        submitResult: async (_activeSession, result) => {
+          submitted = result;
+          return true;
+        },
+      },
+    },
+    session
+  );
+
+  assert.equal(cycle.processed, 1);
+  assert.deepEqual(methods, [
+    "initialize",
+    "notifications/initialized",
+    "tools/list",
+    "initialize",
+    "notifications/initialized",
+    "tools/call",
+  ]);
+  assert.deepEqual(submitted, {
+    version: 1,
+    requestId: "request-local-mcp",
+    outcome: { ok: true, value: { content: [{ type: "text", text: "local result" }] } },
+  });
+});
+
 test("streaming gateway cycle submits ordered events one at a time and terminates", async () => {
   const submissions: Array<{ sequence: number; event: unknown }> = [];
   const request: Omit<LocalAgentGatewayRequest, "version"> = {

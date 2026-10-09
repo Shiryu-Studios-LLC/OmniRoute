@@ -285,16 +285,19 @@ async function discoverComfyUi(
   deps: LocalDiscoveryDependencies,
   resolveHost: (hostname: string) => Promise<string[]>
 ): Promise<{ models: string[]; capabilities: string[] }> {
-  const base = await validateLocalEndpoint(rawUrl, resolveHost);
-  const info = parseObject(await requestJson(deps.fetch, appendPath(base, "/object_info")));
-  if (!info) throw new Error("ComfyUI returned invalid node metadata");
-  const nodeTypes = new Set(Object.keys(info));
-  const models = comfyModelNames(info).map((name) => `comfyui:checkpoint:${name}`);
+  const [checkpointInfo, samplerInfo, saveImageInfo] = await Promise.all(
+    ["CheckpointLoaderSimple", "KSampler", "SaveImage"].map(async (nodeType) =>
+      parseObject(
+        await requestLocalServiceJson(rawUrl, `/object_info/${nodeType}`, deps.fetch, resolveHost)
+      )
+    )
+  );
+  const models = comfyModelNames(checkpointInfo ?? {}).map((name) => `comfyui:checkpoint:${name}`);
   const capabilities: string[] = [];
   if (
-    nodeTypes.has("KSampler") &&
-    nodeTypes.has("CheckpointLoaderSimple") &&
-    nodeTypes.has("SaveImage") &&
+    parseObject(checkpointInfo?.CheckpointLoaderSimple) &&
+    parseObject(samplerInfo?.KSampler) &&
+    parseObject(saveImageInfo?.SaveImage) &&
     models.length > 0
   ) {
     capabilities.push("comfyui:image");

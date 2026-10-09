@@ -56,13 +56,19 @@ test("discovers ComfyUI checkpoint IDs and only executable image capability", as
     { ollamaUrl: "http://ollama.internal:11434", comfyUiUrl: "http://192.168.1.20:8188" },
     {
       resolveHost: async () => ["192.168.1.20"],
-      fetch: async () =>
-        jsonResponse({
-          CheckpointLoaderSimple: { input: { required: { ckpt_name: [["sdxl.safetensors"]] } } },
-          KSampler: {},
-          SaveImage: {},
-          VHS_VideoCombine: {},
-        }),
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/object_info/CheckpointLoaderSimple")) {
+          return jsonResponse({
+            CheckpointLoaderSimple: {
+              input: { required: { ckpt_name: [["sdxl.safetensors"]] } },
+            },
+          });
+        }
+        if (url.endsWith("/object_info/KSampler")) return jsonResponse({ KSampler: {} });
+        if (url.endsWith("/object_info/SaveImage")) return jsonResponse({ SaveImage: {} });
+        throw new Error(`Unexpected ComfyUI metadata request: ${url}`);
+      },
     }
   );
 
@@ -87,13 +93,14 @@ test("probes only the default loopback endpoints when service URLs are omitted",
         requested.push(`${init?.method ?? "GET"} ${url}`);
         if (url.endsWith("/api/tags")) return jsonResponse({ models: [{ name: "qwen3" }] });
         if (url.endsWith("/api/show")) return jsonResponse({ capabilities: ["completion"] });
-        if (url.endsWith("/object_info")) {
+        if (url.endsWith("/object_info/CheckpointLoaderSimple"))
           return jsonResponse({
-            CheckpointLoaderSimple: { input: { required: { ckpt_name: [["sdxl.safetensors"]] } } },
-            KSampler: {},
-            SaveImage: {},
+            CheckpointLoaderSimple: {
+              input: { required: { ckpt_name: [["sdxl.safetensors"]] } },
+            },
           });
-        }
+        if (url.endsWith("/object_info/KSampler")) return jsonResponse({ KSampler: {} });
+        if (url.endsWith("/object_info/SaveImage")) return jsonResponse({ SaveImage: {} });
         throw new Error(`Unexpected local service request: ${url}`);
       },
     }
@@ -102,7 +109,9 @@ test("probes only the default loopback endpoints when service URLs are omitted",
   assert.deepEqual(requested, [
     "GET http://127.0.0.1:11434/api/tags",
     "POST http://127.0.0.1:11434/api/show",
-    "GET http://127.0.0.1:8188/object_info",
+    "GET http://127.0.0.1:8188/object_info/CheckpointLoaderSimple",
+    "GET http://127.0.0.1:8188/object_info/KSampler",
+    "GET http://127.0.0.1:8188/object_info/SaveImage",
   ]);
   assert.deepEqual(result.services, [
     { service: "ollama", reachable: true, models: ["qwen3"] },
@@ -130,7 +139,9 @@ test("reports omitted default loopback services as unavailable when probes fail"
 
   assert.deepEqual(requested, [
     "http://127.0.0.1:11434/api/tags",
-    "http://127.0.0.1:8188/object_info",
+    "http://127.0.0.1:8188/object_info/CheckpointLoaderSimple",
+    "http://127.0.0.1:8188/object_info/KSampler",
+    "http://127.0.0.1:8188/object_info/SaveImage",
   ]);
   assert.deepEqual(result.services, [
     { service: "ollama", reachable: false, models: [] },
