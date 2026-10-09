@@ -251,6 +251,8 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
   limited to a fixed OpenAI connection and does not grant inference entitlements.
 - Store and update a tenant-scoped Front Desk business identity through the owner/admin API;
   Front Desk can opt into reading it from OmniRoute.
+- Owner/admins can also read and edit that profile in the Worker-served portal through their
+  OIDC session. Writes require the same origin and commit the profile with a content-free audit.
 - Configure MCP defaults.
 - Register devices.
 - Provision Front Desk host configuration and branding.
