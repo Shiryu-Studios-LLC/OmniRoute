@@ -82,6 +82,7 @@ export async function listCloudTenantPortalMembers(
       limit + 1
     )
     .all();
+  if (!rows.success) throw new Error("D1 tenant membership list failed");
   const page = rows.results.slice(0, limit);
   const members = page.map((row) => ({
     id: row.id,

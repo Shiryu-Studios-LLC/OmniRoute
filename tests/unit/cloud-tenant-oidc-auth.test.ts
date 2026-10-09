@@ -988,6 +988,7 @@ test("onboarding readiness portal returns tenant-scoped booleans to owner/admin 
     Object.keys(readiness).sort(),
     [
       "activeOwner",
+      "activeOwnerApiKey",
       "activeProviderConnection",
       "activeMcpServer",
       "businessProfileConfigured",
@@ -1002,6 +1003,7 @@ test("onboarding readiness portal returns tenant-scoped booleans to owner/admin 
   );
   assert.ok(Object.values(readiness).every((value) => typeof value === "boolean"));
   assert.equal(readiness.activeOwner, true);
+  assert.equal(readiness.activeOwnerApiKey, false);
   assert.equal(readiness.localAiEnabled, true);
   assert.equal(readiness.mcpEnabled, true);
   assert.equal(readiness.frontDeskConfigured, false);

@@ -263,6 +263,8 @@ test("production routine tenant operations bind to the customer API key tenant a
       now,
     });
     const adminToken = "valid-cloud-admin-token-0123456789";
+    const inferenceAdminToken = "valid-cloud-inference-admin-token-0123456789";
+    const lifecycleAdminToken = "valid-cloud-lifecycle-admin-token-0123456789";
     const call = (path: string, token: string, method = "GET", body?: unknown) =>
       handleCloudApiRequest(
         new Request(`https://omniroute.test/__cloud/v1/tenants/${path}`, {
@@ -273,7 +275,14 @@ test("production routine tenant operations bind to the customer API key tenant a
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         }),
-        { db: d1, adminToken, environment: "production", now: () => new Date(now) }
+        {
+          db: d1,
+          adminToken,
+          inferenceAdminToken,
+          lifecycleAdminToken,
+          environment: "production",
+          now: () => new Date(now),
+        }
       );
 
     assert.equal(
@@ -308,13 +317,23 @@ test("production routine tenant operations bind to the customer API key tenant a
     );
     assert.equal(
       (await call("tenant-customer/inference-entitlements", adminToken)).status,
+      401,
+      "the global token cannot administer inference entitlements"
+    );
+    assert.equal(
+      (await call("tenant-customer/inference-entitlements", inferenceAdminToken)).status,
       200,
-      "the platform token retains inference entitlement administration"
+      "the inference-scoped token administers inference entitlements"
     );
     assert.equal(
       (await call("tenant-customer/status", adminToken)).status,
+      401,
+      "the global token cannot perform lifecycle operations"
+    );
+    assert.equal(
+      (await call("tenant-customer/status", lifecycleAdminToken)).status,
       200,
-      "the global token retains platform lifecycle operations"
+      "the lifecycle-scoped token performs platform lifecycle operations"
     );
   } finally {
     d1.db.close();
@@ -675,16 +694,16 @@ test("membership and key creation reject non-customer, suspended, and cross-tena
   }
 });
 
-test("maintenance identity attributes trusted-owner provisioning audits correctly", async () => {
+test("lifecycle identity attributes trusted-owner provisioning audits correctly", async () => {
   const { d1, now } = await fixture();
   const adminToken = "platform-admin-secret";
-  const maintenanceToken = "platform-maintenance-secret";
+  const lifecycleAdminToken = "platform-lifecycle-secret";
   try {
     const response = await handleCloudApiRequest(
       new Request("https://omniroute.test/__cloud/v1/tenants", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${maintenanceToken}`,
+          Authorization: `Bearer ${lifecycleAdminToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -697,7 +716,7 @@ test("maintenance identity attributes trusted-owner provisioning audits correctl
       {
         db: d1,
         adminToken,
-        maintenanceToken,
+        lifecycleAdminToken,
         now: () => new Date(now),
       }
     );
@@ -712,8 +731,8 @@ test("maintenance identity attributes trusted-owner provisioning audits correctl
     assert.deepEqual(
       auditRows.results.map(({ action, actor, status }) => ({ action, actor, status })),
       [
-        { action: "cloud.api.post", actor: "cloud-maintenance", status: "attempted" },
-        { action: "customer.provision", actor: "cloud-maintenance", status: "success" },
+        { action: "cloud.api.post", actor: "cloud-lifecycle-admin", status: "attempted" },
+        { action: "customer.provision", actor: "cloud-lifecycle-admin", status: "success" },
       ]
     );
   } finally {
