@@ -125,7 +125,7 @@ test("cloud runtime readiness requires D1, Durable Object, and R2 storage", asyn
   assert.deepEqual(await response.json(), {
     status: "ready",
     runtime: "cloudflare",
-    checks: { database: "ok", gateway: "ok", artifacts: "ok" },
+    checks: { database: "ok", gateway: "ok", artifacts: "ok", oidcEgress: "disabled" },
   });
   assert.equal(doProbeCount, 1);
   assert.equal(artifactProbeCount, 1);
@@ -141,7 +141,12 @@ test("cloud runtime readiness fails closed for missing or failing dependencies",
   assert.deepEqual(await unconfiguredResponse.json(), {
     status: "not_ready",
     runtime: "cloudflare",
-    checks: { database: "unconfigured", gateway: "unconfigured", artifacts: "unconfigured" },
+    checks: {
+      database: "unconfigured",
+      gateway: "unconfigured",
+      artifacts: "unconfigured",
+      oidcEgress: "disabled",
+    },
   });
 
   const failing = createCloudRuntime({

@@ -641,6 +641,7 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
     database: "ok",
     gateway: "ok",
     artifacts: "ok",
+    oidcEgress: "disabled",
     configuration: "unconfigured",
     configurationIssues: [
       "missing:identityAdminToken",
@@ -691,9 +692,46 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
     database: "ok",
     gateway: "ok",
     artifacts: "ok",
+    oidcEgress: "disabled",
     configuration: "ok",
     configurationIssues: [],
   });
+
+  const oidcEgressToken = "oidc-egress-staging-secret-with-at-least-thirty-two-characters";
+  const enabledWithoutBinding = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      ...runtimeBindings,
+      OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED: "true",
+      OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN: oidcEgressToken,
+    },
+  });
+  const enabledWithoutBindingResponse = await enabledWithoutBinding.fetch(readinessRequest());
+  assert.equal(enabledWithoutBindingResponse.status, 503);
+  const enabledWithoutBindingBody = await enabledWithoutBindingResponse.text();
+  assert.match(enabledWithoutBindingBody, /"oidcEgress":"error"/);
+  assert.match(enabledWithoutBindingBody, /missing:oidcEgressBinding/);
+  assert.doesNotMatch(enabledWithoutBindingBody, new RegExp(oidcEgressToken));
+
+  const enabledWithBinding = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      ...runtimeBindings,
+      OIDC_EGRESS: { fetch: async () => new Response(null) },
+      OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED: "true",
+      OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN: oidcEgressToken,
+    },
+  });
+  const enabledWithBindingResponse = await enabledWithBinding.fetch(readinessRequest());
+  assert.equal(enabledWithBindingResponse.status, 200);
+  const enabledWithBindingBody = (await enabledWithBindingResponse.json()) as {
+    checks: Record<string, string>;
+  };
+  assert.equal(enabledWithBindingBody.checks.oidcEgress, "ok");
 
   const reusedSecretRuntime = createCloudRuntime({
     env: {

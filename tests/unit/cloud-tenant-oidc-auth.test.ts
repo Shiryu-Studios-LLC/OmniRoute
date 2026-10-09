@@ -42,6 +42,7 @@ import {
   handleCloudTenantOidcAuthRequest,
 } from "../../src/cloud/tenantOidcAuth";
 import { createCloudRuntime } from "../../src/cloud/runtime";
+import { createOidcEgressProxyHandler } from "../../cloudflare/mcp-egress-proxy/oidcHandler.ts";
 import { CLOUD_CUSTOMER_PORTAL_PATH } from "../../src/cloud/customerPortal";
 import {
   acceptCloudTenantOidcOwnerClaim,
@@ -51,7 +52,7 @@ import {
   CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS,
 } from "../../src/cloud/tenantOidcOwnerClaims";
 
-const ISSUER = "https://identity.example.test";
+const ISSUER = "https://identity.example.com";
 const ORIGIN = "https://cloud.example.test";
 const ENCRYPTION_KEY = Buffer.alloc(32, 41).toString("base64");
 const NOW = Date.UTC(2026, 9, 8, 12);
@@ -458,22 +459,35 @@ function getCookieValue(response: Response, name: string): string {
 
 function runtime(
   db: CloudDb,
-  fetcher: typeof fetch = fetch,
+  fetcher?: typeof fetch,
   sessions?: {
     idFromName(name: string): unknown;
     get(id: unknown): { revokeSession(deviceId: string, timestamp: string): Promise<unknown> };
   }
 ) {
+  const oidcProxyToken = "oidc-proxy-test-secret-with-at-least-thirty-two-characters";
+  const oidcProxy = fetcher
+    ? createOidcEgressProxyHandler({
+        proxyToken: oidcProxyToken,
+        transport: { fetch: (url, init) => fetcher(url, init) },
+      })
+    : undefined;
   return createCloudRuntime({
     env: {
       DB: db,
       OMNIROUTE_ENV: "production",
       OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ORIGIN,
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
+      ...(oidcProxy
+        ? {
+            OIDC_EGRESS: { fetch: (request: Request) => oidcProxy(request) },
+            OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN: oidcProxyToken,
+            OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED: "true",
+          }
+        : {}),
       ...(sessions ? { GATEWAY_SESSIONS: sessions as never } : {}),
     },
     now: () => new Date(NOW),
-    fetcher,
   });
 }
 
@@ -629,7 +643,7 @@ async function createPortalSession(
       { headers: { Cookie: `omni_oidc_state=${getCookieValue(login, "omni_oidc_state")}` } }
     )
   );
-  assert.equal(callback.status, 303);
+  assert.equal(callback.status, 303, await callback.clone().text());
   return { app, cookie: getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE) };
 }
 
@@ -1686,7 +1700,7 @@ test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an
       { headers: { Cookie: `omni_oidc_state=${stateCookie}`, Origin: ORIGIN } }
     )
   );
-  assert.equal(callback.status, 303);
+  assert.equal(callback.status, 303, await callback.clone().text());
   assert.equal(callback.headers.get("location"), `${ORIGIN}${CLOUD_CUSTOMER_PORTAL_PATH}`);
   assert.equal(fetchState.tokenRequests.length, 1);
   assert.equal(fetchState.tokenRequests[0]?.get("code_verifier")?.length, 43);
@@ -1769,6 +1783,34 @@ test("tenant OIDC login uses fixed origin, state, nonce and PKCE, then issues an
     })
   );
   assert.equal(revoked.status, 401);
+});
+
+test("production OIDC login fails closed without the fixed egress binding", async () => {
+  const { db, tenant } = await setup();
+  const app = createCloudRuntime({
+    env: {
+      DB: db,
+      OMNIROUTE_ENV: "production",
+      OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ORIGIN,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
+    },
+    now: () => new Date(NOW),
+  });
+  const originalFetch = globalThis.fetch;
+  let directFetchCalls = 0;
+  globalThis.fetch = (async () => {
+    directFetchCalls += 1;
+    throw new Error("direct Worker fetch must not be used");
+  }) as typeof fetch;
+  try {
+    const response = await app.fetch(
+      new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGIN_PATH}?tenant=${tenant.slug}`)
+    );
+    assert.equal(response.status, 503);
+    assert.equal(directFetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("first-owner claim creates one owner only after verified OIDC and cannot be replayed", async () => {

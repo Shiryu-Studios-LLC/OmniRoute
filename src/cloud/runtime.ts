@@ -25,6 +25,7 @@ import {
 } from "./tenantOnboardingHttpApi";
 import { CLOUD_CUSTOMER_MCP_SERVERS_PATH, handleCloudTenantMcpRequest } from "./tenantMcpHttpApi";
 import type { CloudMcpEgressBinding } from "./mcpEgressTransport";
+import { createCloudOidcEgressTransport, type CloudOidcEgressBinding } from "./oidcEgressTransport";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import { CLOUD_TENANT_HOSTS_PATH, handleCloudTenantHostsRequest } from "./tenantHostsHttpApi";
 import type { CustomerHostTxtResolver } from "./tenantHostDns";
@@ -80,6 +81,9 @@ export interface CloudRuntimeEnv {
   MCP_EGRESS?: CloudMcpEgressBinding;
   OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN?: string;
   OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED?: string;
+  OIDC_EGRESS?: CloudOidcEgressBinding;
+  OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN?: string;
+  OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED?: string;
 }
 
 export interface CloudRuntimeOptions {
@@ -120,6 +124,13 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
   const env = options.env;
   const requireDeploymentConfiguration =
     env?.OMNIROUTE_ENV === "staging" || env?.OMNIROUTE_ENV === "production";
+  const oidcEgressEnabled = env?.OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED === "true";
+  const oidcEgressToken = env?.OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN;
+  const oidcEgressState: "ok" | "disabled" | "error" = !oidcEgressEnabled
+    ? "disabled"
+    : env?.OIDC_EGRESS && oidcEgressToken && /^[A-Za-z0-9_-]{32,512}$/.test(oidcEgressToken)
+      ? "ok"
+      : "error";
 
   const configurationStatus = (): {
     status: "ok" | "unconfigured" | "error";
@@ -152,11 +163,19 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
     if (frontDeskConfigToken !== undefined && !isDeploymentToken(frontDeskConfigToken)) {
       issues.push("invalid:frontDeskServiceToken");
     }
+    if (oidcEgressEnabled) {
+      if (!env?.OIDC_EGRESS) issues.push("missing:oidcEgressBinding");
+      if (!oidcEgressToken) issues.push("missing:oidcEgressToken");
+      else if (!/^[A-Za-z0-9_-]{32,512}$/.test(oidcEgressToken)) {
+        issues.push("invalid:oidcEgressToken");
+      }
+    }
     const configuredSecrets = [
       ...scopedTokens.map(([, token]) => token).filter((token): token is string => Boolean(token)),
       credentialEncryptionKey,
       idempotencyKey,
       ...(frontDeskConfigToken ? [frontDeskConfigToken] : []),
+      ...(oidcEgressEnabled && oidcEgressToken ? [oidcEgressToken] : []),
     ].filter((secret): secret is string => Boolean(secret));
     if (new Set(configuredSecrets).size !== configuredSecrets.length) {
       issues.push("duplicate:operatorOrRuntimeSecret");
@@ -355,6 +374,14 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             publicOrigin: options.env?.OMNIROUTE_CLOUD_PUBLIC_ORIGIN,
             environment: options.env?.OMNIROUTE_ENV,
             credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            oidcTransport:
+              options.env?.OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED === "true"
+                ? (createCloudOidcEgressTransport({
+                    binding: options.env?.OIDC_EGRESS,
+                    proxyToken: options.env?.OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN,
+                  }) ?? undefined)
+                : undefined,
+            requireControlledEgress: requireDeploymentConfiguration,
             now: () => now().getTime(),
             fetcher: options.fetcher,
             customerHostTxtResolver: options.customerHostTxtResolver,
@@ -388,12 +415,14 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           database: "ok" | "unconfigured" | "error";
           gateway: "ok" | "unconfigured" | "error";
           artifacts: "ok" | "unconfigured" | "error";
+          oidcEgress: "ok" | "disabled" | "error";
           configuration?: "ok" | "unconfigured" | "error";
           configurationIssues?: string[];
         } = {
           database: "unconfigured",
           gateway: "unconfigured",
           artifacts: "unconfigured",
+          oidcEgress: oidcEgressState,
           ...(configuration !== null
             ? {
                 configuration: configuration.status,
@@ -437,6 +466,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           checks.database === "ok" &&
           checks.gateway === "ok" &&
           checks.artifacts === "ok" &&
+          checks.oidcEgress !== "error" &&
           (configuration === null || configuration.status === "ok");
         return Response.json(
           {

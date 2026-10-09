@@ -105,6 +105,8 @@ const ENV_VAR_ALLOWLIST = new Set([
   // They are injected into Actions/Wrangler, not read by the OmniRoute runtime.
   "CLOUDFLARE_API_TOKEN",
   "CLOUDFLARE_STAGING_D1_DATABASE_ID",
+  "CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID", // Optional VPC Service UUID consumed by deploy-cloudflare-staging.yml
+  "OIDC_EGRESS_PROXY_TOKEN", // Optional secret consumed by the private cloudflare/mcp-egress-proxy process
   "OMNIROUTE_BUILD_SHA",
   "OMNIROUTE_URL", // used by ad-hoc tooling, validated elsewhere
   "OMNIROUTE_KEY", // ditto

@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createNodePinnedMcpTransport } from "../../src/lib/mcp/nodePinnedMcpTransport.ts";
+import { createOidcEgressProxyHandler, OIDC_PROXY_PATH } from "./oidcHandler.ts";
 import {
   DEFAULT_PROXY_BODY_READ_TIMEOUT_MS,
   MAX_PROXY_PAYLOAD_BYTES,
@@ -24,9 +25,13 @@ class IncomingBodyTimeoutError extends Error {
   }
 }
 
-async function readIncomingBody(request: IncomingMessage, timeoutMs: number): Promise<Buffer> {
+async function readIncomingBody(
+  request: IncomingMessage,
+  timeoutMs: number,
+  maxBytes = MAX_PROXY_PAYLOAD_BYTES
+): Promise<Buffer> {
   const length = request.headers["content-length"];
-  if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > MAX_PROXY_PAYLOAD_BYTES)) {
+  if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > maxBytes)) {
     request.resume();
     throw new RangeError("payload too large");
   }
@@ -37,7 +42,7 @@ async function readIncomingBody(request: IncomingMessage, timeoutMs: number): Pr
     for await (const chunk of request) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += bytes.byteLength;
-      if (total > MAX_PROXY_PAYLOAD_BYTES) {
+      if (total > maxBytes) {
         oversized = true;
         chunks.length = 0;
         continue;
@@ -63,6 +68,7 @@ async function readIncomingBody(request: IncomingMessage, timeoutMs: number): Pr
 /** Starts the standalone Node.js HTTP service. No request details are logged. */
 export function startMcpEgressProxyServer(options: {
   proxyToken: string;
+  oidcProxyToken?: string;
   port?: number;
   host?: string;
   timeoutMs?: number;
@@ -80,11 +86,17 @@ export function startMcpEgressProxyServer(options: {
     maxInFlight: options.maxInFlight,
     transport: createNodePinnedMcpTransport(),
   });
+  const oidcHandler = createOidcEgressProxyHandler({
+    proxyToken: options.oidcProxyToken ?? options.proxyToken,
+    transport: createNodePinnedMcpTransport(),
+    timeoutMs: options.timeoutMs ?? 10_000,
+  });
   const server = createServer(async (incoming, outgoing) => {
     try {
       const signedHeaders = ["x-omniroute-timestamp", "x-omniroute-nonce", "x-omniroute-signature"];
       const requestPath = new URL(incoming.url ?? "/", "http://localhost").pathname;
       const isHealthRequest = requestPath === "/healthz";
+      const isOidcRequest = requestPath === OIDC_PROXY_PATH;
       if (isHealthRequest && incoming.method !== "GET") {
         outgoing.writeHead(405, {
           allow: "GET",
@@ -115,7 +127,11 @@ export function startMcpEgressProxyServer(options: {
       }
       const body = isHealthRequest
         ? Buffer.alloc(0)
-        : await readIncomingBody(incoming, bodyReadTimeoutMs);
+        : await readIncomingBody(
+            incoming,
+            bodyReadTimeoutMs,
+            isOidcRequest ? 96 * 1024 : MAX_PROXY_PAYLOAD_BYTES
+          );
       const host = incoming.headers.host ?? "localhost";
       const requestHeaders = new Headers();
       for (const name of signedHeaders) {
@@ -128,7 +144,7 @@ export function startMcpEgressProxyServer(options: {
         headers: requestHeaders,
         body: body.byteLength ? new Uint8Array(body) : undefined,
       });
-      const result = await handler(request);
+      const result = await (isOidcRequest ? oidcHandler(request) : handler(request));
       const responseBody = Buffer.from(await result.arrayBuffer());
       const responseHeaders = Object.fromEntries(result.headers.entries());
       outgoing.writeHead(result.status, {
@@ -160,10 +176,12 @@ const entryPath = process.argv[1];
 if (entryPath && fileURLToPath(import.meta.url) === entryPath) {
   const proxyToken = process.env.MCP_EGRESS_PROXY_TOKEN;
   if (!proxyToken) throw new Error("MCP_EGRESS_PROXY_TOKEN must be configured");
+  const oidcProxyToken = process.env.OIDC_EGRESS_PROXY_TOKEN;
   const port = Number(process.env.PORT ?? "8788");
   const rawMaxInFlight = process.env.MCP_EGRESS_PROXY_MAX_IN_FLIGHT;
   startMcpEgressProxyServer({
     proxyToken,
+    ...(oidcProxyToken ? { oidcProxyToken } : {}),
     port,
     host: process.env.HOST ?? "127.0.0.1",
     ...(rawMaxInFlight ? { maxInFlight: Number(rawMaxInFlight) } : {}),

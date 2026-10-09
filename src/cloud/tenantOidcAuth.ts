@@ -1,5 +1,6 @@
 import { createLocalJWKSet, jwtVerify } from "jose";
 import type { CloudDb } from "./db";
+import type { CloudOidcOutboundTransport } from "./oidcEgressTransport";
 import { encryptCloudCredential, decryptCloudCredential } from "./credentialEncryption";
 import {
   CloudMembershipConflictError,
@@ -138,6 +139,9 @@ export interface CloudTenantOidcAuthOptions {
   credentialEncryptionKey?: string;
   now?: () => number;
   fetcher?: typeof fetch;
+  /** Controlled fixed-binding transport. Required for staging and production login. */
+  oidcTransport?: CloudOidcOutboundTransport;
+  requireControlledEgress?: boolean;
   customerHostTxtResolver?: CustomerHostTxtResolver;
 }
 
@@ -187,13 +191,14 @@ function expectedOrigin(request: Request, options: CloudTenantOidcAuthOptions): 
   }
 }
 
-function safeRemoteUrl(value: unknown, publicOrigin: URL): URL {
+function safeRemoteUrl(value: unknown, publicOrigin: URL, issuer?: string): URL {
   if (typeof value !== "string" || value.length > 2048) throw new Error("invalid endpoint");
   const url = new URL(value);
   const hostname = url.hostname.toLowerCase();
   const isIpLiteral = hostname.startsWith("[") || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname);
   if (
     url.protocol !== "https:" ||
+    url.port !== "" ||
     url.username !== "" ||
     url.password !== "" ||
     url.hash !== "" ||
@@ -202,7 +207,8 @@ function safeRemoteUrl(value: unknown, publicOrigin: URL): URL {
     hostname.endsWith(".localhost") ||
     hostname.endsWith(".local") ||
     hostname.endsWith(".internal") ||
-    url.origin === publicOrigin.origin
+    url.origin === publicOrigin.origin ||
+    (issuer !== undefined && url.origin !== new URL(issuer).origin)
   ) {
     throw new Error("invalid endpoint");
   }
@@ -259,19 +265,38 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function createOidcFetcher(options: CloudTenantOidcAuthOptions, issuer: string) {
+  return (
+    url: URL,
+    init: RequestInit,
+    operation: "discovery" | "token" | "jwks"
+  ): Promise<Response> => {
+    if (options.oidcTransport) return options.oidcTransport.fetch(issuer, operation, url, init);
+    if (options.requireControlledEgress) {
+      throw new Error("controlled OIDC egress is not configured");
+    }
+    return (options.fetcher ?? fetch)(url, init);
+  };
+}
+
 async function fetchJson(
-  fetcher: typeof fetch,
+  fetcher: ReturnType<typeof createOidcFetcher>,
   url: URL,
   maxBytes: number,
-  timeoutMs: number
+  timeoutMs: number,
+  operation: "discovery" | "jwks"
 ): Promise<unknown> {
-  const response = await fetcher(url, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    redirect: "manual",
-    cache: "no-store",
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const response = await fetcher(
+    url,
+    {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      redirect: "manual",
+      cache: "no-store",
+      signal: AbortSignal.timeout(timeoutMs),
+    },
+    operation
+  );
   if (!response.ok || (response.status >= 300 && response.status < 400)) {
     throw new Error("remote OIDC endpoint failed");
   }
@@ -281,7 +306,7 @@ async function fetchJson(
 async function discoverOidc(
   issuer: string,
   publicOrigin: URL,
-  fetcher: typeof fetch
+  fetcher: ReturnType<typeof createOidcFetcher>
 ): Promise<{
   authorizationEndpoint: URL;
   tokenEndpoint: URL;
@@ -292,14 +317,19 @@ async function discoverOidc(
   const discoveryUrl = new URL(`${issuer.replace(/\/$/, "")}/.well-known/openid-configuration`);
   const metadata = await fetchJson(
     fetcher,
-    safeRemoteUrl(discoveryUrl.toString(), publicOrigin),
+    safeRemoteUrl(discoveryUrl.toString(), publicOrigin, issuer),
     MAX_METADATA_BYTES,
-    5000
+    5000,
+    "discovery"
   );
   if (!isRecord(metadata) || metadata.issuer !== issuer) throw new Error("OIDC issuer mismatch");
-  const authorizationEndpoint = safeRemoteUrl(metadata.authorization_endpoint, publicOrigin);
-  const tokenEndpoint = safeRemoteUrl(metadata.token_endpoint, publicOrigin);
-  const jwksUri = safeRemoteUrl(metadata.jwks_uri, publicOrigin);
+  const authorizationEndpoint = safeRemoteUrl(
+    metadata.authorization_endpoint,
+    publicOrigin,
+    issuer
+  );
+  const tokenEndpoint = safeRemoteUrl(metadata.token_endpoint, publicOrigin, issuer);
+  const jwksUri = safeRemoteUrl(metadata.jwks_uri, publicOrigin, issuer);
   if (issuerUrl.protocol !== "https:") throw new Error("OIDC issuer must use HTTPS");
 
   const advertised = Array.isArray(metadata.id_token_signing_alg_values_supported)
@@ -423,7 +453,7 @@ async function startLoginForTenant(
   if (!credentials) return json({ error: "OIDC login unavailable" }, 404);
 
   try {
-    const fetcher = options.fetcher ?? fetch;
+    const fetcher = createOidcFetcher(options, credentials.issuer);
     const metadata = await discoverOidc(credentials.issuer, origin, fetcher);
     await cleanupOldStates(db, nowMs);
     const state = randomToken();
@@ -588,25 +618,30 @@ async function callback(
         field: "pkceVerifier",
       }
     );
-    const tokenEndpoint = safeRemoteUrl(consumed.token_endpoint, origin);
-    const tokenResponse = await (options.fetcher ?? fetch)(tokenEndpoint, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/x-www-form-urlencoded",
+    const tokenEndpoint = safeRemoteUrl(consumed.token_endpoint, origin, consumed.issuer);
+    const remoteFetch = createOidcFetcher(options, consumed.issuer);
+    const tokenResponse = await remoteFetch(
+      tokenEndpoint,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: consumed.redirect_uri,
+          client_id: credentials.clientId,
+          client_secret: credentials.clientSecret,
+          code_verifier: verifier,
+        }).toString(),
+        redirect: "manual",
+        cache: "no-store",
+        signal: AbortSignal.timeout(10_000),
       },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: consumed.redirect_uri,
-        client_id: credentials.clientId,
-        client_secret: credentials.clientSecret,
-        code_verifier: verifier,
-      }),
-      redirect: "manual",
-      cache: "no-store",
-      signal: AbortSignal.timeout(10_000),
-    });
+      "token"
+    );
     if (!tokenResponse.ok || (tokenResponse.status >= 300 && tokenResponse.status < 400)) {
       throw new Error("token exchange failed");
     }
@@ -618,8 +653,8 @@ async function callback(
     ) {
       throw new Error("ID token missing");
     }
-    const jwksUri = safeRemoteUrl(consumed.jwks_uri, origin);
-    const jwks = await fetchJson(options.fetcher ?? fetch, jwksUri, MAX_JWKS_BYTES, 5000);
+    const jwksUri = safeRemoteUrl(consumed.jwks_uri, origin, consumed.issuer);
+    const jwks = await fetchJson(remoteFetch, jwksUri, MAX_JWKS_BYTES, 5000, "jwks");
     if (
       !isRecord(jwks) ||
       !Array.isArray(jwks.keys) ||

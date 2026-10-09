@@ -22,6 +22,11 @@ test("Cloudflare staging deployment is manual and requires an explicit staging c
 
 test("staging deploy constructs a staging-only Worker config without production routes", () => {
   assert.equal(wranglerConfig.vars?.OMNIROUTE_ENV, "production");
+  assert.equal(
+    wranglerConfig.vpc_services,
+    undefined,
+    "production config must not bind staging OIDC egress"
+  );
   assert.match(workflow, /"vars"/);
   assert.match(workflow, /OMNIROUTE_ENV: "staging"/);
   assert.match(workflow, /config\.name = "omniroute-cloud-runtime-staging"/);
@@ -65,6 +70,24 @@ test("staging deploy constructs a staging-only Worker config without production 
   );
 });
 
+test("staging OIDC egress stays off unless a dedicated VPC Service and token are supplied", () => {
+  assert.match(workflow, /"vpc_services"/);
+  assert.match(workflow, /CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID/);
+  assert.match(workflow, /OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN/);
+  assert.match(workflow, /Boolean\(oidcServiceId\) !== Boolean\(oidcToken\)/);
+  assert.match(
+    workflow,
+    /config\.vars[\s\S]*OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED: oidcServiceId \? "true" : "false"/
+  );
+  assert.match(
+    workflow,
+    /config\.vpc_services = \[\{ binding: "OIDC_EGRESS", service_id: oidcServiceId \}\]/
+  );
+  assert.match(workflow, /wrangler secret put OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN/);
+  assert.match(workflow, /OIDC_EGRESS_EXPECTED/);
+  assert.doesNotMatch(workflow, /config\.services\s*=/);
+});
+
 test("staging secret values are piped to Wrangler and never printed or shell-traced", () => {
   const secretNames = [
     "OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN",
@@ -75,6 +98,7 @@ test("staging secret values are piped to Wrangler and never printed or shell-tra
     "OMNIROUTE_CLOUD_MAINTENANCE_TOKEN",
     "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY",
     "OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY",
+    "OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN",
   ];
 
   for (const name of secretNames) {

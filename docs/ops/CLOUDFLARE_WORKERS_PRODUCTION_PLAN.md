@@ -181,8 +181,18 @@ until the private runtime explicitly supplies its interface address. With the
 repository's dependencies installed, the process entry point is:
 
 ```sh
-MCP_EGRESS_PROXY_TOKEN=<provided-secret> HOST=<private-interface> PORT=8788 node --import tsx/esm cloudflare/mcp-egress-proxy/server.ts
+MCP_EGRESS_PROXY_TOKEN=<mcp-proxy-secret> OIDC_EGRESS_PROXY_TOKEN=<oidc-proxy-secret> HOST=<private-interface> PORT=8788 node --import tsx/esm cloudflare/mcp-egress-proxy/server.ts
 ```
+
+The OIDC endpoint on this process accepts only authenticated discovery, token,
+and JWKS requests whose target remains on the configured issuer origin. It uses
+the same DNS-pinned Node transport, rejects redirects, and bounds request and
+response sizes and time. `OIDC_EGRESS_PROXY_TOKEN` must match the Worker secret
+`OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN`; keep it separate from the MCP token. If
+the OIDC-specific variable is omitted, the process uses the MCP token for local
+compatibility, but staging configuration requires the dedicated token. The
+Worker does not call this endpoint unless its staging-only VPC Service binding,
+matching token, and explicit enable flag are all present.
 
 The proxy defaults to at most 32 in-flight upstream requests per process.
 Set MCP_EGRESS_PROXY_MAX_IN_FLIGHT to an integer from 1 through 1000 to tune
@@ -461,6 +471,21 @@ The workflow binds each scoped secret through `wrangler secret put` using stdin
 and checks successful use and cross-scope denial for the new route families.
 Tenant lifecycle status audit rows identify the lifecycle or maintenance actor;
 customer provisioning audit rows identify the lifecycle actor.
+
+OIDC controlled egress is optional and disabled by default. To enable it only
+in the isolated staging Worker, provide the GitHub Environment variable
+`CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID` as the UUID of the dedicated VPC
+Service and the GitHub Environment secret
+`OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN`. The service must target the private Node
+egress proxy and the proxy process must receive the same value as
+`OIDC_EGRESS_PROXY_TOKEN`. The workflow emits only a single `OIDC_EGRESS`
+`vpc_services` binding in its temporary staging config and sets the runtime flag
+only when both inputs are present; partial configuration fails before deploy.
+The checked-in production Wrangler config remains without VPC bindings. Readiness
+reports `oidcEgress: "disabled"` when off, `"ok"` when the enabled binding and
+token are present, and fails closed when the flag is on with missing or invalid
+configuration. An `ok` status proves configuration presence, not live issuer
+reachability or network-firewall policy.
 
 The credential key must be a base64-encoded 32-byte key used only for Cloud
 credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The idempotency
