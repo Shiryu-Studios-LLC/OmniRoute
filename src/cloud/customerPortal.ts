@@ -810,6 +810,58 @@ const PORTAL_SCRIPT = `
     } finally { button.disabled = false; }
   });
 
+  const loadOidcDraft = async () => {
+    const result = await api("/__cloud/auth/oidc-draft");
+    const draft = result.draft;
+    byId("oidc-draft-status").textContent = draft
+      ? "A pending issuer draft is saved. It does not change organization sign-in."
+      : "No pending issuer draft is saved.";
+    byId("oidc-draft-issuer").value = draft?.issuer || "";
+    byId("oidc-draft-client-id").value = draft?.clientId || "";
+    byId("oidc-draft-scopes").value = Array.isArray(draft?.scopes)
+      ? draft.scopes.join(" ")
+      : "openid profile email";
+    byId("oidc-draft-client-secret").value = "";
+    byId("delete-oidc-draft").disabled = !draft;
+  };
+
+  byId("oidc-draft-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("save-oidc-draft");
+    const secret = byId("oidc-draft-client-secret");
+    button.disabled = true;
+    try {
+      const scopes = byId("oidc-draft-scopes").value.trim().split(/\s+/).filter(Boolean);
+      await api("/__cloud/auth/oidc-draft", {
+        method: "PUT",
+        body: JSON.stringify({
+          issuer: byId("oidc-draft-issuer").value.trim(),
+          clientId: byId("oidc-draft-client-id").value.trim(),
+          clientSecret: secret.value,
+          scopes,
+        }),
+      });
+      secret.value = "";
+      setStatus("Pending issuer draft saved. Organization sign-in is unchanged.");
+      await loadOidcDraft();
+    } catch (error) {
+      secret.value = "";
+      setStatus(error instanceof Error ? error.message : "Could not save issuer draft.", true);
+    } finally { secret.value = ""; button.disabled = false; }
+  });
+
+  byId("delete-oidc-draft").addEventListener("click", async () => {
+    const button = byId("delete-oidc-draft");
+    button.disabled = true;
+    try {
+      await api("/__cloud/auth/oidc-draft", { method: "DELETE" });
+      setStatus("Pending issuer draft deleted.");
+      await loadOidcDraft();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not delete issuer draft.", true);
+    } finally { button.disabled = false; }
+  });
+
   inviteForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = byId("redeem-invitation");
@@ -857,6 +909,7 @@ const PORTAL_SCRIPT = `
         byId("front-desk-config-panel").hidden = false;
         byId("customer-host-panel").hidden = false;
         byId("onboarding-readiness-panel").hidden = false;
+        byId("oidc-draft-panel").hidden = false;
         try {
           await loadBusinessProfile();
         } catch (error) {
@@ -896,6 +949,11 @@ const PORTAL_SCRIPT = `
           await loadMembers();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "Could not load members.", true);
+        }
+        try {
+          await loadOidcDraft();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not load issuer draft.", true);
         }
       } else {
         byId("member-readonly").hidden = false;
@@ -1107,6 +1165,23 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
         <h2>Onboarding readiness</h2>
         <p>This checklist reports setup status only. OIDC configuration and inference entitlements can be changed only by a platform admin. Inference access is default-deny.</p>
         <ul id="onboarding-readiness"></ul>
+      </section>
+      <section id="oidc-draft-panel" hidden>
+        <h2>Pending organization sign-in setup</h2>
+        <p id="oidc-draft-status" aria-live="polite"></p>
+        <p>This securely saves issuer details for review. Saving a draft does not test it or change how anyone signs in.</p>
+        <form id="oidc-draft-form">
+          <label for="oidc-draft-issuer">Issuer URL</label>
+          <input id="oidc-draft-issuer" type="url" maxlength="500" required>
+          <label for="oidc-draft-client-id">Client ID</label>
+          <input id="oidc-draft-client-id" maxlength="200" required>
+          <label for="oidc-draft-client-secret">Client secret</label>
+          <input id="oidc-draft-client-secret" type="password" autocomplete="new-password" maxlength="500" required>
+          <label for="oidc-draft-scopes">Scopes (space separated)</label>
+          <input id="oidc-draft-scopes" maxlength="2000" value="openid profile email" required>
+          <button id="save-oidc-draft" type="submit">Save pending sign-in setup</button>
+          <button id="delete-oidc-draft" type="button" disabled>Delete pending setup</button>
+        </form>
       </section>
     </main>
     <script nonce="${nonce}">${PORTAL_SCRIPT}</script>

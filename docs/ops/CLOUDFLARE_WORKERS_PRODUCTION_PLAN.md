@@ -126,6 +126,14 @@ controls. The platform-admin path remains the break-glass recovery path.
 Migration `0020_cloud_tenant_oidc_owner_claims.sql` must be applied before
 issuing or redeeming claims.
 
+Tenant owners and admins can also save, review, replace, or delete an encrypted
+pending issuer draft in the OIDC portal. Drafts are stored separately from the
+active OIDC configuration; the Worker does not test the issuer, make outbound
+discovery/token/JWKS requests, or use draft values for login. Migration
+`0031_cloud_tenant_oidc_config_drafts.sql` must be applied before using this
+portal feature. Activating a customer-managed issuer remains blocked on
+controlled public egress and owner recovery.
+
 ### 5. MCP cloud runtime
 
 - Tenant-scope MCP servers and credentials.

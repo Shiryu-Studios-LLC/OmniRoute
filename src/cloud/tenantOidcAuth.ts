@@ -50,6 +50,13 @@ import {
 } from "./tenantSettingsHttpApi";
 import { getCloudTenantSettings, updateCloudTenantSettings } from "./tenantSettings";
 import {
+  deleteCloudTenantOidcDraft,
+  getCloudTenantOidcDraft,
+  saveCloudTenantOidcDraft,
+  type CloudTenantOidcDraftAuthorization,
+} from "./tenantOidcDrafts";
+import { CLOUD_TENANT_OIDC_DRAFT_PATH } from "./tenantOidcDrafts";
+import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaimByHash,
@@ -73,6 +80,7 @@ export const CLOUD_TENANT_MCP_SERVERS_PATH = "/__cloud/auth/mcp-servers";
 export const CLOUD_TENANT_ONBOARDING_PATH = "/__cloud/auth/onboarding";
 export const CLOUD_TENANT_MCP_SETTINGS_PATH = "/__cloud/auth/mcp-settings";
 export const CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH = "/__cloud/auth/local-ai-settings";
+export { CLOUD_TENANT_OIDC_DRAFT_PATH };
 export const CLOUD_TENANT_FRONT_DESK_PATH = "/__cloud/auth/front-desk";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
@@ -1111,6 +1119,104 @@ async function customerOnboardingReadinessPortal(
   }
 }
 
+async function customerOidcDraftPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  if (new URL(request.url).search !== "") {
+    return json({ error: "Query parameters are not supported" }, 400);
+  }
+  if (request.method !== "GET" && request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!options.db) return json({ error: "OIDC draft service is unavailable" }, 503);
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  const rateLimit = await consumeCloudRateLimit(options.db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-oidc-draft:${session.tenant_id}:${session.membership_id}`,
+    limit: 10,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!rateLimit.allowed) return json({ error: "OIDC draft rate limit exceeded" }, 429);
+  const authorization: CloudTenantOidcDraftAuthorization = {
+    tenantId: session.tenant_id,
+    membershipId: session.membership_id,
+    sessionTokenHash: session.session_token_hash,
+    nowMs,
+  };
+  try {
+    if (request.method === "GET") {
+      return json({ draft: await getCloudTenantOidcDraft(options.db, authorization) });
+    }
+    if (request.method === "DELETE") {
+      const deleted = await deleteCloudTenantOidcDraft(options.db, {
+        authorization,
+        audit: {
+          id: crypto.randomUUID(),
+          tenantId: session.tenant_id,
+          timestamp: new Date(nowMs).toISOString(),
+          action: "customer.oidc.draft.delete",
+          actor: `membership:${session.membership_id}`,
+          target: "pending-issuer-draft",
+          resourceType: "customer-oidc-draft",
+          status: "success",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: { draftOnly: true },
+        },
+      });
+      return deleted ? json({ deleted: true }) : json({ error: "OIDC draft not found" }, 404);
+    }
+    if (request.method !== "PUT") {
+      return json({ error: "Method not allowed" }, 405, { Allow: "GET, PUT, DELETE" });
+    }
+    const parsed = await readCloudCustomerSettingsBody(request, 5_000);
+    if (parsed instanceof Response) return parsed;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      Object.keys(parsed).some(
+        (key) => !["issuer", "clientId", "clientSecret", "scopes"].includes(key)
+      ) ||
+      typeof (parsed as Record<string, unknown>).issuer !== "string" ||
+      typeof (parsed as Record<string, unknown>).clientId !== "string" ||
+      typeof (parsed as Record<string, unknown>).clientSecret !== "string"
+    ) {
+      return json({ error: "Invalid OIDC draft" }, 400);
+    }
+    const saved = await saveCloudTenantOidcDraft(options.db, options.credentialEncryptionKey, {
+      authorization,
+      issuer: (parsed as Record<string, unknown>).issuer,
+      clientId: (parsed as Record<string, unknown>).clientId,
+      clientSecret: (parsed as Record<string, unknown>).clientSecret,
+      scopes: (parsed as Record<string, unknown>).scopes,
+      timestamp: new Date(nowMs).toISOString(),
+      audit: {
+        id: crypto.randomUUID(),
+        tenantId: session.tenant_id,
+        timestamp: new Date(nowMs).toISOString(),
+        action: "customer.oidc.draft.save",
+        actor: `membership:${session.membership_id}`,
+        target: "pending-issuer-draft",
+        resourceType: "customer-oidc-draft",
+        status: "success",
+        requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+        metadata: { draftOnly: true },
+      },
+    });
+    return saved ? json({ draft: saved }) : json({ error: "Owner or admin session required" }, 403);
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof RangeError) {
+      return json({ error: error.message }, 400);
+    }
+    return json({ error: "OIDC draft could not be saved" }, 503);
+  }
+}
+
 async function customerMcpSettingsPortal(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1783,6 +1889,7 @@ export async function handleCloudTenantOidcAuthRequest(
   const isOnboarding = pathname === CLOUD_TENANT_ONBOARDING_PATH;
   const isMcpSettings = pathname === CLOUD_TENANT_MCP_SETTINGS_PATH;
   const isLocalAiSettings = pathname === CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH;
+  const isOidcDraft = pathname === CLOUD_TENANT_OIDC_DRAFT_PATH;
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1802,6 +1909,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isOnboarding &&
     !isMcpSettings &&
     !isLocalAiSettings &&
+    !isOidcDraft &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1834,7 +1942,9 @@ export async function handleCloudTenantOidcAuthRequest(
                   ? ["PUT"]
                   : isLocalAiSettings
                     ? ["PUT"]
-                    : [expectedMethod];
+                    : isOidcDraft
+                      ? ["GET", "PUT", "DELETE"]
+                      : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1852,6 +1962,7 @@ export async function handleCloudTenantOidcAuthRequest(
     return customerProviderConnectionsPortal(request, options, origin, nowMs);
   if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
   if (isFrontDesk) return customerFrontDeskConfigPortal(request, options, origin, nowMs);
+  if (isOidcDraft) return customerOidcDraftPortal(request, options, origin, nowMs);
   if (isOnboarding) return customerOnboardingReadinessPortal(request, options, nowMs);
   if (isMcpSettings) return customerMcpSettingsPortal(request, options, origin, nowMs);
   if (isLocalAiSettings) return customerLocalAiSettingsPortal(request, options, origin, nowMs);
