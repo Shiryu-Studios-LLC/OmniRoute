@@ -550,6 +550,7 @@ test(
       database: "ok",
       gateway: "ok",
       artifacts: "ok",
+      oidcEgress: "disabled",
     });
     const unauthorizedAdminRequest = await requestJson(
       `${baseUrl}/__cloud/v1/tenants/__smoke_missing__/status`
@@ -625,6 +626,116 @@ test(
     assert.notEqual(customerA.customerKey, customerB.customerKey);
     assert.notEqual(customerA.deviceId, customerB.deviceId);
     assert.notEqual(customerA.credential, customerB.credential);
+
+    await t.test(
+      "owner pairing creates a tenant device once and stores only code and credential digests",
+      async () => {
+        const tenantId = `local-pair-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+        const provisioned = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
+          token: adminToken,
+          body: {
+            id: tenantId,
+            name: "Local Integration Pairing",
+            slug: tenantId,
+            ownerPrincipalId: `principal-${tenantId}`,
+          },
+        });
+        assert.equal(provisioned.response.status, 201, JSON.stringify(provisioned.body));
+        const customerKey = String(provisioned.body.ownerApiKey.token);
+        const settings = await requestJson(`${baseUrl}/__cloud/v1/customer/settings`, {
+          method: "PUT",
+          token: customerKey,
+          body: { localAiEnabled: true, mcpEnabled: false },
+        });
+        assert.equal(settings.response.status, 200, JSON.stringify(settings.body));
+
+        const issue = await requestJson(`${baseUrl}/__gateway/v1/customer/local-agent/pairings`, {
+          token: customerKey,
+          body: {},
+        });
+        assert.equal(issue.response.status, 201, JSON.stringify(issue.body));
+        const pairingCode = String(issue.body.pairingCode);
+        assert.match(pairingCode, /^[A-Za-z0-9_-]{43}$/);
+
+        const exchange = await requestJson(`${baseUrl}/__gateway/v1/device/pair`, {
+          body: { version: 1, pairingCode },
+        });
+        assert.equal(exchange.response.status, 201, JSON.stringify(exchange.body));
+        const deviceId = String(exchange.body.deviceId);
+        const credential = String(exchange.body.credential);
+        assert.match(deviceId, /^[A-Za-z0-9-]{36}$/);
+        assert.match(credential, /^[A-Za-z0-9_-]{43}$/);
+        assert.notEqual(credential, pairingCode);
+
+        const session = await deviceTransport.connect(deviceId, credential);
+        assert.ok(session, "paired credential should connect through the Worker and D1 directory");
+        assert.equal(await deviceTransport.heartbeat(session!, []), true);
+
+        const replay = await requestJson(`${baseUrl}/__gateway/v1/device/pair`, {
+          body: { version: 1, pairingCode },
+        });
+        assert.equal(replay.response.status, 401, "one-time pairing code must reject replay");
+
+        const codeHash = createHash("sha256").update(pairingCode).digest("hex");
+        const credentialHash = createHash("sha256").update(credential).digest("hex");
+        const query = spawnSync(
+          process.execPath,
+          [
+            wranglerBin,
+            "d1",
+            "execute",
+            workerName,
+            "--local",
+            "--persist-to",
+            persistDir,
+            "--config",
+            wranglerConfigPath,
+            "--env-file",
+            safeEnvPath,
+            "--command",
+            `SELECT code_hash, consumed_at FROM cloud_gateway_pairings WHERE code_hash = '${codeHash}'; SELECT id, tenant_id, credential_hash FROM cloud_gateway_devices WHERE id = '${deviceId}';`,
+            "--json",
+          ],
+          {
+            cwd: tempDir,
+            env: {
+              PATH: process.env.PATH ?? "",
+              HOME: homeDir,
+              TMPDIR: tempDir,
+              NODE_ENV: "test",
+              NO_COLOR: "1",
+              CI: "1",
+            },
+            encoding: "utf8",
+            timeout: 30_000,
+            maxBuffer: 4 * 1024 * 1024,
+          }
+        );
+        assert.equal(query.status, 0, `D1 pairing query failed:\n${query.stdout}\n${query.stderr}`);
+        const queryResults = JSON.parse(query.stdout) as Array<{
+          results?: Array<Record<string, unknown>>;
+        }>;
+        const rows = queryResults.flatMap((result) => result.results ?? []);
+        const pairingRow = rows.find((row) => Object.hasOwn(row, "code_hash"));
+        const deviceRow = rows.find((row) => Object.hasOwn(row, "credential_hash"));
+        assert.equal(pairingRow?.code_hash, codeHash);
+        assert.equal(typeof pairingRow?.consumed_at, "string");
+        assert.equal(deviceRow?.id, deviceId);
+        assert.equal(deviceRow?.tenant_id, tenantId);
+        assert.equal(deviceRow?.credential_hash, credentialHash);
+        const storedState = JSON.stringify(rows);
+        assert.equal(
+          storedState.includes(pairingCode),
+          false,
+          "D1 must not store pairing code text"
+        );
+        assert.equal(
+          storedState.includes(credential),
+          false,
+          "D1 must not store device credential text"
+        );
+      }
+    );
 
     await t.test(
       "D1 customer hosts resolve exact tenants without disclosing credentials",

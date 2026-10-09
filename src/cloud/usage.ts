@@ -245,5 +245,6 @@ export async function listCloudUsageRecords(
     )
     .bind(...values)
     .all<UsageRow>();
+  if (!result.success) throw new Error("D1 usage history read failed");
   return result.results.map(mapRow);
 }

@@ -289,5 +289,6 @@ export async function listCloudComplianceAudit(
     )
     .bind(...values)
     .all<AuditRow>();
+  if (!result.success) throw new Error("D1 compliance audit read failed");
   return result.results.map(mapRow);
 }
