@@ -158,6 +158,19 @@ respective runtime configuration, and the Worker binding must target the
 dedicated VPC Service only. The current branch's production Wrangler config
 does not include that binding or enable the egress flag.
 
+The proxy process exposes `GET /healthz` as a no-store liveness response for a
+private service or tunnel probe. It does not test DNS, upstream reachability,
+or the outbound firewall. Keep this probe reachable only inside the proxy's
+private service path. Start the process with its signing token, bind the
+listener only to the dedicated proxy-side private interface, and do not
+publish it on a public address. The default host is loopback (`127.0.0.1`)
+until the private runtime explicitly supplies its interface address. With the
+repository's dependencies installed, the process entry point is:
+
+```sh
+MCP_EGRESS_PROXY_TOKEN=<provided-secret> HOST=<private-interface> PORT=8788 node --import tsx/esm cloudflare/mcp-egress-proxy/server.ts
+```
+
 #### Egress decision (2026-10-08)
 
 The least-privilege Cloudflare shape is a **VPC Service bound to one dedicated

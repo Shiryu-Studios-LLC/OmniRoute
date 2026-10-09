@@ -294,6 +294,16 @@ test("Node HTTP server exposes the handler and rejects unauthenticated requests"
   });
   try {
     const address = server.address() as AddressInfo;
+    const healthResponse = await fetch(`http://127.0.0.1:${address.port}/healthz`);
+    assert.equal(healthResponse.status, 200);
+    assert.equal(healthResponse.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await healthResponse.json(), { status: "ok" });
+    const invalidHealthMethod = await fetch(`http://127.0.0.1:${address.port}/healthz`, {
+      method: "POST",
+    });
+    assert.equal(invalidHealthMethod.status, 405);
+    assert.equal(invalidHealthMethod.headers.get("allow"), "GET");
+
     const response = await fetch(`http://127.0.0.1:${address.port}/v1/mcp/forward`, {
       method: "POST",
       headers: {

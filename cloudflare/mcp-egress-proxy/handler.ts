@@ -209,6 +209,15 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
 
   return async function handle(request: Request): Promise<Response> {
     const requestUrl = new URL(request.url);
+    if (requestUrl.pathname === "/healthz") {
+      if (request.method !== "GET") {
+        return new Response(null, {
+          status: 405,
+          headers: { allow: "GET", "cache-control": "no-store" },
+        });
+      }
+      return jsonResponse({ status: "ok" });
+    }
     if (requestUrl.pathname !== REQUEST_PATH) return jsonResponse({ error: "not_found" }, 404);
     if (request.method !== "POST") {
       return new Response(null, {

@@ -51,24 +51,37 @@ export function startMcpEgressProxyServer(options: {
   const server = createServer(async (incoming, outgoing) => {
     try {
       const signedHeaders = ["x-omniroute-timestamp", "x-omniroute-nonce", "x-omniroute-signature"];
-      for (const name of signedHeaders) {
-        const rawValues: string[] = [];
-        for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
-          if (incoming.rawHeaders[index].toLowerCase() === name) {
-            rawValues.push(incoming.rawHeaders[index + 1]);
+      const requestPath = new URL(incoming.url ?? "/", "http://localhost").pathname;
+      const isHealthRequest = requestPath === "/healthz";
+      if (isHealthRequest && incoming.method !== "GET") {
+        outgoing.writeHead(405, {
+          allow: "GET",
+          "cache-control": "no-store",
+          "content-length": "0",
+        });
+        outgoing.end();
+        return;
+      }
+      if (!isHealthRequest) {
+        for (const name of signedHeaders) {
+          const rawValues: string[] = [];
+          for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+            if (incoming.rawHeaders[index].toLowerCase() === name) {
+              rawValues.push(incoming.rawHeaders[index + 1]);
+            }
+          }
+          const normalized = incoming.headers[name];
+          if (
+            rawValues.length !== 1 ||
+            typeof normalized !== "string" ||
+            rawValues[0] !== normalized
+          ) {
+            sendJsonError(outgoing, 401, "unauthorized");
+            return;
           }
         }
-        const normalized = incoming.headers[name];
-        if (
-          rawValues.length !== 1 ||
-          typeof normalized !== "string" ||
-          rawValues[0] !== normalized
-        ) {
-          sendJsonError(outgoing, 401, "unauthorized");
-          return;
-        }
       }
-      const body = await readIncomingBody(incoming);
+      const body = isHealthRequest ? Buffer.alloc(0) : await readIncomingBody(incoming);
       const host = incoming.headers.host ?? "localhost";
       const requestHeaders = new Headers();
       for (const name of signedHeaders) {
