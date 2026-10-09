@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { request as createHttpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
+import type { TcpNetConnectOpts } from "node:net";
 import test from "node:test";
 import type { McpOutboundTransport } from "../../src/lib/mcp/mcpOutboundTransport.ts";
-import { createNodePinnedMcpTransport } from "../../src/lib/mcp/nodePinnedMcpTransport.ts";
+import {
+  createNodePinnedMcpTransport,
+  createPinnedMcpLookup,
+  type McpPinnedAddress,
+} from "../../src/lib/mcp/nodePinnedMcpTransport.ts";
 import {
   createMcpEgressProxyHandler,
   createMcpEgressSignature,
@@ -448,6 +453,82 @@ test("Node pinned transport rejects non-HTTPS and private literal destinations",
   await assert.rejects(transport.fetch("http://mcp.example.com/mcp", { method: "POST" }));
   await assert.rejects(transport.fetch("https://127.0.0.1/mcp", { method: "POST" }));
   assert.equal(resolverCalls, 0);
+});
+
+test("Node pinned transport rejects mixed public/private DNS before transport can connect", async () => {
+  let resolverCalls = 0;
+  const transport = createNodePinnedMcpTransport({
+    lookupAll: async () => {
+      resolverCalls += 1;
+      return [
+        { address: "93.184.216.34", family: 4 },
+        { address: "10.0.0.8", family: 4 },
+      ];
+    },
+  });
+  const alreadyAborted = new AbortController();
+  alreadyAborted.abort(new Error("test must not establish a socket"));
+
+  await assert.rejects(
+    transport.fetch(VALID_URL, { method: "POST", body: "{}", signal: alreadyAborted.signal }),
+    (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "MCP_OUTBOUND_DNS_REJECTED"
+  );
+  assert.equal(resolverCalls, 1);
+});
+
+test("Node pinned transport rejects IPv6 ULA and link-local DNS answers", async (context) => {
+  for (const address of ["fd00::1", "fe80::1"]) {
+    await context.test(address, async () => {
+      let resolverCalls = 0;
+      const transport = createNodePinnedMcpTransport({
+        lookupAll: async () => {
+          resolverCalls += 1;
+          return [
+            { address: "2606:4700:4700::1111", family: 6 },
+            { address, family: 6 },
+          ];
+        },
+      });
+      const alreadyAborted = new AbortController();
+      alreadyAborted.abort(new Error("test must not establish a socket"));
+
+      await assert.rejects(
+        transport.fetch(VALID_URL, { method: "POST", body: "{}", signal: alreadyAborted.signal }),
+        (error: unknown) =>
+          error instanceof Error && "code" in error && error.code === "MCP_OUTBOUND_DNS_REJECTED"
+      );
+      assert.equal(resolverCalls, 1);
+    });
+  }
+});
+
+test("pinned DNS lookup only returns validated addresses across lookup modes", async () => {
+  const records: McpPinnedAddress[] = [
+    { address: "93.184.216.34", family: 4 },
+    { address: "2606:4700:4700::1111", family: 6 },
+  ];
+  const lookup = createPinnedMcpLookup(records);
+  type LookupOptions = Parameters<NonNullable<TcpNetConnectOpts["lookup"]>>[1];
+  const resolve = (options: LookupOptions): Promise<Array<{ address: string; family: number }>> =>
+    new Promise((resolve, reject) => {
+      lookup("mcp.example.com", options, (error, address, family) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(Array.isArray(address) ? address : [{ address, family: family ?? 0 }]);
+      });
+    });
+
+  assert.deepEqual(await resolve({}), [records[0]]);
+  assert.deepEqual(await resolve({ all: true }), records);
+  assert.deepEqual(await resolve({ all: true, family: 4 }), [records[0]]);
+  assert.deepEqual(await resolve({ family: 6 }), [records[1]]);
+  await assert.rejects(
+    resolve({ family: 5 }),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOTFOUND"
+  );
 });
 
 test("Node HTTP server exposes the handler and rejects unauthenticated requests", async () => {

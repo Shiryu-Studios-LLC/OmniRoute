@@ -53,6 +53,7 @@ import { getCloudTenantSettings, updateCloudTenantSettings } from "./tenantSetti
 import {
   deleteCloudTenantOidcDraft,
   getCloudTenantOidcDraft,
+  recordCloudTenantOidcDraftValidation,
   saveCloudTenantOidcDraft,
   type CloudTenantOidcDraftAuthorization,
 } from "./tenantOidcDrafts";
@@ -1171,8 +1172,8 @@ async function customerOidcDraftPortal(
   if (!session) return json({ error: "Owner or admin session required" }, 403);
   const rateLimit = await consumeCloudRateLimit(options.db, {
     tenantId: CLOUD_PLATFORM_TENANT_ID,
-    bucketKey: `customer-oidc-draft:${session.tenant_id}:${session.membership_id}`,
-    limit: 10,
+    bucketKey: `${request.method === "POST" ? "customer-oidc-draft-test" : "customer-oidc-draft"}:${session.tenant_id}:${session.membership_id}`,
+    limit: request.method === "POST" ? 5 : 10,
     windowMs: 60_000,
     nowMs,
   });
@@ -1186,6 +1187,46 @@ async function customerOidcDraftPortal(
   try {
     if (request.method === "GET") {
       return json({ draft: await getCloudTenantOidcDraft(options.db, authorization) });
+    }
+    if (request.method === "POST") {
+      const draft = await getCloudTenantOidcDraft(options.db, authorization);
+      if (!draft) return json({ error: "OIDC draft not found" }, 404);
+
+      let validated = false;
+      const controlledEgressUnavailable =
+        options.requireControlledEgress === true && !options.oidcTransport;
+      if (!controlledEgressUnavailable) {
+        try {
+          const fetcher = createOidcFetcher(options, draft.issuer);
+          await discoverOidc(draft.issuer, origin, fetcher);
+          validated = true;
+        } catch {
+          // The response and audit intentionally reveal only a static validation outcome.
+        }
+      }
+
+      const audited = await recordCloudTenantOidcDraftValidation(options.db, {
+        authorization,
+        expectedDraftUpdatedAt: draft.updatedAt,
+        audit: {
+          id: crypto.randomUUID(),
+          tenantId: session.tenant_id,
+          timestamp: new Date(nowMs).toISOString(),
+          action: "customer.oidc.draft.validate",
+          actor: `membership:${session.membership_id}`,
+          target: "pending-issuer-draft",
+          resourceType: "customer-oidc-draft",
+          status: validated ? "success" : "failure",
+          metadata: { outcome: validated ? "discovery_succeeded" : "discovery_failed" },
+        },
+      });
+      if (audited === "session_inactive") {
+        return json({ error: "Owner or admin session required" }, 403);
+      }
+      if (audited === "draft_changed") return json({ validated: false }, 409);
+      return validated
+        ? json({ validated: true })
+        : json({ validated: false }, controlledEgressUnavailable ? 503 : 422);
     }
     if (request.method === "DELETE") {
       const deleted = await deleteCloudTenantOidcDraft(options.db, {
@@ -1206,7 +1247,7 @@ async function customerOidcDraftPortal(
       return deleted ? json({ deleted: true }) : json({ error: "OIDC draft not found" }, 404);
     }
     if (request.method !== "PUT") {
-      return json({ error: "Method not allowed" }, 405, { Allow: "GET, PUT, DELETE" });
+      return json({ error: "Method not allowed" }, 405, { Allow: "GET, PUT, POST, DELETE" });
     }
     const parsed = await readCloudCustomerSettingsBody(request, 5_000);
     if (parsed instanceof Response) return parsed;
@@ -1248,7 +1289,15 @@ async function customerOidcDraftPortal(
     if (error instanceof TypeError || error instanceof RangeError) {
       return json({ error: error.message }, 400);
     }
-    return json({ error: "OIDC draft could not be saved" }, 503);
+    return json(
+      {
+        error:
+          request.method === "POST"
+            ? "OIDC draft validation is unavailable"
+            : "OIDC draft could not be saved",
+      },
+      503
+    );
   }
 }
 
@@ -1978,7 +2027,7 @@ export async function handleCloudTenantOidcAuthRequest(
                   : isLocalAiSettings
                     ? ["PUT"]
                     : isOidcDraft
-                      ? ["GET", "PUT", "DELETE"]
+                      ? ["GET", "PUT", "POST", "DELETE"]
                       : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });

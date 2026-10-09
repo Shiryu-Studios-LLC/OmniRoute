@@ -153,6 +153,55 @@ export async function getCloudTenantOidcDraft(
   return row ? mapDraft(row) : null;
 }
 
+/** Records only a sanitized validation outcome if the owner/admin session is still active. */
+export async function recordCloudTenantOidcDraftValidation(
+  db: CloudDb,
+  input: {
+    authorization: CloudTenantOidcDraftAuthorization;
+    expectedDraftUpdatedAt: string;
+    audit: CloudComplianceAuditInput;
+  }
+): Promise<"recorded" | "session_inactive" | "draft_changed"> {
+  const { record } = prepareCloudComplianceAuditInsert(db, input.audit);
+  const result = await db
+    .prepare(
+      `INSERT INTO cloud_compliance_audit (
+         id, tenant_id, timestamp, action, actor, target, details_json,
+         ip_address, resource_type, status, request_id, metadata_json
+       ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE ${sessionPredicate()}
+            AND EXISTS (
+              SELECT 1 FROM cloud_tenant_oidc_config_drafts draft
+               WHERE draft.tenant_id = ? AND draft.updated_at = ?
+            )`
+    )
+    .bind(
+      record.id,
+      record.tenantId,
+      record.timestamp,
+      record.action,
+      record.actor,
+      record.target,
+      record.details === null ? null : JSON.stringify(record.details),
+      record.ipAddress,
+      record.resourceType,
+      record.status,
+      record.requestId,
+      record.metadata === null ? null : JSON.stringify(record.metadata),
+      ...sessionBindings(input.authorization),
+      input.authorization.tenantId,
+      input.expectedDraftUpdatedAt
+    )
+    .run();
+  if (!result.success) throw new Error("OIDC draft validation audit write failed");
+  if (Number(result.meta?.changes ?? 0) === 1) return "recorded";
+  const activeSession = await db
+    .prepare<{ active: number }>(`SELECT ${sessionPredicate()} AS active`)
+    .bind(...sessionBindings(input.authorization))
+    .first();
+  return activeSession?.active === 1 ? "draft_changed" : "session_inactive";
+}
+
 export async function saveCloudTenantOidcDraft(
   db: CloudDb,
   encryptionKey: string | undefined,

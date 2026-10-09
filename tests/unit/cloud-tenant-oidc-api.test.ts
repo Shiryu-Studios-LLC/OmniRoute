@@ -10,6 +10,7 @@ import {
   isCloudCredentialEnvelope,
 } from "../../src/cloud/credentialEncryption";
 import { createCloudCustomerMembership } from "../../src/cloud/customerIdentity";
+import { addCloudTenantOidcIdentity } from "../../src/cloud/tenantOidc";
 import { createCloudCustomerTenant } from "../../src/cloud/tenants";
 import { handleCloudApiRequest } from "../../src/cloud/httpApi";
 
@@ -161,7 +162,7 @@ async function json(response: Response): Promise<unknown> {
   return response.json();
 }
 
-test("Cloud OIDC admin API encrypts secrets and binds exact identities to tenant memberships", async () => {
+test("Cloud OIDC admin API encrypts secrets and rejects unverified identity links", async () => {
   const { db, ownerA, ownerB } = await makeDb();
   assert.equal((await call(db, "customer-a/oidc", "GET", undefined, "")).status, 401);
   const maintenanceAccess = await handleCloudApiRequest(
@@ -230,19 +231,13 @@ test("Cloud OIDC admin API encrypts secrets and binds exact identities to tenant
     "private-client-secret"
   );
 
-  const linked = await call(db, "customer-a/oidc/identities", "POST", {
+  const unverifiedIdentityLink = await call(db, "customer-a/oidc/identities", "POST", {
     issuer: "https://id.example.com/tenant-a",
     subject: "subject:Exact-Case-123",
     membershipId: ownerA.id,
   });
-  assert.equal(linked.status, 201);
-  const link = (await json(linked)) as Record<string, unknown>;
-  assert.equal(link.tenantId, "customer-a");
-  assert.equal(link.issuer, "https://id.example.com/tenant-a");
-  assert.equal(link.subject, "subject:Exact-Case-123");
-  assert.equal(link.membershipId, ownerA.id);
-  assert.equal(link.principalId, ownerA.principalId);
-  assert.equal(link.role, "owner");
+  assert.equal(unverifiedIdentityLink.status, 405);
+  assert.deepEqual(await json(await call(db, "customer-a/oidc/identities")), []);
   const auditRows = db.db
     .prepare(
       "SELECT details_json, metadata_json FROM cloud_compliance_audit WHERE action LIKE 'customer.oidc.%'"
@@ -252,57 +247,7 @@ test("Cloud OIDC admin API encrypts secrets and binds exact identities to tenant
   assert.equal(auditText.includes("private-client-secret"), false);
   assert.equal(auditText.includes("subject:Exact-Case-123"), false);
 
-  const duplicateSubject = await call(db, "customer-a/oidc/identities", "POST", {
-    issuer: "https://id.example.com/tenant-a",
-    subject: "subject:Exact-Case-123",
-    membershipId: ownerA.id,
-  });
-  assert.equal(duplicateSubject.status, 409, "issuer and subject are unique within the tenant");
-  const secondIdentityForMembership = await call(db, "customer-a/oidc/identities", "POST", {
-    issuer: "https://id.example.com/tenant-a",
-    subject: "another-subject",
-    membershipId: ownerA.id,
-  });
-  assert.equal(secondIdentityForMembership.status, 409, "a membership cannot have ambiguous links");
-
-  const links = (await json(await call(db, "customer-a/oidc/identities"))) as Array<
-    Record<string, unknown>
-  >;
-  assert.equal(links.length, 1);
-  assert.equal(links[0].subject, "subject:Exact-Case-123");
-
-  const crossTenantMembership = await call(db, "customer-a/oidc/identities", "POST", {
-    issuer: "https://id.example.com/tenant-a",
-    subject: "foreign-subject",
-    membershipId: ownerB.id,
-  });
-  assert.equal(crossTenantMembership.status, 404);
-
-  const mismatchedIssuer = await call(db, "customer-a/oidc/identities", "POST", {
-    issuer: "https://id.example.com/other-tenant",
-    subject: "new-subject",
-    membershipId: ownerA.id,
-  });
-  assert.equal(mismatchedIssuer.status, 400);
-
-  const emailAutoJoinRejected = await call(db, "customer-a/oidc/identities", "POST", {
-    issuer: "https://id.example.com/tenant-a",
-    subject: "new-subject",
-    membershipId: ownerA.id,
-    email: "owner@example.com",
-  });
-  assert.equal(emailAutoJoinRejected.status, 400);
-
-  const deleteLink = await call(db, `customer-a/oidc/identities/${link.id}`, "DELETE");
-  assert.equal(deleteLink.status, 200);
-  assert.deepEqual(await json(deleteLink), { deleted: true });
-
-  const memberLink = await call(db, "customer-a/oidc/identities", "POST", {
-    issuer: "https://id.example.com/tenant-a",
-    subject: "member-subject",
-    membershipId: "not-a-real-membership",
-  });
-  assert.equal(memberLink.status, 404);
+  assert.equal(ownerA.tenantId, "customer-a");
   assert.equal(ownerB.tenantId, "customer-b");
 });
 
@@ -397,12 +342,13 @@ test("Cloud OIDC config changes clear old issuer links and deletion clears the t
     isEnabled: true,
   });
   assert.equal(created.status, 201);
-  const link = await call(db, "customer-a/oidc/identities", "POST", {
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: "customer-a",
     issuer: "https://id.example.com/tenant-a",
     subject: "member-subject",
     membershipId: memberA.id,
+    now: NOW,
   });
-  assert.equal(link.status, 201);
 
   const update = await call(db, "customer-a/oidc", "PUT", {
     issuer: "https://id.example.com/tenant-a-v2",
@@ -418,12 +364,14 @@ test("Cloud OIDC config changes clear old issuer links and deletion clears the t
     "changing issuer clears exact links tied to the previous issuer"
   );
 
-  const relinked = await call(db, "customer-a/oidc/identities", "POST", {
+  const relinked = await addCloudTenantOidcIdentity(db, {
+    tenantId: "customer-a",
     issuer: "https://id.example.com/tenant-a-v2",
     subject: "member-subject-v2",
     membershipId: memberA.id,
+    now: NOW,
   });
-  assert.equal(relinked.status, 201);
+  assert.equal(relinked.issuer, "https://id.example.com/tenant-a-v2");
 
   const deleted = await call(db, "customer-a/oidc", "DELETE");
   assert.equal(deleted.status, 200);

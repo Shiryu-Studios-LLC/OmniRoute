@@ -88,6 +88,28 @@ test("staging OIDC egress stays off unless a dedicated VPC Service and token are
   assert.doesNotMatch(workflow, /config\.services\s*=/);
 });
 
+test("staging verifies the exact R2 artifact bucket before any migration or deployment", () => {
+  const r2Check = workflow.indexOf(
+    "https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${expectedName}"
+  );
+  const d1MigrationList = workflow.indexOf("npx wrangler d1 migrations list");
+  const d1Migrations = workflow.indexOf("npx wrangler d1 migrations apply");
+  const workerDeploy = workflow.indexOf("npx wrangler deploy --config");
+
+  assert.notEqual(r2Check, -1, "the workflow should call the Cloudflare R2 bucket metadata API");
+  assert.ok(r2Check < d1MigrationList, "R2 must be verified before inspecting D1 migrations");
+  assert.ok(r2Check < d1Migrations, "R2 must be verified before applying D1 migrations");
+  assert.ok(r2Check < workerDeploy, "R2 must be verified before deploying the Worker");
+  assert.match(workflow, /r2\/buckets\/\$\{expectedName\}[\s\S]*?method: "GET"/);
+  assert.match(workflow, /expectedName = "omniroute-cloud-runtime-staging-artifacts"/);
+  assert.match(workflow, /payload\?\.result\?\.name !== expectedName/);
+  assert.match(workflow, /The dedicated staging R2 artifact bucket is missing; create/);
+  assert.match(workflow, /R2 is enabled and the API token has R2 Read permission/);
+  assert.match(workflow, /Could not verify the dedicated staging R2 artifact bucket/);
+  assert.match(workflow, /Cloudflare returned invalid R2 bucket metadata/);
+  assert.doesNotMatch(workflow, /console\.error\(JSON\.stringify\(payload\)\)/);
+});
+
 test("staging secret values are piped to Wrangler and never printed or shell-traced", () => {
   const secretNames = [
     "OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN",

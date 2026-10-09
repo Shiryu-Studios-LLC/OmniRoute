@@ -16,6 +16,7 @@ import {
 import { CLOUD_PLATFORM_TENANT_ID, createCloudCustomerTenant } from "../../src/cloud/tenants";
 import {
   decryptCloudCredential,
+  encryptCloudCredential,
   isCloudCredentialEnvelope,
 } from "../../src/cloud/credentialEncryption";
 import { CLOUD_TENANT_OIDC_DRAFT_PATH } from "../../src/cloud/tenantOidcDrafts";
@@ -3166,6 +3167,120 @@ class RevokeOidcSessionBeforeDraftBatchCloudDb implements CloudDb {
   }
 }
 
+class RevokeOidcSessionBeforeValidationAuditCloudDb implements CloudDb {
+  triggered = false;
+
+  constructor(
+    private readonly inner: CloudDb,
+    private readonly membershipId: string,
+    private readonly revokedAtMs: number
+  ) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    const statement = this.inner.prepare<T>(sql);
+    if (!/^\s*INSERT INTO cloud_compliance_audit\b/i.test(sql)) return statement;
+    const db = this;
+    return {
+      bind(...values: unknown[]) {
+        statement.bind(...values);
+        return this;
+      },
+      first<U = T>(column?: string) {
+        return statement.first<U>(column);
+      },
+      all<U = T>() {
+        return statement.all<U>();
+      },
+      async run() {
+        if (!db.triggered) {
+          db.triggered = true;
+          await db.inner
+            .prepare(
+              `UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ?
+                WHERE membership_id = ? AND revoked_at_ms IS NULL`
+            )
+            .bind(db.revokedAtMs, db.membershipId)
+            .run();
+        }
+        return statement.run();
+      },
+    };
+  }
+
+  batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    return this.inner.batch(statements);
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.inner.exec(sql);
+  }
+}
+
+class ReplaceOidcDraftBeforeValidationAuditStatement<T = unknown> implements CloudDbStatement<T> {
+  private inner: CloudDbStatement<T>;
+
+  constructor(
+    inner: CloudDbStatement<T>,
+    private readonly db: CloudDb,
+    private readonly tenantId: string,
+    private readonly updatedAt: string
+  ) {
+    this.inner = inner;
+  }
+
+  bind(...values: unknown[]): CloudDbStatement<T> {
+    this.inner = this.inner.bind(...values);
+    return this;
+  }
+
+  first<U = T>(column?: string): Promise<U | null> {
+    return this.inner.first<U>(column);
+  }
+
+  all<U = T>(): Promise<{ results: U[]; success: boolean; meta?: Record<string, unknown> }> {
+    return this.inner.all<U>();
+  }
+
+  async run(): Promise<{ success: boolean; meta?: Record<string, unknown> }> {
+    await this.db
+      .prepare(
+        `UPDATE cloud_tenant_oidc_config_drafts
+            SET issuer = ?, updated_at = ? WHERE tenant_id = ?`
+      )
+      .bind("https://replacement-idp.example.com", this.updatedAt, this.tenantId)
+      .run();
+    return this.inner.run();
+  }
+}
+
+class ReplaceOidcDraftBeforeValidationAuditCloudDb implements CloudDb {
+  constructor(
+    private readonly inner: CloudDb,
+    private readonly tenantId: string,
+    private readonly updatedAt: string
+  ) {}
+
+  prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+    const statement = this.inner.prepare<T>(sql);
+    return /^\s*INSERT INTO cloud_compliance_audit\b/i.test(sql)
+      ? new ReplaceOidcDraftBeforeValidationAuditStatement(
+          statement,
+          this.inner,
+          this.tenantId,
+          this.updatedAt
+        )
+      : statement;
+  }
+
+  batch(statements: CloudDbStatement[]): Promise<unknown[]> {
+    return this.inner.batch(statements);
+  }
+
+  exec(sql: string): Promise<unknown> {
+    return this.inner.exec(sql);
+  }
+}
+
 test("OIDC issuer drafts are isolated, encrypted, redacted, and never alter active sign-in", async () => {
   const { db, tenant, membership } = await setup();
   await db
@@ -3209,6 +3324,16 @@ test("OIDC issuer drafts are isolated, encrypted, redacted, and never alter acti
         "SELECT token_hash, revoked_at_ms FROM cloud_tenant_oidc_sessions WHERE tenant_id = ?"
       )
       .all(tenant.id),
+    loginStates: db.raw
+      .prepare(
+        "SELECT state_hash, tenant_id, issuer, client_id, consumed_at_ms FROM cloud_tenant_oidc_login_states WHERE tenant_id = ?"
+      )
+      .all(tenant.id),
+    ownerClaims: db.raw
+      .prepare(
+        "SELECT code_hash, issuer, expires_at_ms, consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
+      )
+      .all(tenant.id),
   };
   const initial = await request("GET");
   assert.equal(initial.status, 200);
@@ -3237,7 +3362,7 @@ test("OIDC issuer drafts are isolated, encrypted, redacted, and never alter acti
   assert.equal((await request("GET", undefined, ORIGIN, "?tenant=other-tenant")).status, 400);
 
   const draftInput = {
-    issuer: "https://pending-idp.example/realm",
+    issuer: "https://pending-idp.example.com/realm",
     clientId: "pending-client-id",
     clientSecret: "pending-client-secret-do-not-leak",
     scopes: ["openid", "profile", "email"],
@@ -3250,6 +3375,108 @@ test("OIDC issuer drafts are isolated, encrypted, redacted, and never alter acti
   assert.equal(savedBody.draft.hasClientSecret, true);
   assert.equal(JSON.stringify(savedBody).includes(draftInput.clientSecret), false);
   assert.equal(outboundCalls, 0, "saving or reading a draft never calls an issuer");
+
+  const discoveryUrl = "https://pending-idp.example.com/realm/.well-known/openid-configuration";
+  let discoveryCalls = 0;
+  const discoveryFetcher: typeof fetch = async (input) => {
+    discoveryCalls += 1;
+    assert.equal(String(input), discoveryUrl);
+    return Response.json({
+      issuer: draftInput.issuer,
+      authorization_endpoint: "https://pending-idp.example.com/realm/authorize",
+      token_endpoint: "https://pending-idp.example.com/realm/token",
+      jwks_uri: "https://pending-idp.example.com/realm/jwks",
+      id_token_signing_alg_values_supported: ["RS256"],
+    });
+  };
+  const validationApp = runtime(db, discoveryFetcher);
+  const validate = (app: ReturnType<typeof runtime>, origin = ORIGIN) =>
+    app.fetch(
+      new Request(route, {
+        method: "POST",
+        headers: { Origin: origin, Cookie: cookieHeader },
+      })
+    );
+  const validated = await validate(validationApp);
+  assert.equal(validated.status, 200);
+  const validatedBody = await validated.json();
+  assert.deepEqual(validatedBody, { validated: true });
+  assert.equal(discoveryCalls, 1);
+
+  const invalidMetadataApp = runtime(db, async () =>
+    Response.json({
+      issuer: "https://attacker.example",
+      authorization_endpoint: "https://attacker.example/authorize",
+      token_endpoint: "https://attacker.example/token",
+      jwks_uri: "https://attacker.example/jwks",
+      id_token_signing_alg_values_supported: ["RS256"],
+    })
+  );
+  const invalidMetadata = await validate(invalidMetadataApp);
+  assert.equal(invalidMetadata.status, 422);
+  assert.deepEqual(await invalidMetadata.json(), { validated: false });
+
+  const egressFailureApp = runtime(db, async () => {
+    throw new Error("private transport diagnostic must not be returned");
+  });
+  const egressFailure = await validate(egressFailureApp);
+  assert.equal(egressFailure.status, 422);
+  assert.deepEqual(await egressFailure.json(), { validated: false });
+  const egressDisabled = await validate(runtime(db));
+  assert.equal(egressDisabled.status, 503);
+  assert.deepEqual(await egressDisabled.json(), { validated: false });
+
+  const replacedDuringDiscovery = await validate(
+    runtime(
+      new ReplaceOidcDraftBeforeValidationAuditCloudDb(
+        db,
+        tenant.id,
+        new Date(NOW + 1).toISOString()
+      ),
+      discoveryFetcher
+    )
+  );
+  assert.equal(replacedDuringDiscovery.status, 409);
+  assert.deepEqual(await replacedDuringDiscovery.json(), { validated: false });
+
+  const validationAudits = db.raw
+    .prepare(
+      "SELECT status, metadata_json FROM cloud_compliance_audit WHERE action = 'customer.oidc.draft.validate'"
+    )
+    .all() as Array<{ status: string; metadata_json: string }>;
+  assert.deepEqual(
+    validationAudits.map((audit) => [audit.status, JSON.parse(audit.metadata_json)]),
+    [
+      ["success", { outcome: "discovery_succeeded" }],
+      ["failure", { outcome: "discovery_failed" }],
+      ["failure", { outcome: "discovery_failed" }],
+      ["failure", { outcome: "discovery_failed" }],
+    ]
+  );
+  assert.equal(JSON.stringify(validationAudits).includes(draftInput.issuer), false);
+  assert.equal(JSON.stringify(validationAudits).includes(draftInput.clientId), false);
+  assert.equal(JSON.stringify(validationAudits).includes(draftInput.clientSecret), false);
+  assert.equal(JSON.stringify(validatedBody).includes(draftInput.issuer), false);
+  assert.equal(JSON.stringify(validatedBody).includes(draftInput.clientSecret), false);
+  assert.deepEqual(
+    db.raw
+      .prepare(
+        "SELECT state_hash, tenant_id, issuer, client_id, consumed_at_ms FROM cloud_tenant_oidc_login_states WHERE tenant_id = ?"
+      )
+      .all(tenant.id),
+    before.loginStates,
+    "draft validation must not create or consume login state"
+  );
+  assert.deepEqual(
+    db.raw
+      .prepare(
+        "SELECT code_hash, issuer, expires_at_ms, consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
+      )
+      .all(tenant.id),
+    before.ownerClaims,
+    "draft validation must not change owner claims"
+  );
+
   const activeLogin = await portal.app.fetch(
     new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_LOGIN_PATH}?tenant=${tenant.slug}`)
   );
@@ -3348,6 +3575,17 @@ test("OIDC issuer draft writes reject member, revoked-session, and audit-failure
     clientId: "pending-client",
     clientSecret: "pending-secret",
   });
+  const memberValidation = await runtime(db).fetch(
+    new Request(path, {
+      method: "POST",
+      headers: {
+        Origin: ORIGIN,
+        Cookie: cookieHeader,
+      },
+    })
+  );
+  assert.equal(memberValidation.status, 403);
+
   const memberDenied = await runtime(db).fetch(
     new Request(path, {
       method: "PUT",
@@ -3363,20 +3601,95 @@ test("OIDC issuer draft writes reject member, revoked-session, and audit-failure
     .run();
   const freshPortal = await createPortalSession(db, tenant.slug, "external-user-17");
   const freshCookie = `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${freshPortal.cookie}`;
-  const raceDb = new RevokeOidcSessionBeforeDraftBatchCloudDb(db, membership.id, NOW + 1);
-  const revoked = await runtime(raceDb).fetch(
+  const originDenied = await runtime(db).fetch(
     new Request(path, {
-      method: "PUT",
-      headers: { Origin: ORIGIN, Cookie: freshCookie, "Content-Type": "application/json" },
-      body,
+      method: "POST",
+      headers: {
+        Origin: "https://evil.example",
+        Cookie: freshCookie,
+      },
+    })
+  );
+  assert.equal(originDenied.status, 403);
+
+  await db
+    .prepare(
+      "UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ? WHERE membership_id = ? AND revoked_at_ms IS NULL"
+    )
+    .bind(NOW + 1, membership.id)
+    .run();
+  const revokedValidation = await runtime(db).fetch(
+    new Request(path, {
+      method: "POST",
+      headers: { Origin: ORIGIN, Cookie: freshCookie },
+    })
+  );
+  assert.equal(revokedValidation.status, 403);
+
+  const currentPortal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const currentCookie = `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${currentPortal.cookie}`;
+  await db
+    .prepare(
+      "INSERT INTO cloud_tenant_oidc_config_drafts (tenant_id, issuer, client_id, client_secret_encrypted, scopes_json, created_by_membership_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(
+      tenant.id,
+      "https://pending-idp.example.com",
+      "pending-client",
+      await encryptCloudCredential("pending-secret", ENCRYPTION_KEY, {
+        tenantId: tenant.id,
+        connectionId: "tenant-oidc-pending-draft",
+        field: "clientSecret",
+      }),
+      JSON.stringify(["openid", "profile", "email"]),
+      membership.id,
+      new Date(NOW).toISOString(),
+      new Date(NOW).toISOString()
+    )
+    .run();
+  const auditRaceDb = new RevokeOidcSessionBeforeValidationAuditCloudDb(db, membership.id, NOW + 1);
+  const revoked = await runtime(auditRaceDb, async () =>
+    Response.json({
+      issuer: "https://pending-idp.example.com",
+      authorization_endpoint: "https://pending-idp.example.com/authorize",
+      token_endpoint: "https://pending-idp.example.com/token",
+      jwks_uri: "https://pending-idp.example.com/jwks",
+      id_token_signing_alg_values_supported: ["RS256"],
+    })
+  ).fetch(
+    new Request(path, {
+      method: "POST",
+      headers: { Origin: ORIGIN, Cookie: currentCookie },
     })
   );
   assert.equal(revoked.status, 403);
   assert.equal(
     db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = 'customer.oidc.draft.validate'"
+      )
+      .get(tenant.id)?.count,
+    0,
+    "validation audit must be rejected if the session is revoked during discovery"
+  );
+
+  const refreshedPortal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const refreshedCookie = `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${refreshedPortal.cookie}`;
+  const raceDb = new RevokeOidcSessionBeforeDraftBatchCloudDb(db, membership.id, NOW + 2);
+  const saveRevoked = await runtime(raceDb).fetch(
+    new Request(path, {
+      method: "PUT",
+      headers: { Origin: ORIGIN, Cookie: refreshedCookie, "Content-Type": "application/json" },
+      body,
+    })
+  );
+  assert.equal(saveRevoked.status, 403);
+  assert.equal(
+    db.raw
       .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_config_drafts WHERE tenant_id = ?")
       .get(tenant.id)?.count,
-    0
+    1,
+    "the existing draft remains unchanged when a save races with session revocation"
   );
   assert.equal(
     db.raw
@@ -3404,7 +3717,39 @@ test("OIDC issuer draft writes reject member, revoked-session, and audit-failure
     db.raw
       .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_config_drafts WHERE tenant_id = ?")
       .get(tenant.id)?.count,
-    0,
-    "the draft insert rolls back when its required audit row cannot be written"
+    1,
+    "the draft remains unchanged when its replacement audit cannot be written"
   );
+  assert.equal(
+    (
+      db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_config_drafts WHERE tenant_id = ?")
+        .get(tenant.id) as { issuer: string }
+    ).issuer,
+    "https://pending-idp.example.com",
+    "the draft content rolls back when its required audit cannot be written"
+  );
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const unavailable = await runtime(db).fetch(
+      new Request(path, {
+        method: "POST",
+        headers: {
+          Origin: ORIGIN,
+          Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${usablePortal.cookie}`,
+        },
+      })
+    );
+    assert.equal(unavailable.status, 503);
+  }
+  const rateLimited = await runtime(db).fetch(
+    new Request(path, {
+      method: "POST",
+      headers: {
+        Origin: ORIGIN,
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${usablePortal.cookie}`,
+      },
+    })
+  );
+  assert.equal(rateLimited.status, 429, "issuer discovery tests are rate limited per membership");
 });

@@ -251,6 +251,46 @@ jobs:
             process.exitCode = 1;
           });
           NODE
+          node <<'NODE'
+          const expectedName = "omniroute-cloud-runtime-staging-artifacts";
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+
+          async function main() {
+            let response;
+            try {
+              response = await fetch(
+                `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${expectedName}`,
+                {
+                  method: "GET",
+                  headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+                  signal: AbortSignal.timeout(30_000),
+                },
+              );
+            } catch {
+              throw new Error("Could not verify the dedicated staging R2 artifact bucket; check Cloudflare API access and the R2 Read permission. Refusing migrations.");
+            }
+            if (response.status === 404) {
+              throw new Error("The dedicated staging R2 artifact bucket is missing; create omniroute-cloud-runtime-staging-artifacts and grant R2 Read permission. Refusing migrations.");
+            }
+            if (!response.ok) {
+              throw new Error(`Cloudflare R2 bucket metadata check failed (HTTP ${response.status}); verify R2 is enabled and the API token has R2 Read permission. Refusing migrations.`);
+            }
+            let payload;
+            try {
+              payload = await response.json();
+            } catch {
+              throw new Error("Cloudflare returned invalid R2 bucket metadata; refusing migrations.");
+            }
+            if (payload?.success !== true || payload?.result?.name !== expectedName) {
+              throw new Error("Configured R2 bucket is not exactly omniroute-cloud-runtime-staging-artifacts; refusing migrations.");
+            }
+          }
+
+          main().catch((error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
           npx wrangler d1 migrations list omniroute-cloud-runtime-staging --remote --config "$WRANGLER_CONFIG"
           npx wrangler d1 migrations apply omniroute-cloud-runtime-staging --remote --config "$WRANGLER_CONFIG"
 

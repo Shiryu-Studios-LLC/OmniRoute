@@ -826,6 +826,7 @@ const PORTAL_SCRIPT = `
       : "openid profile email";
     byId("oidc-draft-client-secret").value = "";
     byId("delete-oidc-draft").disabled = !draft;
+    byId("test-oidc-draft").disabled = !draft;
   };
 
   byId("oidc-draft-form").addEventListener("submit", async (event) => {
@@ -862,6 +863,23 @@ const PORTAL_SCRIPT = `
       await loadOidcDraft();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not delete issuer draft.", true);
+    } finally { button.disabled = false; }
+  });
+
+  byId("test-oidc-draft").addEventListener("click", async () => {
+    const button = byId("test-oidc-draft");
+    button.disabled = true;
+    try {
+      const result = await api("/__cloud/auth/oidc-draft", { method: "POST" });
+      if (result.validated !== true) throw new Error("Issuer discovery could not be confirmed.");
+      setStatus("Issuer discovery succeeded. This does not test sign-in or activate the setup.");
+    } catch (error) {
+      setStatus(
+        error instanceof Error && error.message !== "Request failed"
+          ? error.message
+          : "Issuer discovery could not be confirmed. Check the issuer setup and try again.",
+        true
+      );
     } finally { button.disabled = false; }
   });
 
@@ -1172,7 +1190,7 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
       <section id="oidc-draft-panel" hidden>
         <h2>Pending organization sign-in setup</h2>
         <p id="oidc-draft-status" aria-live="polite"></p>
-        <p>This securely saves issuer details for review. Saving a draft does not test it or change how anyone signs in.</p>
+        <p>This securely saves issuer details for review. Testing checks issuer discovery only; it does not test sign-in or change how anyone signs in.</p>
         <form id="oidc-draft-form">
           <label for="oidc-draft-issuer">Issuer URL</label>
           <input id="oidc-draft-issuer" type="url" maxlength="500" required>
@@ -1183,6 +1201,7 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <label for="oidc-draft-scopes">Scopes (space separated)</label>
           <input id="oidc-draft-scopes" maxlength="2000" value="openid profile email" required>
           <button id="save-oidc-draft" type="submit">Save pending sign-in setup</button>
+          <button id="test-oidc-draft" type="button" disabled>Test issuer discovery</button>
           <button id="delete-oidc-draft" type="button" disabled>Delete pending setup</button>
         </form>
       </section>
