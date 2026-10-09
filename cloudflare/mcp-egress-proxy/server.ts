@@ -67,6 +67,7 @@ export function startMcpEgressProxyServer(options: {
   host?: string;
   timeoutMs?: number;
   bodyReadTimeoutMs?: number;
+  maxInFlight?: number;
 }): ReturnType<typeof createServer> {
   const bodyReadTimeoutMs = options.bodyReadTimeoutMs ?? DEFAULT_PROXY_BODY_READ_TIMEOUT_MS;
   if (!Number.isFinite(bodyReadTimeoutMs) || bodyReadTimeoutMs <= 0) {
@@ -76,6 +77,7 @@ export function startMcpEgressProxyServer(options: {
     proxyToken: options.proxyToken,
     timeoutMs: options.timeoutMs,
     bodyReadTimeoutMs,
+    maxInFlight: options.maxInFlight,
     transport: createNodePinnedMcpTransport(),
   });
   const server = createServer(async (incoming, outgoing) => {
@@ -159,5 +161,11 @@ if (entryPath && fileURLToPath(import.meta.url) === entryPath) {
   const proxyToken = process.env.MCP_EGRESS_PROXY_TOKEN;
   if (!proxyToken) throw new Error("MCP_EGRESS_PROXY_TOKEN must be configured");
   const port = Number(process.env.PORT ?? "8788");
-  startMcpEgressProxyServer({ proxyToken, port, host: process.env.HOST ?? "127.0.0.1" });
+  const rawMaxInFlight = process.env.MCP_EGRESS_PROXY_MAX_IN_FLIGHT;
+  startMcpEgressProxyServer({
+    proxyToken,
+    port,
+    host: process.env.HOST ?? "127.0.0.1",
+    ...(rawMaxInFlight ? { maxInFlight: Number(rawMaxInFlight) } : {}),
+  });
 }

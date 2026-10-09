@@ -8,6 +8,7 @@ import { createNodePinnedMcpTransport } from "../../src/lib/mcp/nodePinnedMcpTra
 import {
   createMcpEgressProxyHandler,
   createMcpEgressSignature,
+  DEFAULT_PROXY_MAX_IN_FLIGHT,
   MAX_PROXY_PAYLOAD_BYTES,
 } from "../../cloudflare/mcp-egress-proxy/handler.ts";
 import { startMcpEgressProxyServer } from "../../cloudflare/mcp-egress-proxy/server.ts";
@@ -272,6 +273,107 @@ test("times out even when an injected transport does not observe abort", async (
   );
   assert.equal(response.status, 504);
   assert.deepEqual(await response.json(), { error: "upstream_timeout" });
+});
+
+test("bounds concurrent upstream work and releases the slot after completion", async () => {
+  let releaseFirst: ((response: Response) => void) | undefined;
+  let startedFirst: (() => void) | undefined;
+  const firstStarted = new Promise<void>((resolve) => {
+    startedFirst = resolve;
+  });
+  let calls = 0;
+  const handler = createMcpEgressProxyHandler({
+    proxyToken: TOKEN,
+    maxInFlight: 1,
+    transport: {
+      async fetch() {
+        calls += 1;
+        if (calls === 1) {
+          startedFirst?.();
+          return new Promise<Response>((resolve) => {
+            releaseFirst = resolve;
+          });
+        }
+        return new Response("ok");
+      },
+    },
+  });
+
+  const first = handler(request(envelope()));
+  await firstStarted;
+  const busy = await handler(request(envelope()));
+  assert.equal(busy.status, 503);
+  assert.deepEqual(await busy.json(), { error: "proxy_busy" });
+  assert.equal(calls, 1);
+
+  releaseFirst?.(new Response("first"));
+  assert.equal((await first).status, 200);
+  const afterCompletion = await handler(request(envelope()));
+  assert.equal(afterCompletion.status, 200);
+  assert.equal(calls, 2);
+});
+
+test("releases the concurrency slot after an upstream failure", async () => {
+  let calls = 0;
+  const handler = createMcpEgressProxyHandler({
+    proxyToken: TOKEN,
+    maxInFlight: 1,
+    transport: {
+      async fetch() {
+        calls += 1;
+        if (calls === 1) throw new Error("upstream failed");
+        return new Response("recovered");
+      },
+    },
+  });
+
+  assert.equal((await handler(request(envelope()))).status, 502);
+  assert.equal((await handler(request(envelope()))).status, 200);
+  assert.equal(calls, 2);
+});
+
+test("keeps a timed-out slot occupied until ignored upstream work settles", async () => {
+  let releaseFirst: ((response: Response) => void) | undefined;
+  let calls = 0;
+  const handler = createMcpEgressProxyHandler({
+    proxyToken: TOKEN,
+    timeoutMs: 10,
+    maxInFlight: 1,
+    transport: {
+      async fetch() {
+        calls += 1;
+        if (calls === 1) {
+          return new Promise<Response>((resolve) => {
+            releaseFirst = resolve;
+          });
+        }
+        return new Response("ok");
+      },
+    },
+  });
+
+  assert.equal((await handler(request(envelope()))).status, 504);
+  const busy = await handler(request(envelope()));
+  assert.equal(busy.status, 503);
+  assert.deepEqual(await busy.json(), { error: "proxy_busy" });
+  assert.equal(calls, 1);
+
+  releaseFirst?.(new Response("late"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal((await handler(request(envelope()))).status, 200);
+  assert.equal(calls, 2);
+});
+
+test("rejects an invalid upstream concurrency limit", () => {
+  assert.throws(
+    () =>
+      createMcpEgressProxyHandler({
+        proxyToken: TOKEN,
+        maxInFlight: DEFAULT_PROXY_MAX_IN_FLIGHT + 0.5,
+        transport: { fetch: async () => new Response() },
+      }),
+    /in-flight limit is invalid/
+  );
 });
 
 test("cancels an upstream response stream when the proxy timeout expires", async () => {

@@ -176,6 +176,12 @@ repository's dependencies installed, the process entry point is:
 MCP_EGRESS_PROXY_TOKEN=<provided-secret> HOST=<private-interface> PORT=8788 node --import tsx/esm cloudflare/mcp-egress-proxy/server.ts
 ```
 
+The proxy defaults to at most 32 in-flight upstream requests per process.
+Set MCP_EGRESS_PROXY_MAX_IN_FLIGHT to an integer from 1 through 1000 to tune
+that bound for the private proxy runtime. Requests at capacity receive a
+retryable 503 proxy_busy; a timed-out request keeps its slot until the
+transport operation actually settles, even if that transport ignores abort.
+
 #### Egress decision (2026-10-08)
 
 The least-privilege Cloudflare shape is a **VPC Service bound to one dedicated

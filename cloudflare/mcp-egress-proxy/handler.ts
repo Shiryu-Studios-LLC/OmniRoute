@@ -3,6 +3,7 @@ import type { McpOutboundTransport } from "../../src/lib/mcp/mcpOutboundTranspor
 
 export const MAX_PROXY_PAYLOAD_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_PROXY_BODY_READ_TIMEOUT_MS = 10_000;
+export const DEFAULT_PROXY_MAX_IN_FLIGHT = 32;
 const REQUEST_PATH = "/v1/mcp/forward";
 const MAX_CLOCK_SKEW_SECONDS = 30;
 const MAX_REPLAYED_NONCES = 50_000;
@@ -32,6 +33,7 @@ export interface McpEgressProxyOptions {
   transport: McpOutboundTransport;
   timeoutMs?: number;
   bodyReadTimeoutMs?: number;
+  maxInFlight?: number;
   rateLimit?: { limit: number; windowMs: number };
   nowSeconds?: () => number;
 }
@@ -217,6 +219,7 @@ async function readBoundedResponse(response: Response, signal: AbortSignal): Pro
 export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
   const timeoutMs = options.timeoutMs ?? 30_000;
   const bodyReadTimeoutMs = options.bodyReadTimeoutMs ?? DEFAULT_PROXY_BODY_READ_TIMEOUT_MS;
+  const maxInFlight = options.maxInFlight ?? DEFAULT_PROXY_MAX_IN_FLIGHT;
   const nowSeconds = options.nowSeconds ?? (() => Math.floor(Date.now() / 1000));
   const rateLimit = options.rateLimit ?? { limit: 300, windowMs: 60_000 };
   if (
@@ -229,6 +232,9 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
   ) {
     throw new TypeError("MCP egress proxy signing secret and positive timeout are required");
   }
+  if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1 || maxInFlight > 1000) {
+    throw new TypeError("MCP egress proxy in-flight limit is invalid");
+  }
   if (
     !Number.isInteger(rateLimit.limit) ||
     rateLimit.limit < 1 ||
@@ -240,6 +246,7 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
   const seenNonces = new Map<string, number>();
   let rateWindow = -1;
   let rateCount = 0;
+  let inFlightCount = 0;
 
   return async function handle(request: Request): Promise<Response> {
     const requestUrl = new URL(request.url);
@@ -317,6 +324,7 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
     }
     const payload = validateBody(parsed);
     if (!payload) return jsonResponse({ error: "invalid_request" }, 400);
+    if (inFlightCount >= maxInFlight) return jsonResponse({ error: "proxy_busy" }, 503);
 
     const upstreamHeaders = new Headers();
     if (payload.headers?.accept) upstreamHeaders.set("accept", payload.headers.accept);
@@ -330,6 +338,13 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
     }
 
     const abort = new AbortController();
+    inFlightCount += 1;
+    let slotReleased = false;
+    const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      inFlightCount -= 1;
+    };
     let rejectTimeout: ((reason?: unknown) => void) | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       rejectTimeout = reject;
@@ -339,40 +354,39 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
       rejectTimeout?.(new Error("proxy upstream timeout"));
     }, timeoutMs);
     timer.unref?.();
+    const upstreamOperation = (async () => {
+      const upstream = await options.transport.fetch(
+        payload.url,
+        {
+          method: "POST",
+          headers: upstreamHeaders,
+          body: payload.body,
+          redirect: "manual",
+          signal: abort.signal,
+        },
+        { tenantId: payload.tenantId, serverId: payload.serverId }
+      );
+      const body = await readBoundedResponse(upstream, abort.signal);
+      const headers: { contentType?: string; mcpSessionId?: string } = {};
+      const contentType = upstream.headers.get("content-type");
+      const mcpSessionId = upstream.headers.get("mcp-session-id");
+      if (contentType) headers.contentType = contentType;
+      if (mcpSessionId) headers.mcpSessionId = mcpSessionId;
+      const serialized = JSON.stringify({ status: upstream.status, headers, body });
+      if (Buffer.byteLength(serialized, "utf8") > MAX_PROXY_PAYLOAD_BYTES) {
+        return jsonResponse({ error: "upstream_response_too_large" }, 502);
+      }
+      return new Response(serialized, {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    })();
+    void upstreamOperation.then(releaseSlot, releaseSlot);
     try {
-      return await Promise.race([
-        (async () => {
-          const upstream = await options.transport.fetch(
-            payload.url,
-            {
-              method: "POST",
-              headers: upstreamHeaders,
-              body: payload.body,
-              redirect: "manual",
-              signal: abort.signal,
-            },
-            { tenantId: payload.tenantId, serverId: payload.serverId }
-          );
-          const body = await readBoundedResponse(upstream, abort.signal);
-          const headers: { contentType?: string; mcpSessionId?: string } = {};
-          const contentType = upstream.headers.get("content-type");
-          const mcpSessionId = upstream.headers.get("mcp-session-id");
-          if (contentType) headers.contentType = contentType;
-          if (mcpSessionId) headers.mcpSessionId = mcpSessionId;
-          const serialized = JSON.stringify({ status: upstream.status, headers, body });
-          if (Buffer.byteLength(serialized, "utf8") > MAX_PROXY_PAYLOAD_BYTES) {
-            return jsonResponse({ error: "upstream_response_too_large" }, 502);
-          }
-          return new Response(serialized, {
-            status: 200,
-            headers: {
-              "content-type": "application/json; charset=utf-8",
-              "cache-control": "no-store",
-            },
-          });
-        })(),
-        timeout,
-      ]);
+      return await Promise.race([upstreamOperation, timeout]);
     } catch (error) {
       return jsonResponse(
         { error: abort.signal.aborted ? "upstream_timeout" : "upstream_failure" },
