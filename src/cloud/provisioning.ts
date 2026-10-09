@@ -7,18 +7,39 @@ import {
 import { getCloudTenantById, type CloudTenant } from "./tenants";
 import { getCloudTenantSettings, type CloudTenantSettings } from "./tenantSettings";
 
-export interface ProvisionedCloudCustomer {
+interface ProvisionedCloudCustomerBase {
   tenant: CloudTenant;
   settings: CloudTenantSettings;
+}
+
+export interface ProvisionedCloudCustomer extends ProvisionedCloudCustomerBase {
   ownerMembership: { id: string; tenantId: string; principalId: string; role: "owner" };
   ownerApiKey: IssuedCloudCustomerApiKey;
 }
 
+export interface ProvisionedOidcPendingCloudCustomer extends ProvisionedCloudCustomerBase {
+  ownerMembership: null;
+  ownerApiKey: null;
+  bootstrapMode: "oidc_pending";
+}
+
+export type CloudCustomerProvisioningInput =
+  | { id: string; name: string; slug: string; ownerPrincipalId: string; now: string }
+  | { id: string; name: string; slug: string; bootstrapMode: "oidc_pending"; now: string };
+
 /** Create the tenant, owner principal binding, and one-time API key as one compensated operation. */
+export function provisionCloudCustomer(
+  db: CloudDb,
+  input: Extract<CloudCustomerProvisioningInput, { ownerPrincipalId: string }>
+): Promise<ProvisionedCloudCustomer>;
+export function provisionCloudCustomer(
+  db: CloudDb,
+  input: Extract<CloudCustomerProvisioningInput, { bootstrapMode: "oidc_pending" }>
+): Promise<ProvisionedOidcPendingCloudCustomer>;
 export async function provisionCloudCustomer(
   db: CloudDb,
-  input: { id: string; name: string; slug: string; ownerPrincipalId: string; now: string }
-): Promise<ProvisionedCloudCustomer> {
+  input: CloudCustomerProvisioningInput
+): Promise<ProvisionedCloudCustomer | ProvisionedOidcPendingCloudCustomer> {
   let tenantInserted = false;
   try {
     const insertResult = await db
@@ -35,18 +56,29 @@ export async function provisionCloudCustomer(
       throw new Error("Customer tenant could not be created");
     }
 
-    const [tenant, settings, ownerMembership] = await Promise.all([
+    const [tenant, settings] = await Promise.all([
       getCloudTenantById(db, input.id),
       getCloudTenantSettings(db, input.id),
-      createCloudCustomerMembership(db, {
-        tenantId: input.id,
-        principalId: input.ownerPrincipalId,
-        role: "owner",
-        now: input.now,
-      }),
     ]);
     if (!tenant) throw new Error("Provisioned customer tenant could not be read back");
     if (!settings) throw new Error("Provisioned customer tenant settings could not be read back");
+
+    if ("bootstrapMode" in input) {
+      return {
+        tenant,
+        settings,
+        ownerMembership: null,
+        ownerApiKey: null,
+        bootstrapMode: "oidc_pending",
+      };
+    }
+
+    const ownerMembership = await createCloudCustomerMembership(db, {
+      tenantId: input.id,
+      principalId: input.ownerPrincipalId,
+      role: "owner",
+      now: input.now,
+    });
     const ownerApiKey = await issueCloudCustomerApiKey(db, {
       tenantId: input.id,
       membershipId: ownerMembership.id,

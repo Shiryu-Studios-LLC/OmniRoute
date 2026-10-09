@@ -273,6 +273,100 @@ test("platform tenant creation rejects requests without a verified owner princip
   }
 });
 
+test("platform admin can provision an explicit OIDC-pending tenant without creating a key or owner", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer platform-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-oidc-pending",
+          name: "OIDC Pending Customer",
+          slug: "oidc-pending-customer",
+          bootstrapMode: "oidc_pending",
+        }),
+      }),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+
+    assert.equal(response.status, 201);
+    const provisioned = (await response.json()) as {
+      tenant: { id: string; kind: string };
+      bootstrapMode: string;
+      ownerMembership: unknown;
+      ownerApiKey: unknown;
+    };
+    assert.equal(provisioned.tenant.id, "tenant-oidc-pending");
+    assert.equal(provisioned.tenant.kind, "customer");
+    assert.equal(provisioned.bootstrapMode, "oidc_pending");
+    assert.equal(provisioned.ownerMembership, null);
+    assert.equal(provisioned.ownerApiKey, null);
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM cloud_customer_memberships WHERE tenant_id = ?")
+        .bind("tenant-oidc-pending")
+        .first(),
+      null
+    );
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM cloud_customer_api_keys WHERE tenant_id = ?")
+        .bind("tenant-oidc-pending")
+        .first(),
+      null
+    );
+    const audit = await d1
+      .prepare<{ metadata_json: string }>(
+        "SELECT metadata_json FROM cloud_compliance_audit WHERE action = 'customer.provision' AND target = ?"
+      )
+      .bind("tenant-oidc-pending")
+      .first();
+    assert.deepEqual(JSON.parse(audit?.metadata_json ?? "{}"), {
+      slug: "oidc-pending-customer",
+      bootstrapMode: "oidc_pending",
+    });
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("OIDC-pending provisioning cannot also name a trusted owner", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer platform-secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-invalid-bootstrap",
+          name: "Invalid Bootstrap",
+          slug: "invalid-bootstrap",
+          ownerPrincipalId: "trusted-owner",
+          bootstrapMode: "oidc_pending",
+        }),
+      }),
+      { db: d1, adminToken: "platform-secret", now: () => new Date(now) }
+    );
+    assert.equal(response.status, 400);
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM tenants WHERE id = ?")
+        .bind("tenant-invalid-bootstrap")
+        .first(),
+      null
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
 test("customer provisioning compensates tenant and owner writes when key issuance fails", async () => {
   const { d1, now } = await fixture();
   try {
@@ -496,7 +590,7 @@ test("membership and key creation reject non-customer, suspended, and cross-tena
   }
 });
 
-test("maintenance identity attributes tenant provision attempt and success audits correctly", async () => {
+test("maintenance identity attributes trusted-owner provisioning audits correctly", async () => {
   const { d1, now } = await fixture();
   const adminToken = "platform-admin-secret";
   const maintenanceToken = "platform-maintenance-secret";
@@ -536,6 +630,39 @@ test("maintenance identity attributes tenant provision attempt and success audit
         { action: "cloud.api.post", actor: "cloud-maintenance", status: "attempted" },
         { action: "customer.provision", actor: "cloud-maintenance", status: "success" },
       ]
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("maintenance credentials cannot create OIDC-pending tenants", async () => {
+  const { d1, now } = await fixture();
+  const adminToken = "platform-admin-secret";
+  const maintenanceToken = "platform-maintenance-secret";
+  try {
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${maintenanceToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-maintenance-oidc-pending",
+          name: "Maintenance OIDC Pending",
+          slug: "maintenance-oidc-pending",
+          bootstrapMode: "oidc_pending",
+        }),
+      }),
+      { db: d1, adminToken, maintenanceToken, now: () => new Date(now) }
+    );
+    assert.equal(response.status, 401);
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM tenants WHERE id = 'tenant-maintenance-oidc-pending'")
+        .first(),
+      null
     );
   } finally {
     d1.db.close();

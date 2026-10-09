@@ -209,7 +209,7 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Create customer tenant.
 - Create owner/admin membership.
 - Generate tenant-scoped credentials.
-- The platform-admin tenant-create request requires an owner principal ID from an external verified identity flow; it creates the tenant, owner membership, and one-time API key with compensating rollback and an audit record. The Cloud runtime does not verify the owner's real-world identity itself.
+- The platform-admin tenant-create request supports either an owner principal ID from an external verified identity flow (creating the tenant, owner membership, and one-time API key) or explicit `bootstrapMode: "oidc_pending"` (creating the tenant and settings without an owner or key). The latter is followed by platform-admin OIDC configuration and first-owner claim issuance. Both paths have compensating rollback and audit records. The Cloud runtime does not verify real-world identity outside its configured OIDC callback.
 - Configure provider defaults.
 - Configure MCP defaults.
 - Register devices.

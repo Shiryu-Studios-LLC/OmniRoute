@@ -1068,7 +1068,7 @@ export async function handleCloudApiRequest(
 
       const body = validateFields(
         await readBody(request),
-        ["id", "name", "slug", "ownerPrincipalId"],
+        ["id", "name", "slug", "ownerPrincipalId", "bootstrapMode"],
         ["id", "name", "slug"]
       );
       if (typeof body.id !== "string" || !validId(body.id)) throw new ApiError(400, "Invalid id");
@@ -1078,14 +1078,34 @@ export async function handleCloudApiRequest(
       if (typeof body.slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(body.slug)) {
         throw new ApiError(400, "Invalid slug");
       }
-      if (typeof body.ownerPrincipalId !== "string" || !validId(body.ownerPrincipalId)) {
-        throw new ApiError(400, "An ownerPrincipalId from a trusted identity flow is required");
+      const ownerPrincipalProvided = body.ownerPrincipalId !== undefined;
+      const oidcPendingRequested = body.bootstrapMode === "oidc_pending";
+      if (body.bootstrapMode !== undefined && !oidcPendingRequested) {
+        throw new ApiError(400, "bootstrapMode must be oidc_pending");
       }
+      if (ownerPrincipalProvided && oidcPendingRequested) {
+        throw new ApiError(400, "ownerPrincipalId and oidc_pending bootstrap cannot be combined");
+      }
+      if (
+        ownerPrincipalProvided &&
+        (typeof body.ownerPrincipalId !== "string" || !validId(body.ownerPrincipalId))
+      ) {
+        throw new ApiError(400, "Invalid ownerPrincipalId from trusted identity flow");
+      }
+      if (!ownerPrincipalProvided && !oidcPendingRequested) {
+        throw new ApiError(
+          400,
+          "A trusted ownerPrincipalId or explicit oidc_pending bootstrapMode is required"
+        );
+      }
+      if (oidcPendingRequested && !isAdminToken) return json({ error: "Unauthorized" }, 401);
       const provisioned = await provisionCloudCustomer(db, {
         id: body.id,
         name: body.name.trim(),
         slug: body.slug,
-        ownerPrincipalId: body.ownerPrincipalId,
+        ...(oidcPendingRequested
+          ? { bootstrapMode: "oidc_pending" as const }
+          : { ownerPrincipalId: body.ownerPrincipalId as string }),
         now: now().toISOString(),
       });
       try {
@@ -1101,8 +1121,12 @@ export async function handleCloudApiRequest(
           requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
           metadata: {
             slug: provisioned.tenant.slug,
-            membershipId: provisioned.ownerMembership.id,
-            apiKeyId: provisioned.ownerApiKey.id,
+            bootstrapMode:
+              "bootstrapMode" in provisioned ? provisioned.bootstrapMode : "trusted_owner",
+            ...(provisioned.ownerMembership
+              ? { membershipId: provisioned.ownerMembership.id }
+              : {}),
+            ...(provisioned.ownerApiKey ? { apiKeyId: provisioned.ownerApiKey.id } : {}),
           },
         });
       } catch {
