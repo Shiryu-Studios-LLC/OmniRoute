@@ -133,6 +133,49 @@ test("gateway cycle connects when there is no reusable session and returns a bou
   });
 });
 
+test("gateway cycle reconnects when a cached device session has been revoked", async () => {
+  const events: string[] = [];
+  const replacementSession = {
+    ...session,
+    sessionId: "session-reconnected",
+    sessionToken: "fresh-token",
+  };
+  const cycle = await runLocalAgentGatewayCycle(
+    config,
+    {
+      now: () => Date.parse("2026-10-08T12:00:00.000Z"),
+      createNonce: () => "heartbeat-nonce-reconnect",
+      discover: async () => ({ heartbeat: { status: "online", capabilities: [] }, services: [] }),
+      fetch: async () => Response.json({ accepted: true }),
+      gateway: {
+        connect: async () => {
+          events.push("connect");
+          return replacementSession;
+        },
+        heartbeat: async (activeSession) => {
+          events.push(`heartbeat:${activeSession.sessionId}`);
+          return activeSession === replacementSession;
+        },
+        poll: async (activeSession) => {
+          events.push(`poll:${activeSession.sessionId}`);
+          return [];
+        },
+        submitResult: async () => true,
+      },
+      execute: async () => ({}),
+    },
+    session
+  );
+
+  assert.equal(cycle.session, replacementSession);
+  assert.deepEqual(events, [
+    "heartbeat:session-123",
+    "connect",
+    "heartbeat:session-reconnected",
+    "poll:session-reconnected",
+  ]);
+});
+
 test("gateway cycle ignores malformed and expired envelopes", async () => {
   let submitted = 0;
   let executed = 0;

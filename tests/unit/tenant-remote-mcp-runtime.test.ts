@@ -223,3 +223,25 @@ test("upstream timeouts are bounded and invocation requires a valid remote proto
     "TENANT_FORBIDDEN"
   );
 });
+
+test("remote MCP discovery rejects JSON-RPC responses with a mismatched ID or version", async () => {
+  for (const invalidEnvelope of [
+    { jsonrpc: "2.0", id: 99, result: {} },
+    { jsonrpc: "1.0", id: 1, result: {} },
+  ]) {
+    let requests = 0;
+    const runtimeInstance = runtime({
+      transport: {
+        fetch: async () => {
+          requests += 1;
+          return Response.json(invalidEnvelope);
+        },
+      },
+    });
+    await assertRuntimeError(
+      runtimeInstance.discoverTools(principal("a"), serverA.id),
+      "MCP_UPSTREAM_PROTOCOL_ERROR"
+    );
+    assert.equal(requests, 1);
+  }
+});

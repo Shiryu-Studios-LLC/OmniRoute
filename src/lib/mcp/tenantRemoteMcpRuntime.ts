@@ -227,7 +227,7 @@ async function readBoundedText(response: Response, maxBytes: number): Promise<st
   return new TextDecoder().decode(bytes);
 }
 
-function parseRpcResponse(text: string): Record<string, unknown> {
+function parseRpcResponse(text: string, expectedId: number): Record<string, unknown> {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -244,6 +244,12 @@ function parseRpcResponse(text: string): Record<string, unknown> {
     );
   }
   const record = value as Record<string, unknown>;
+  if (record.jsonrpc !== "2.0" || record.id !== expectedId) {
+    throw new TenantRemoteMcpError(
+      "MCP_UPSTREAM_PROTOCOL_ERROR",
+      "MCP server returned a response with an invalid JSON-RPC version or ID"
+    );
+  }
   if (record.error) {
     throw new TenantRemoteMcpError("MCP_UPSTREAM_PROTOCOL_ERROR", "MCP server rejected discovery");
   }
@@ -424,7 +430,7 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       authorization,
       { tenantId, serverId: server.id }
     );
-    const initResponse = parseRpcResponse(initialized.body);
+    const initResponse = parseRpcResponse(initialized.body, 1);
     const initResult = initResponse.result;
     if (!initResult || typeof initResult !== "object" || Array.isArray(initResult)) {
       throw new TenantRemoteMcpError(
@@ -449,7 +455,7 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       authorization,
       { tenantId, serverId: server.id }
     );
-    const listResponse = parseRpcResponse(listed.body);
+    const listResponse = parseRpcResponse(listed.body, 2);
     const listResult = listResponse.result;
     return {
       tenantId,
@@ -525,7 +531,7 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       connection.authorization,
       { tenantId: connection.tenantId, serverId }
     );
-    const parsed = parseRpcResponse(called.body);
+    const parsed = parseRpcResponse(called.body, 3);
     if (!parsed.result || typeof parsed.result !== "object" || Array.isArray(parsed.result)) {
       throw new TenantRemoteMcpError(
         "MCP_UPSTREAM_PROTOCOL_ERROR",
