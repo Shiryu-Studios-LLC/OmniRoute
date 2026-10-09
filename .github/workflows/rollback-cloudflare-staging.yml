@@ -1,0 +1,95 @@
+name: Roll back Cloudflare staging Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version_id:
+        description: Explicit previously deployed staging Worker version UUID
+        required: true
+        type: string
+      confirm_rollback:
+        description: Type rollback-staging to roll back the isolated staging Worker
+        required: true
+        type: string
+      confirm_data_compatibility:
+        description: Type d1-do-compatible after reviewing deployed schema and Durable Object compatibility
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-staging
+  cancel-in-progress: false
+
+jobs:
+  rollback-staging:
+    name: Roll back isolated staging Worker version
+    runs-on: ubuntu-latest
+    environment: cloudflare-staging
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      STAGING_WORKER_NAME: omniroute-cloud-runtime-staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate rollback confirmation and target
+        shell: bash
+        env:
+          TARGET_VERSION_ID: ${{ inputs.target_version_id }}
+          CONFIRM_ROLLBACK: ${{ inputs.confirm_rollback }}
+          CONFIRM_DATA_COMPATIBILITY: ${{ inputs.confirm_data_compatibility }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRM_ROLLBACK" == "rollback-staging" ]] || {
+            echo "Type rollback-staging to continue."
+            exit 1
+          }
+          [[ "$CONFIRM_DATA_COMPATIBILITY" == "d1-do-compatible" ]] || {
+            echo "Review the current D1 schema and Durable Object compatibility, then type d1-do-compatible."
+            exit 1
+          }
+          [[ "$TARGET_VERSION_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || {
+            echo "TARGET_VERSION_ID must be an explicit Worker version UUID."
+            exit 1
+          }
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || {
+            echo "Missing CLOUDFLARE_API_TOKEN in cloudflare-staging environment."
+            exit 1
+          }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[[:xdigit:]]{32}$ ]] || {
+            echo "CLOUDFLARE_ACCOUNT_ID must be a 32-character Cloudflare account ID."
+            exit 1
+          }
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Verify target belongs to the staging Worker
+        shell: bash
+        env:
+          TARGET_VERSION_ID: ${{ inputs.target_version_id }}
+        run: |
+          set -euo pipefail
+          npx wrangler versions view "$TARGET_VERSION_ID" --name "$STAGING_WORKER_NAME" --json
+
+      - name: Roll back staging Worker code to the explicit version
+        shell: bash
+        env:
+          TARGET_VERSION_ID: ${{ inputs.target_version_id }}
+        run: |
+          set -euo pipefail
+          npx wrangler rollback "$TARGET_VERSION_ID" \
+            --name "$STAGING_WORKER_NAME" \
+            --message "Manual staging rollback to $TARGET_VERSION_ID"

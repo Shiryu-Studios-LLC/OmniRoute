@@ -21,8 +21,12 @@ type ProviderConnectionRecord = {
 
 const core = await import("../../src/lib/db/core.ts");
 const localDb = await import("../../src/lib/localDb.ts");
+const tenantProvisioning =
+  await import("../../src/lib/tenantProvisioning/provisionCustomerTenant.ts");
+const tenantContext = await import("../../src/lib/tenantContext.ts");
 const credentialsRoute = await import("../../src/app/api/cloud/credentials/update/route.ts");
 const aliasRoute = await import("../../src/app/api/cloud/models/alias/route.ts");
+const cloudAuthRoute = await import("../../src/app/api/cloud/auth/route.ts");
 
 async function resetStorage() {
   delete process.env.OMNIROUTE_API_KEY;
@@ -41,7 +45,7 @@ async function createKey(scopes: string[] = []): Promise<ApiKeyRecord> {
   return localDb.createApiKey(`cloud-write-${scopes.join("-") || "none"}`, "machine-test", scopes);
 }
 
-async function createActiveConnection(): Promise<ProviderConnectionRecord> {
+async function createActiveConnection(projectId?: string): Promise<ProviderConnectionRecord> {
   const connection = await localDb.createProviderConnection({
     provider: "openai",
     authType: "oauth",
@@ -51,6 +55,7 @@ async function createActiveConnection(): Promise<ProviderConnectionRecord> {
     accessToken: "old-access-token",
     refreshToken: "old-refresh-token",
     expiresAt: "2026-01-01T00:00:00.000Z",
+    ...(projectId ? { projectId } : {}),
   });
   assert.ok(connection?.id);
   return connection as ProviderConnectionRecord;
@@ -101,6 +106,12 @@ function cloudAliasRequest(token: string | null, body = aliasUpdateBody()) {
     headers,
     body: JSON.stringify(body),
   });
+}
+
+function cloudAuthRequest(token: string | null) {
+  const headers = new Headers();
+  if (token) headers.set("authorization", `Bearer ${token}`);
+  return new Request("http://localhost/api/cloud/auth", { method: "POST", headers });
 }
 
 async function captureConsoleLog<T>(fn: () => Promise<T>): Promise<{ value: T; logs: string }> {
@@ -200,6 +211,53 @@ test("PUT /api/cloud/models/alias accepts API key with manage scope", async () =
   assert.equal(response.status, 200);
   assert.equal(body.success, true);
   assert.equal(aliases["fast-default"], "openai/gpt-4o-mini");
+});
+
+test("POST /api/cloud/auth scopes provider connection reads to the authenticated customer tenant", async () => {
+  const platformConnection = await createActiveConnection("platform-project-marker");
+  assert.ok(platformConnection.id);
+
+  const customer = await tenantProvisioning.provisionCustomerTenant({
+    name: "Customer Cloud Auth",
+    slug: "customer-cloud-auth",
+    owner: { principalId: "customer-cloud-auth-owner", identityVerified: true },
+    provisionedBy: "platform-cloud-auth-test",
+  });
+
+  const customerConnection = await tenantContext.runWithTenantContext(
+    {
+      tenantId: customer.tenant.id,
+      principalId: customer.apiKey.id,
+      role: "owner",
+    },
+    () => createActiveConnection("customer-project-marker")
+  );
+
+  const response = await cloudAuthRoute.POST(cloudAuthRequest(customer.apiKey.key));
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.connections.length, 1);
+  assert.equal(body.connections[0].projectId, "customer-project-marker");
+  assert.ok(
+    !body.connections.some(
+      (connection: { projectId: string }) => connection.projectId === "platform-project-marker"
+    )
+  );
+
+  const platformRows = await tenantContext.runWithTenantContext(
+    { tenantId: "tenant_shiryu_admin", principalId: "platform-test" },
+    () => localDb.getProviderConnections({ isActive: true })
+  );
+  assert.equal(platformRows.length, 1);
+  assert.equal(platformRows[0].id, platformConnection.id);
+
+  const customerRows = await tenantContext.runWithTenantContext(
+    { tenantId: customer.tenant.id, principalId: customer.apiKey.id },
+    () => localDb.getProviderConnections({ isActive: true })
+  );
+  assert.equal(customerRows.length, 1);
+  assert.equal(customerRows[0].id, customerConnection.id);
 });
 
 test("cloud write routes keep 401 for missing or invalid Bearer credentials", async () => {

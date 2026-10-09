@@ -574,11 +574,18 @@ After the repository is cloud-ready:
 
 #### Rollback and D1 recovery
 
-The staging workflow does not automate rollback. Before each deployment, record the
-last known-good Worker version ID and the D1 migration state. If a Worker version
-fails its smoke checks, stop further promotion and roll the Worker back to the
-recorded version using the Cloudflare dashboard or `wrangler rollback`. Worker
-versions capture bindings and code, but do not restore D1 or Durable Object state;
+The staging deploy workflow does not automatically roll back after failed smoke checks.
+Before each deployment, record the last known-good Worker version ID and the D1
+migration state. If a Worker version fails its smoke checks, stop further promotion
+and run the manual `Rollback Cloudflare staging Worker` workflow with that explicit
+version ID. The workflow requires the protected `cloudflare-staging` environment,
+checks that the version belongs to `omniroute-cloud-runtime-staging`, and requires an
+operator to confirm D1/Durable Object compatibility. It invokes
+`wrangler rollback <version-id> --name omniroute-cloud-runtime-staging`; it does not
+deploy to production, change bindings, or restore D1 or Durable Object state. The
+operator must verify the target code remains compatible with the current data and
+Durable Object schema before confirming. Worker rollbacks leave connected resources
+unchanged and may fail when required resources or Durable Object migrations differ;
 see [Cloudflare Worker rollbacks](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
 
 Treat schema and data recovery separately. Prefer a forward-only corrective
