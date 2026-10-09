@@ -1458,6 +1458,39 @@ test("Worker cancels a stalled gateway request body after the configured read ti
   }
 });
 
+test("Worker cancels a stalled customer gateway body after the default read timeout", async () => {
+  const fixture = createRuntimeFixture();
+  let cancelled = false;
+  try {
+    const owner = await customerKey(fixture, "tenant-a", "owner");
+    const body = new ReadableStream<Uint8Array>({
+      pull() {},
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const response = await fixture.fetch(
+      new Request("https://cloud.example.test/__gateway/v1/customer/local-agent/pairings", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${owner.token}`,
+          "content-type": "application/json",
+        },
+        body,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" })
+    );
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: "Pairing request must be an empty JSON object",
+    });
+    assert.equal(cancelled, true);
+  } finally {
+    fixture.d1.db.close();
+  }
+});
+
 test("connect rate limit rejects before reading another unauthenticated request body", async () => {
   const fixture = createRuntimeFixture({
     gatewayConnectFallbackRateLimit: { limit: 1, windowMs: 60_000 },

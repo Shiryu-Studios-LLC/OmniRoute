@@ -431,6 +431,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             failedKeyRateLimit: options.customerAuthFailureRateLimit,
             failedKeyFallbackRateLimit: options.customerAuthFailureFallbackRateLimit,
             pairingIssueRateLimit: options.gatewayPairingIssueRateLimit,
+            bodyReadTimeoutMs: options.gatewayRequestBodyTimeoutMs,
           });
         } catch {
           return Response.json(

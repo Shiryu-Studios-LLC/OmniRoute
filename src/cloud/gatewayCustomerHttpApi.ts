@@ -24,6 +24,7 @@ const PATH = "/__gateway/v1/customer/invoke";
 const PAIRING_PATH = "/__gateway/v1/customer/local-agent/pairings";
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
+const DEFAULT_BODY_READ_TIMEOUT_MS = 10_000;
 const DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CAPABILITY = /^[A-Za-z0-9_:.\/-]{1,128}$/;
 // Per tenant, allow at most 30 local capability starts in a rolling minute.
@@ -40,6 +41,7 @@ export interface GatewayCustomerHttpApiOptions {
   failedKeyRateLimit?: { limit: number; windowMs: number };
   failedKeyFallbackRateLimit?: { limit: number; windowMs: number };
   pairingIssueRateLimit?: { limit: number; windowMs: number };
+  bodyReadTimeoutMs?: number;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -60,7 +62,10 @@ function bearerToken(request: Request): string | null {
   return match?.[1] ?? null;
 }
 
-async function readBody(request: Request): Promise<Record<string, unknown> | null> {
+async function readBody(
+  request: Request,
+  timeoutMs = DEFAULT_BODY_READ_TIMEOUT_MS
+): Promise<Record<string, unknown> | null> {
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) return null;
   const advertisedLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(advertisedLength) && advertisedLength > MAX_BODY_BYTES) return null;
@@ -68,19 +73,35 @@ async function readBody(request: Request): Promise<Record<string, unknown> | nul
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
+  let cancellationStarted = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cancelReader = () => {
+    if (cancellationStarted) return;
+    cancellationStarted = true;
+    void reader.cancel("request body rejected").catch(() => undefined);
+  };
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      cancelReader();
+      reject(new Error("Gateway customer request body timed out"));
+    }, timeoutMs);
+  });
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), timeout]);
       if (done) break;
       size += value.byteLength;
       if (size > MAX_BODY_BYTES) {
-        await reader.cancel();
+        cancelReader();
         return null;
       }
       chunks.push(value);
     }
   } catch {
     return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (!cancellationStarted) reader.releaseLock();
   }
   const bytes = new Uint8Array(size);
   let offset = 0;
@@ -200,7 +221,7 @@ export async function handleGatewayCustomerRequest(
   if (url.pathname === PAIRING_PATH) {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
     if (url.search) return json({ error: "Unsupported request metadata" }, 400);
-    const body = await readBody(request);
+    const body = await readBody(request, options.bodyReadTimeoutMs);
     if (!body || Object.keys(body).length !== 0) {
       return json({ error: "Pairing request must be an empty JSON object" }, 400);
     }
@@ -280,7 +301,7 @@ export async function handleGatewayCustomerRequest(
     return json({ error: "A valid Idempotency-Key header is required" }, 400);
   }
 
-  const body = await readBody(request);
+  const body = await readBody(request, options.bodyReadTimeoutMs);
   if (!body) return json({ error: "Invalid or oversized JSON body" }, 400);
   const allowedFields = ["deviceId", "capability", "payload", "timeoutMs", "stream"];
   if (Object.keys(body).some((key) => !allowedFields.includes(key))) {
