@@ -13,6 +13,7 @@ import { provisionCloudCustomer } from "../../src/cloud/provisioning";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 import { getCloudTenantMcpCredential } from "../../src/cloud/tenantMcpServers";
 import { handleCloudTenantMcpRequest } from "../../src/cloud/tenantMcpHttpApi";
+import { createMcpEgressProxyHandler } from "../../cloudflare/mcp-egress-proxy/handler.ts";
 
 const ENCRYPTION_KEY = Buffer.alloc(32, 29).toString("base64");
 const NOW = "2026-10-08T12:00:00.000Z";
@@ -449,6 +450,127 @@ test("MCP discovery and invocation require explicit controlled-egress enablement
     );
     assert.equal(invokedByOtherTenant?.status, 404);
     assert.equal(proxyCalls, 7);
+  } finally {
+    db.db.close();
+  }
+});
+
+test("Worker MCP egress adapter authenticates against the real proxy handler with tenant context", async () => {
+  const db = await migratedDb();
+  const proxyToken = "test-proxy-token-which-is-long-enough-32-chars";
+  try {
+    const owner = await provision(db, "mcp-cross-layer-owner");
+    const other = await provision(db, "mcp-cross-layer-other");
+    await enableMcp(db, owner.tenantId, other.tenantId);
+    const created = await call(
+      db,
+      request(owner.token, "POST", COLLECTION, {
+        name: "Cross layer server",
+        transport: "streamable_http",
+        endpoint: "https://mcp.example.com/mcp",
+        credential: "cross-layer-upstream-secret",
+      })
+    );
+    assert.equal(created?.status, 201);
+    const server = await body<{ server: { id: string } }>(created!);
+
+    const forwarded: Array<{
+      context: { tenantId: string; serverId: string };
+      authorization: string | null;
+      method: string;
+    }> = [];
+    const proxyHandler = createMcpEgressProxyHandler({
+      proxyToken,
+      transport: {
+        async fetch(_url, init, context) {
+          assert.ok(context, "the proxy must supply its validated tenant and server context");
+          const rpc = JSON.parse(String(init.body)) as { id?: number; method: string };
+          forwarded.push({
+            context,
+            authorization: new Headers(init.headers).get("authorization"),
+            method: rpc.method,
+          });
+          const result =
+            rpc.method === "initialize"
+              ? { protocolVersion: "2024-11-05", serverInfo: { name: "real-proxy" } }
+              : rpc.method === "tools/list"
+                ? { tools: [{ name: "lookup", inputSchema: { type: "object" } }] }
+                : { content: [{ type: "text", text: "cross-layer-ok" }] };
+          return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+        },
+      },
+    });
+    let signedProxyRequests = 0;
+    const egressBinding = {
+      async fetch(proxyRequest: Request): Promise<Response> {
+        signedProxyRequests += 1;
+        assert.equal(proxyRequest.url, "http://omniroute-mcp-egress.internal:8080/v1/mcp/forward");
+        const response = await proxyHandler(proxyRequest);
+        assert.equal(response.status, 200, "the real handler must accept the Worker HMAC");
+        return response;
+      },
+    };
+
+    const noEnablement = await call(
+      db,
+      request(owner.token, "GET", `${COLLECTION}/${server.server.id}/tools`),
+      { egressBinding, egressProxyToken: proxyToken }
+    );
+    assert.equal(noEnablement?.status, 503);
+    const noBinding = await call(
+      db,
+      request(owner.token, "GET", `${COLLECTION}/${server.server.id}/tools`),
+      { egressEnabled: true, egressProxyToken: proxyToken }
+    );
+    assert.equal(noBinding?.status, 503);
+    const noSigningToken = await call(
+      db,
+      request(owner.token, "GET", `${COLLECTION}/${server.server.id}/tools`),
+      { egressEnabled: true, egressBinding }
+    );
+    assert.equal(noSigningToken?.status, 503);
+    assert.equal(signedProxyRequests, 0, "disabled configuration must not reach proxy egress");
+
+    const discovered = await call(
+      db,
+      request(owner.token, "GET", `${COLLECTION}/${server.server.id}/tools`),
+      { egressEnabled: true, egressBinding, egressProxyToken: proxyToken }
+    );
+    assert.equal(discovered?.status, 200, await discovered?.clone().text());
+    assert.equal(signedProxyRequests, 3, "discovery sends initialize and tools/list calls");
+    assert.deepEqual(
+      forwarded.map((item) => item.context),
+      Array.from({ length: 3 }, () => ({ tenantId: owner.tenantId, serverId: server.server.id }))
+    );
+    assert.ok(
+      forwarded.every((item) => item.authorization === "Bearer cross-layer-upstream-secret")
+    );
+
+    const invocation = await call(
+      db,
+      request(owner.token, "POST", `${COLLECTION}/${server.server.id}/tools/lookup`, {
+        arguments: {},
+      }),
+      { egressEnabled: true, egressBinding, egressProxyToken: proxyToken }
+    );
+    assert.equal(invocation?.status, 200, await invocation?.clone().text());
+    assert.match(await invocation!.text(), /cross-layer-ok/);
+    assert.equal(signedProxyRequests, 7);
+    assert.ok(forwarded.slice(3).every((item) => item.context.tenantId === owner.tenantId));
+    assert.ok(forwarded.slice(3).every((item) => item.context.serverId === server.server.id));
+    assert.ok(
+      forwarded
+        .slice(3)
+        .every((item) => item.authorization === "Bearer cross-layer-upstream-secret")
+    );
+
+    const foreignTenant = await call(
+      db,
+      request(other.token, "GET", `${COLLECTION}/${server.server.id}/tools`),
+      { egressEnabled: true, egressBinding, egressProxyToken: proxyToken }
+    );
+    assert.equal(foreignTenant?.status, 404);
+    assert.equal(signedProxyRequests, 7, "foreign tenant access must be rejected before egress");
   } finally {
     db.db.close();
   }

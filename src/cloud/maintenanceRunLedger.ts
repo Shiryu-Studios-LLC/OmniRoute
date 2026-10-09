@@ -7,6 +7,7 @@ export const CLOUD_MAINTENANCE_TASK_KEYS = [
   "settled-inference-reservations",
   "expired-inference-responses",
   "expired-oidc-artifacts",
+  "expired-gateway-image-jobs",
 ] as const;
 
 export type CloudMaintenanceTaskKey = (typeof CLOUD_MAINTENANCE_TASK_KEYS)[number];
