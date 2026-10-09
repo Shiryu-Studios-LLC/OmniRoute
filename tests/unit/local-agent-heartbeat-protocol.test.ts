@@ -164,6 +164,50 @@ test("signed heartbeats update status and reject tampering, replay, and stale ti
   );
 });
 
+test("devices with expired heartbeats read offline and return online after reconnecting", () => {
+  seedTenants();
+  const registration = asTenant("agent_tenant_a", () =>
+    agents.registerLocalAgent({ name: "restartable-worker" })
+  );
+  const nowMs = Date.now();
+  core
+    .getDbInstance()
+    .prepare(
+      `UPDATE local_agent_devices
+          SET status = 'busy', last_seen_at = ?, capabilities_json = ?
+        WHERE id = ?`
+    )
+    .run(new Date(nowMs - 5 * 60 * 1000 - 1).toISOString(), '["ollama"]', registration.device.id);
+
+  assert.equal(
+    asTenant("agent_tenant_a", () => agents.getLocalAgent(registration.device.id))?.status,
+    "offline",
+    "a process that stopped heartbeating must not remain busy forever"
+  );
+  assert.equal(
+    asTenant(
+      "agent_tenant_a",
+      () => agents.listLocalAgents().find((device) => device.id === registration.device.id)?.status
+    ),
+    "offline"
+  );
+
+  const payload = { status: "online" as const, capabilities: ["ollama"] };
+  const nonce = "restart-heartbeat-reconnect-01";
+  const updated = asTenant("agent_tenant_a", () =>
+    agents.acceptLocalAgentHeartbeat({
+      deviceId: registration.device.id,
+      credential: registration.credential,
+      timestamp: nowMs,
+      nonce,
+      signature: signLocalAgentHeartbeat(registration.credential, nowMs, nonce, payload),
+      payload,
+      nowMs,
+    })
+  );
+  assert.equal(updated.status, "online");
+});
+
 test("heartbeat credentials are tenant-bound and revocation immediately blocks signed traffic", () => {
   seedTenants();
   const registration = asTenant("agent_tenant_a", () =>

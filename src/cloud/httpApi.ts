@@ -1154,11 +1154,13 @@ export async function handleCloudApiRequest(
           const deviceIds = await listCloudGatewayDeviceIds(db, target.id);
           if (isActive) {
             await invalidateDeviceSessions(options.sessions, deviceIds, timestamp);
-            updated =
-              (await setCloudCustomerTenantActive(db, target.id, true, timestamp)) ?? target;
+            const resumed = await setCloudCustomerTenantActive(db, target.id, true, timestamp);
+            if (!resumed?.isActive) throw new Error("Tenant resume did not persist");
+            updated = resumed;
           } else {
-            updated =
-              (await setCloudCustomerTenantActive(db, target.id, false, timestamp)) ?? target;
+            const suspended = await setCloudCustomerTenantActive(db, target.id, false, timestamp);
+            if (suspended?.isActive !== false) throw new Error("Tenant suspension did not persist");
+            updated = suspended;
             await invalidateDeviceSessions(options.sessions, deviceIds, timestamp);
           }
         }

@@ -213,6 +213,16 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
   }
 
   async run() {
+    if (this.sql.startsWith("UPDATE tenants")) {
+      const [isActive, updatedAt, tenantId] = this.values;
+      const tenant = this.database.tenants.find((entry) => entry.id === tenantId);
+      if (tenant?.kind === "customer") {
+        tenant.is_active = Number(isActive);
+        tenant.updated_at = String(updatedAt);
+        return { success: true, meta: { changes: 1 } };
+      }
+      return { success: true, meta: { changes: 0 } };
+    }
     if (this.sql.startsWith("INSERT INTO tenants")) {
       const [id, name, slug, createdAt, updatedAt] = this.values;
       this.database.tenants.push({

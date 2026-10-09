@@ -11,6 +11,9 @@ import {
 
 const HEARTBEAT_MAX_SKEW_MS = 5 * 60 * 1000;
 const NONCE_TTL_MS = 10 * 60 * 1000;
+// A stopped or crashed agent cannot publish an offline heartbeat. Treat its
+// last reported status as offline after a short liveness grace period.
+const LOCAL_AGENT_OFFLINE_AFTER_MS = 5 * 60 * 1000;
 
 const createSchema = z
   .object({ tenantId: z.string().min(1).optional(), name: z.string().trim().min(1).max(128) })
@@ -75,11 +78,15 @@ function toDevice(row: DeviceRow): LocalAgentDevice {
       // Treat malformed persisted metadata as unavailable; never expose raw DB content.
     }
   }
+  const lastSeenAtMs = row.last_seen_at ? Date.parse(row.last_seen_at) : Number.NaN;
+  const heartbeatIsFresh =
+    Number.isFinite(lastSeenAtMs) && Date.now() - lastSeenAtMs <= LOCAL_AGENT_OFFLINE_AFTER_MS;
+  const reportedStatus = row.status === "online" || row.status === "busy" ? row.status : "offline";
   return {
     id: row.id,
     tenantId: row.tenant_id,
     name: row.name,
-    status: row.status === "online" || row.status === "busy" ? row.status : "offline",
+    status: heartbeatIsFresh ? reportedStatus : "offline",
     capabilities,
     serviceHealth,
     createdAt: row.created_at,
