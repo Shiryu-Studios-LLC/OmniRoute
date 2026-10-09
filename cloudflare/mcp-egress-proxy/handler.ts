@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { McpOutboundTransport } from "../../src/lib/mcp/mcpOutboundTransport.ts";
 
 export const MAX_PROXY_PAYLOAD_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_PROXY_BODY_READ_TIMEOUT_MS = 10_000;
 const REQUEST_PATH = "/v1/mcp/forward";
 const MAX_CLOCK_SKEW_SECONDS = 30;
 const MAX_REPLAYED_NONCES = 50_000;
@@ -30,6 +31,7 @@ export interface McpEgressProxyOptions {
   proxyToken: string;
   transport: McpOutboundTransport;
   timeoutMs?: number;
+  bodyReadTimeoutMs?: number;
   rateLimit?: { limit: number; windowMs: number };
   nowSeconds?: () => number;
 }
@@ -119,7 +121,14 @@ function validateBody(value: unknown): McpEgressProxyBody | null {
   };
 }
 
-async function readBoundedRequest(request: Request): Promise<string> {
+class RequestBodyTimeoutError extends Error {
+  constructor() {
+    super("proxy request body timeout");
+    this.name = "RequestBodyTimeoutError";
+  }
+}
+
+async function readBoundedRequestWithTimeout(request: Request, timeoutMs: number): Promise<string> {
   const contentLength = request.headers.get("content-length");
   if (
     contentLength &&
@@ -131,19 +140,31 @@ async function readBoundedRequest(request: Request): Promise<string> {
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let rejectTimeout: ((reason?: unknown) => void) | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timer = setTimeout(() => {
+    rejectTimeout?.(new RequestBodyTimeoutError());
+  }, timeoutMs);
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), timeout]);
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_PROXY_PAYLOAD_BYTES) {
-        await reader.cancel();
-        throw new RangeError("payload too large");
-      }
+      if (total > MAX_PROXY_PAYLOAD_BYTES) throw new RangeError("payload too large");
       chunks.push(value);
     }
+  } catch (error) {
+    void reader.cancel(error).catch(() => undefined);
+    throw error;
   } finally {
-    reader.releaseLock();
+    clearTimeout(timer);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A cancelled stream may still have a read settling; it is already detached from the request.
+    }
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -195,13 +216,16 @@ async function readBoundedResponse(response: Response, signal: AbortSignal): Pro
 /** Creates an authenticated, bounded MCP egress endpoint for Web Request runtimes. */
 export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
   const timeoutMs = options.timeoutMs ?? 30_000;
+  const bodyReadTimeoutMs = options.bodyReadTimeoutMs ?? DEFAULT_PROXY_BODY_READ_TIMEOUT_MS;
   const nowSeconds = options.nowSeconds ?? (() => Math.floor(Date.now() / 1000));
   const rateLimit = options.rateLimit ?? { limit: 300, windowMs: 60_000 };
   if (
     options.proxyToken.length < 32 ||
     options.proxyToken.length > 512 ||
     !Number.isFinite(timeoutMs) ||
-    timeoutMs <= 0
+    timeoutMs <= 0 ||
+    !Number.isFinite(bodyReadTimeoutMs) ||
+    bodyReadTimeoutMs <= 0
   ) {
     throw new TypeError("MCP egress proxy signing secret and positive timeout are required");
   }
@@ -237,8 +261,11 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
     }
     let rawBody: string;
     try {
-      rawBody = await readBoundedRequest(request);
+      rawBody = await readBoundedRequestWithTimeout(request, bodyReadTimeoutMs);
     } catch (error) {
+      if (error instanceof RequestBodyTimeoutError) {
+        return jsonResponse({ error: "request_timeout" }, 408);
+      }
       return jsonResponse(
         { error: error instanceof RangeError ? "payload_too_large" : "invalid_json" },
         error instanceof RangeError ? 413 : 400

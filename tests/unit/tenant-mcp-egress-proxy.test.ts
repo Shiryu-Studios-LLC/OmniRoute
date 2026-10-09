@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { request as createHttpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 import type { McpOutboundTransport } from "../../src/lib/mcp/mcpOutboundTransport.ts";
@@ -301,6 +302,39 @@ test("cancels an upstream response stream when the proxy timeout expires", async
   assert.equal(streamCancelled, true);
 });
 
+test("times out and cancels a stalled unauthenticated Web request body", async () => {
+  let streamCancelled = false;
+  const handler = createMcpEgressProxyHandler({
+    proxyToken: TOKEN,
+    bodyReadTimeoutMs: 10,
+    transport: {
+      async fetch() {
+        throw new Error("unexpected");
+      },
+    },
+  });
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new Uint8Array([123]));
+      return new Promise<void>(() => undefined);
+    },
+    cancel() {
+      streamCancelled = true;
+    },
+  });
+  const stalledRequest = new Request("http://proxy.test/v1/mcp/forward", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+    // Node's Fetch implementation requires half duplex for streaming request bodies.
+    duplex: "half",
+  } as RequestInit);
+  const response = await handler(stalledRequest);
+  assert.equal(response.status, 408);
+  assert.deepEqual(await response.json(), { error: "request_timeout" });
+  assert.equal(streamCancelled, true);
+});
+
 test("Node pinned transport rejects non-HTTPS and private literal destinations", async () => {
   let resolverCalls = 0;
   const transport = createNodePinnedMcpTransport({
@@ -344,6 +378,51 @@ test("Node HTTP server exposes the handler and rejects unauthenticated requests"
     });
     assert.equal(response.status, 401);
     assert.deepEqual(await response.json(), { error: "unauthorized" });
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test("Node HTTP server returns 408 and closes a stalled request body", async () => {
+  const server = startMcpEgressProxyServer({
+    proxyToken: TOKEN,
+    host: "127.0.0.1",
+    port: 0,
+    bodyReadTimeoutMs: 30,
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  try {
+    const address = server.address() as AddressInfo;
+    const response = await new Promise<{ statusCode?: number }>((resolve, reject) => {
+      const clientRequest = createHttpRequest(
+        {
+          host: "127.0.0.1",
+          port: address.port,
+          path: "/v1/mcp/forward",
+          method: "POST",
+          headers: {
+            "content-length": "128",
+            "content-type": "application/json",
+            "x-omniroute-timestamp": String(Math.floor(Date.now() / 1000)),
+            "x-omniroute-nonce": randomBytes(16).toString("base64url"),
+            "x-omniroute-signature": "0".repeat(64),
+          },
+        },
+        (incomingResponse) => {
+          incomingResponse.resume();
+          incomingResponse.once("end", () => resolve({ statusCode: incomingResponse.statusCode }));
+        }
+      );
+      clientRequest.once("error", reject);
+      clientRequest.write("{");
+    });
+    assert.equal(response.statusCode, 408);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
