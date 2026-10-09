@@ -296,6 +296,13 @@ maintenance telemetry is enabled.
 - Use service/module boundaries and lazy loading where appropriate.
 - Verify that provider executors used by the cloud path use Web APIs or supported Worker-compatible primitives.
 
+The standalone Worker now forwards only the exact `/__cloud/v1/tenants` path
+and its descendants to the D1 admin API handler. Unrelated and near-prefix
+paths return 404 before any D1 operation. This preserves the isolated control
+plane boundary; it does not provide the missing OpenNext application fallback
+or resolve the Node/SQLite middleware graph documented in the compatibility
+audit.
+
 **Exit:** production cloud build is reproducible and within size/runtime limits.
 
 ### 13. Security and isolation

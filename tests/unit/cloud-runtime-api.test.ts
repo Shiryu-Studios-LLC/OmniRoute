@@ -327,6 +327,7 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
 }
 
 class TestD1 implements CloudDb {
+  prepareCount = 0;
   readonly tenants = tenants.map((tenant) => ({ ...tenant }));
   readonly providerRows = connections.map((connection) => ({ ...connection }));
   readonly providerNodeRows = nodes.map((node) => ({ ...node }));
@@ -353,6 +354,7 @@ class TestD1 implements CloudDb {
   ];
 
   prepare<T = unknown>(sql: string) {
+    this.prepareCount += 1;
     return new Statement<T>(this, sql);
   }
 
@@ -398,6 +400,35 @@ test("cloud CRUD API requires the configured server-side admin token", async () 
     request("/__cloud/v1/tenants/tenant-a", "wrong-token")
   );
   assert.equal(response.status, 401);
+});
+
+test("cloud runtime sends only the tenant admin API path boundary to the D1 admin handler", async () => {
+  const db = new TestD1();
+  const app = runtime(db);
+
+  for (const path of ["/__cloud/v1/unrelated", "/__cloud/v1/tenantsExtra"]) {
+    const response = await app.fetch(request(path));
+    assert.equal(response.status, 404, `${path} should be rejected by the Worker router`);
+  }
+  assert.equal(db.prepareCount, 0, "unrelated cloud paths must not start a D1 operation");
+
+  const tenantResponse = await app.fetch(request("/__cloud/v1/tenants/tenant-a"));
+  assert.equal(tenantResponse.status, 200, "tenant admin routes must still reach the D1 handler");
+  assert.ok(db.prepareCount > 0, "a valid tenant path must perform its D1-backed lookup");
+
+  db.prepareCount = 0;
+  const collectionResponse = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body: "{invalid tenant payload}",
+    })
+  );
+  assert.equal(collectionResponse.status, 400, "the tenant collection POST must remain routed");
+  assert.ok(db.prepareCount > 0, "tenant collection creation must still reach the D1 handler");
 });
 
 test("maintenance run history is bounded and readable only by the platform admin", async () => {

@@ -29,6 +29,8 @@ import type {
   GatewayDurableObjectNamespace,
 } from "./connectorGatewayDurableObject";
 
+const CLOUD_TENANT_ADMIN_API_PATH = "/__cloud/v1/tenants";
+
 export interface CloudRuntimeEnv {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
@@ -316,7 +318,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         }
       }
 
-      if (url.pathname.startsWith("/__cloud/v1/")) {
+      if (
+        url.pathname === CLOUD_TENANT_ADMIN_API_PATH ||
+        url.pathname.startsWith(`${CLOUD_TENANT_ADMIN_API_PATH}/`)
+      ) {
         return handleCloudApiRequest(request, {
           db: options.env?.DB,
           adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
