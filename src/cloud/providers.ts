@@ -1,4 +1,9 @@
 import type { CloudDb } from "./db";
+import {
+  validateProviderExecutionContract,
+  type ProviderExecutionLocation,
+  type ProviderOwnershipMode,
+} from "./providerExecution";
 
 export interface CloudProviderConnection {
   id: string;
@@ -27,6 +32,8 @@ export interface CloudProviderConnection {
   globalPriority: number | null;
   defaultModel: string | null;
   tokenType: string | null;
+  credentialOwnership: ProviderOwnershipMode;
+  executionLocation: ProviderExecutionLocation;
   createdAt: string;
   updatedAt: string;
 }
@@ -58,6 +65,8 @@ export interface CloudProviderConnectionInput {
   globalPriority?: number | null;
   defaultModel?: string | null;
   tokenType?: string | null;
+  credentialOwnership?: ProviderOwnershipMode;
+  executionLocation?: ProviderExecutionLocation;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -74,6 +83,8 @@ export interface CloudProviderNode {
   modelsPath: string | null;
   iconUrl: string | null;
   customHeadersJson: string | null;
+  credentialOwnership: ProviderOwnershipMode;
+  executionLocation: ProviderExecutionLocation;
   createdAt: string;
   updatedAt: string;
 }
@@ -90,6 +101,8 @@ export interface CloudProviderNodeInput {
   modelsPath?: string | null;
   iconUrl?: string | null;
   customHeadersJson?: string | null;
+  credentialOwnership?: ProviderOwnershipMode;
+  executionLocation?: ProviderExecutionLocation;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -116,6 +129,11 @@ function serializeProviderSpecificData(value: unknown): string | null {
 }
 
 function connectionFromRow(row: Record<string, unknown>): CloudProviderConnection {
+  const executionContract = validateProviderExecutionContract({
+    credentialOwnership:
+      row.credential_ownership == null ? undefined : String(row.credential_ownership),
+    executionLocation: row.execution_location == null ? undefined : String(row.execution_location),
+  });
   return {
     id: String(row.id),
     tenantId: String(row.tenant_id),
@@ -143,12 +161,18 @@ function connectionFromRow(row: Record<string, unknown>): CloudProviderConnectio
     globalPriority: row.global_priority == null ? null : Number(row.global_priority),
     defaultModel: row.default_model == null ? null : String(row.default_model),
     tokenType: row.token_type == null ? null : String(row.token_type),
+    ...executionContract,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
 }
 
 function nodeFromRow(row: Record<string, unknown>): CloudProviderNode {
+  const executionContract = validateProviderExecutionContract({
+    credentialOwnership:
+      row.credential_ownership == null ? undefined : String(row.credential_ownership),
+    executionLocation: row.execution_location == null ? undefined : String(row.execution_location),
+  });
   return {
     id: String(row.id),
     tenantId: String(row.tenant_id),
@@ -161,6 +185,7 @@ function nodeFromRow(row: Record<string, unknown>): CloudProviderNode {
     modelsPath: row.models_path == null ? null : String(row.models_path),
     iconUrl: row.icon_url == null ? null : String(row.icon_url),
     customHeadersJson: row.custom_headers_json == null ? null : String(row.custom_headers_json),
+    ...executionContract,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -216,6 +241,7 @@ export async function createCloudProviderConnection(
   db: CloudDb,
   input: CloudProviderConnectionInput
 ): Promise<CloudProviderConnection> {
+  const executionContract = validateProviderExecutionContract(input);
   const now = input.updatedAt ?? input.createdAt ?? new Date().toISOString();
   const createdAt = input.createdAt ?? now;
 
@@ -226,8 +252,8 @@ export async function createCloudProviderConnection(
         access_token, refresh_token, expires_at, token_expires_at, scope, project_id,
         test_status, error_code, last_error, last_error_at, api_key, id_token,
         provider_specific_data, expires_in, display_name, global_priority,
-        default_model, token_type, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        default_model, token_type, credential_ownership, execution_location, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.id,
@@ -256,6 +282,8 @@ export async function createCloudProviderConnection(
       input.globalPriority ?? null,
       input.defaultModel ?? null,
       input.tokenType ?? null,
+      executionContract.credentialOwnership,
+      executionContract.executionLocation,
       createdAt,
       now
     )
@@ -282,6 +310,7 @@ export async function updateCloudProviderConnection(
     tenantId,
     updatedAt: new Date().toISOString(),
   };
+  const executionContract = validateProviderExecutionContract(merged);
 
   await db
     .prepare(
@@ -291,7 +320,7 @@ export async function updateCloudProviderConnection(
         scope = ?, project_id = ?, test_status = ?, error_code = ?, last_error = ?,
         last_error_at = ?, api_key = ?, id_token = ?, provider_specific_data = ?,
         expires_in = ?, display_name = ?, global_priority = ?, default_model = ?,
-        token_type = ?, updated_at = ?
+        token_type = ?, credential_ownership = ?, execution_location = ?, updated_at = ?
        WHERE tenant_id = ? AND id = ?`
     )
     .bind(
@@ -319,6 +348,8 @@ export async function updateCloudProviderConnection(
       merged.globalPriority ?? null,
       merged.defaultModel ?? null,
       merged.tokenType ?? null,
+      executionContract.credentialOwnership,
+      executionContract.executionLocation,
       merged.updatedAt,
       tenantId,
       id
@@ -369,6 +400,7 @@ export async function createCloudProviderNode(
   db: CloudDb,
   input: CloudProviderNodeInput
 ): Promise<CloudProviderNode> {
+  const executionContract = validateProviderExecutionContract(input);
   const now = input.updatedAt ?? input.createdAt ?? new Date().toISOString();
   const createdAt = input.createdAt ?? now;
 
@@ -376,8 +408,9 @@ export async function createCloudProviderNode(
     .prepare(
       `INSERT INTO provider_nodes (
         id, tenant_id, type, name, prefix, api_type, base_url,
-        chat_path, models_path, icon_url, custom_headers_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        chat_path, models_path, icon_url, custom_headers_json, credential_ownership, execution_location,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.id,
@@ -391,6 +424,8 @@ export async function createCloudProviderNode(
       input.modelsPath ?? null,
       input.iconUrl ?? null,
       input.customHeadersJson ?? null,
+      executionContract.credentialOwnership,
+      executionContract.executionLocation,
       createdAt,
       now
     )
@@ -417,12 +452,14 @@ export async function updateCloudProviderNode(
     tenantId,
     updatedAt: new Date().toISOString(),
   };
+  const executionContract = validateProviderExecutionContract(merged);
 
   await db
     .prepare(
       `UPDATE provider_nodes SET
         type = ?, name = ?, prefix = ?, api_type = ?, base_url = ?,
-        chat_path = ?, models_path = ?, icon_url = ?, custom_headers_json = ?, updated_at = ?
+        chat_path = ?, models_path = ?, icon_url = ?, custom_headers_json = ?, credential_ownership = ?,
+        execution_location = ?, updated_at = ?
        WHERE tenant_id = ? AND id = ?`
     )
     .bind(
@@ -435,6 +472,8 @@ export async function updateCloudProviderNode(
       merged.modelsPath ?? null,
       merged.iconUrl ?? null,
       merged.customHeadersJson ?? null,
+      executionContract.credentialOwnership,
+      executionContract.executionLocation,
       merged.updatedAt,
       tenantId,
       id

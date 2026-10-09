@@ -95,6 +95,7 @@ async function fixture(
     "0012_cloud_inference_idempotency_capacity.sql",
     "0013_cloud_inference_idempotency_tombstone_retention.sql",
     "0014_cloud_inference_reservation_retention.sql",
+    "0022_provider_execution_contract.sql",
   ])
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   for (const [id, name, slug] of [
@@ -142,7 +143,7 @@ async function fixture(
     connectionId,
     field: "apiKey",
   });
-  await createCloudProviderConnection(db, {
+  const connection = await createCloudProviderConnection(db, {
     id: connectionId,
     tenantId: TENANT_A,
     provider: "openai",
@@ -150,6 +151,8 @@ async function fixture(
     createdAt: NOW,
     updatedAt: NOW,
   });
+  assert.equal(connection.credentialOwnership, "customer_managed");
+  assert.equal(connection.executionLocation, "third_party");
   let clock = Date.parse(NOW);
   const runtime = (fetcher: typeof fetch, extra: Record<string, unknown> = {}) =>
     createCloudRuntime({

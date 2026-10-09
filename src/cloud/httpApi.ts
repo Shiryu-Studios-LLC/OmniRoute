@@ -70,6 +70,7 @@ import {
   CLOUD_MAINTENANCE_RUNS_MAX_PAGE_SIZE,
   listCloudMaintenanceRuns,
 } from "./maintenanceRunLedger";
+import { isProviderExecutionLocation, isProviderOwnershipMode } from "./providerExecution";
 
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
@@ -178,6 +179,8 @@ const CONNECTION_FIELDS = [
   "globalPriority",
   "defaultModel",
   "tokenType",
+  "credentialOwnership",
+  "executionLocation",
 ] as const;
 
 const NODE_FIELDS = [
@@ -190,6 +193,8 @@ const NODE_FIELDS = [
   "modelsPath",
   "iconUrl",
   "customHeadersJson",
+  "credentialOwnership",
+  "executionLocation",
 ] as const;
 
 const USAGE_FIELDS = [
@@ -259,6 +264,19 @@ async function connectionInput(
   for (const field of CONNECTION_FIELDS) {
     if (!(field in body)) continue;
     const current = body[field];
+    if (field === "credentialOwnership") {
+      if (!isProviderOwnershipMode(current))
+        throw new ApiError(400, "Invalid provider ownership mode");
+      result[field] = current;
+      continue;
+    }
+    if (field === "executionLocation") {
+      if (!isProviderExecutionLocation(current)) {
+        throw new ApiError(400, "Invalid provider execution location");
+      }
+      result[field] = current;
+      continue;
+    }
     if (["priority", "expiresIn", "globalPriority"].includes(field)) {
       const nullable = field !== "priority";
       if (
@@ -365,6 +383,19 @@ async function nodeInput(
 
   for (const field of NODE_FIELDS) {
     if (!(field in body)) continue;
+    if (field === "credentialOwnership") {
+      if (!isProviderOwnershipMode(body[field]))
+        throw new ApiError(400, "Invalid provider ownership mode");
+      result[field] = body[field];
+      continue;
+    }
+    if (field === "executionLocation") {
+      if (!isProviderExecutionLocation(body[field])) {
+        throw new ApiError(400, "Invalid provider execution location");
+      }
+      result[field] = body[field];
+      continue;
+    }
     const fieldValue = nullableString(body[field], field);
     if ((field === "type" || field === "name") && (!fieldValue || !fieldValue.trim())) {
       throw new ApiError(400, `${field} cannot be empty`);

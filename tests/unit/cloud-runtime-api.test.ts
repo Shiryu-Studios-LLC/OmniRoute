@@ -253,6 +253,8 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
         "global_priority",
         "default_model",
         "token_type",
+        "credential_ownership",
+        "execution_location",
         "created_at",
         "updated_at",
       ];
@@ -285,6 +287,8 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
         "global_priority",
         "default_model",
         "token_type",
+        "credential_ownership",
+        "execution_location",
         "updated_at",
       ];
       const [tenantId, id] = this.values.slice(fields.length);
@@ -309,6 +313,8 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
         "models_path",
         "icon_url",
         "custom_headers_json",
+        "credential_ownership",
+        "execution_location",
         "created_at",
         "updated_at",
       ];
@@ -532,6 +538,8 @@ test("provider connection reads remain tenant-scoped and redact credentials", as
   const body = (await allowed.json()) as Record<string, unknown>;
   assert.equal(body.id, "alpha-openai");
   assert.equal(body.tenantId, "tenant-a");
+  assert.equal(body.credentialOwnership, "customer_managed");
+  assert.equal(body.executionLocation, "third_party");
   assert.equal(body.hasCredentials, true);
   assert.equal("accessToken" in body, false);
   assert.equal("providerSpecificData" in body, false);
@@ -540,6 +548,53 @@ test("provider connection reads remain tenant-scoped and redact credentials", as
     request("/__cloud/v1/tenants/tenant-b/provider-connections/alpha-openai")
   );
   assert.equal(crossTenant.status, 404);
+});
+
+test("provider API persists the typed ownership and execution location contract", async () => {
+  const db = new TestD1();
+  const app = runtime(db);
+  const response = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants/tenant-a/provider-connections", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "hosted-connection",
+        provider: "openai",
+        credentialOwnership: "shiryu_hosted",
+        executionLocation: "shiryu_hosted",
+      }),
+    })
+  );
+  assert.equal(response.status, 201);
+  const body = (await response.json()) as Record<string, unknown>;
+  assert.equal(body.credentialOwnership, "shiryu_hosted");
+  assert.equal(body.executionLocation, "shiryu_hosted");
+  const stored = db.providerRows.find((row) => row.id === "hosted-connection");
+  assert.equal(stored?.credential_ownership, "shiryu_hosted");
+  assert.equal(stored?.execution_location, "shiryu_hosted");
+
+  const invalid = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants/tenant-a/provider-connections", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "invalid-contract",
+        provider: "openai",
+        credentialOwnership: "shiryu_owned",
+      }),
+    })
+  );
+  assert.equal(invalid.status, 400);
+  assert.equal(
+    db.providerRows.some((row) => row.id === "invalid-contract"),
+    false
+  );
 });
 
 test("cloud runtime rejects client-submitted provider credential ciphertext", async () => {

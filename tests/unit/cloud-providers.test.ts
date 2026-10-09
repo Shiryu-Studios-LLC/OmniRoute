@@ -118,6 +118,8 @@ class MockD1 implements CloudDb {
         globalPriority,
         defaultModel,
         tokenType,
+        credentialOwnership,
+        executionLocation,
         createdAt,
         updatedAt,
       ] = values;
@@ -148,6 +150,8 @@ class MockD1 implements CloudDb {
         global_priority: globalPriority,
         default_model: defaultModel,
         token_type: tokenType,
+        credential_ownership: credentialOwnership,
+        execution_location: executionLocation,
         created_at: createdAt,
         updated_at: updatedAt,
       });
@@ -186,6 +190,8 @@ class MockD1 implements CloudDb {
         "global_priority",
         "default_model",
         "token_type",
+        "credential_ownership",
+        "execution_location",
         "updated_at",
       ];
       fields.forEach((field, index) => {
@@ -216,6 +222,8 @@ class MockD1 implements CloudDb {
         modelsPath,
         iconUrl,
         customHeadersJson,
+        credentialOwnership,
+        executionLocation,
         createdAt,
         updatedAt,
       ] = values;
@@ -231,6 +239,8 @@ class MockD1 implements CloudDb {
         models_path: modelsPath,
         icon_url: iconUrl,
         custom_headers_json: customHeadersJson,
+        credential_ownership: credentialOwnership,
+        execution_location: executionLocation,
         created_at: createdAt,
         updated_at: updatedAt,
       });
@@ -254,6 +264,8 @@ class MockD1 implements CloudDb {
         "models_path",
         "icon_url",
         "custom_headers_json",
+        "credential_ownership",
+        "execution_location",
         "updated_at",
       ].forEach((field, index) => {
         row[field] = values[index];
@@ -291,6 +303,14 @@ test("cloud provider connection CRUD is tenant-scoped", async () => {
 
   assert.equal((await getCloudProviderConnections(db, "tenant-a")).length, 1);
   assert.equal((await getCloudProviderConnections(db, "tenant-a"))[0]?.id, "conn-a");
+  assert.equal(
+    (await getCloudProviderConnectionById(db, "tenant-a", "conn-a"))?.credentialOwnership,
+    "customer_managed"
+  );
+  assert.equal(
+    (await getCloudProviderConnectionById(db, "tenant-a", "conn-a"))?.executionLocation,
+    "third_party"
+  );
   assert.equal(await getCloudProviderConnectionById(db, "tenant-a", "conn-b"), null);
 
   const blockedUpdate = await updateCloudProviderConnection(db, "tenant-a", "conn-b", {
@@ -301,6 +321,37 @@ test("cloud provider connection CRUD is tenant-scoped", async () => {
 
   assert.equal(await deleteCloudProviderConnection(db, "tenant-a", "conn-b"), false);
   assert.equal(await deleteCloudProviderConnection(db, "tenant-b", "conn-b"), true);
+});
+
+test("provider execution contract supports future ownership modes and validates runtime input", async () => {
+  const db = new MockD1();
+  const hosted = await createCloudProviderConnection(db, {
+    id: "hosted",
+    tenantId: "tenant-a",
+    provider: "openai",
+    credentialOwnership: "shiryu_hosted",
+    executionLocation: "shiryu_hosted",
+  });
+  assert.equal(hosted.credentialOwnership, "shiryu_hosted");
+  assert.equal(hosted.executionLocation, "shiryu_hosted");
+
+  const thirdParty = await updateCloudProviderConnection(db, "tenant-a", "hosted", {
+    credentialOwnership: "third_party",
+    executionLocation: "third_party",
+  });
+  assert.equal(thirdParty?.credentialOwnership, "third_party");
+  assert.equal(thirdParty?.executionLocation, "third_party");
+
+  await assert.rejects(
+    () =>
+      createCloudProviderConnection(db, {
+        id: "invalid",
+        tenantId: "tenant-a",
+        provider: "openai",
+        credentialOwnership: "shiryu_owned" as "shiryu_hosted",
+      }),
+    /Invalid provider ownership mode/
+  );
 });
 
 test("cloud provider node CRUD is tenant-scoped", async () => {
@@ -321,6 +372,10 @@ test("cloud provider node CRUD is tenant-scoped", async () => {
   });
 
   assert.equal((await getCloudProviderNodes(db, "tenant-a")).length, 1);
+  assert.equal(
+    (await getCloudProviderNodeById(db, "tenant-a", "node-a"))?.credentialOwnership,
+    "customer_managed"
+  );
   assert.equal(await getCloudProviderNodeById(db, "tenant-a", "node-b"), null);
 
   assert.equal(await updateCloudProviderNode(db, "tenant-a", "node-b", { name: "hijacked" }), null);

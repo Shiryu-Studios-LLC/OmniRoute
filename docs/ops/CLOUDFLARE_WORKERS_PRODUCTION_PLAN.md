@@ -87,6 +87,8 @@ The Cloudflare boundary checker now scans the Worker entry graph and all src/clo
 
 **Exit:** tenant and provider CRUD execute through the async D1 contract, with automated tenant-isolation coverage, without importing local-only runtime dependencies.
 
+Cloud provider connection and node records also carry `credentialOwnership` and `executionLocation`. `credentialOwnership` is `customer_managed`, `shiryu_hosted`, or `third_party`; `executionLocation` is `customer_environment`, `shiryu_hosted`, or `third_party`. The server-side cloud CRUD API validates and returns these fields. Migration `0022_provider_execution_contract.sql` gives existing customer credentials the backward-compatible `customer_managed` plus `third_party` defaults. `shiryu_hosted` is currently an explicit placement value only; it does not enable or route to Shiryu-hosted GPU infrastructure.
+
 ### 3. Multi-tenant provider isolation — NEXT
 
 Complete the existing `multi-tenant` foundation:
