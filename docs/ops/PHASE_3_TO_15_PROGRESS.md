@@ -4,7 +4,7 @@ title: "OmniRoute Phases 3–15 Progress"
 
 # OmniRoute Phases 3–15 Progress
 
-Last updated: 2026-10-08
+Last updated: 2026-10-09
 
 ## Current state
 
@@ -227,12 +227,12 @@ Phase 13 OIDC settings race regression (2026-10-08): a focused CloudDb wrapper r
 
 Phase 12 OpenNext compatibility finding (2026-10-08): the source proxy contract test confirms `src/proxy.ts` must stay on its Node runtime because it imports the local SQLite-backed auth pipeline. The current OpenNext Cloudflare support matrix does not support Node.js Middleware, so accessing D1 through OpenNext context cannot fix the existing proxy bundle. The official custom Worker hook can wrap the generated fetch handler but does not remove that auth graph. Full parity also needs D1 schemas and checks for local API keys, CLI access tokens, and dashboard login settings. The isolated Worker still builds in dry-run mode at 95 inputs / 581,962 bytes (107,161 gzip), SHA-256 `ce38ddb781cf58102d2b0149dd1e1fb5b0456202782efb0cf94c63aba854ca40`; this does not satisfy the full-app build criterion. No deployment occurred.
 
-Phase 4 API-key session race follow-up (2026-10-08): customer portal API-key issuance and revocation now recheck the exact OIDC session, active tenant, current owner/admin membership, and enabled issuer inside the D1 mutation statement. This closes a race where a portal session could be revoked after route authorization but before the key write batch. Focused OIDC suite passes 28/28, including revocation immediately before both issue and revoke batches; core typecheck and targeted ESLint pass.
+Phase 4 API-key session race follow-up (2026-10-09): customer portal API-key issuance and revocation now recheck the exact OIDC session, active tenant, current owner/admin membership, and enabled issuer inside the D1 mutation statement. This closes a race where a portal session could be revoked after route authorization but before the key write batch. Focused OIDC suite passes 28/28, including revocation immediately before both issue and revoke batches; core typecheck and targeted ESLint pass.
 
-Phase 9 gateway rotation race follow-up (2026-10-08): a successful device connect now re-reads the authoritative directory after storing its Durable Object session; if concurrent credential rotation or revocation changed tenant/device credentials, the new session is revoked and connect fails. Gateway and Durable Object suites pass 22/22.
+Phase 9 gateway rotation race follow-up (2026-10-09): a successful device connect now re-reads the authoritative directory after storing its Durable Object session; if concurrent credential rotation or revocation changed tenant/device credentials, the new session is revoked and connect fails. Gateway and Durable Object suites pass 22/22.
 
-Phase 10 ComfyUI polling follow-up (2026-10-08): local execution continues polling when a running history entry contains intermediate outputs without image files, and only stops on an explicit provider error or a completed result. Executor tests pass 9/9; local discovery tests pass 9/9.
+Phase 10 ComfyUI polling follow-up (2026-10-09): local execution continues polling when a running history entry contains intermediate outputs without image files, and only stops on an explicit provider error or a completed result. Executor tests pass 9/9; local discovery tests pass 9/9.
 
-Phase 11 deployment readiness follow-up (2026-10-08): staging and production `/__cloud/readiness` now require D1, Durable Object, and valid distinct admin, maintenance, credential-encryption, and inference-idempotency secrets. The response exposes only generic configuration state; local/dev response shape is unchanged. Cloud runtime API tests pass 21/21.
+Phase 11 deployment readiness follow-up (2026-10-09): staging and production `/__cloud/readiness` now require D1, Durable Object, and valid distinct admin, maintenance, credential-encryption, and inference-idempotency secrets. The response exposes only generic configuration state; local/dev response shape is unchanged. Cloud runtime API tests pass 21/21.
 
-Integrated follow-up verification (2026-10-08): the combined OIDC, gateway, capability-executor, and cloud-runtime unit run passes 68/68; `npm run typecheck:core`, `npm run cloudflare:check`, and `npm run cloudflare:build` dry run pass. The dry run packages 95 inputs at 588,217 bytes (107,941 gzip), SHA-256 `6332548bb156ffe5da597c4184743470d3709b33ed688a36686da7042868828d`. No staging or production deployment occurred.
+Integrated follow-up verification (2026-10-09): the combined OIDC, gateway, capability-executor, and cloud-runtime unit run passes 68/68; `npm run typecheck:core`, `npm run cloudflare:check`, and `npm run cloudflare:build` dry run pass. The dry run packages 95 inputs at 588,217 bytes (107,941 gzip), SHA-256 `6332548bb156ffe5da597c4184743470d3709b33ed688a36686da7042868828d`. No staging or production deployment occurred.
