@@ -24,6 +24,7 @@ interface OnboardingStatusRow {
 
 export interface CloudCustomerOnboardingReadiness {
   activeOwner: boolean;
+  activeOwnerApiKey: boolean;
   oidcConfigured: boolean;
   oidcEnabled: boolean;
   activeProviderConnection: boolean;
@@ -52,7 +53,8 @@ function json(body: unknown, status = 200): Response {
 /** Read tenant-scoped boolean flags for one trusted, already-authorized tenant identity. */
 export async function getCloudCustomerOnboardingReadiness(
   db: CloudDb,
-  tenantId: string
+  tenantId: string,
+  timestamp = new Date().toISOString()
 ): Promise<CloudCustomerOnboardingReadiness | null> {
   const row = await db
     .prepare<OnboardingStatusRow>(
@@ -61,6 +63,13 @@ export async function getCloudCustomerOnboardingReadiness(
            SELECT 1 FROM cloud_customer_memberships m
             WHERE m.tenant_id = t.id AND m.role = 'owner' AND m.is_active = 1
          ) AS active_owner,
+         EXISTS (
+           SELECT 1 FROM cloud_customer_api_keys k
+           JOIN cloud_customer_memberships m
+             ON m.tenant_id = k.tenant_id AND m.id = k.membership_id
+           WHERE k.tenant_id = t.id AND m.is_active = 1 AND m.role IN ('owner', 'admin')
+             AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > ?)
+         ) AS active_owner_api_key,
          EXISTS (
            SELECT 1 FROM cloud_tenant_oidc_configs o WHERE o.tenant_id = t.id
          ) AS oidc_configured,
@@ -101,11 +110,12 @@ export async function getCloudCustomerOnboardingReadiness(
       WHERE t.id = ? AND t.kind = 'customer' AND t.is_active = 1
       LIMIT 1`
     )
-    .bind(tenantId)
+    .bind(timestamp, tenantId)
     .first();
   if (!row) return null;
   return {
     activeOwner: row.active_owner === 1,
+    activeOwnerApiKey: row.active_owner_api_key === 1,
     oidcConfigured: row.oidc_configured === 1,
     oidcEnabled: row.oidc_enabled === 1,
     activeProviderConnection: row.active_provider_connection === 1,
@@ -175,7 +185,11 @@ export async function handleCloudCustomerOnboardingRequest(
   }
 
   try {
-    const readiness = await getCloudCustomerOnboardingReadiness(options.db, identity.tenantId);
+    const readiness = await getCloudCustomerOnboardingReadiness(
+      options.db,
+      identity.tenantId,
+      now().toISOString()
+    );
     if (!readiness) return json({ error: "Customer onboarding status is unavailable" }, 503);
     return json(readiness);
   } catch {

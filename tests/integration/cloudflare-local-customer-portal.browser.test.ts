@@ -275,17 +275,7 @@ test(
     assert.equal(typeof membershipId, "string", membershipResult.stdout);
 
     const subject = `owner-subject-${tenantId}`;
-    const identity = await requestJson(
-      `${baseUrl}/__cloud/v1/tenants/${tenantId}/oidc/identities`,
-      {
-        method: "POST",
-        token: adminToken,
-        body: { issuer, subject, membershipId },
-      }
-    );
-    assert.equal(identity.response.status, 201, JSON.stringify(identity.body));
-    const identityId = identity.body.id;
-    assert.equal(typeof identityId, "string", JSON.stringify(identity.body));
+    const identityId = randomUUID();
 
     // A short-lived, random, local-only session lets Chromium exercise the real
     // Worker cookie-authenticated owner routes without any external IdP account.
@@ -306,7 +296,7 @@ test(
       safeEnvPath,
       "--yes",
       "--command",
-      `INSERT INTO cloud_tenant_oidc_sessions (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms) VALUES (${sqlText(tokenHash)}, ${sqlText(tenantId)}, ${sqlText(String(membershipId))}, ${sqlText(String(identityId))}, ${nowMs}, ${expiresAtMs});`,
+      `INSERT INTO cloud_tenant_oidc_identities (id, tenant_id, issuer, subject, membership_id, created_at) VALUES (${sqlText(identityId)}, ${sqlText(tenantId)}, ${sqlText(issuer)}, ${sqlText(subject)}, ${sqlText(String(membershipId))}, datetime('now')); INSERT INTO cloud_tenant_oidc_sessions (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms) VALUES (${sqlText(tokenHash)}, ${sqlText(tenantId)}, ${sqlText(String(membershipId))}, ${sqlText(identityId)}, ${nowMs}, ${expiresAtMs});`,
     ]);
     assert.equal(seedResult.status, 0, `${seedResult.stdout}\n${seedResult.stderr}`);
 
@@ -334,7 +324,11 @@ test(
     await page.getByRole("heading", { name: "Onboarding readiness" }).waitFor();
     await page.getByText(/Inference access is default-deny/).waitFor();
     await page.getByText(/Only a platform admin can configure entitlements/).waitFor();
-    assert.equal(await page.locator("#onboarding-readiness li").count(), 11);
+    assert.equal(await page.locator("#onboarding-readiness li").count(), 12);
+    const apiKeyReadiness = page
+      .locator("#onboarding-readiness li")
+      .filter({ hasText: "Active owner/admin API key available" });
+    assert.match((await apiKeyReadiness.textContent()) ?? "", /Complete/);
     assert.equal(await page.locator("#local-ai-opt-in-enabled").isChecked(), false);
     assert.equal(await page.locator("#mcp-opt-in-enabled").isChecked(), false);
     assert.equal(await page.locator("#mcp-server-panel").isVisible(), false);
@@ -631,6 +625,19 @@ test(
     await page.getByText("API key created.").waitFor();
     const issuedKey = await page.locator("#api-key-result code").textContent();
     assert.match(issuedKey ?? "", /^orc_live_/);
+    const activeApiKeys = page.locator("#api-keys .api-key-row button", {
+      hasText: "Revoke key",
+    });
+    await activeApiKeys.first().click();
+    await page.getByText("API key revoked.").waitFor();
+    assert.match((await apiKeyReadiness.textContent()) ?? "", /Complete/);
+    await activeApiKeys.first().click();
+    await page.getByText("API key revoked.").waitFor();
+    await page.waitForFunction(() =>
+      document
+        .querySelector("#onboarding-readiness")
+        ?.textContent?.includes("Active owner/admin API key available: Awaiting setup")
+    );
 
     await page.getByRole("button", { name: "Create one-use invitation" }).click();
     await page.getByText("Invitation created.").waitFor();

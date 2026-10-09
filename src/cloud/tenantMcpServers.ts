@@ -317,6 +317,7 @@ export async function listCloudTenantMcpServers(
     )
     .bind(tenantId)
     .all();
+  if (!result.success) throw new Error("D1 MCP server registry read failed");
   return result.results
     .map(mapRow)
     .filter((server): server is CloudTenantMcpServer => server !== null);

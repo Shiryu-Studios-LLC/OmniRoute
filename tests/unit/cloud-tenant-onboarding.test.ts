@@ -11,6 +11,7 @@ import {
 import { provisionCloudCustomer } from "../../src/cloud/provisioning";
 import {
   CLOUD_CUSTOMER_ONBOARDING_PATH,
+  getCloudCustomerOnboardingReadiness,
   handleCloudCustomerOnboardingRequest,
 } from "../../src/cloud/tenantOnboardingHttpApi";
 import { createCloudRuntime } from "../../src/cloud/runtime";
@@ -267,6 +268,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
     const statusA = (await responseA?.json()) as Record<string, unknown>;
     assert.deepEqual(statusA, {
       activeOwner: true,
+      activeOwnerApiKey: true,
       oidcConfigured: true,
       oidcEnabled: false,
       activeProviderConnection: false,
@@ -322,6 +324,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
     const statusB = (await responseB?.json()) as Record<string, unknown>;
     assert.deepEqual(statusB, {
       activeOwner: true,
+      activeOwnerApiKey: true,
       oidcConfigured: true,
       oidcEnabled: true,
       activeProviderConnection: true,
@@ -339,6 +342,7 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       assert.deepEqual(Object.keys(status).sort(), [
         "activeMcpServer",
         "activeOwner",
+        "activeOwnerApiKey",
         "activeProviderConnection",
         "businessProfileConfigured",
         "enabledInferenceEntitlement",
@@ -382,6 +386,39 @@ test("customer onboarding reports tenant-scoped boolean flags without exposing c
       options
     );
     assert.equal(deniedMember?.status, 403);
+
+    await db
+      .prepare("UPDATE cloud_customer_api_keys SET revoked_at = ? WHERE tenant_id = ?")
+      .bind(TEST_NOW, customerA.tenant.id)
+      .run();
+    await issueCloudCustomerApiKey(db, {
+      tenantId: customerA.tenant.id,
+      membershipId: admin.id,
+      now: "2026-10-08T11:59:00.000Z",
+      expiresAt: "2026-10-08T12:00:30.000Z",
+    });
+    assert.equal(
+      (
+        await getCloudCustomerOnboardingReadiness(
+          db,
+          customerA.tenant.id,
+          "2026-10-08T12:00:15.000Z"
+        )
+      )?.activeOwnerApiKey,
+      true,
+      "an unexpired owner/admin key should satisfy the readiness flag"
+    );
+    assert.equal(
+      (
+        await getCloudCustomerOnboardingReadiness(
+          db,
+          customerA.tenant.id,
+          new Date(TEST_NOW_MS).toISOString()
+        )
+      )?.activeOwnerApiKey,
+      false,
+      "expired or revoked owner/admin keys must not satisfy readiness"
+    );
   } finally {
     db.db.close();
   }

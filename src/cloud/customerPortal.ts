@@ -356,6 +356,7 @@ const PORTAL_SCRIPT = `
     const data = await api("/__cloud/auth/onboarding");
     const steps = [
       ["activeOwner", "Organization owner assigned"],
+      ["activeOwnerApiKey", "Active owner/admin API key available", "Create a replacement key in API key management if needed."],
       ["oidcConfigured", "Organization sign-in configured", "OIDC configuration is managed by a platform admin."],
       ["oidcEnabled", "Organization sign-in enabled", "Only a platform admin can enable OIDC."],
       ["activeProviderConnection", "Provider connection active"],
@@ -636,6 +637,7 @@ const PORTAL_SCRIPT = `
             await api("/__cloud/auth/api-keys/" + encodeURIComponent(key.id), { method: "DELETE" });
             setStatus("API key revoked.");
             await loadApiKeys();
+            await loadOnboardingReadiness();
           } catch (error) {
             setStatus(error instanceof Error ? error.message : "Could not revoke API key.", true);
             revoke.disabled = false;
@@ -684,6 +686,7 @@ const PORTAL_SCRIPT = `
       byId("api-key-expires-at").value = "";
       setStatus("API key created.");
       await loadApiKeys();
+      await loadOnboardingReadiness();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not create API key.", true);
     } finally { button.disabled = false; }

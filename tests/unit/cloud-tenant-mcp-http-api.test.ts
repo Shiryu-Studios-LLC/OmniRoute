@@ -25,7 +25,8 @@ class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
 
   constructor(
     private readonly db: DatabaseSync,
-    private readonly sql: string
+    private readonly sql: string,
+    private readonly failMcpServerListRead: () => boolean
   ) {}
 
   bind(...values: unknown[]): CloudDbStatement<T> {
@@ -38,6 +39,14 @@ class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
   }
 
   async all<U = T>(): Promise<{ results: U[]; success: boolean }> {
+    if (
+      this.sql.startsWith(
+        "SELECT id, tenant_id, name, transport, endpoint, credential_encrypted"
+      ) &&
+      this.failMcpServerListRead()
+    ) {
+      return { results: [], success: false };
+    }
     return {
       results: this.db.prepare(this.sql).all(...(this.values as never[])) as U[],
       success: true,
@@ -52,13 +61,14 @@ class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
 
 class SqliteCloudDb implements CloudDb {
   readonly db = new DatabaseSync(":memory:");
+  failMcpServerListReads = false;
 
   constructor() {
     this.db.exec("PRAGMA foreign_keys = ON");
   }
 
   prepare<T = unknown>(sql: string): CloudDbStatement<T> {
-    return new SqliteStatement<T>(this.db, sql);
+    return new SqliteStatement<T>(this.db, sql, () => this.failMcpServerListReads);
   }
 
   async batch(statements: CloudDbStatement[]): Promise<unknown[]> {
@@ -296,6 +306,32 @@ test("customer MCP registry CRUD encrypts credentials and never contacts saved e
       ["cloud.mcp_server.create", "cloud.mcp_server.update", "cloud.mcp_server.delete"]
     );
     assert.ok(audit.results.every((entry) => !JSON.stringify(entry).includes("mcp-bearer")));
+  } finally {
+    db.db.close();
+  }
+});
+
+test("MCP registry list fails closed when D1 reports an unsuccessful read", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provision(db, "mcp-list-failure");
+    await enableMcp(db, owner.tenantId);
+    const create = await call(
+      db,
+      request(owner.token, "POST", COLLECTION, {
+        name: "Docs",
+        transport: "streamable_http",
+        endpoint: "https://mcp.example.test/mcp",
+      })
+    );
+    assert.equal(create.status, 201);
+
+    db.failMcpServerListReads = true;
+    const list = await call(db, request(owner.token, "GET"));
+    assert.equal(list.status, 503);
+    assert.deepEqual(await body(list), {
+      error: "Customer MCP configuration could not be completed",
+    });
   } finally {
     db.db.close();
   }
