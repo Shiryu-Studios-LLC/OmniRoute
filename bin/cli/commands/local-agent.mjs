@@ -622,6 +622,50 @@ export async function runLocalAgentCommand(
   }
 }
 
+/** Check customer-local AI/MCP services without pairing or contacting the gateway. */
+export async function checkLocalAgentCommand(
+  options = {},
+  { env = process.env, stdout = process.stdout, discover = null } = {}
+) {
+  const discoveryFunction =
+    discover ??
+    (await import("../../../src/lib/localAgent/localDiscovery.ts")).discoverLocalCapabilities;
+  const result = await discoveryFunction(
+    {
+      ollamaUrl: optionalLocalUrl(
+        options.ollamaUrl,
+        env.SHIRYU_LOCAL_AGENT_OLLAMA_URL,
+        "Ollama URL"
+      ),
+      comfyUiUrl: optionalLocalUrl(
+        options.comfyUiUrl,
+        env.SHIRYU_LOCAL_AGENT_COMFYUI_URL,
+        "ComfyUI URL"
+      ),
+      mcpServers: parseMcpServers(env.SHIRYU_LOCAL_AGENT_MCP_SERVERS),
+    },
+    { fetch: globalThis.fetch }
+  );
+
+  for (const service of result.services) {
+    const state = service.reachable ? "online" : "offline";
+    const models = service.models.length ? ` (${service.models.length} models)` : "";
+    stdout.write(`${service.service}: ${state}${models}\n`);
+  }
+  for (const server of result.mcpServers ?? []) {
+    stdout.write(`MCP ${server.id}: online (${server.tools.length} tools)\n`);
+  }
+  const capabilities = result.heartbeat.capabilities;
+  stdout.write(
+    capabilities.length ? `Capabilities: ${capabilities.join(", ")}\n` : "Capabilities: none\n"
+  );
+  return {
+    ok:
+      result.services.some((service) => service.reachable) || (result.mcpServers?.length ?? 0) > 0,
+    result,
+  };
+}
+
 export function registerLocalAgent(
   program,
   { platform = process.platform, keytarLoader, home = homedir() } = {}
@@ -629,6 +673,23 @@ export function registerLocalAgent(
   const localAgent = program
     .command("local-agent")
     .description("Manage a tenant-registered outbound Local Agent");
+
+  localAgent
+    .command("check")
+    .description("Check local Ollama, ComfyUI, and MCP services without pairing")
+    .option("--ollama-url <url>", "Local Ollama URL (or SHIRYU_LOCAL_AGENT_OLLAMA_URL)")
+    .option("--comfyui-url <url>", "Local ComfyUI URL (or SHIRYU_LOCAL_AGENT_COMFYUI_URL)")
+    .action(async (options) => {
+      try {
+        const checked = await checkLocalAgentCommand(options);
+        if (!checked.ok) process.exitCode = 1;
+      } catch {
+        process.stderr.write(
+          "Local Agent service check failed; check the local service configuration.\n"
+        );
+        process.exitCode = 1;
+      }
+    });
 
   localAgent
     .command("pair")

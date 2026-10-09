@@ -108,6 +108,18 @@ only the Ollama and ComfyUI services configured on the customer machine. It does
 open an inbound port. A one-time device credential is read from an environment
 variable and is never accepted as a command-line argument:
 
+Check local services before pairing. This command contacts only the configured local
+services and does not require a gateway URL, device ID, or credential:
+
+```bash
+omniroute local-agent check
+```
+
+It reports service reachability, discovered model counts, and advertised capabilities.
+It exits unsuccessfully when none of the configured local services is reachable. Ollama
+and ComfyUI default to their loopback ports; override them with `--ollama-url` or
+`--comfyui-url` when needed.
+
 ```bash
 omniroute local-agent run \
   --gateway-url https://connect.shiryu.org \

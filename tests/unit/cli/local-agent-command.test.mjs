@@ -8,6 +8,7 @@ import { Command } from "commander";
 import {
   registerLocalAgent,
   pairLocalAgentCommand,
+  checkLocalAgentCommand,
   resolveLocalAgentConfig,
   runLocalAgentCommand,
 } from "../../../bin/cli/commands/local-agent.mjs";
@@ -33,6 +34,65 @@ test("local-agent run is registered with explicit non-secret options", () => {
       "--heartbeat-interval-ms",
     ]
   );
+});
+
+test("local-agent check is available without gateway identity or credentials", async () => {
+  const program = new Command();
+  registerLocalAgent(program);
+  const localAgent = program.commands.find((command) => command.name() === "local-agent");
+  const check = localAgent.commands.find((command) => command.name() === "check");
+  assert.ok(check);
+  assert.deepEqual(
+    check.options.map((option) => option.long),
+    ["--ollama-url", "--comfyui-url"]
+  );
+
+  let observedConfig;
+  let output = "";
+  const checked = await checkLocalAgentCommand(
+    { ollamaUrl: "http://127.0.0.1:11434" },
+    {
+      env: {},
+      stdout: { write: (value) => (output += value) },
+      discover: async (config) => {
+        observedConfig = config;
+        return {
+          heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+          services: [{ service: "ollama", reachable: true, models: ["local"] }],
+        };
+      },
+    }
+  );
+
+  assert.deepEqual(observedConfig, {
+    ollamaUrl: "http://127.0.0.1:11434/",
+    comfyUiUrl: undefined,
+    mcpServers: [],
+  });
+  assert.equal(checked.ok, true);
+  assert.match(output, /ollama: online \(1 models\)/);
+  assert.match(output, /Capabilities: ollama:chat:local/);
+});
+
+test("local-agent check reports missing local services as unsuccessful", async () => {
+  let output = "";
+  const checked = await checkLocalAgentCommand(
+    {},
+    {
+      env: {},
+      stdout: { write: (value) => (output += value) },
+      discover: async () => ({
+        heartbeat: { status: "online", capabilities: [] },
+        services: [
+          { service: "ollama", reachable: false, models: [] },
+          { service: "comfyui", reachable: false, models: [] },
+        ],
+      }),
+    }
+  );
+  assert.equal(checked.ok, false);
+  assert.match(output, /ollama: offline/);
+  assert.match(output, /comfyui: offline/);
 });
 
 test("local-agent pair reads its code outside argv and saves the credential privately", async () => {
