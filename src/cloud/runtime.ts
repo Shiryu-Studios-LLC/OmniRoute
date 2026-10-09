@@ -7,6 +7,10 @@ import {
   CLOUD_CUSTOMER_SETTINGS_PATH,
   handleCloudCustomerSettingsRequest,
 } from "./tenantSettingsHttpApi";
+import {
+  CLOUD_CUSTOMER_ONBOARDING_PATH,
+  handleCloudCustomerOnboardingRequest,
+} from "./tenantOnboardingHttpApi";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
@@ -83,6 +87,21 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         } catch {
           return Response.json(
             { error: "Customer settings request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (url.pathname === CLOUD_CUSTOMER_ONBOARDING_PATH) {
+        try {
+          const response = await handleCloudCustomerOnboardingRequest(request, {
+            db: options.env?.DB,
+            now,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Customer onboarding status is unavailable" },
             { status: 503, headers: { "Cache-Control": "no-store" } }
           );
         }

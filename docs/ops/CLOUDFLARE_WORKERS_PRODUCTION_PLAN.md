@@ -353,6 +353,14 @@ tenant-scoped audit record. This configures feature availability only; it does
 not provision provider credentials, MCP servers, Front Desk branding, or a
 browser-based customer setup flow.
 
+Owner/admin customer API keys can read `/__cloud/v1/customer/onboarding` for
+seven tenant-derived boolean flags: active owner, OIDC configured/enabled,
+active provider connection, enabled cloud inference entitlement, and Local AI
+and MCP opt-ins. The response contains no issuer URLs, provider names, or
+credential values, rejects tenant selectors, and uses pre-auth edge-IP plus
+tenant rate limits. This is a readiness view; it does not complete owner
+identity verification or self-service provider/MCP provisioning.
+
 After the repository is cloud-ready:
 
 1. Push the verified branch to GitHub.
