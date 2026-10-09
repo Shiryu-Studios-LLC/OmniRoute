@@ -141,6 +141,7 @@ export async function listCloudMaintenanceRuns(
     )
     .bind(limit)
     .all();
+  if (!result.success) throw new Error("D1 maintenance telemetry read failed");
   return result.results.map((row) => ({
     id: row.id,
     taskKey: row.task_key,

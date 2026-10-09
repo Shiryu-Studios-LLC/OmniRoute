@@ -24,6 +24,7 @@ import {
 import { CLOUD_CUSTOMER_MCP_SERVERS_PATH, handleCloudTenantMcpRequest } from "./tenantMcpHttpApi";
 import type { CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
+import { CLOUD_TENANT_HOSTS_PATH, handleCloudTenantHostsRequest } from "./tenantHostsHttpApi";
 import {
   CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH,
   CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH,
@@ -128,6 +129,25 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       if (url.pathname === CLOUD_CUSTOMER_PORTAL_PATH) {
         const response = handleCloudCustomerPortalRequest(request);
         if (response) return response;
+      }
+
+      if (
+        url.pathname === CLOUD_TENANT_HOSTS_PATH ||
+        url.pathname.startsWith(`${CLOUD_TENANT_HOSTS_PATH}/`)
+      ) {
+        try {
+          const response = await handleCloudTenantHostsRequest(request, {
+            db: options.env?.DB,
+            adminToken: options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+            now,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Tenant host request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
       }
 
       if (url.pathname === CLOUD_CUSTOMER_SETTINGS_PATH) {

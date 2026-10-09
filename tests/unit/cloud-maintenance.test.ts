@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
 import { runCloudMaintenanceTasks } from "../../src/cloud/maintenance";
-import { cleanupExpiredCloudMaintenanceRuns } from "../../src/cloud/maintenanceRunLedger";
+import {
+  cleanupExpiredCloudMaintenanceRuns,
+  listCloudMaintenanceRuns,
+} from "../../src/cloud/maintenanceRunLedger";
 
 interface StoredRun {
   task: string;
@@ -16,6 +19,7 @@ class MaintenanceDb implements CloudDb {
   readonly runs: StoredRun[] = [];
   failWrites = false;
   failRetention = false;
+  failReads = false;
 
   prepare<T = unknown>(sql: string): CloudDbStatement<T> {
     let values: unknown[] = [];
@@ -28,6 +32,9 @@ class MaintenanceDb implements CloudDb {
         return null as U | null;
       },
       async all<U = T>() {
+        if (thisDb.failReads) {
+          return { results: [] as U[], success: false };
+        }
         return { results: [] as U[], success: true };
       },
       async run() {
@@ -325,4 +332,13 @@ test("maintenance retention failure is logged without hiding task failures", asy
     { message: "Cloud maintenance telemetry retention failed", task: "expired-maintenance-runs" },
   ]);
   assert.equal(JSON.stringify(logs).includes("sensitive"), false);
+});
+
+test("maintenance history read fails closed when D1 reports an unsuccessful query", async () => {
+  const db = new MaintenanceDb();
+  db.failReads = true;
+
+  await assert.rejects(listCloudMaintenanceRuns(db, 10), {
+    message: "D1 maintenance telemetry read failed",
+  });
 });

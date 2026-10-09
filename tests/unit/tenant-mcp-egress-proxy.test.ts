@@ -273,6 +273,34 @@ test("times out even when an injected transport does not observe abort", async (
   assert.deepEqual(await response.json(), { error: "upstream_timeout" });
 });
 
+test("cancels an upstream response stream when the proxy timeout expires", async () => {
+  let streamCancelled = false;
+  const handler = createMcpEgressProxyHandler({
+    proxyToken: TOKEN,
+    timeoutMs: 10,
+    transport: {
+      async fetch() {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull() {
+              return new Promise<void>(() => undefined);
+            },
+            cancel() {
+              streamCancelled = true;
+            },
+          })
+        );
+      },
+    },
+  });
+  const response = await handler(
+    request({ tenantId: "tenant_test", serverId: "server_test", url: VALID_URL, body: "" })
+  );
+  assert.equal(response.status, 504);
+  assert.deepEqual(await response.json(), { error: "upstream_timeout" });
+  assert.equal(streamCancelled, true);
+});
+
 test("Node pinned transport rejects non-HTTPS and private literal destinations", async () => {
   let resolverCalls = 0;
   const transport = createNodePinnedMcpTransport({

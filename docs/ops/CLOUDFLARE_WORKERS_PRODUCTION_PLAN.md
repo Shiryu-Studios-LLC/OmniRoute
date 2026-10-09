@@ -357,10 +357,10 @@ or resolve the Node/SQLite middleware graph documented in the compatibility
 audit.
 
 The latest Worker-only Wrangler dry run (2026-10-09, after the gateway
-pre-auth rate-limit update) bundles 95 inputs (591,198 bytes; 108,816 bytes
-gzip; SHA-256
-`3a38640fd2bfaa9928ee27198c475e78704bf6b2469fd54d969d5d608524f64d`) and
-succeeds. The AST boundary check reports 41 reachable source files and 665,867
+pre-auth rate-limit and tenant host-registry updates) bundles 97 inputs
+(603,887 bytes; 111,498 bytes gzip; SHA-256
+`bcbec2a7bdd39d847b57b629f678a41e49bcf8aef361c260375c9304d96d5240`) and
+succeeds. The AST boundary check reports 43 reachable source files and 681,264
 source bytes. It is a dry run; no deployment occurred. The full
 `npm run cloudflare:open-next:build` run took 12m37: Next compiled and generated
 594 static pages, then OpenNext failed middleware bundling with 103 resolution

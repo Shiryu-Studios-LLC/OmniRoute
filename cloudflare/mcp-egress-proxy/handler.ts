@@ -154,14 +154,23 @@ async function readBoundedRequest(request: Request): Promise<string> {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
-async function readBoundedResponse(response: Response): Promise<string> {
+async function readBoundedResponse(response: Response, signal: AbortSignal): Promise<string> {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  const cancelOnAbort = () => {
+    void reader.cancel(signal.reason).catch(() => undefined);
+  };
+  if (signal.aborted) {
+    cancelOnAbort();
+    throw signal.reason ?? new Error("proxy upstream timeout");
+  }
+  signal.addEventListener("abort", cancelOnAbort, { once: true });
   try {
     while (true) {
       const { done, value } = await reader.read();
+      if (signal.aborted) throw signal.reason ?? new Error("proxy upstream timeout");
       if (done) break;
       total += value.byteLength;
       if (total > MAX_PROXY_PAYLOAD_BYTES) {
@@ -171,6 +180,7 @@ async function readBoundedResponse(response: Response): Promise<string> {
       chunks.push(value);
     }
   } finally {
+    signal.removeEventListener("abort", cancelOnAbort);
     reader.releaseLock();
   }
   const bytes = new Uint8Array(total);
@@ -316,7 +326,7 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
             },
             { tenantId: payload.tenantId, serverId: payload.serverId }
           );
-          const body = await readBoundedResponse(upstream);
+          const body = await readBoundedResponse(upstream, abort.signal);
           const headers: { contentType?: string; mcpSessionId?: string } = {};
           const contentType = upstream.headers.get("content-type");
           const mcpSessionId = upstream.headers.get("mcp-session-id");
