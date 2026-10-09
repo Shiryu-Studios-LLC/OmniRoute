@@ -14,6 +14,7 @@ const MAX_CANONICAL_REQUEST_BYTES = 1024 * 1024;
 const MAX_CLEANUP_BATCH_SIZE = 1000;
 const HKDF_SALT = new TextEncoder().encode("omniroute-cloud-inference-idempotency-v1");
 const REQUEST_HASH_PURPOSE = "cloud-inference-request-fingerprint-v1";
+const CLEANUP_RESULT_ERROR = "Cloud inference idempotency cleanup failed";
 
 export interface CloudInferenceIdempotencyScope {
   tenantId: string;
@@ -482,7 +483,17 @@ export async function cleanupExpiredCloudInferenceResponses(
     )
     .bind(nowMs, batchSize)
     .run();
-  const deletedCount = Number(tombstones.meta?.changes ?? 0);
+  const tombstoneChanges = tombstones.meta?.changes;
+  if (
+    !tombstones.success ||
+    typeof tombstoneChanges !== "number" ||
+    !Number.isSafeInteger(tombstoneChanges) ||
+    tombstoneChanges < 0 ||
+    tombstoneChanges > batchSize
+  ) {
+    throw new Error(CLEANUP_RESULT_ERROR);
+  }
+  const deletedCount = tombstoneChanges;
   const remainingBatchSize = batchSize - deletedCount;
   if (remainingBatchSize === 0) return deletedCount;
 
@@ -503,5 +514,15 @@ export async function cleanupExpiredCloudInferenceResponses(
     )
     .bind(nowMs, nowMs, nowMs, remainingBatchSize)
     .run();
-  return deletedCount + Number(responses.meta?.changes ?? 0);
+  const responseChanges = responses.meta?.changes;
+  if (
+    !responses.success ||
+    typeof responseChanges !== "number" ||
+    !Number.isSafeInteger(responseChanges) ||
+    responseChanges < 0 ||
+    responseChanges > remainingBatchSize
+  ) {
+    throw new Error(CLEANUP_RESULT_ERROR);
+  }
+  return deletedCount + responseChanges;
 }

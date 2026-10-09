@@ -100,6 +100,41 @@ async function claimCloudInferenceIdempotency(
   return claimWithSecret(db, { ...input, requestHashSecret: REQUEST_HASH_SECRET });
 }
 
+function failCleanupRun(
+  db: CloudDb,
+  sqlPrefix: string,
+  onPrepare?: (sql: string) => void
+): CloudDb {
+  return {
+    prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+      onPrepare?.(sql);
+      const statement = db.prepare<T>(sql);
+      if (!sql.trimStart().startsWith(sqlPrefix)) return statement;
+      return {
+        bind(...values: unknown[]) {
+          statement.bind(...values);
+          return this as unknown as CloudDbStatement<T>;
+        },
+        first<U = T>(column?: string) {
+          return statement.first<U>(column);
+        },
+        all<U = T>() {
+          return statement.all<U>();
+        },
+        async run() {
+          return { success: false, meta: { changes: 0 } };
+        },
+      };
+    },
+    batch(statements) {
+      return db.batch(statements);
+    },
+    exec(sql) {
+      return db.exec(sql);
+    },
+  };
+}
+
 async function makeDb(options: { withCapacityMigration?: boolean } = {}): Promise<SqliteCloudDb> {
   const db = new SqliteCloudDb();
   const migrations = ["0001_cloud_runtime.sql", "0011_cloud_inference_idempotency.sql"];
@@ -558,6 +593,48 @@ test("30-day tombstone cleanup is bounded and frees the global cap counter", asy
     ).kind,
     "claimed",
     "capacity released by cleanup can be used for a new tombstone"
+  );
+});
+
+test("expired inference cleanup rejects failed D1 operations without continuing", async () => {
+  const db = await makeDb();
+  let responseUpdatePrepared = false;
+  const failingDb = failCleanupRun(db, "DELETE FROM cloud_inference_idempotency", (sql) => {
+    if (sql.trimStart().startsWith("UPDATE cloud_inference_idempotency")) {
+      responseUpdatePrepared = true;
+    }
+  });
+
+  await assert.rejects(cleanupExpiredCloudInferenceResponses(failingDb, { nowMs: NOW_MS + 1 }), {
+    message: "Cloud inference idempotency cleanup failed",
+  });
+  assert.equal(responseUpdatePrepared, false, "a failed tombstone delete must stop the cleanup");
+});
+
+test("expired inference cleanup reports a failed response update", async () => {
+  const db = await makeDb();
+  const claim = await claimCloudInferenceIdempotency(db, {
+    key: KEY,
+    scope: SCOPE,
+    request: REQUEST,
+    nowMs: NOW_MS,
+  });
+  assert.equal(claim.kind, "claimed");
+  if (claim.kind !== "claimed") assert.fail("expected an idempotency claim");
+  await completeCloudInferenceIdempotency(
+    db,
+    claim.claim,
+    { status: 200, body: '{"id":"expired-response"}' },
+    NOW_MS
+  );
+  const failingDb = failCleanupRun(db, "UPDATE cloud_inference_idempotency");
+
+  await assert.rejects(
+    cleanupExpiredCloudInferenceResponses(failingDb, {
+      nowMs: NOW_MS + CLOUD_INFERENCE_IDEMPOTENCY_RESPONSE_TTL_MS + 1,
+      batchSize: 1,
+    }),
+    { message: "Cloud inference idempotency cleanup failed" }
   );
 });
 
