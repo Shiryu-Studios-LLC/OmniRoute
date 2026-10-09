@@ -93,4 +93,7 @@ sessions are stored by `0016_cloud_tenant_oidc_sessions.sql`; digest-only member
 and their OIDC callback binding are stored by `0018_cloud_tenant_membership_invitations.sql`.
 OIDC client secrets and PKCE verifiers are encrypted using the Worker credential encryption
 key. Customer OIDC issuer configuration remains platform-admin managed; tenant owners/admins
-can invite members but cannot change the issuer or auto-link identities by email/domain.
+can invite members but cannot change the issuer or auto-link identities by email/domain. BYO
+OIDC per tenant is the selected long-term direction. Customer-managed issuer changes should wait
+for controlled outbound resolution and a verified first-owner recovery flow; keep the current
+platform-admin configuration path available for break-glass recovery.
