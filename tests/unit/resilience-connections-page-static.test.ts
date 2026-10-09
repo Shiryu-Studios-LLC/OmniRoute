@@ -104,7 +104,7 @@ test("BreakerTimeline does NOT fetch independently (single-provider invariant)",
 });
 
 test("/dashboard/resilience/connections in LOCAL_ONLY_API_PREFIXES", () => {
-  const src = read("src/server/authz/routeGuard.ts");
+  const src = read("src/shared/authz/localOnlyRoutes.ts");
   assert.match(
     src,
     /"\/dashboard\/resilience\/connections"/,
@@ -113,7 +113,7 @@ test("/dashboard/resilience/connections in LOCAL_ONLY_API_PREFIXES", () => {
 });
 
 test("/api/resilience/connections in LOCAL_ONLY_API_PREFIXES", () => {
-  const src = read("src/server/authz/routeGuard.ts");
+  const src = read("src/shared/authz/localOnlyRoutes.ts");
   assert.match(src, /"\/api\/resilience\/connections"/, "api path missing from LOCAL_ONLY");
 });
 
