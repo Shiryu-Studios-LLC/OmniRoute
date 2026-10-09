@@ -35,6 +35,7 @@ import {
   CLOUD_TENANT_MCP_SERVERS_PATH,
   CLOUD_TENANT_ONBOARDING_PATH,
   CLOUD_TENANT_MCP_SETTINGS_PATH,
+  CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
@@ -258,13 +259,21 @@ function getCookieValue(response: Response, name: string): string {
   return cookie.split(";", 1)[0]!.slice(name.length + 1);
 }
 
-function runtime(db: CloudDb, fetcher: typeof fetch = fetch) {
+function runtime(
+  db: CloudDb,
+  fetcher: typeof fetch = fetch,
+  sessions?: {
+    idFromName(name: string): unknown;
+    get(id: unknown): { revokeSession(deviceId: string, timestamp: string): Promise<unknown> };
+  }
+) {
   return createCloudRuntime({
     env: {
       DB: db,
       OMNIROUTE_ENV: "production",
       OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ORIGIN,
       OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ENCRYPTION_KEY,
+      ...(sessions ? { GATEWAY_SESSIONS: sessions as never } : {}),
     },
     now: () => new Date(NOW),
     fetcher,
@@ -855,6 +864,92 @@ test("onboarding readiness portal returns only nine tenant-scoped booleans to ow
     new Request(`${ORIGIN}/__cloud/v1/customer/onboarding`)
   );
   assert.equal(publicWithoutKey.status, 401);
+});
+
+test("Local AI portal opt-in is owner/admin scoped and invalidates tenant device sessions", async () => {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  await db
+    .prepare(
+      `INSERT INTO cloud_gateway_devices
+        (id, tenant_id, credential_hash, capabilities_json, status, created_at)
+       VALUES (?, ?, ?, '[]', 'online', ?)`
+    )
+    .bind("device-local-ai", tenant.id, "a".repeat(64), new Date(NOW).toISOString())
+    .run();
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const revoked: Array<{ deviceId: string; timestamp: string }> = [];
+  const sessions = {
+    idFromName: (name: string) => name,
+    get: () => ({
+      revokeSession: async (deviceId: string, timestamp: string) => {
+        revoked.push({ deviceId, timestamp });
+      },
+    }),
+  };
+  const app = runtime(db, fetch, sessions);
+  const path = `${ORIGIN}${CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH}`;
+  const update = (localAiEnabled: boolean) =>
+    app.fetch(
+      new Request(path, {
+        method: "PUT",
+        headers: {
+          Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+          Origin: ORIGIN,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ localAiEnabled }),
+      })
+    );
+
+  const enabled = await update(true);
+  assert.equal(enabled.status, 200, await enabled.clone().text());
+  assert.deepEqual(await enabled.json(), { localAiEnabled: true });
+  assert.deepEqual(
+    revoked.map(({ deviceId }) => deviceId),
+    ["device-local-ai"]
+  );
+
+  const unchanged = await update(true);
+  assert.equal(unchanged.status, 200, await unchanged.clone().text());
+  assert.deepEqual(await unchanged.json(), { localAiEnabled: true });
+  assert.equal(revoked.length, 1, "saving an unchanged enabled state must not revoke sessions");
+
+  const disabled = await update(false);
+  assert.equal(disabled.status, 200, await disabled.clone().text());
+  assert.deepEqual(await disabled.json(), { localAiEnabled: false });
+  assert.deepEqual(
+    revoked.map(({ deviceId }) => deviceId),
+    ["device-local-ai", "device-local-ai"]
+  );
+
+  const settings = await db
+    .prepare<{ local_ai_enabled: number; mcp_enabled: number }>(
+      "SELECT local_ai_enabled, mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+  assert.equal(settings?.local_ai_enabled, 0);
+  assert.equal(settings?.mcp_enabled, 0);
+  const audit = await db
+    .prepare<{ action: string; metadata_json: string }>(
+      `SELECT action, metadata_json FROM cloud_compliance_audit
+        WHERE tenant_id = ? AND action = 'customer.settings.local_ai_portal.update'
+        ORDER BY timestamp, rowid`
+    )
+    .bind(tenant.id)
+    .all();
+  assert.deepEqual(
+    audit.results.map(({ action, metadata_json }) => [action, JSON.parse(metadata_json)]),
+    [
+      ["customer.settings.local_ai_portal.update", { localAiEnabled: true }],
+      ["customer.settings.local_ai_portal.update", { localAiEnabled: true }],
+      ["customer.settings.local_ai_portal.update", { localAiEnabled: false }],
+    ]
+  );
 });
 
 test("MCP portal opt-in is owner/admin scoped, MCP-only, audited, and does not enable invocation", async () => {

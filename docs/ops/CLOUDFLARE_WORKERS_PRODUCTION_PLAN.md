@@ -355,8 +355,9 @@ plane boundary; it does not provide the missing OpenNext application fallback
 or resolve the Node/SQLite middleware graph documented in the compatibility
 audit.
 
-The latest Worker-only Wrangler dry run bundles 95 inputs (538,263 bytes;
-100,569 bytes gzip) and succeeds. The full
+The latest Worker-only Wrangler dry run bundles 95 inputs (581,962 bytes;
+107,161 bytes gzip; SHA-256 `ce38ddb781cf58102d2b0149dd1e1fb5b0456202782efb0cf94c63aba854ca40`)
+and succeeds. It is a dry run; no deployment occurred. The full
 `npm run cloudflare:open-next:build` run took 12m37: Next compiled and generated
 594 static pages, then OpenNext failed middleware bundling with 103 resolution
 errors, including `bun:sqlite`, native `keytar`/`koffi` modules, Playwright's
@@ -456,13 +457,14 @@ tenant-scoped audit record. This configures feature availability only; it does
 not provision provider credentials, MCP servers, Front Desk branding, or a
 browser-based customer setup flow.
 
-The OIDC customer portal also provides an owner/admin-only MCP opt-in control.
-Its write accepts only the `mcpEnabled` boolean, binds the active session hash
-and current membership role in the D1 update, and audits the setting atomically.
-It leaves `localAiEnabled` unchanged and does not call the Local Agent session
-invalidation path. The public settings endpoint remains bearer API-key-only.
-Enabling MCP permits saved server configuration; discovery and invocation
-remain separately disabled until controlled egress is verified.
+The OIDC customer portal provides owner/admin-only opt-in controls for both
+Local AI and MCP. Each accepts only its own boolean, binds the active session
+hash and current membership role in the D1 update, and audits the setting
+atomically. Changing Local AI revokes existing Durable Object device sessions;
+devices must reconnect before using the feature. The public settings endpoint
+remains bearer API-key-only. Enabling MCP permits saved server configuration;
+discovery and invocation remain separately disabled until controlled egress is
+verified.
 
 Owner/admin customer API keys can read `/__cloud/v1/customer/onboarding` for
 nine tenant-derived boolean flags: active owner, OIDC configured/enabled,

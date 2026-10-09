@@ -11,6 +11,10 @@ import {
   type CloudCustomerRole,
 } from "./customerIdentity";
 import { CLOUD_PLATFORM_TENANT_ID, getCloudTenantById, getCloudTenantBySlug } from "./tenants";
+import type {
+  GatewayCoordinatorStub,
+  GatewayDurableObjectNamespace,
+} from "./connectorGatewayDurableObject";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import { getActiveCloudTenantOidcIdentity, getCloudTenantOidcCredentials } from "./tenantOidc";
 import {
@@ -33,8 +37,11 @@ import {
 } from "./customerProviderHttpApi";
 import { handleCloudTenantMcpPortalRequest } from "./tenantMcpHttpApi";
 import { getCloudCustomerOnboardingReadiness } from "./tenantOnboardingHttpApi";
-import { readCloudCustomerSettingsBody } from "./tenantSettingsHttpApi";
-import { updateCloudTenantSettings } from "./tenantSettings";
+import {
+  invalidateCloudTenantDeviceSessions,
+  readCloudCustomerSettingsBody,
+} from "./tenantSettingsHttpApi";
+import { getCloudTenantSettings, updateCloudTenantSettings } from "./tenantSettings";
 import {
   acceptCloudTenantOidcOwnerClaim,
   getPendingCloudTenantOidcOwnerClaim,
@@ -58,6 +65,7 @@ export const CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH =
 export const CLOUD_TENANT_MCP_SERVERS_PATH = "/__cloud/auth/mcp-servers";
 export const CLOUD_TENANT_ONBOARDING_PATH = "/__cloud/auth/onboarding";
 export const CLOUD_TENANT_MCP_SETTINGS_PATH = "/__cloud/auth/mcp-settings";
+export const CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH = "/__cloud/auth/local-ai-settings";
 export const CLOUD_TENANT_OIDC_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 export const CLOUD_TENANT_OIDC_SESSION_COOKIE = "omni_customer_session";
@@ -107,6 +115,7 @@ interface ResolvedOidcSessionRow extends OidcSessionRow {
 
 export interface CloudTenantOidcAuthOptions {
   db?: CloudDb;
+  sessions?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
   /** Exact origin, for example https://cloud.example.com, with no path or slash. */
   publicOrigin?: string;
   environment?: string;
@@ -1122,6 +1131,97 @@ async function customerMcpSettingsPortal(
   }
 }
 
+async function customerLocalAiSettingsPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
+  if (new URL(request.url).search !== "") {
+    return json({ error: "Query parameters are not supported" }, 400);
+  }
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!options.db) return json({ error: "Local AI settings are unavailable" }, 503);
+  const session = await requireMembershipManager(request, options, nowMs);
+  if (!session) return json({ error: "Owner or admin session required" }, 403);
+  const limit = await consumeCloudRateLimit(options.db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-local-ai-settings-portal:${session.tenant_id}:${session.membership_id}`,
+    limit: 30,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!limit.allowed) return json({ error: "Local AI settings rate limit exceeded" }, 429);
+  if (
+    request.headers.get("content-type")?.toLowerCase().split(";", 1)[0]?.trim() !==
+    "application/json"
+  ) {
+    return json({ error: "JSON body required" }, 415);
+  }
+  const body = await readCloudCustomerSettingsBody(request, 5_000);
+  if (body instanceof Response) return body;
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    Array.isArray(body) ||
+    Object.keys(body).length !== 1 ||
+    typeof (body as Record<string, unknown>).localAiEnabled !== "boolean"
+  ) {
+    return json({ error: "Expected only a localAiEnabled boolean" }, 400);
+  }
+  const localAiEnabled = (body as { localAiEnabled: boolean }).localAiEnabled;
+  const timestamp = new Date(nowMs).toISOString();
+  try {
+    const currentSettings = await getCloudTenantSettings(options.db, session.tenant_id);
+    if (!currentSettings) return json({ error: "Local AI settings are unavailable" }, 503);
+    if (localAiEnabled && !currentSettings.localAiEnabled) {
+      await invalidateCloudTenantDeviceSessions(
+        options.db,
+        options.sessions,
+        session.tenant_id,
+        timestamp
+      );
+    }
+    const settings = await updateCloudTenantSettings(options.db, {
+      tenantId: session.tenant_id,
+      membershipId: session.membership_id,
+      authorization: {
+        type: "oidc_session",
+        sessionTokenHash: session.session_token_hash,
+      },
+      localAiEnabled,
+      updatedAt: timestamp,
+      audit: {
+        id: crypto.randomUUID(),
+        tenantId: session.tenant_id,
+        timestamp,
+        action: "customer.settings.local_ai_portal.update",
+        actor: `membership:${session.membership_id}`,
+        target: "tenant-local-ai-opt-in",
+        resourceType: "customer-setting",
+        status: "success",
+        requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+        metadata: { localAiEnabled },
+      },
+    });
+    if (!settings) return json({ error: "Owner or admin session required" }, 403);
+    if (!localAiEnabled && currentSettings.localAiEnabled) {
+      await invalidateCloudTenantDeviceSessions(
+        options.db,
+        options.sessions,
+        session.tenant_id,
+        timestamp
+      );
+    }
+    return json({ localAiEnabled: settings.localAiEnabled });
+  } catch {
+    return json({ error: "Local AI settings could not be updated" }, 503);
+  }
+}
+
 async function listMemberships(
   request: Request,
   options: CloudTenantOidcAuthOptions,
@@ -1614,6 +1714,7 @@ export async function handleCloudTenantOidcAuthRequest(
     pathname.startsWith(`${CLOUD_TENANT_MCP_SERVERS_PATH}/`);
   const isOnboarding = pathname === CLOUD_TENANT_ONBOARDING_PATH;
   const isMcpSettings = pathname === CLOUD_TENANT_MCP_SETTINGS_PATH;
+  const isLocalAiSettings = pathname === CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH;
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1631,6 +1732,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isMcpServers &&
     !isOnboarding &&
     !isMcpSettings &&
+    !isLocalAiSettings &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -1659,7 +1761,9 @@ export async function handleCloudTenantOidcAuthRequest(
               ? ["GET"]
               : isMcpSettings
                 ? ["PUT"]
-                : [expectedMethod];
+                : isLocalAiSettings
+                  ? ["PUT"]
+                  : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -1678,6 +1782,7 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
   if (isOnboarding) return customerOnboardingReadinessPortal(request, options, nowMs);
   if (isMcpSettings) return customerMcpSettingsPortal(request, options, origin, nowMs);
+  if (isLocalAiSettings) return customerLocalAiSettingsPortal(request, options, origin, nowMs);
   if (isLogin) {
     return startLogin(request, options, origin, nowMs);
   }

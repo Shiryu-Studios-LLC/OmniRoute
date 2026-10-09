@@ -354,6 +354,27 @@ const PORTAL_SCRIPT = `
     return data;
   };
 
+  byId("local-ai-opt-in-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = byId("save-local-ai-opt-in");
+    button.disabled = true;
+    const localAiEnabled = byId("local-ai-opt-in-enabled").checked;
+    try {
+      const result = await api("/__cloud/auth/local-ai-settings", {
+        method: "PUT", body: JSON.stringify({ localAiEnabled }),
+      });
+      if (result.localAiEnabled !== localAiEnabled) {
+        throw new Error("Local AI setting could not be confirmed");
+      }
+      setStatus(localAiEnabled
+        ? "Local AI enabled. Existing device sessions were revoked; reconnect devices to use Local AI."
+        : "Local AI disabled. Existing device sessions were revoked.");
+      await loadOnboardingReadiness();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Local AI setting could not be saved.", true);
+    } finally { button.disabled = false; }
+  });
+
   byId("mcp-opt-in-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = byId("save-mcp-opt-in");
@@ -617,6 +638,7 @@ const PORTAL_SCRIPT = `
         byId("manager-panel").hidden = false;
         byId("business-profile-panel").hidden = false;
         byId("provider-connection-panel").hidden = false;
+        byId("local-ai-settings-panel").hidden = false;
         byId("mcp-settings-panel").hidden = false;
         byId("onboarding-readiness-panel").hidden = false;
         try {
@@ -631,6 +653,7 @@ const PORTAL_SCRIPT = `
         }
         try {
           const readiness = await loadOnboardingReadiness();
+          byId("local-ai-opt-in-enabled").checked = readiness.localAiEnabled;
           byId("mcp-opt-in-enabled").checked = readiness.mcpEnabled;
           byId("mcp-server-panel").hidden = !readiness.mcpEnabled;
           if (readiness.mcpEnabled) await loadMcpServers();
@@ -780,6 +803,15 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <label for="provider-api-key">OpenAI API key</label>
           <input id="provider-api-key" type="password" autocomplete="new-password" maxlength="8192" required>
           <button id="create-provider-connection" type="submit">Add OpenAI connection</button>
+        </form>
+      </section>
+      <section id="local-ai-settings-panel" hidden>
+        <h2>Local AI</h2>
+        <p>Allow this tenant to connect registered Local Agent devices. Local services stay on customer hardware and are reached through the authenticated outbound gateway.</p>
+        <form id="local-ai-opt-in-form">
+          <label for="local-ai-opt-in-enabled">Allow Local AI connections</label>
+          <input id="local-ai-opt-in-enabled" type="checkbox">
+          <button id="save-local-ai-opt-in" type="submit">Save Local AI setting</button>
         </form>
       </section>
       <section id="mcp-settings-panel" hidden>

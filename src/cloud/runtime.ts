@@ -30,6 +30,7 @@ import {
   CLOUD_TENANT_MCP_SERVERS_PATH,
   CLOUD_TENANT_ONBOARDING_PATH,
   CLOUD_TENANT_MCP_SETTINGS_PATH,
+  CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH,
   CLOUD_TENANT_BUSINESS_PROFILE_PATH,
   CLOUD_TENANT_PROVIDER_CONNECTIONS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
@@ -211,6 +212,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         url.pathname.startsWith(`${CLOUD_TENANT_MCP_SERVERS_PATH}/`) ||
         url.pathname === CLOUD_TENANT_ONBOARDING_PATH ||
         url.pathname === CLOUD_TENANT_MCP_SETTINGS_PATH ||
+        url.pathname === CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH ||
         url.pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH ||
         url.pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH
@@ -218,6 +220,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         try {
           const response = await handleCloudTenantOidcAuthRequest(request, {
             db: options.env?.DB,
+            sessions: options.env?.GATEWAY_SESSIONS,
             publicOrigin: options.env?.OMNIROUTE_CLOUD_PUBLIC_ORIGIN,
             environment: options.env?.OMNIROUTE_ENV,
             credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,

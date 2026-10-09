@@ -93,7 +93,7 @@ export async function readCloudCustomerSettingsBody(
   }
 }
 
-async function invalidateTenantDeviceSessions(
+export async function invalidateCloudTenantDeviceSessions(
   db: CloudDb,
   sessions: GatewayDurableObjectNamespace<GatewayCoordinatorStub> | undefined,
   tenantId: string,
@@ -188,7 +188,7 @@ export async function handleCloudCustomerSettingsRequest(
     if (!currentSettings) return json({ error: "Customer settings are unavailable" }, 503);
     const timestamp = now().toISOString();
     if (body.localAiEnabled && !currentSettings.localAiEnabled) {
-      await invalidateTenantDeviceSessions(
+      await invalidateCloudTenantDeviceSessions(
         options.db,
         options.sessions,
         identity.tenantId,
@@ -219,7 +219,7 @@ export async function handleCloudCustomerSettingsRequest(
       },
     });
     if (!body.localAiEnabled) {
-      await invalidateTenantDeviceSessions(
+      await invalidateCloudTenantDeviceSessions(
         options.db,
         options.sessions,
         identity.tenantId,

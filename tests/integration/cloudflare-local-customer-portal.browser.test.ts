@@ -335,6 +335,7 @@ test(
     await page.getByText(/Inference access is default-deny/).waitFor();
     await page.getByText(/Only a platform admin can configure entitlements/).waitFor();
     assert.equal(await page.locator("#onboarding-readiness li").count(), 9);
+    assert.equal(await page.locator("#local-ai-opt-in-enabled").isChecked(), false);
     assert.equal(await page.locator("#mcp-opt-in-enabled").isChecked(), false);
     assert.equal(await page.locator("#mcp-server-panel").isVisible(), false);
     const publicSettingsStatus = await page.evaluate(
@@ -346,6 +347,14 @@ test(
       (await page.locator("#onboarding-readiness").textContent())?.includes(tenantId),
       false
     );
+    await page.locator("#local-ai-opt-in-enabled").check();
+    await page.getByRole("button", { name: "Save Local AI setting" }).click();
+    await page
+      .getByText(
+        "Local AI enabled. Existing device sessions were revoked; reconnect devices to use Local AI."
+      )
+      .waitFor();
+    assert.equal(await page.locator("#local-ai-opt-in-enabled").isChecked(), true);
     await page.getByLabel("Business name").fill("Browser Configured Business");
     await page.getByLabel("Description").fill("Tenant-managed profile from the customer portal.");
     await page.getByLabel("Hours").fill("Weekdays 9 to 5");
@@ -436,7 +445,7 @@ test(
       `SELECT local_ai_enabled, mcp_enabled FROM cloud_tenant_settings WHERE tenant_id = ${sqlText(tenantId)};`,
     ]);
     assert.equal(mcpSettings.status, 0, `${mcpSettings.stdout}\n${mcpSettings.stderr}`);
-    assert.match(mcpSettings.stdout, /"local_ai_enabled":\s*0/);
+    assert.match(mcpSettings.stdout, /"local_ai_enabled":\s*1/);
     assert.match(mcpSettings.stdout, /"mcp_enabled":\s*1/);
 
     const mcpSecret = "mcp-test-browser-credential";

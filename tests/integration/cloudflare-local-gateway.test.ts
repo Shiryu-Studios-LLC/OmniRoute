@@ -19,6 +19,7 @@ import { runLocalAgentGatewayCycle } from "../../src/lib/localAgent/runner.js";
 const enabled = process.env.RUN_CLOUDFLARE_LOCAL_INT === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const adminToken = "local-integration-admin-token-only";
+const maintenanceToken = "local-integration-maintenance-token-only";
 const capability = "ollama:chat:integration-test";
 const localOllamaBaseUrl = "http://127.0.0.1:11434";
 
@@ -368,11 +369,13 @@ test(
 
     // Wrangler loads .env from its project root. Run it from this temporary root
     // and put only a throwaway control-plane token in the explicitly selected env.
-    await writeFile(path.join(tempDir, ".env"), `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}\n`, {
-      mode: 0o600,
-    });
-    await writeFile(path.join(tempDir, ".dev.vars"), "", { mode: 0o600 });
-    await writeFile(safeEnvPath, `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}\n`, { mode: 0o600 });
+    const localSecrets = [
+      `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}`,
+      `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}`,
+    ].join("\n");
+    await writeFile(path.join(tempDir, ".env"), `${localSecrets}\n`, { mode: 0o600 });
+    await writeFile(path.join(tempDir, ".dev.vars"), `${localSecrets}\n`, { mode: 0o600 });
+    await writeFile(safeEnvPath, `${localSecrets}\n`, { mode: 0o600 });
     await writeFile(
       wranglerConfigPath,
       JSON.stringify(
@@ -1265,6 +1268,137 @@ test(
     const resultB = await invokeAndComplete(customerB, "handled by customer B device");
     assert.notEqual(resultA.requestId, resultB.requestId);
 
+    await t.test(
+      "maintenance can suspend and restore one tenant with a sanitized audit trail",
+      async () => {
+        const lifecycleUrl = `${baseUrl}/__cloud/v1/tenants/${customerA.tenantId}/status`;
+        const suspended = await requestJson(lifecycleUrl, {
+          method: "POST",
+          token: maintenanceToken,
+          body: { status: "suspended" },
+        });
+        assert.equal(
+          suspended.response.status,
+          200,
+          `maintenance should suspend tenant A: ${JSON.stringify(suspended.body)}`
+        );
+        assert.equal(suspended.body.isActive, false);
+
+        assert.equal(
+          await deviceTransport.heartbeat(customerA.session!, [capability]),
+          false,
+          "suspending tenant A should invalidate its existing device session"
+        );
+        assert.equal(
+          (
+            await invoke(
+              customerA.customerKey,
+              customerA.deviceId,
+              `suspended-tenant-${randomUUID()}`
+            )
+          ).response.status,
+          401,
+          "tenant A's customer key must stop working while suspended"
+        );
+        await invokeAndComplete(customerB, "tenant B remains available during tenant A suspension");
+
+        const auditSql = `SELECT action, actor, target, resource_type, status, metadata_json, details_json
+        FROM cloud_compliance_audit
+        WHERE action = 'tenant.lifecycle.status' AND target = '${customerA.tenantId}'
+        ORDER BY timestamp DESC, id DESC LIMIT 2;`;
+        const auditResult = spawnSync(
+          process.execPath,
+          [
+            wranglerBin,
+            "d1",
+            "execute",
+            workerName,
+            "--local",
+            "--persist-to",
+            persistDir,
+            "--config",
+            wranglerConfigPath,
+            "--env-file",
+            safeEnvPath,
+            "--command",
+            auditSql,
+            "--json",
+          ],
+          {
+            cwd: tempDir,
+            env: {
+              PATH: process.env.PATH ?? "",
+              HOME: homeDir,
+              TMPDIR: tempDir,
+              NODE_ENV: "test",
+              NO_COLOR: "1",
+              CI: "1",
+            },
+            encoding: "utf8",
+            timeout: 30_000,
+            maxBuffer: 4 * 1024 * 1024,
+          }
+        );
+        assert.equal(
+          auditResult.status,
+          0,
+          `local D1 lifecycle audit query failed:\n${auditResult.stdout}\n${auditResult.stderr}`
+        );
+        const auditOutput: unknown = JSON.parse(auditResult.stdout);
+        assert.ok(Array.isArray(auditOutput), "Wrangler should return D1 query results as JSON");
+        const auditRecords = auditOutput.flatMap((entry: unknown) => {
+          if (entry === null || typeof entry !== "object") return [];
+          const results = (entry as { results?: unknown }).results;
+          return Array.isArray(results) ? results : [];
+        }) as Array<Record<string, unknown>>;
+        assert.equal(
+          auditRecords.length,
+          2,
+          "the lifecycle should record attempted and successful audit rows"
+        );
+        for (const record of auditRecords) {
+          assert.equal(record.action, "tenant.lifecycle.status");
+          assert.equal(record.actor, "cloud-maintenance");
+          assert.equal(record.target, customerA.tenantId);
+          assert.equal(record.resource_type, "tenant");
+          assert.equal(record.details_json, null);
+          assert.deepEqual(JSON.parse(String(record.metadata_json)), { status: "suspended" });
+        }
+        assert.deepEqual(
+          new Set(auditRecords.map((record) => record.status)),
+          new Set(["attempted", "success"])
+        );
+
+        const resumed = await requestJson(lifecycleUrl, {
+          method: "POST",
+          token: maintenanceToken,
+          body: { status: "active" },
+        });
+        assert.equal(
+          resumed.response.status,
+          200,
+          `maintenance should resume tenant A: ${JSON.stringify(resumed.body)}`
+        );
+        assert.equal(resumed.body.isActive, true);
+
+        const freshSession = await deviceTransport.connect(
+          customerA.deviceId,
+          customerA.credential
+        );
+        assert.ok(
+          freshSession,
+          "the still-registered device should reconnect after tenant recovery"
+        );
+        assert.equal(
+          await deviceTransport.heartbeat(freshSession, [capability]),
+          true,
+          "a fresh session should heartbeat after tenant recovery"
+        );
+        customerA.session = freshSession;
+        await invokeAndComplete(customerA, "tenant A works after maintenance recovery");
+      }
+    );
+
     assert.equal(
       (await invoke(customerA.customerKey, customerB.deviceId, `cross-tenant-${randomUUID()}`))
         .response.status,
@@ -1317,6 +1451,9 @@ test(
     // The local worker config and environment were generated under tempDir, not
     // the repository; assert this invariant to guard against future test changes.
     const localEnv = await readFile(path.join(tempDir, ".env"), "utf8");
-    assert.equal(localEnv, `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}\n`);
+    assert.equal(
+      localEnv,
+      `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}\nOMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}\n`
+    );
   }
 );
