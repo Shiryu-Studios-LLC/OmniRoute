@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { classifyHostLocality } from "./routeGuard";
+import { classifyHostLocality } from "@/shared/authz/peerLocality";
 
 /**
  * Resolve the real peer IP from the trusted `<token>|<ip>` stamp that the custom

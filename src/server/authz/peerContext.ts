@@ -4,7 +4,7 @@ import { getLegacyCliTokenSync, getMachineTokenSync } from "../../lib/machineTok
 import type { PolicyContext } from "./context";
 import { CLI_TOKEN_HEADER, PEER_IP_HEADER, VIA_PROXY_HEADER } from "./headers";
 import { resolveStampedPeer, resolveStampedViaProxy } from "./peerStamp";
-import { isLoopbackHost, isPrivateLanHost } from "./routeGuard";
+import { isLoopbackHost, isPrivateLanHost } from "@/shared/authz/peerLocality";
 
 /**
  * Peer-locality + local-CLI-token helpers shared by the route policies.

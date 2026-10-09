@@ -23,6 +23,11 @@
 
 import { getAuthzBypassSnapshot } from "@/lib/config/runtimeSettings";
 import {
+  classifyHostLocality,
+  isLoopbackHost,
+  isPrivateLanHost,
+} from "@/shared/authz/peerLocality";
+import {
   LOCAL_ONLY_API_PREFIXES,
   LOCAL_ONLY_API_REGEXES,
   isLocalOnlyPath as isStaticLocalOnlyPath,
@@ -32,8 +37,7 @@ import {
   SPAWN_CAPABLE_PATTERNS,
 } from "@/shared/constants/spawnCapablePrefixes";
 
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
-
+export { classifyHostLocality, isLoopbackHost, isPrivateLanHost };
 export { LOCAL_ONLY_API_PREFIXES, LOCAL_ONLY_API_REGEXES };
 /** Legacy name retained for existing server consumers. */
 export const LOCAL_ONLY_API_PATTERNS = LOCAL_ONLY_API_REGEXES;
@@ -98,70 +102,6 @@ export const ALWAYS_PROTECTED_API_PATHS: ReadonlyArray<string> = [
   "/api/settings/export-json",
   "/api/settings/import-json",
 ];
-
-export function isLoopbackHost(hostHeader: string | null): boolean {
-  if (!hostHeader) return false;
-  let host = hostHeader.trim();
-  if (host.startsWith("[")) {
-    // IPv6 literal: [::1] or [::1]:port
-    const bracketEnd = host.indexOf("]");
-    host = bracketEnd >= 0 ? host.slice(1, bracketEnd) : host.slice(1);
-  } else if ((host.match(/:/g) || []).length === 1) {
-    // IPv4 / hostname with a single :port — strip it. A bare IPv6 address
-    // ("::1", "::ffff:127.0.0.1") has multiple colons and must stay intact
-    // (splitting on ":" would mangle it to "" and miss the loopback match).
-    host = host.split(":")[0];
-  }
-  host = host.replace(/^::ffff:/i, "");
-  return LOOPBACK_HOSTS.has(host.toLowerCase());
-}
-
-/**
- * Classify a resolved peer IP into the locality tiers the authz layer cares
- * about. `null`/unknown → "remote" (fail closed). Used by the pipeline to stamp
- * a trusted locality marker that route handlers read without re-deriving it
- * from the spoofable Host header.
- */
-export function classifyHostLocality(ip: string | null): "loopback" | "lan" | "remote" {
-  if (!ip) return "remote";
-  if (isLoopbackHost(ip)) return "loopback";
-  if (isPrivateLanHost(ip)) return "lan";
-  return "remote";
-}
-
-/**
- * Private-LAN ranges (RFC 1918 IPv4 + IPv6 ULA/link-local). Matched against the
- * real socket peer address (NOT the spoofable Host header), so a public-internet
- * client — which presents a public source IP — never matches.
- */
-const PRIVATE_LAN_PATTERNS: ReadonlyArray<RegExp> = [
-  /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,
-  /^100\.(6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/,
-  /^192\.168\.\d{1,3}\.\d{1,3}$/,
-  /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/,
-  /^f[cd][0-9a-f]{2}:/i, // IPv6 ULA fc00::/7
-  /^fe80:/i, // IPv6 link-local
-];
-
-/**
- * True when the peer address is a private-LAN address. Used to widen the
- * LOCAL_ONLY tier to a trusted private network (owner-authorized 2026-05-30 for
- * a LAN-deployed instance). Loopback-only surfaces that do NOT use this (e.g.
- * the CLI-token path) remain strictly loopback.
- */
-export function isPrivateLanHost(hostHeader: string | null): boolean {
-  if (!hostHeader) return false;
-  let host = hostHeader.trim();
-  if (host.startsWith("[")) {
-    const bracketEnd = host.indexOf("]");
-    host = bracketEnd >= 0 ? host.slice(1, bracketEnd) : host.slice(1);
-  }
-  host = host.replace(/^::ffff:/i, "");
-  // Strip :port only for IPv4 / hostname (a lone colon); leave IPv6 intact.
-  if ((host.match(/:/g) || []).length === 1) host = host.split(":")[0];
-  host = host.toLowerCase();
-  return PRIVATE_LAN_PATTERNS.some((re) => re.test(host));
-}
 
 /**
  * Paths that are LOCAL_ONLY for all write methods but may be accessed from
