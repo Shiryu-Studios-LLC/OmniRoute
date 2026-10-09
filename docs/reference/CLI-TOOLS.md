@@ -139,6 +139,10 @@ the credential in `~/Library/LaunchAgents/com.omniroute.local-agent.plist`, also
 with owner-only permissions. Re-running install updates and restarts the service.
 Remove the service and stored credential with
 `omniroute local-agent service uninstall`.
+Use `omniroute local-agent service start`, `stop`, and `status` to control or inspect the
+current user's managed service. On Linux, status reports systemd's active/inactive state; on
+macOS, it reports whether the LaunchAgent is loaded in the current user's GUI domain; Windows
+reports the Task Scheduler state.
 
 For local development, the gateway URL may use plain HTTP only when its host is
 `localhost`, `127.0.0.1`, or `[::1]`. Remote gateway URLs must use HTTPS.

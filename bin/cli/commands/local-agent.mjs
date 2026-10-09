@@ -16,8 +16,20 @@ import {
 import { randomBytes } from "node:crypto";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
-import { installLocalAgentSystemd, uninstallLocalAgentSystemd } from "../localAgentSystemd.mjs";
-import { installLocalAgentLaunchd, uninstallLocalAgentLaunchd } from "../localAgentLaunchd.mjs";
+import {
+  getLocalAgentSystemdStatus,
+  installLocalAgentSystemd,
+  startLocalAgentSystemd,
+  stopLocalAgentSystemd,
+  uninstallLocalAgentSystemd,
+} from "../localAgentSystemd.mjs";
+import {
+  getLocalAgentLaunchdStatus,
+  installLocalAgentLaunchd,
+  startLocalAgentLaunchd,
+  stopLocalAgentLaunchd,
+  uninstallLocalAgentLaunchd,
+} from "../localAgentLaunchd.mjs";
 import {
   getLocalAgentWindowsTaskStatus,
   installLocalAgentWindowsTask,
@@ -808,41 +820,53 @@ export function registerLocalAgent(
       }
     });
 
-  if (platform === "win32") {
-    for (const [name, operation] of [
-      ["start", "start"],
-      ["stop", "stop"],
-      ["status", "status"],
-    ]) {
+  const serviceControls =
+    platform === "win32"
+      ? {
+          start: () => startLocalAgentWindowsTask({ platform }),
+          stop: () => stopLocalAgentWindowsTask({ platform }),
+          status: () => getLocalAgentWindowsTaskStatus({ platform }),
+        }
+      : platform === "darwin"
+        ? {
+            start: () => startLocalAgentLaunchd(),
+            stop: () => stopLocalAgentLaunchd(),
+            status: () => getLocalAgentLaunchdStatus(),
+          }
+        : platform === "linux"
+          ? {
+              start: () => startLocalAgentSystemd(),
+              stop: () => stopLocalAgentSystemd(),
+              status: () => getLocalAgentSystemdStatus(),
+            }
+          : null;
+
+  if (serviceControls) {
+    for (const operation of ["start", "stop", "status"]) {
       service
-        .command(name)
+        .command(operation)
         .description(
-          `${name[0].toUpperCase()}${name.slice(1)} the Windows per-user Local Agent task`
+          `${operation[0].toUpperCase()}${operation.slice(1)} the per-user Local Agent service`
         )
         .action(() => {
           try {
-            const result =
-              operation === "start"
-                ? startLocalAgentWindowsTask({ platform })
-                : operation === "stop"
-                  ? stopLocalAgentWindowsTask({ platform })
-                  : getLocalAgentWindowsTaskStatus({ platform });
+            const result = serviceControls[operation]();
             if (operation === "status") {
               process.stdout.write(
                 result.installed
-                  ? `Local Agent task: ${result.state}\n`
-                  : "Local Agent task is not installed.\n"
+                  ? `Local Agent service: ${result.state}\n`
+                  : "Local Agent service is not installed.\n"
               );
             } else {
               process.stdout.write(
                 result
-                  ? `Local Agent task ${operation} requested.\n`
-                  : "Local Agent task is not installed.\n"
+                  ? `Local Agent service ${operation} requested.\n`
+                  : "Local Agent service is not installed.\n"
               );
             }
           } catch {
             process.stderr.write(
-              `Local Agent task ${operation} failed; existing configuration was preserved.\n`
+              `Local Agent service ${operation} failed; existing configuration was preserved.\n`
             );
             process.exitCode = 1;
           }

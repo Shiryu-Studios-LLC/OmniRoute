@@ -225,3 +225,61 @@ export function uninstallLocalAgentSystemd({
   }
   return true;
 }
+
+function managedSystemdFiles(home) {
+  const files = paths(home);
+  if (!existsSync(files.unitFile)) return null;
+  if (!readFileSync(files.unitFile, "utf8").startsWith(`${SERVICE_MARKER}\n`)) {
+    throw new Error("Refusing to control an unmanaged Local Agent systemd unit");
+  }
+  if (!existsSync(files.envFile)) {
+    throw new Error("Local Agent systemd credential file is missing");
+  }
+  if (!readFileSync(files.envFile, "utf8").startsWith(`${ENV_MARKER}\n`)) {
+    throw new Error("Refusing to control an unmanaged Local Agent environment file");
+  }
+  return files;
+}
+
+/** Start only the current user's managed Local Agent systemd unit. */
+export function startLocalAgentSystemd({
+  home = process.env.HOME || homedir(),
+  platform = process.platform,
+  exec = execFileSync,
+} = {}) {
+  if (platform !== "linux") throw new Error("Local Agent service controls are supported on Linux");
+  if (!managedSystemdFiles(home)) return false;
+  runSystemctl(["start", SERVICE_NAME], exec);
+  return true;
+}
+
+/** Stop only the current user's managed Local Agent systemd unit. */
+export function stopLocalAgentSystemd({
+  home = process.env.HOME || homedir(),
+  platform = process.platform,
+  exec = execFileSync,
+} = {}) {
+  if (platform !== "linux") throw new Error("Local Agent service controls are supported on Linux");
+  if (!managedSystemdFiles(home)) return false;
+  runSystemctl(["stop", SERVICE_NAME], exec);
+  return true;
+}
+
+/** Report systemd's active state for the current user's managed unit. */
+export function getLocalAgentSystemdStatus({
+  home = process.env.HOME || homedir(),
+  platform = process.platform,
+  exec = execFileSync,
+} = {}) {
+  if (platform !== "linux") throw new Error("Local Agent service status is supported on Linux");
+  if (!managedSystemdFiles(home)) return { installed: false, state: "not-installed" };
+  try {
+    exec("systemctl", ["--user", "is-active", "--quiet", SERVICE_NAME], { stdio: "ignore" });
+    return { installed: true, state: "active" };
+  } catch (error) {
+    if (error?.status === 3 || error?.status === 4) {
+      return { installed: true, state: "inactive" };
+    }
+    throw new Error("Could not verify the Local Agent systemd service state");
+  }
+}

@@ -36,6 +36,20 @@ test("local-agent run is registered with explicit non-secret options", () => {
   );
 });
 
+test("Linux and macOS expose the same per-user service lifecycle commands as Windows", () => {
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const program = new Command();
+    registerLocalAgent(program, { platform });
+    const localAgent = program.commands.find((command) => command.name() === "local-agent");
+    const service = localAgent.commands.find((command) => command.name() === "service");
+    assert.deepEqual(
+      service.commands.map((command) => command.name()),
+      ["install", "uninstall", "start", "stop", "status"],
+      `${platform} service commands`
+    );
+  }
+});
+
 test("local-agent check is available without gateway identity or credentials", async () => {
   const program = new Command();
   registerLocalAgent(program);

@@ -226,7 +226,7 @@ test(
         safeEnvPath,
         "--yes",
         "--command",
-        "CREATE TABLE cloud_test_mock_provider_calls (id TEXT PRIMARY KEY, call_count INTEGER NOT NULL, last_error TEXT); INSERT INTO cloud_test_mock_provider_calls (id, call_count, last_error) VALUES ('inference', 0, NULL);",
+        "CREATE TABLE cloud_test_mock_provider_calls (id TEXT PRIMARY KEY, call_count INTEGER NOT NULL, last_error TEXT, fail_generation_count INTEGER NOT NULL DEFAULT 0); INSERT INTO cloud_test_mock_provider_calls (id, call_count, last_error, fail_generation_count) VALUES ('inference', 0, NULL, 0);",
       ],
       {
         cwd: tempDir,
@@ -330,13 +330,13 @@ test(
     assert.equal(connection.response.status, 201, JSON.stringify(connection.body));
 
     const idempotencyKey = `cloud-local-inference-${crypto.randomUUID()}`;
-    const inferenceRequest = () =>
+    const inferenceRequest = (requestIdempotencyKey = idempotencyKey) =>
       fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${customerKey}`,
           "content-type": "application/json",
-          "idempotency-key": idempotencyKey,
+          "idempotency-key": requestIdempotencyKey,
         },
         body: JSON.stringify({
           model,
@@ -449,5 +449,77 @@ test(
     assert.equal((finalState.body.usage as unknown[]).length, 1);
     assert.equal((finalState.body.reservations as unknown[]).length, 1);
     assert.equal((finalState.body.audits as unknown[]).length, 1);
+
+    const armFailure = spawnSync(
+      process.execPath,
+      [
+        wranglerBin,
+        "d1",
+        "execute",
+        workerName,
+        "--local",
+        "--persist-to",
+        persistDir,
+        "--config",
+        wranglerConfigPath,
+        "--env-file",
+        safeEnvPath,
+        "--yes",
+        "--command",
+        "UPDATE cloud_test_mock_provider_calls SET fail_generation_count = 1 WHERE id = 'inference';",
+      ],
+      {
+        cwd: tempDir,
+        env: commandEnv,
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 2 * 1024 * 1024,
+      }
+    );
+    assert.equal(armFailure.status, 0, `failed to arm upstream fixture:\n${armFailure.stderr}`);
+
+    const failedKey = `cloud-local-inference-failure-${crypto.randomUUID()}`;
+    const failedResponse = await inferenceRequest(failedKey);
+    assert.equal(
+      failedResponse.status,
+      502,
+      `a provider failure should fail closed:\n${await failedResponse.text()}\n${output}`
+    );
+    const afterFailureStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(
+      afterFailureStats.body.callCount,
+      4,
+      "count and failed generation each dispatch once"
+    );
+    assert.equal(afterFailureStats.body.lastError, "simulated upstream generation failure");
+
+    const failedReplay = await inferenceRequest(failedKey);
+    assert.equal(failedReplay.status, 503, "an uncertain failure must not redispatch on same key");
+    const afterFailedReplayStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(afterFailedReplayStats.body.callCount, 4, "failure replay must not call upstream");
+
+    const recoveredKey = `cloud-local-inference-recovery-${crypto.randomUUID()}`;
+    const recoveredResponse = await inferenceRequest(recoveredKey);
+    assert.equal(
+      recoveredResponse.status,
+      200,
+      `a new request should succeed after the provider recovers:\n${await recoveredResponse
+        .clone()
+        .text()}\n${output}`
+    );
+    assert.equal((await recoveredResponse.text()).includes("local mock provider."), true);
+    const recoveredStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(
+      recoveredStats.body.callCount,
+      6,
+      "recovery should dispatch one count and generation"
+    );
+    assert.equal(recoveredStats.body.lastError, null);
   }
 );

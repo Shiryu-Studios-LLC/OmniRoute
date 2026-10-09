@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  getLocalAgentSystemdStatus,
   installLocalAgentSystemd,
+  startLocalAgentSystemd,
+  stopLocalAgentSystemd,
   uninstallLocalAgentSystemd,
 } from "../../../bin/cli/localAgentSystemd.mjs";
 
@@ -190,6 +193,66 @@ test("systemd uninstall stops only the managed service before deleting its secre
     assert.equal(calls[0][1].join(" "), "--user disable --now omniroute-local-agent.service");
     assert.throws(() => readFileSync(installed.envFile), { code: "ENOENT" });
     assert.throws(() => readFileSync(installed.unitFile), { code: "ENOENT" });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("systemd lifecycle controls target only the managed per-user unit", () => {
+  const home = createHome();
+  const calls = [];
+  let active = false;
+  const exec = (_command, args) => {
+    calls.push(args);
+    if (args.includes("is-active")) {
+      if (!active) throw Object.assign(new Error("inactive"), { status: 3 });
+    } else if (args[1] === "start") {
+      active = true;
+    } else if (args[1] === "stop") {
+      active = false;
+    }
+  };
+
+  try {
+    assert.deepEqual(getLocalAgentSystemdStatus({ home, platform: "linux", exec }), {
+      installed: false,
+      state: "not-installed",
+    });
+    assert.equal(startLocalAgentSystemd({ home, platform: "linux", exec }), false);
+    installLocalAgentSystemd(serviceConfig(), { home, platform: "linux", exec });
+    assert.deepEqual(getLocalAgentSystemdStatus({ home, platform: "linux", exec }), {
+      installed: true,
+      state: "inactive",
+    });
+    assert.equal(startLocalAgentSystemd({ home, platform: "linux", exec }), true);
+    assert.deepEqual(getLocalAgentSystemdStatus({ home, platform: "linux", exec }), {
+      installed: true,
+      state: "active",
+    });
+    assert.equal(stopLocalAgentSystemd({ home, platform: "linux", exec }), true);
+    assert.deepEqual(getLocalAgentSystemdStatus({ home, platform: "linux", exec }), {
+      installed: true,
+      state: "inactive",
+    });
+    assert.ok(
+      calls.some((args) => args.join(" ") === "--user start omniroute-local-agent.service")
+    );
+    assert.ok(calls.some((args) => args.join(" ") === "--user stop omniroute-local-agent.service"));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("systemd lifecycle controls reject an unmanaged unit", () => {
+  const home = createHome();
+  const unit = join(home, ".config", "systemd", "user", "omniroute-local-agent.service");
+  try {
+    mkdirSync(join(home, ".config", "systemd", "user"), { recursive: true });
+    writeFileSync(unit, "[Service]\nExecStart=custom\n");
+    assert.throws(
+      () => startLocalAgentSystemd({ home, platform: "linux", exec: () => {} }),
+      /unmanaged/
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

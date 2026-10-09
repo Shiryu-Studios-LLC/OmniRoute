@@ -14,7 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  getLocalAgentLaunchdStatus,
   installLocalAgentLaunchd,
+  startLocalAgentLaunchd,
+  stopLocalAgentLaunchd,
   uninstallLocalAgentLaunchd,
 } from "../../../bin/cli/localAgentLaunchd.mjs";
 
@@ -323,6 +326,39 @@ test("launchd refuses unmanaged files, unsafe paths, and root user domains", () 
         }),
       /control character/
     );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("launchd lifecycle controls load and unload only the managed current-user agent", () => {
+  const home = createHome();
+  const calls = [];
+  let loaded = false;
+  const exec = (_command, args) => {
+    calls.push(args);
+    if (args[0] === "print" && args[1] === "gui/501/com.omniroute.local-agent" && !loaded) {
+      throw Object.assign(new Error("service not loaded"), { status: 113 });
+    }
+    if (args[0] === "bootstrap") loaded = true;
+    if (args[0] === "bootout") loaded = false;
+  };
+  const options = { home, platform: "darwin", uid: 501, exec };
+
+  try {
+    assert.deepEqual(getLocalAgentLaunchdStatus(options), {
+      installed: false,
+      state: "not-installed",
+    });
+    assert.equal(startLocalAgentLaunchd(options), false);
+    installLocalAgentLaunchd(serviceConfig(), options);
+    assert.deepEqual(getLocalAgentLaunchdStatus(options), { installed: true, state: "loaded" });
+    assert.equal(startLocalAgentLaunchd(options), true);
+    assert.ok(calls.some((args) => args[0] === "kickstart"));
+    assert.equal(stopLocalAgentLaunchd(options), true);
+    assert.deepEqual(getLocalAgentLaunchdStatus(options), { installed: true, state: "unloaded" });
+    assert.equal(startLocalAgentLaunchd(options), true);
+    assert.deepEqual(getLocalAgentLaunchdStatus(options), { installed: true, state: "loaded" });
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

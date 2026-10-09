@@ -362,3 +362,57 @@ export function uninstallLocalAgentLaunchd({
   }
   return true;
 }
+
+function managedLaunchdPlist(home) {
+  const canonicalHome = realpathSync(home);
+  const files = paths(canonicalHome);
+  const existing = readExistingPlist(files.plistFile);
+  if (!existing) return null;
+  if (!isManagedPlist(existing.contents)) {
+    throw new Error("Refusing to control an unmanaged Local Agent launchd plist");
+  }
+  return { files };
+}
+
+/** Start only the current user's managed Local Agent LaunchAgent. */
+export function startLocalAgentLaunchd({
+  home = process.env.HOME || homedir(),
+  platform = process.platform,
+  uid = userInfo().uid,
+  exec = execFileSync,
+} = {}) {
+  if (platform !== "darwin") throw new Error("Local Agent service controls are supported on macOS");
+  const managed = managedLaunchdPlist(home);
+  if (!managed) return false;
+  const domain = launchDomain(uid);
+  if (isLoaded(domain, exec)) runLaunchctl(["kickstart", `${domain}/${LABEL}`], exec);
+  else runLaunchctl(["bootstrap", domain, managed.files.plistFile], exec);
+  return true;
+}
+
+/** Stop only the current user's managed Local Agent LaunchAgent. */
+export function stopLocalAgentLaunchd({
+  home = process.env.HOME || homedir(),
+  platform = process.platform,
+  uid = userInfo().uid,
+  exec = execFileSync,
+} = {}) {
+  if (platform !== "darwin") throw new Error("Local Agent service controls are supported on macOS");
+  if (!managedLaunchdPlist(home)) return false;
+  const domain = launchDomain(uid);
+  if (isLoaded(domain, exec)) runLaunchctl(["bootout", `${domain}/${LABEL}`], exec);
+  return true;
+}
+
+/** Report whether the managed LaunchAgent is loaded in the current user's GUI domain. */
+export function getLocalAgentLaunchdStatus({
+  home = process.env.HOME || homedir(),
+  platform = process.platform,
+  uid = userInfo().uid,
+  exec = execFileSync,
+} = {}) {
+  if (platform !== "darwin") throw new Error("Local Agent service status is supported on macOS");
+  if (!managedLaunchdPlist(home)) return { installed: false, state: "not-installed" };
+  const loaded = isLoaded(launchDomain(uid), exec);
+  return { installed: true, state: loaded ? "loaded" : "unloaded" };
+}

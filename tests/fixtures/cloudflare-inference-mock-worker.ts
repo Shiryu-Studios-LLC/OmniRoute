@@ -38,7 +38,11 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
 }
 
-async function mockProviderFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+async function mockProviderFetch(
+  env: WorkerEnv,
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
   const request = new Request(input, init);
   const url = new URL(request.url);
   if (request.method !== "POST" || request.redirect !== "manual") {
@@ -66,6 +70,27 @@ async function mockProviderFetch(input: RequestInfo | URL, init?: RequestInit): 
     ) {
       throw new Error("Mock provider rejected an invalid streaming request");
     }
+    const failure = await env.DB.prepare<{ fail_generation_count: number }>(
+      "SELECT fail_generation_count FROM cloud_test_mock_provider_calls WHERE id = ?"
+    )
+      .bind("inference")
+      .first();
+    if (failure && failure.fail_generation_count > 0) {
+      const consumed = await env.DB.prepare(
+        `UPDATE cloud_test_mock_provider_calls
+            SET fail_generation_count = fail_generation_count - 1,
+                last_error = 'simulated upstream generation failure'
+          WHERE id = ? AND fail_generation_count > 0`
+      )
+        .bind("inference")
+        .run();
+      if (Number(consumed.meta?.changes ?? 0) === 1) {
+        return Response.json({ error: { message: "simulated upstream failure" } }, { status: 503 });
+      }
+    }
+    await env.DB.prepare("UPDATE cloud_test_mock_provider_calls SET last_error = NULL WHERE id = ?")
+      .bind("inference")
+      .run();
     const encoder = new TextEncoder();
     const chunks = [
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello from the "}\n\n',
@@ -188,7 +213,7 @@ const worker = {
       fetcher: async (input, init) => {
         await incrementMockCallCount(env);
         try {
-          return await mockProviderFetch(input, init);
+          return await mockProviderFetch(env, input, init);
         } catch (error) {
           await env.DB.prepare(
             "UPDATE cloud_test_mock_provider_calls SET last_error = ? WHERE id = ?"
