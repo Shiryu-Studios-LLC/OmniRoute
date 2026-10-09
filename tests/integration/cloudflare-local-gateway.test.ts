@@ -546,7 +546,11 @@ test(
     assert.equal(database.body.database, "d1");
     const readiness = await requestJson(`${baseUrl}/__cloud/readiness`);
     assert.equal(readiness.response.status, 200);
-    assert.deepEqual(readiness.body.checks, { database: "ok", gateway: "ok" });
+    assert.deepEqual(readiness.body.checks, {
+      database: "ok",
+      gateway: "ok",
+      artifacts: "ok",
+    });
     const unauthorizedAdminRequest = await requestJson(
       `${baseUrl}/__cloud/v1/tenants/__smoke_missing__/status`
     );

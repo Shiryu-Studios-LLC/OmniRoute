@@ -55,7 +55,6 @@ import {
   type CloudInferenceEntitlement,
 } from "./inferencePolicy";
 import {
-  addCloudTenantOidcIdentity,
   deleteCloudTenantOidcConfig,
   deleteCloudTenantOidcIdentity,
   getCloudTenantOidcConfig,
@@ -835,44 +834,10 @@ export async function handleCloudApiRequest(
           if (request.method === "GET") {
             return json(await listCloudTenantOidcIdentities(db, tenantId));
           }
-          if (request.method === "POST") {
-            const body = validateFields(
-              await readBody(request),
-              ["issuer", "subject", "membershipId"],
-              ["issuer", "subject", "membershipId"]
-            );
-            if (
-              typeof body.issuer !== "string" ||
-              typeof body.subject !== "string" ||
-              typeof body.membershipId !== "string"
-            ) {
-              throw new ApiError(400, "Invalid OIDC identity link");
-            }
-            await recordAudit("customer.oidc.identity.link", body.membershipId, "attempted", {
-              issuer: body.issuer,
-            });
-            let identity;
-            try {
-              identity = await addCloudTenantOidcIdentity(db, {
-                tenantId,
-                issuer: body.issuer,
-                subject: body.subject,
-                membershipId: body.membershipId,
-                now: timestamp,
-              });
-            } catch (error) {
-              if (error instanceof TypeError || error instanceof RangeError) {
-                const status = error.message.includes("not found") ? 404 : 400;
-                throw new ApiError(status, error.message);
-              }
-              throw error;
-            }
-            await recordAudit("customer.oidc.identity.link", identity.id, "success", {
-              membershipId: identity.membershipId,
-              issuer: identity.issuer,
-            });
-            return json(identity, 201);
-          }
+          // Identity links must be created by a verified OIDC callback, invitation
+          // redemption, or first-owner claim. A platform token cannot assert control
+          // of an arbitrary issuer/subject pair on a customer's behalf.
+          return json({ error: "Method not allowed" }, 405);
         }
 
         if (segments.length === 4 && resourceId === "identities" && request.method === "DELETE") {

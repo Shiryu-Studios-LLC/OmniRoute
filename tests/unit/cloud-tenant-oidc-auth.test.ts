@@ -391,6 +391,51 @@ test("cloud runtime dispatches the first-owner claim redemption route", async ()
   assert.equal(response.status, 400);
 });
 
+test("platform admin cannot link an unverified OIDC subject to a customer membership", async () => {
+  const { db, tenant, membership, identity } = await setup();
+  const adminToken = "valid-cloud-admin-token-0123456789";
+  const app = createCloudRuntime({
+    env: {
+      DB: db,
+      OMNIROUTE_ENV: "production",
+      OMNIROUTE_CLOUD_ADMIN_TOKEN: adminToken,
+    },
+    now: () => new Date(NOW),
+  });
+  const before = await db
+    .prepare<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+
+  const response = await app.fetch(
+    new Request(`${ORIGIN}/__cloud/v1/tenants/${tenant.id}/oidc/identities`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        issuer: ISSUER,
+        subject: "attacker-controlled-subject",
+        membershipId: membership.id,
+      }),
+    })
+  );
+  const after = await db
+    .prepare<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?"
+    )
+    .bind(tenant.id)
+    .first();
+
+  assert.equal(response.status, 405);
+  assert.equal(before?.count, 1);
+  assert.equal(after?.count, before?.count);
+  assert.ok(identity.id);
+});
+
 function getCookieValue(response: Response, name: string): string {
   const cookies = response.headers.getSetCookie();
   const cookie = cookies.find((value) => value.startsWith(`${name}=`));

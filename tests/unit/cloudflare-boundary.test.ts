@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { GatewayCoordinatorStub } from "../../src/cloud/connectorGatewayDurableObject";
-import { createCloudRuntime } from "../../src/cloud/runtime";
+import { createCloudRuntime, type CloudRuntimeEnv } from "../../src/cloud/runtime";
 
 test("cloud runtime exposes a Worker-safe health endpoint", async () => {
   const runtime = createCloudRuntime({
@@ -67,8 +67,10 @@ test("cloud runtime reports a healthy D1 binding", async () => {
   });
 });
 
-test("cloud runtime readiness requires D1 and Durable Object storage", async () => {
+test("cloud runtime readiness requires D1, Durable Object, and R2 storage", async () => {
   let doProbeCount = 0;
+  let artifactProbeCount = 0;
+  let artifactBodyCancelled = false;
   const runtime = createCloudRuntime({
     env: {
       DB: {
@@ -102,6 +104,19 @@ test("cloud runtime readiness requires D1 and Durable Object storage", async () 
             },
           }) as GatewayCoordinatorStub,
       },
+      GATEWAY_ARTIFACTS: {
+        async get(key) {
+          assert.equal(key, "__omniroute_healthcheck__/readiness");
+          artifactProbeCount += 1;
+          return {
+            body: new ReadableStream({
+              cancel() {
+                artifactBodyCancelled = true;
+              },
+            }),
+          };
+        },
+      } as CloudRuntimeEnv["GATEWAY_ARTIFACTS"],
     },
   });
 
@@ -110,9 +125,11 @@ test("cloud runtime readiness requires D1 and Durable Object storage", async () 
   assert.deepEqual(await response.json(), {
     status: "ready",
     runtime: "cloudflare",
-    checks: { database: "ok", gateway: "ok" },
+    checks: { database: "ok", gateway: "ok", artifacts: "ok" },
   });
   assert.equal(doProbeCount, 1);
+  assert.equal(artifactProbeCount, 1);
+  assert.equal(artifactBodyCancelled, true);
 });
 
 test("cloud runtime readiness fails closed for missing or failing dependencies", async () => {
@@ -124,7 +141,7 @@ test("cloud runtime readiness fails closed for missing or failing dependencies",
   assert.deepEqual(await unconfiguredResponse.json(), {
     status: "not_ready",
     runtime: "cloudflare",
-    checks: { database: "unconfigured", gateway: "unconfigured" },
+    checks: { database: "unconfigured", gateway: "unconfigured", artifacts: "unconfigured" },
   });
 
   const failing = createCloudRuntime({
@@ -160,6 +177,11 @@ test("cloud runtime readiness fails closed for missing or failing dependencies",
             },
           }) as GatewayCoordinatorStub,
       },
+      GATEWAY_ARTIFACTS: {
+        async get() {
+          throw new Error("internal R2 bucket details");
+        },
+      } as CloudRuntimeEnv["GATEWAY_ARTIFACTS"],
     },
   });
   const failingResponse = await failing.fetch(
@@ -169,7 +191,11 @@ test("cloud runtime readiness fails closed for missing or failing dependencies",
   const failingBody = await failingResponse.text();
   assert.match(failingBody, /"database":"error"/);
   assert.match(failingBody, /"gateway":"error"/);
-  assert.doesNotMatch(failingBody, /internal database details|internal Durable Object details/);
+  assert.match(failingBody, /"artifacts":"error"/);
+  assert.doesNotMatch(
+    failingBody,
+    /internal database details|internal Durable Object details|internal R2 bucket details/
+  );
 });
 
 test("cloud runtime exposes build/runtime metadata without Node dependencies", async () => {

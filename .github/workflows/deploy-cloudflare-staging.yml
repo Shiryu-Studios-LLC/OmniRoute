@@ -318,7 +318,8 @@ jobs:
                 value.status !== "ready" ||
                 value.runtime !== "cloudflare" ||
                 value.checks?.database !== "ok" ||
-                value.checks?.gateway !== "ok"
+                value.checks?.gateway !== "ok" ||
+                value.checks?.artifacts !== "ok"
               ) process.exit(1);
             });
           '

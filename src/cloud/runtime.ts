@@ -350,10 +350,12 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         const checks: {
           database: "ok" | "unconfigured" | "error";
           gateway: "ok" | "unconfigured" | "error";
+          artifacts: "ok" | "unconfigured" | "error";
           configuration?: "ok" | "unconfigured" | "error";
         } = {
           database: "unconfigured",
           gateway: "unconfigured",
+          artifacts: "unconfigured",
           ...(configuration !== null ? { configuration } : {}),
         };
 
@@ -376,9 +378,22 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           }
         }
 
+        if (options.env?.GATEWAY_ARTIFACTS) {
+          try {
+            const probe = await options.env.GATEWAY_ARTIFACTS.get(
+              "__omniroute_healthcheck__/readiness"
+            );
+            await probe?.body?.cancel();
+            checks.artifacts = "ok";
+          } catch {
+            checks.artifacts = "error";
+          }
+        }
+
         const ready =
           checks.database === "ok" &&
           checks.gateway === "ok" &&
+          checks.artifacts === "ok" &&
           (configuration === null || configuration === "ok");
         return Response.json(
           {

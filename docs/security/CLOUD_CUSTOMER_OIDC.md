@@ -70,6 +70,11 @@ Tenant OIDC configuration cannot set a callback or post-login redirect URI.
   event. Issuer changes, expired/reused codes, existing identity conflicts, and inactive
   tenants fail closed. Email/domain claims do not select or create membership.
 
+The platform-admin `POST /__cloud/v1/tenants/<tenant-id>/oidc/identities` mutation is
+disabled. An administrator cannot attach an unverified issuer/subject to a membership;
+identity links are created only by a verified OIDC callback, invitation redemption, or
+first-owner claim.
+
 The session cookie is `HttpOnly`, `SameSite=Lax`, scoped to `/__cloud/auth`, and expires
 within eight hours. The database stores a hash of the opaque cookie token. Session
 introspection checks tenant, membership, identity-link, enabled-issuer, and revocation state
