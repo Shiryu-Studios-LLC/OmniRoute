@@ -157,7 +157,7 @@ export async function appendCloudUsageRecord(
   input: CloudUsageRecordInput
 ): Promise<CloudUsageRecord> {
   const record = normalizeInput(input);
-  await db
+  const result = await db
     .prepare(
       `INSERT INTO cloud_usage_history (
         id, tenant_id, provider, model, connection_id, api_key_id, api_key_name,
@@ -190,6 +190,7 @@ export async function appendCloudUsageRecord(
       record.timestamp
     )
     .run();
+  if (!result.success) throw new Error("D1 usage write failed");
   return record;
 }
 

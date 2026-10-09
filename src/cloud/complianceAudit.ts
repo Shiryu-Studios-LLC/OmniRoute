@@ -192,7 +192,8 @@ export async function appendCloudComplianceAudit(
   input: CloudComplianceAuditInput
 ): Promise<CloudComplianceAuditRecord> {
   const prepared = prepareCloudComplianceAuditInsert(db, input);
-  await prepared.statement.run();
+  const result = await prepared.statement.run();
+  if (!result.success) throw new Error("D1 compliance audit write failed");
   return prepared.record;
 }
 

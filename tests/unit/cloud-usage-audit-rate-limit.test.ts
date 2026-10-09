@@ -11,6 +11,8 @@ class MemoryD1 implements CloudDb {
   readonly usage = new Map<string, Row>();
   readonly audits = new Map<string, Row>();
   readonly rateLimits = new Map<string, Row>();
+  failUsageWrites = false;
+  failAuditWrites = false;
 
   prepare<T = unknown>(sql: string): CloudDbStatement<T> {
     return new MemoryStatement<T>(this, sql);
@@ -91,6 +93,7 @@ class MemoryD1 implements CloudDb {
       "statement bindings match placeholders"
     );
     if (sql.startsWith("INSERT INTO cloud_usage_history")) {
+      if (this.failUsageWrites) return { success: false };
       const [
         id,
         tenant_id,
@@ -140,6 +143,7 @@ class MemoryD1 implements CloudDb {
       return { success: true };
     }
     if (sql.startsWith("INSERT INTO cloud_compliance_audit")) {
+      if (this.failAuditWrites) return { success: false };
       const [
         id,
         tenant_id,
@@ -237,6 +241,27 @@ test("D1 usage history requires tenant scope and keeps tenant A/B rows separate"
     /non-negative safe integer/
   );
   await assert.rejects(listCloudUsageRecords(db, "tenant-a", { limit: 501 }), /between 1 and 500/);
+});
+
+test("D1 usage and audit appenders surface unsuccessful writes", async () => {
+  const db = new MemoryD1();
+  db.failUsageWrites = true;
+  db.failAuditWrites = true;
+
+  await assert.rejects(
+    appendCloudUsageRecord(db, { id: "usage-failed", tenantId: "tenant-a" }),
+    /D1 usage write failed/
+  );
+  await assert.rejects(
+    appendCloudComplianceAudit(db, {
+      id: "audit-failed",
+      tenantId: "tenant-a",
+      action: "cloud.operation",
+    }),
+    /D1 compliance audit write failed/
+  );
+  assert.equal(db.usage.size, 0);
+  assert.equal(db.audits.size, 0);
 });
 
 test("D1 compliance audit is tenant-scoped and scrubs sensitive metadata", async () => {
