@@ -153,7 +153,17 @@ export async function expireStaleCloudImageJobs(
     )
     .bind(now, now, boundedLimit)
     .run();
-  return Number(result.meta?.changes ?? 0);
+  const changes = result.meta?.changes;
+  if (
+    !result.success ||
+    typeof changes !== "number" ||
+    !Number.isSafeInteger(changes) ||
+    changes < 0 ||
+    changes > boundedLimit
+  ) {
+    throw new Error("D1 gateway image-job expiry returned invalid state");
+  }
+  return changes;
 }
 
 export async function getCloudImageJob(db: CloudDb, jobId: string): Promise<CloudImageJob | null> {
@@ -393,14 +403,27 @@ export async function cleanupExpiredCloudImageJobs(
     )
     .bind(now, boundedLimit)
     .all<{ job_id: string; object_key: string }>();
+  if (!rows.success || !Array.isArray(rows.results) || rows.results.length > boundedLimit) {
+    throw new Error("D1 gateway image-job cleanup read failed");
+  }
   if (rows.results.length === 0) return 0;
   await bucket.delete(rows.results.map((row) => row.object_key));
   const placeholders = rows.results.map(() => "?").join(",");
-  await db
+  const result = await db
     .prepare(
       `DELETE FROM cloud_gateway_image_jobs WHERE job_id IN (${placeholders}) AND retention_expires_at <= ?`
     )
     .bind(...rows.results.map((row) => row.job_id), now)
     .run();
-  return rows.results.length;
+  const changes = result.meta?.changes;
+  if (
+    !result.success ||
+    typeof changes !== "number" ||
+    !Number.isSafeInteger(changes) ||
+    changes < 0 ||
+    changes > rows.results.length
+  ) {
+    throw new Error("D1 gateway image-job cleanup delete failed");
+  }
+  return changes;
 }

@@ -20,6 +20,7 @@ import {
 import { coordinatorFromNamespace } from "../../src/cloud/gatewayHttpApi";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 import { handleGatewayImageJobRequest } from "../../src/cloud/gatewayImageJobHttpApi";
+import { cleanupExpiredCloudImageJobs } from "../../src/cloud/imageJobs";
 import {
   createCloudCustomerMembership,
   issueCloudCustomerApiKey,
@@ -79,6 +80,37 @@ class SqliteD1 implements CloudDb {
   async exec(sql: string): Promise<unknown> {
     return this.db.exec(sql);
   }
+}
+
+function failRunForSqlPrefix(db: CloudDb, sqlPrefix: string): CloudDb {
+  return {
+    prepare<T = unknown>(sql: string): CloudDbStatement<T> {
+      const statement = db.prepare<T>(sql);
+      if (!sql.trimStart().startsWith(sqlPrefix)) return statement;
+      const failed: CloudDbStatement<T> = {
+        bind(...values: unknown[]) {
+          statement.bind(...values);
+          return failed;
+        },
+        first<U = T>(column?: string) {
+          return statement.first<U>(column);
+        },
+        all<U = T>() {
+          return statement.all<U>();
+        },
+        async run() {
+          return { success: false, meta: { changes: 0 } };
+        },
+      };
+      return failed;
+    },
+    batch(statements) {
+      return db.batch(statements);
+    },
+    exec(sql) {
+      return db.exec(sql);
+    },
+  };
 }
 
 class MemoryStorage implements GatewayDurableStorage, GatewayDurableStorageTransaction {
@@ -593,4 +625,55 @@ test("image job active caps recover after expiry and uncertain R2 writes are del
     .first();
   assert.ok(row);
   assert.equal(await fixture.bucket.get(row.object_key), null);
+});
+
+test("image-job cleanup reports failed D1 deletion and a later pass recovers", async () => {
+  const fixture = await createFixture();
+  const created = await createJob(fixture, "image-job-cleanup-retry-0001");
+  const job = (await created.json()) as { jobId: string };
+  const cleanupAtMs = fixture.currentTime() + 5 * 60_000 + 1;
+  const cleanupAt = new Date(cleanupAtMs).toISOString();
+  const expiryAt = new Date(cleanupAtMs - 1).toISOString();
+  await fixture.db
+    .prepare(
+      `UPDATE cloud_gateway_image_jobs
+          SET expires_at = ?, retention_expires_at = ?
+        WHERE job_id = ?`
+    )
+    .bind(expiryAt, cleanupAt, job.jobId)
+    .run();
+  const row = await fixture.db
+    .prepare<{ object_key: string }>(
+      "SELECT object_key FROM cloud_gateway_image_jobs WHERE job_id = ?"
+    )
+    .bind(job.jobId)
+    .first();
+  assert.ok(row);
+  await fixture.bucket.put(row.object_key, png, { httpMetadata: { contentType: "image/png" } });
+
+  await assert.rejects(
+    cleanupExpiredCloudImageJobs(
+      failRunForSqlPrefix(fixture.db, "DELETE FROM cloud_gateway_image_jobs"),
+      fixture.bucket,
+      cleanupAt
+    ),
+    { message: "D1 gateway image-job cleanup delete failed" }
+  );
+  assert.equal(await fixture.bucket.get(row.object_key), null);
+  assert.ok(
+    await fixture.db
+      .prepare("SELECT job_id FROM cloud_gateway_image_jobs WHERE job_id = ?")
+      .bind(job.jobId)
+      .first(),
+    "failed D1 cleanup must leave metadata available for a retry"
+  );
+
+  assert.equal(await cleanupExpiredCloudImageJobs(fixture.db, fixture.bucket, cleanupAt), 1);
+  assert.equal(
+    await fixture.db
+      .prepare("SELECT job_id FROM cloud_gateway_image_jobs WHERE job_id = ?")
+      .bind(job.jobId)
+      .first(),
+    null
+  );
 });
