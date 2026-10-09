@@ -27,6 +27,10 @@ import {
 } from "./gatewayProtocol";
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+// Device polling is independently rate limited to 180 requests per minute;
+// one poll per second leaves room for retries while meeting the gateway's
+// default 15-second invocation deadline.
+const DEFAULT_GATEWAY_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const DEFAULT_RETRY_MAX_MS = 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -176,18 +180,21 @@ async function sendHeartbeat(
 export async function runLocalAgentGatewayCycle(
   config: LocalAgentRunnerConfig,
   dependencies: LocalAgentGatewayRunnerDependencies,
-  previousSession?: LocalAgentGatewaySession
+  previousSession?: LocalAgentGatewaySession,
+  discoverySnapshot?: LocalDiscoveryResult
 ): Promise<LocalAgentGatewayCycleResult> {
   validateConfig(config);
   const discover = dependencies.discover ?? discoverLocalCapabilities;
-  const discovery = await discover(
-    {
-      ollamaUrl: config.ollamaUrl,
-      comfyUiUrl: config.comfyUiUrl,
-      mcpServers: config.mcpServers,
-    },
-    { fetch: dependencies.fetch, mcp: dependencies.mcp }
-  );
+  const discovery =
+    discoverySnapshot ??
+    (await discover(
+      {
+        ollamaUrl: config.ollamaUrl,
+        comfyUiUrl: config.comfyUiUrl,
+        mcpServers: config.mcpServers,
+      },
+      { fetch: dependencies.fetch, mcp: dependencies.mcp }
+    ));
 
   let session = previousSession;
   if (
@@ -581,16 +588,56 @@ export async function runLocalAgentWithGateway(
   }
   let failureCount = 0;
   let session: LocalAgentGatewaySession | undefined;
+  let discovery: LocalDiscoveryResult | undefined;
+  let discoveryAt = Number.NEGATIVE_INFINITY;
+  let discoveryRefresh: Promise<boolean> | undefined;
+  const refreshDiscovery = (): Promise<boolean> => {
+    if (discoveryRefresh) return discoveryRefresh;
+    const discover = dependencies.discover ?? discoverLocalCapabilities;
+    discoveryRefresh = Promise.resolve()
+      .then(() =>
+        discover(
+          {
+            ollamaUrl: config.ollamaUrl,
+            comfyUiUrl: config.comfyUiUrl,
+            mcpServers: config.mcpServers,
+          },
+          { fetch: dependencies.fetch, mcp: dependencies.mcp }
+        )
+      )
+      .then(
+        (result) => {
+          discovery = result;
+          discoveryAt = (dependencies.now ?? Date.now)();
+          return true;
+        },
+        () => {
+          discoveryAt = (dependencies.now ?? Date.now)();
+          return false;
+        }
+      )
+      .finally(() => {
+        discoveryRefresh = undefined;
+      });
+    return discoveryRefresh;
+  };
   while (!signal.aborted) {
     try {
+      const currentTime = (dependencies.now ?? Date.now)();
+      if (!discovery || currentTime - discoveryAt >= interval) {
+        const refreshed = refreshDiscovery();
+        if (!discovery && !(await refreshed)) throw new Error("Local service discovery failed");
+      }
+      if (!discovery) throw new Error("Local service discovery is unavailable");
       const cycle = await runLocalAgentGatewayCycle(
         config,
         { ...dependencies, abortSignal: signal },
-        session
+        session,
+        discovery
       );
       session = cycle.session;
       failureCount = 0;
-      await sleep(interval, signal);
+      await sleep(DEFAULT_GATEWAY_POLL_INTERVAL_MS, signal);
     } catch {
       if (signal.aborted) break;
       session = undefined;

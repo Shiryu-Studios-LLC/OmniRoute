@@ -471,7 +471,116 @@ test("gateway runner clears an offline session, backs off, and reconnects before
     "heartbeat:session-after-outage",
     "poll:session-after-outage",
   ]);
-  assert.deepEqual(delays, [5, 25]);
+  assert.deepEqual(delays, [5, 1_000]);
+});
+
+test("gateway runner polls within invocation deadlines and drains queued work between discovery refreshes", async () => {
+  const controller = new AbortController();
+  const events: string[] = [];
+  const delays: number[] = [];
+  const request = (requestId: string): Omit<LocalAgentGatewayRequest, "version"> => ({
+    requestId,
+    capability: "ollama:chat:local",
+    payload: { messages: [{ role: "user", content: requestId }] },
+    expiresAt: new Date(now + 15_000).toISOString(),
+  });
+  let now = Date.parse("2026-10-08T12:00:00.000Z");
+  let discoveryCount = 0;
+  let pollCount = 0;
+
+  await runLocalAgentWithGateway(
+    { ...config, heartbeatIntervalMs: 30_000 },
+    {
+      now: () => now,
+      discover: async () => {
+        discoveryCount += 1;
+        return {
+          heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+          services: [],
+        };
+      },
+      fetch: async () => Response.json({ accepted: true }),
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+        now += milliseconds;
+        if (delays.length === 3) controller.abort();
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => {
+          pollCount += 1;
+          if (pollCount === 1) return [];
+          if (pollCount === 2) return [request("request-first")];
+          return [request("request-second")];
+        },
+        submitResult: async (_activeSession, result) => {
+          events.push(result.requestId);
+          return true;
+        },
+      },
+      execute: async (gatewayRequest) => ({ requestId: gatewayRequest.requestId }),
+    },
+    controller.signal
+  );
+
+  assert.deepEqual(delays, [1_000, 1_000, 1_000]);
+  assert.equal(discoveryCount, 1);
+  assert.equal(pollCount, 3);
+  assert.deepEqual(events, ["request-first", "request-second"]);
+  assert.ok(now - Date.parse("2026-10-08T12:00:00.000Z") < 15_000);
+});
+
+test("slow periodic discovery does not pause gateway polling", async () => {
+  const controller = new AbortController();
+  const discoveryResult = {
+    heartbeat: { status: "online" as const, capabilities: ["ollama:chat:local"] },
+    services: [],
+  };
+  let now = Date.parse("2026-10-08T12:00:00.000Z");
+  let discoveryCount = 0;
+  let pollCount = 0;
+  let finishRefresh: ((result: typeof discoveryResult) => void) | undefined;
+  let markRefreshStarted: (() => void) | undefined;
+  const refreshStarted = new Promise<void>((resolve) => {
+    markRefreshStarted = resolve;
+  });
+
+  const run = runLocalAgentWithGateway(
+    { ...config, heartbeatIntervalMs: 2_000 },
+    {
+      now: () => now,
+      discover: async () => {
+        discoveryCount += 1;
+        if (discoveryCount === 1) return discoveryResult;
+        markRefreshStarted?.();
+        return new Promise<typeof discoveryResult>((resolve) => {
+          finishRefresh = resolve;
+        });
+      },
+      fetch: async () => Response.json({ accepted: true }),
+      sleep: async (milliseconds) => {
+        now += milliseconds;
+        if (now - Date.parse("2026-10-08T12:00:00.000Z") >= 3_000) controller.abort();
+      },
+      gateway: {
+        connect: async () => session,
+        heartbeat: async () => true,
+        poll: async () => {
+          pollCount += 1;
+          return [];
+        },
+        submitResult: async () => true,
+      },
+    },
+    controller.signal
+  );
+
+  await refreshStarted;
+  await run;
+  finishRefresh?.(discoveryResult);
+  assert.equal(discoveryCount, 2);
+  assert.equal(pollCount, 3);
 });
 
 test("gateway cycle ignores malformed and expired envelopes", async () => {
