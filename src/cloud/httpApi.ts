@@ -74,6 +74,7 @@ import { isProviderExecutionLocation, isProviderOwnershipMode } from "./provider
 
 const API_PREFIX = "/__cloud/v1/tenants";
 const MAX_BODY_BYTES = 256 * 1024;
+const BODY_READ_TIMEOUT_MS = 10_000;
 export interface CloudApiOptions {
   db?: CloudDb;
   /** Privileged server-to-server token. Never expose this value to browser clients. */
@@ -132,14 +133,67 @@ async function readJson(request: Request): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) {
     throw new ApiError(415, "Expected application/json");
   }
-  const contentLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && !/^\d+$/.test(contentLength)) {
+    void request.body?.cancel("invalid content length").catch(() => undefined);
+    throw new ApiError(400, "Invalid Content-Length header");
+  }
+  if (contentLength !== null && Number(contentLength) > MAX_BODY_BYTES) {
+    void request.body?.cancel("request body rejected").catch(() => undefined);
     throw new ApiError(413, "Request body is too large");
   }
-  const body = await request.text();
-  if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
-    throw new ApiError(413, "Request body is too large");
+
+  if (!request.body) throw new ApiError(400, "Invalid JSON body");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let timedOut = false;
+  let cancellationStarted = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cancelReader = () => {
+    if (cancellationStarted) return;
+    cancellationStarted = true;
+    void reader.cancel("request body rejected").catch(() => undefined);
+  };
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      cancelReader();
+      reject(new ApiError(408, "Request body timed out"));
+    }, BODY_READ_TIMEOUT_MS);
+  });
+
+  let body: string;
+  try {
+    while (true) {
+      const { done, value } = await Promise.race([reader.read(), timeout]);
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_BODY_BYTES) {
+        cancelReader();
+        throw new ApiError(413, "Request body is too large");
+      }
+      chunks.push(value);
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    body = new TextDecoder().decode(bytes);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      timedOut ? 408 : 400,
+      timedOut ? "Request body timed out" : "Invalid JSON body"
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (!cancellationStarted) reader.releaseLock();
   }
+
   try {
     return JSON.parse(body) as unknown;
   } catch {

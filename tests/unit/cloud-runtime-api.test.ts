@@ -591,6 +591,39 @@ test("cloud runtime sends only the tenant admin API path boundary to the D1 admi
   assert.ok(db.prepareCount > 0, "tenant collection creation must still reach the D1 handler");
 });
 
+test("cloud admin API bounds chunked JSON bodies while reading and cancels oversized streams", async () => {
+  const app = runtime();
+  let cancelled = false;
+  let chunksSent = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!chunksSent) {
+        chunksSent = true;
+        controller.enqueue(new Uint8Array(256 * 1024));
+        controller.enqueue(new Uint8Array(1));
+      }
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const response = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" })
+  );
+
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { error: "Request body is too large" });
+  assert.equal(cancelled, true);
+});
+
 test("maintenance run history is bounded and readable only by the platform admin", async () => {
   const db = new TestD1();
   const app = runtime(db, undefined, undefined, "test-cloud-maintenance-secret");
