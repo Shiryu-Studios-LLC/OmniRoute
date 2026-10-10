@@ -193,6 +193,33 @@ test("only the endpoint and POST method are accepted", async () => {
   assert.equal(methodResponse.headers.get("allow"), "POST");
 });
 
+test("proxy rejects unsafe MCP destinations before invoking its transport", async () => {
+  let calls = 0;
+  const handler = createMcpEgressProxyHandler({
+    proxyToken: TOKEN,
+    transport: {
+      async fetch() {
+        calls += 1;
+        return new Response("unexpected");
+      },
+    },
+  });
+  for (const url of [
+    "http://mcp.example.com/mcp",
+    "https://127.0.0.1/mcp",
+    "https://[::1]/mcp",
+    "https://mcp.example.com:8443/mcp",
+    "https://user:password@mcp.example.com/mcp",
+    "https://mcp.example.com/mcp?next=https://other.example",
+    "https://mcp.example.com/mcp#fragment",
+  ]) {
+    const response = await handler(request({ ...(envelope() as object), url }));
+    assert.equal(response.status, 400, url);
+    assert.deepEqual(await response.json(), { error: "invalid_request" }, url);
+  }
+  assert.equal(calls, 0, "invalid destinations never reach the configured transport");
+});
+
 test("rejects extra JSON fields, unsupported header names, and unsafe header values", async () => {
   const handler = createMcpEgressProxyHandler({
     proxyToken: TOKEN,

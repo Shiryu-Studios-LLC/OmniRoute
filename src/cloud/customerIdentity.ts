@@ -14,6 +14,19 @@ export interface CloudCustomerIdentity {
   apiKeyId: string;
 }
 
+/** Authoritative D1 identity resolved from a tenant OIDC browser session. */
+export interface CloudCustomerSessionIdentity {
+  tenantId: string;
+  tenantName: string;
+  tenantSlug: string;
+  principalId: string;
+  role: CloudCustomerRole;
+  membershipId: string;
+  identityId: string;
+  issuer: string;
+  expiresAtMs: number;
+}
+
 export interface IssuedCloudCustomerApiKey {
   id: string;
   tenantId: string;
@@ -547,5 +560,64 @@ export async function authenticateCloudCustomerApiKey(
     role: row.role as CloudCustomerRole,
     membershipId: row.membership_id,
     apiKeyId: row.api_key_id,
+  };
+}
+
+/**
+ * Resolve a browser session to its current tenant membership from D1.
+ * The caller supplies no tenant or role claims; current membership, tenant
+ * activation, OIDC enablement, expiry, and revocation are checked together.
+ */
+export async function authenticateCloudCustomerSession(
+  db: CloudDb,
+  token: string,
+  nowMs = Date.now()
+): Promise<CloudCustomerSessionIdentity | null> {
+  if (typeof token !== "string" || !/^[A-Za-z0-9_-]{40,128}$/.test(token)) return null;
+  const tokenHash = await hashToken(token);
+  const row = await db
+    .prepare<{
+      tenant_id: string;
+      tenant_name: string;
+      tenant_slug: string;
+      membership_id: string;
+      principal_id: string;
+      role: string;
+      identity_id: string;
+      issuer: string;
+      expires_at_ms: number;
+    }>(
+      `SELECT session.tenant_id, tenant.name AS tenant_name, tenant.slug AS tenant_slug,
+              membership.id AS membership_id, membership.principal_id, membership.role,
+              identity.id AS identity_id, identity.issuer, session.expires_at_ms
+         FROM cloud_tenant_oidc_sessions AS session
+         JOIN tenants AS tenant ON tenant.id = session.tenant_id
+           AND tenant.kind = 'customer' AND tenant.is_active = 1
+         JOIN cloud_customer_memberships AS membership
+           ON membership.tenant_id = session.tenant_id AND membership.id = session.membership_id
+          AND membership.is_active = 1
+         JOIN cloud_tenant_oidc_identities AS identity
+           ON identity.tenant_id = session.tenant_id AND identity.id = session.identity_id
+          AND identity.membership_id = session.membership_id
+         JOIN cloud_tenant_oidc_configs AS config
+           ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
+          AND config.is_enabled = 1
+        WHERE session.token_hash = ? AND session.revoked_at_ms IS NULL
+          AND session.expires_at_ms > ?
+        LIMIT 1`
+    )
+    .bind(tokenHash, nowMs)
+    .first();
+  if (!row || !ROLE_SET.has(row.role as CloudCustomerRole)) return null;
+  return {
+    tenantId: row.tenant_id,
+    tenantName: row.tenant_name,
+    tenantSlug: row.tenant_slug,
+    membershipId: row.membership_id,
+    principalId: row.principal_id,
+    role: row.role as CloudCustomerRole,
+    identityId: row.identity_id,
+    issuer: row.issuer,
+    expiresAtMs: row.expires_at_ms,
   };
 }

@@ -6,6 +6,7 @@ import {
   CloudMembershipConflictError,
   CloudLastActiveOwnerError,
   CloudCustomerApiKeyPortalAuthorizationError,
+  authenticateCloudCustomerSession,
   getCloudCustomerMembership,
   issueCloudCustomerApiKey,
   revokeCloudCustomerApiKey,
@@ -931,39 +932,15 @@ async function introspectSession(
   if (!token || !TOKEN_PATTERN.test(token)) {
     return json({ authenticated: false }, 401, { Vary: "Cookie" });
   }
-  const tokenHash = await sha256(token);
-  const row = await options.db
-    .prepare<OidcSessionRow>(
-      `SELECT session.tenant_id, tenant.name AS tenant_name, tenant.slug AS tenant_slug,
-              membership.id AS membership_id, membership.principal_id, membership.role,
-              identity.id AS identity_id, identity.issuer, identity.subject,
-              session.expires_at_ms
-         FROM cloud_tenant_oidc_sessions AS session
-         JOIN tenants AS tenant ON tenant.id = session.tenant_id
-           AND tenant.kind = 'customer' AND tenant.is_active = 1
-         JOIN cloud_customer_memberships AS membership
-           ON membership.tenant_id = session.tenant_id AND membership.id = session.membership_id
-          AND membership.is_active = 1
-         JOIN cloud_tenant_oidc_identities AS identity
-           ON identity.tenant_id = session.tenant_id AND identity.id = session.identity_id
-          AND identity.membership_id = session.membership_id
-         JOIN cloud_tenant_oidc_configs AS config
-           ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
-          AND config.is_enabled = 1
-        WHERE session.token_hash = ? AND session.revoked_at_ms IS NULL
-          AND session.expires_at_ms > ?
-        LIMIT 1`
-    )
-    .bind(tokenHash, nowMs)
-    .first();
+  const row = await authenticateCloudCustomerSession(options.db, token, nowMs);
   if (!row) return json({ authenticated: false }, 401, { Vary: "Cookie" });
   return json(
     {
       authenticated: true,
-      tenant: { id: row.tenant_id, name: row.tenant_name, slug: row.tenant_slug },
-      membership: { id: row.membership_id, principalId: row.principal_id, role: row.role },
+      tenant: { id: row.tenantId, name: row.tenantName, slug: row.tenantSlug },
+      membership: { id: row.membershipId, principalId: row.principalId, role: row.role },
       identity: { issuer: row.issuer },
-      session: { expiresAt: new Date(row.expires_at_ms).toISOString() },
+      session: { expiresAt: new Date(row.expiresAtMs).toISOString() },
     },
     200,
     { Vary: "Cookie" }

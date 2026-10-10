@@ -2400,6 +2400,11 @@ test(
       "revocation should invalidate the existing Durable Object session"
     );
     assert.equal(
+      await deviceTransport.connect(revokedDevice.deviceId, revokedDevice.credential),
+      null,
+      "revoked device credentials must not establish a new session"
+    );
+    assert.equal(
       (
         await invoke(
           revokedDevice.customerKey,

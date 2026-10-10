@@ -9,6 +9,7 @@ import { handleCloudApiRequest } from "../../src/cloud/httpApi";
 import { provisionCloudCustomer } from "../../src/cloud/provisioning";
 import {
   authenticateCloudCustomerApiKey,
+  authenticateCloudCustomerSession,
   createCloudCustomerMembership,
   getCloudCustomerMembership,
   issueCloudCustomerApiKey,
@@ -96,6 +97,8 @@ async function fixture() {
     "0007_gateway_device_service_health.sql",
     "0008_cloud_tenant_settings.sql",
     "0010_cloud_inference_policy.sql",
+    "0015_cloud_tenant_oidc.sql",
+    "0016_cloud_tenant_oidc_sessions.sql",
   ]) {
     await d1.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }
@@ -637,6 +640,99 @@ test("customer key resolves tenant and role only through active D1 membership", 
       .bind(membership.id)
       .run();
     assert.equal(await authenticateCloudCustomerApiKey(d1, issued.token, now), null);
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("D1 browser sessions resolve only current tenant membership and role", async () => {
+  const { d1, now } = await fixture();
+  try {
+    const membership = await createCloudCustomerMembership(d1, {
+      tenantId: "tenant-customer",
+      principalId: "browser-owner",
+      role: "owner",
+      now,
+    });
+    await d1
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_configs
+           (tenant_id, issuer, client_id, client_secret_encrypted, is_enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)`
+      )
+      .bind(
+        "tenant-customer",
+        "https://identity.example.test",
+        "client-a",
+        "enc:v2:placeholder",
+        now,
+        now
+      )
+      .run();
+    await d1
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_identities
+           (id, tenant_id, issuer, subject, membership_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        "identity-a",
+        "tenant-customer",
+        "https://identity.example.test",
+        "subject-a",
+        membership.id,
+        now
+      )
+      .run();
+
+    const token = "session_token_" + "a".repeat(40);
+    const tokenHash = createHash("sha256").update(token).digest("hex");
+    await d1
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_sessions
+           (token_hash, tenant_id, membership_id, identity_id, created_at_ms, expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        tokenHash,
+        "tenant-customer",
+        membership.id,
+        "identity-a",
+        Date.parse(now),
+        Date.parse(now) + 60_000
+      )
+      .run();
+
+    assert.deepEqual(await authenticateCloudCustomerSession(d1, token, Date.parse(now)), {
+      tenantId: "tenant-customer",
+      tenantName: "Customer",
+      tenantSlug: "customer",
+      principalId: "browser-owner",
+      role: "owner",
+      membershipId: membership.id,
+      identityId: "identity-a",
+      issuer: "https://identity.example.test",
+      expiresAtMs: Date.parse(now) + 60_000,
+    });
+    assert.equal(await authenticateCloudCustomerSession(d1, "x".repeat(43), Date.parse(now)), null);
+    assert.equal(await authenticateCloudCustomerSession(d1, token, Date.parse(now) + 60_000), null);
+
+    await d1
+      .prepare(
+        "UPDATE cloud_customer_memberships SET role = 'viewer' WHERE tenant_id = ? AND id = ?"
+      )
+      .bind("tenant-customer", membership.id)
+      .run();
+    assert.equal(
+      (await authenticateCloudCustomerSession(d1, token, Date.parse(now)))?.role,
+      "viewer"
+    );
+
+    await d1
+      .prepare("UPDATE cloud_customer_memberships SET is_active = 0 WHERE tenant_id = ? AND id = ?")
+      .bind("tenant-customer", membership.id)
+      .run();
+    assert.equal(await authenticateCloudCustomerSession(d1, token, Date.parse(now)), null);
   } finally {
     d1.db.close();
   }

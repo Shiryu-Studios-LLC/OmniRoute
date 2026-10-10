@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import type { McpOutboundTransport } from "../../src/lib/mcp/mcpOutboundTransport.ts";
 
 export const MAX_PROXY_PAYLOAD_BYTES = 2 * 1024 * 1024;
@@ -124,6 +125,30 @@ function validateBody(value: unknown): McpEgressProxyBody | null {
     headers,
     body: value.body,
   };
+}
+
+/**
+ * Keep the proxy's destination policy independent from its transport adapter.
+ * The Worker applies the same policy, while the Node transport additionally
+ * pins DNS answers and rejects private/special-purpose addresses.
+ */
+function isAllowedMcpEndpoint(input: string): boolean {
+  try {
+    const url = new URL(input);
+    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    return (
+      url.protocol === "https:" &&
+      hostname.length > 0 &&
+      isIP(hostname) === 0 &&
+      (url.port === "" || url.port === "443") &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    );
+  } catch {
+    return false;
+  }
 }
 
 class RequestBodyTimeoutError extends Error {
@@ -326,7 +351,9 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
       return jsonResponse({ error: "invalid_json" }, 400);
     }
     const payload = validateBody(parsed);
-    if (!payload) return jsonResponse({ error: "invalid_request" }, 400);
+    if (!payload || !isAllowedMcpEndpoint(payload.url)) {
+      return jsonResponse({ error: "invalid_request" }, 400);
+    }
     if (inFlightCount >= maxInFlight) return jsonResponse({ error: "proxy_busy" }, 503);
 
     const upstreamHeaders = new Headers();
