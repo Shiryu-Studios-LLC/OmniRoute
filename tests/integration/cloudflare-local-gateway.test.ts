@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import http from "node:http";
 import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readFileSync, statSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,11 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import type { LocalAgentGatewaySession } from "../../src/lib/localAgent/gatewayProtocol.js";
 import { createHttpLocalAgentGatewayTransport } from "../../src/lib/localAgent/httpGatewayTransport.js";
+import {
+  pairLocalAgentCommand,
+  resolveLocalAgentConfig,
+} from "../../bin/cli/commands/local-agent.mjs";
+import { installLocalAgentSystemd } from "../../bin/cli/localAgentSystemd.mjs";
 import {
   discoverLocalCapabilities,
   type LocalDiscoveryResult,
@@ -629,7 +635,7 @@ test(
     assert.notEqual(customerA.credential, customerB.credential);
 
     await t.test(
-      "owner pairing creates a tenant device once and stores only code and credential digests",
+      "clean Linux home pairs, installs the user service, and connects through D1",
       async () => {
         const tenantId = `local-pair-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
         const provisioned = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
@@ -658,15 +664,41 @@ test(
         const pairingCode = String(issue.body.pairingCode);
         assert.match(pairingCode, /^[A-Za-z0-9_-]{43}$/);
 
-        const exchange = await requestJson(`${baseUrl}/__gateway/v1/device/pair`, {
-          body: { version: 1, pairingCode },
-        });
-        assert.equal(exchange.response.status, 201, JSON.stringify(exchange.body));
-        const deviceId = String(exchange.body.deviceId);
-        const credential = String(exchange.body.credential);
+        const agentHome = path.join(tempDir, "customer-home");
+        await mkdir(agentHome, { recursive: true });
+        let pairingOutput = "";
+        const paired = await pairLocalAgentCommand(
+          { gatewayUrl: baseUrl },
+          {
+            env: { HOME: agentHome },
+            home: agentHome,
+            readCode: async () => pairingCode,
+            stdout: { write: (value: string) => (pairingOutput += value) },
+            fetcher: fetch,
+          }
+        );
+        const deviceId = paired.deviceId;
+        const credential = String(JSON.parse(readFileSync(paired.configPath, "utf8")).credential);
         assert.match(deviceId, /^[A-Za-z0-9-]{36}$/);
         assert.match(credential, /^[A-Za-z0-9_-]{43}$/);
         assert.notEqual(credential, pairingCode);
+        assert.equal(pairingOutput.includes(pairingCode), false);
+        assert.equal(pairingOutput.includes(credential), false);
+        assert.equal(statSync(paired.configPath).mode & 0o777, 0o600);
+
+        const config = resolveLocalAgentConfig({}, { HOME: agentHome });
+        const systemctlCalls: string[][] = [];
+        const installed = installLocalAgentSystemd(config, {
+          home: agentHome,
+          platform: "linux",
+          exec: (_command, args) => systemctlCalls.push(args),
+        });
+        const serviceEnv = readFileSync(installed.envFile, "utf8");
+        const serviceUnit = readFileSync(installed.unitFile, "utf8");
+        assert.equal(statSync(installed.envFile).mode & 0o777, 0o600);
+        assert.equal(serviceEnv.includes(credential), true);
+        assert.equal(serviceUnit.includes(credential), false);
+        assert.equal(systemctlCalls.length, 2);
 
         const session = await deviceTransport.connect(deviceId, credential);
         assert.ok(session, "paired credential should connect through the Worker and D1 directory");

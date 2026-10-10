@@ -152,9 +152,11 @@ test("OIDC proxy bounds upstream time and response size", async () => {
 
 test("Worker OIDC transport uses the fixed private binding and refuses issuer-origin changes", async () => {
   let calledUrl = "";
+  let proxyRedirect: RequestRedirect | undefined;
   const binding = {
     async fetch(request: Request) {
       calledUrl = request.url;
+      proxyRedirect = request.redirect;
       const body = JSON.parse(await request.text()) as { url: string };
       assert.equal(body.url, `${ISSUER}/.well-known/openid-configuration`);
       return new Response(
@@ -174,6 +176,7 @@ test("Worker OIDC transport uses the fixed private binding and refuses issuer-or
   assert.equal(response.status, 200);
   assert.equal(await response.text(), '{"ok":true}');
   assert.equal(calledUrl, "http://omniroute-mcp-egress.internal:8080/v1/oidc/fetch");
+  assert.equal(proxyRedirect, "manual");
   await assert.rejects(
     transport.fetch(ISSUER, "jwks", new URL("https://attacker.example/keys"), {
       method: "GET",
@@ -182,6 +185,36 @@ test("Worker OIDC transport uses the fixed private binding and refuses issuer-or
     /issuer origin/
   );
   assert.equal(createCloudOidcEgressTransport({ proxyToken: TOKEN }), null);
+});
+
+test("Worker OIDC transport does not follow redirects from the private proxy", async () => {
+  let calls = 0;
+  let proxyRedirect: RequestRedirect | undefined;
+  const transport = createCloudOidcEgressTransport({
+    proxyToken: TOKEN,
+    binding: {
+      async fetch(request) {
+        calls += 1;
+        proxyRedirect = request.redirect;
+        return new Response(null, {
+          status: 307,
+          headers: { Location: "https://attacker.example/collect" },
+        });
+      },
+    },
+  });
+  assert.ok(transport);
+
+  await assert.rejects(
+    transport.fetch(ISSUER, "token", new URL(`${ISSUER}/oauth/token`), {
+      method: "POST",
+      body: "grant_type=authorization_code&client_secret=sensitive-value",
+      redirect: "manual",
+    }),
+    /proxy rejected the request/
+  );
+  assert.equal(proxyRedirect, "manual");
+  assert.equal(calls, 1);
 });
 
 test("Worker signed envelope authenticates through the Node proxy handler", async () => {

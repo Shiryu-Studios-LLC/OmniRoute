@@ -564,6 +564,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           checks.gateway === "ok" &&
           checks.artifacts === "ok" &&
           checks.oidcEgress !== "error" &&
+          checks.mcpEgress !== "error" &&
           (configuration === null || configuration.status === "ok");
         return Response.json(
           {

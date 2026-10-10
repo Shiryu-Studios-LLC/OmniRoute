@@ -42,6 +42,7 @@ test("Worker MCP transport calls only the fixed VPC proxy and maps bounded respo
 
   assert.equal(seen.length, 1);
   assert.equal(seen[0]?.url, "http://omniroute-mcp-egress.internal:8080/v1/mcp/forward");
+  assert.equal(seen[0]?.redirect, "manual");
   assert.match(seen[0]?.headers.get("x-omniroute-timestamp") ?? "", /^\d+$/);
   assert.match(seen[0]?.headers.get("x-omniroute-nonce") ?? "", /^[\w-]{16,}$/);
   assert.match(seen[0]?.headers.get("x-omniroute-signature") ?? "", /^[a-f0-9]{64}$/);
@@ -73,6 +74,38 @@ test("Worker MCP transport calls only the fixed VPC proxy and maps bounded respo
   assert.equal(result.status, 200);
   assert.equal(result.headers.get("mcp-session-id"), "session-safe");
   assert.deepEqual(await result.json(), { jsonrpc: "2.0", id: 1, result: { tools: [] } });
+});
+
+test("Worker MCP transport does not follow redirects from the private proxy", async () => {
+  const seen: Request[] = [];
+  const transport = createCloudMcpEgressTransport({
+    proxyToken: TOKEN,
+    binding: {
+      async fetch(request) {
+        seen.push(request);
+        return new Response(null, {
+          status: 307,
+          headers: { Location: "https://attacker.example/collect" },
+        });
+      },
+    },
+  });
+  assert.ok(transport);
+
+  await assert.rejects(
+    transport.fetch(
+      "https://mcp.customer.example/mcp",
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer tenant-mcp-secret" },
+        body: JSON.stringify({ method: "tools/call", params: { name: "private_tool" } }),
+      },
+      CONTEXT
+    ),
+    McpOutboundEgressError
+  );
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]?.redirect, "manual");
 });
 
 test("Worker MCP transport fails closed when the VPC binding or proxy token is absent", () => {

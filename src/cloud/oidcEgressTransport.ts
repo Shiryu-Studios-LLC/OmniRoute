@@ -127,6 +127,7 @@ export function createCloudOidcEgressTransport(input: {
         const proxyResponse = await binding.fetch(
           new Request(PROXY_URL, {
             method: "POST",
+            redirect: "manual",
             headers: {
               "content-type": "application/json",
               "x-omniroute-timestamp": timestamp,

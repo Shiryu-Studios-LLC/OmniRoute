@@ -537,9 +537,7 @@ workflow rejects partial configuration, a reused OIDC VPC Service ID, or a
 missing firewall acknowledgement before deployment, and keeps MCP egress
 disabled when configuration is absent. It adds only the temporary staging
 `MCP_EGRESS` binding; the checked-in production Wrangler config remains
-unchanged. The current readiness response reports OIDC egress but does not
-report MCP egress, so staging smoke validation does not independently verify
-MCP proxy reachability or firewall behavior.
+unchanged. Readiness reports OIDC and MCP egress configuration states and returns not-ready when either enabled egress path lacks a valid binding/token. This verifies configuration only; it does not probe MCP proxy reachability or firewall behavior, which must be tested in isolated staging.
 
 The credential key must be a base64-encoded 32-byte key used only for Cloud
 credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The idempotency

@@ -171,11 +171,71 @@ test("cloud runtime readiness requires D1, Durable Object, and R2 storage", asyn
   assert.deepEqual(await response.json(), {
     status: "ready",
     runtime: "cloudflare",
-    checks: { database: "ok", gateway: "ok", artifacts: "ok", oidcEgress: "disabled" },
+    checks: {
+      database: "ok",
+      gateway: "ok",
+      artifacts: "ok",
+      oidcEgress: "disabled",
+      mcpEgress: "disabled",
+    },
   });
   assert.equal(doProbeCount, 1);
   assert.equal(artifactProbeCount, 1);
   assert.equal(artifactBodyCancelled, true);
+});
+
+test("cloud runtime readiness fails closed when enabled MCP egress is misconfigured", async () => {
+  const runtime = createCloudRuntime({
+    env: {
+      DB: {
+        prepare: () => ({
+          bind() {
+            return this;
+          },
+          async first() {
+            return { ok: 1 };
+          },
+          async all() {
+            return { results: [], success: true };
+          },
+          async run() {
+            return { success: true };
+          },
+        }),
+        async batch() {
+          return [];
+        },
+        async exec() {
+          return undefined;
+        },
+      },
+      GATEWAY_SESSIONS: {
+        idFromName: (name) => name,
+        get: () => ({ checkReadiness: async () => undefined }) as GatewayCoordinatorStub,
+      },
+      GATEWAY_ARTIFACTS: {
+        async get() {
+          return null;
+        },
+      } as CloudRuntimeEnv["GATEWAY_ARTIFACTS"],
+      OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED: "true",
+      OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: "mcp-egress-test-token-with-at-least-thirty-two-characters",
+    },
+  });
+
+  const response = await runtime.fetch(new Request("https://omniroute.test/__cloud/readiness"));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    status: "not_ready",
+    runtime: "cloudflare",
+    checks: {
+      database: "ok",
+      gateway: "ok",
+      artifacts: "ok",
+      oidcEgress: "disabled",
+      mcpEgress: "error",
+    },
+  });
 });
 
 test("cloud runtime readiness fails closed for missing or failing dependencies", async () => {
@@ -192,6 +252,7 @@ test("cloud runtime readiness fails closed for missing or failing dependencies",
       gateway: "unconfigured",
       artifacts: "unconfigured",
       oidcEgress: "disabled",
+      mcpEgress: "disabled",
     },
   });
 
