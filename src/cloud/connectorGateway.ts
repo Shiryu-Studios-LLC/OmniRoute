@@ -828,12 +828,13 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
             input.requestId,
             new Date(now()).toISOString()
           );
+          if (!request) return false;
           if (
             request.streamAcknowledgedSequence !== undefined &&
             request.streamAcknowledgedSequence >= input.sequence
           )
             return true;
-          if (!request || request.streamCancelled || request.status === "complete") return false;
+          if (request.streamCancelled || request.status === "complete") return false;
           await wait(Math.min(50, Math.max(1, deadline - now())));
           continue;
         }

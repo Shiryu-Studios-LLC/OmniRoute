@@ -3,6 +3,7 @@ import {
   decryptCloudCredential,
   encryptCloudCredential,
   isCloudCredentialEnvelope,
+  type CloudCredentialEncryptionKey,
 } from "./credentialEncryption";
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -171,7 +172,7 @@ export async function getCloudTenantOidcConfig(
 /** Read decrypted credentials only inside the Worker auth flow for an enabled config. */
 export async function getCloudTenantOidcCredentials(
   db: CloudDb,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   tenantId: string
 ): Promise<CloudTenantOidcCredentials | null> {
   requireId(tenantId, "tenantId");
@@ -193,7 +194,7 @@ export async function getCloudTenantOidcCredentials(
 
 export async function setCloudTenantOidcConfig(
   db: CloudDb,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   input: {
     tenantId: string;
     issuer: string;

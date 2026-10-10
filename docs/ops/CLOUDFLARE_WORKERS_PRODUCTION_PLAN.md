@@ -291,6 +291,7 @@ and [Worker egress through Gateway](https://developers.cloudflare.com/changelog/
 - Create owner/admin membership.
 - Generate tenant-scoped credentials.
 - The platform-admin tenant-create request supports either an owner principal ID from an external verified identity flow (creating the tenant, owner membership, and one-time API key) or explicit `bootstrapMode: "oidc_pending"` (creating the tenant and settings without an owner or key). The latter is followed by platform-admin OIDC configuration and first-owner claim issuance. Both paths have compensating rollback and audit records. The Cloud runtime does not verify real-world identity outside its configured OIDC callback.
+- In staging/production, tenant creation uses a distinct provisioning credential. It can create only `oidc_pending` tenant skeletons; it cannot assert an owner principal, administer tenant OIDC, or change tenant lifecycle. Owner creation still requires the verified OIDC first-owner claim flow.
 - Configure provider connections through the owner/admin customer API or Worker portal. The portal
   uses the OIDC session to list, create, edit, deactivate, and revoke the fixed OpenAI contract;
   credential inputs are transient, encrypted at the Worker boundary, and never returned or audited.
@@ -416,19 +417,19 @@ audit.
 
 The latest Worker-only Wrangler dry run (2026-10-10) runs two independent
 builds and compares their input count, bundle size, gzip size, and SHA-256.
-Both builds match at 106 inputs (783,386 bytes; 141,761 bytes gzip; SHA-256
-`d1e78c8d9ea3628d93c465c26c60f0c55bd5cce9785df7d9f268a4343b544ae9`). The AST
-boundary check reports 52 reachable source files and 888,231 source bytes. It
-is a dry run; no deployment occurred. The full
-`npm run cloudflare:open-next:build` run took 12m37: Next compiled and generated
-594 static pages, then OpenNext failed middleware bundling with 103 resolution
-errors, including `bun:sqlite`, native `keytar`/`koffi` modules, Playwright's
-`chromium-bidi`, a generated TypeScript import, and `@opentelemetry/api`. It
-also emitted 227 filesystem-tracing warnings. The standalone Worker dry run
-therefore does not satisfy the full-app production build exit criterion.
+Both builds match at 106 inputs (795,801 bytes; 143,908 bytes gzip; SHA-256
+`6931b3b6aaee8cc8abde1652a491974e8aca788b2652e8e8b7c8085f5ecf7a93`). The AST
+boundary check reports 52 reachable source files and 905,000 source bytes. It
+is a dry run; no deployment occurred. The latest full
+`npm run cloudflare:open-next:build` rerun compiled Next and generated 594
+static pages, then OpenNext failed middleware bundling with 102 dependency
+resolution errors, including `bun:sqlite` and native modules. The standalone
+Worker dry run therefore does not satisfy the full-app production build exit
+criterion.
 
-OpenNext's current Cloudflare support matrix does not support Node.js
-Middleware. OmniRoute's Next.js 16 `src/proxy.ts` is explicitly Node-only and
+Cloudflare's [current OpenNext support matrix](https://developers.cloudflare.com/workers/framework-guides/web-apps/opennext/)
+marks Node.js middleware as not yet supported and recommends vinext for new
+Workers applications. OmniRoute's Next.js 16 `src/proxy.ts` is explicitly Node-only and
 imports the local SQLite-backed authorization pipeline; the repository's proxy
 contract tests keep it from being changed to an Edge runtime without a complete
 replacement. A custom Worker wrapper around the generated OpenNext fetch
@@ -437,6 +438,9 @@ must introduce and test a D1-backed authorization boundary before routing
 protected application requests to OpenNext. Existing D1 identity storage covers
 customer API keys and OIDC memberships, but not local API keys, CLI access
 tokens, or dashboard login settings, so full policy parity remains incomplete.
+The vinext recommendation is an alternative path to evaluate only after an
+OmniRoute feature and route-compatibility audit; an adapter migration alone does
+not prove the local SQLite authorization and data paths are D1-compatible.
 
 **Exit:** production cloud build is reproducible and within size/runtime limits.
 
@@ -467,6 +471,7 @@ Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 `OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN`,
 `OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN`,
 `OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN`,
+`OMNIROUTE_CLOUD_PROVISIONING_TOKEN`,
 `OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN`,
 `OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN`,
 `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN`, and
@@ -475,22 +480,32 @@ Environment named `cloudflare-staging` with `CLOUDFLARE_API_TOKEN`,
 Environment variable `OMNIROUTE_CLOUD_PUBLIC_ORIGIN` to the exact HTTPS origin
 for the isolated `omniroute-cloud-runtime-staging.<account>.workers.dev` host;
 the workflow validates and binds it for the customer OIDC callback. Each of the
-six operator tokens must be distinct and 32–512 URL-safe characters. The
+seven scoped operator tokens must be distinct and 32–512 URL-safe characters. The
 identity token manages memberships, API keys, and OIDC configuration; the
 inference token manages only tenant inference entitlements and budgets; the
-lifecycle token manages tenant provisioning, lifecycle status, and maintenance
-history; the tenant-hosts token manages verified customer-host administration;
+lifecycle token manages tenant lifecycle status and maintenance history; the
+provisioning token creates only OIDC-pending tenants and cannot assert an owner,
+manage lifecycle, or administer tenant OIDC; the tenant-hosts token manages verified customer-host administration;
 the Front Desk token manages encrypted Front Desk configuration; and the
 maintenance token is limited to tenant lifecycle status and cannot provision
 customers.
 The two key secrets must be distinct base64-encoded 32-byte values, and all
-operator tokens must differ from both keys. All eight secrets are required by
+operator tokens must differ from both keys. All nine scoped/runtime secrets are required by
 the manual staging workflow. The legacy `OMNIROUTE_CLOUD_ADMIN_TOKEN` is
 ignored in staging and production; it remains a local/test compatibility token.
+Credential key rotation can be staged with the optional secret
+`OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON`, a JSON object mapping key IDs
+to base64-encoded 32-byte keys, and the optional non-secret variable
+`OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID`, which must name a key in
+that object. Adding the key map without an active ID enables reads of keyed v3
+envelopes while keeping new writes on v2. Selecting an active ID enables v3
+writes; keep the legacy key configured for existing v2 data. The scheduled maintenance task rewraps bounded batches across all persisted encrypted Cloud credential columns, using per-column cursors and compare-and-set updates. It preserves and counts unreadable rows and reports whether more rows remain. Keep every old wrapping key configured until an operator verifies a completed sweep with no failures and no remaining old-key rows; the Worker does not automatically authorize or enforce key removal. Live D1 migration and scheduled execution still require staging validation.
 The workflow binds each scoped secret through `wrangler secret put` using stdin
 and checks successful use and cross-scope denial for the new route families.
 Tenant lifecycle status audit rows identify the lifecycle or maintenance actor;
-customer provisioning audit rows identify the lifecycle actor.
+customer provisioning audit rows identify the provisioning actor for scoped
+OIDC-pending creation and the local platform-admin actor for legacy owner-bound
+creation.
 
 OIDC controlled egress is optional and disabled by default. To enable it only
 in the isolated staging Worker, provide the GitHub Environment variable
@@ -506,6 +521,25 @@ reports `oidcEgress: "disabled"` when off, `"ok"` when the enabled binding and
 token are present, and fails closed when the flag is on with missing or invalid
 configuration. An `ok` status proves configuration presence, not live issuer
 reachability or network-firewall policy.
+
+MCP controlled egress is separately optional. To enable it in the isolated
+staging Worker, set the GitHub Environment variable
+`CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID` to the UUID of a dedicated VPC
+Service that targets the private Node MCP egress proxy, add the distinct
+`OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN` secret, and set
+`CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED` to the exact value `true`.
+Only set that acknowledgement after verifying that the proxy listens on its
+private interface and its outbound firewall blocks private/internal, loopback,
+link-local, reserved, and metadata destinations while allowing outbound TCP
+443 only. The token must also be supplied to the proxy as
+`MCP_EGRESS_PROXY_TOKEN`; it must differ from the OIDC egress token. The
+workflow rejects partial configuration, a reused OIDC VPC Service ID, or a
+missing firewall acknowledgement before deployment, and keeps MCP egress
+disabled when configuration is absent. It adds only the temporary staging
+`MCP_EGRESS` binding; the checked-in production Wrangler config remains
+unchanged. The current readiness response reports OIDC egress but does not
+report MCP egress, so staging smoke validation does not independently verify
+MCP proxy reachability or firewall behavior.
 
 The credential key must be a base64-encoded 32-byte key used only for Cloud
 credential envelopes; never reuse local `STORAGE_ENCRYPTION_KEY`. The idempotency

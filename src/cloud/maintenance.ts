@@ -2,12 +2,34 @@ import type { CloudDb } from "./db";
 import {
   appendCloudMaintenanceRun,
   cleanupExpiredCloudMaintenanceRuns,
+  type CloudMaintenanceRunDetails,
   type CloudMaintenanceTaskKey,
 } from "./maintenanceRunLedger";
 
 export interface CloudMaintenanceTask {
   name: CloudMaintenanceTaskKey;
   run: () => Promise<unknown>;
+}
+
+function maintenanceDetails(value: unknown): CloudMaintenanceRunDetails | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const result = value as Partial<CloudMaintenanceRunDetails>;
+  if (
+    !Number.isSafeInteger(result.scanned) ||
+    !Number.isSafeInteger(result.rewrapped) ||
+    !Number.isSafeInteger(result.failed) ||
+    !Number.isSafeInteger(result.conflicts) ||
+    typeof result.hasMore !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    scanned: result.scanned as number,
+    rewrapped: result.rewrapped as number,
+    failed: result.failed as number,
+    conflicts: result.conflicts as number,
+    hasMore: result.hasMore,
+  };
 }
 
 export interface CloudMaintenanceLogger {
@@ -30,8 +52,9 @@ export async function runCloudMaintenanceTasks(
     tasks.map(async ({ name, run }) => {
       const startedAtMs = options.now?.() ?? Date.now();
       let failed = false;
+      let details: CloudMaintenanceRunDetails | undefined;
       try {
-        await run();
+        details = maintenanceDetails(await run());
       } catch {
         failed = true;
         logger.error("Cloud maintenance task failed", { task: name });
@@ -45,6 +68,7 @@ export async function runCloudMaintenanceTasks(
             finishedAtMs,
             durationMs: Math.max(0, finishedAtMs - startedAtMs),
             outcome: failed ? "failed" : "succeeded",
+            ...(details ? { details } : {}),
           });
         } catch {
           if (!ledgerFailureLogged) {

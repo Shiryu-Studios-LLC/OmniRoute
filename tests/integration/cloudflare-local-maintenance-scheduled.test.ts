@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { encryptCloudCredential } from "../../src/cloud/credentialEncryption";
 
 const enabled = process.env.RUN_CLOUDFLARE_LOCAL_INT === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -20,7 +21,11 @@ const expectedTasks = [
   "expired-oidc-artifacts",
   "expired-gateway-image-jobs",
   "expired-customer-host-challenges",
+  "rewrap-cloud-credentials",
 ] as const;
+const credentialLegacyKey = Buffer.alloc(32, 41).toString("base64");
+const credentialActiveKey = Buffer.alloc(32, 42).toString("base64");
+const credentialActiveKeyId = "scheduled-rotation-key";
 
 async function getUnusedPort(): Promise<number> {
   const server = net.createServer();
@@ -86,6 +91,9 @@ test(
     const secrets = [
       `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}`,
       `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}`,
+      `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY=${credentialLegacyKey}`,
+      `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON=${JSON.stringify({ [credentialActiveKeyId]: credentialActiveKey })}`,
+      `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID=${credentialActiveKeyId}`,
     ].join("\n");
     await writeFile(path.join(tempDir, ".env"), `${secrets}\n`, { mode: 0o600 });
     await writeFile(path.join(tempDir, ".dev.vars"), `${secrets}\n`, { mode: 0o600 });
@@ -219,6 +227,46 @@ INSERT INTO cloud_customer_host_verification_challenges (hostname, tenant_id, ch
       `seeding customer-host challenges failed:\n${challengeSeedResult.stdout}\n${challengeSeedResult.stderr}`
     );
 
+    const providerEnvelope = await encryptCloudCredential(
+      "local-rewrap-check-secret",
+      credentialLegacyKey,
+      {
+        tenantId: "challenge-tenant",
+        connectionId: "credential-rewrap-provider",
+        field: "apiKey",
+      }
+    );
+    const credentialSeedResult = spawnSync(
+      process.execPath,
+      [
+        wranglerBin,
+        "d1",
+        "execute",
+        workerName,
+        "--local",
+        "--persist-to",
+        persistDir,
+        "--config",
+        configPath,
+        "--env-file",
+        envPath,
+        "--command",
+        `INSERT INTO provider_connections (id, tenant_id, provider, api_key, created_at, updated_at) VALUES ('credential-rewrap-provider', 'challenge-tenant', 'openai', '${providerEnvelope}', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+      ],
+      {
+        cwd: tempDir,
+        env: processEnv,
+        encoding: "utf8",
+        timeout: 60_000,
+        maxBuffer: 4 * 1024 * 1024,
+      }
+    );
+    assert.equal(
+      credentialSeedResult.status,
+      0,
+      `seeding rewrap credential failed:\n${credentialSeedResult.stdout}\n${credentialSeedResult.stderr}`
+    );
+
     const port = new URL(baseUrl).port;
     const child = spawn(
       process.execPath,
@@ -288,6 +336,14 @@ INSERT INTO cloud_customer_host_verification_challenges (hostname, tenant_id, ch
       `scheduled waitUntil did not persist all task outcomes:\n${JSON.stringify(runs)}\n${output}`
     );
     assert.ok(runs.every((run) => run.outcome === "succeeded"));
+    const rewrapRun = runs.find((run) => run.taskKey === "rewrap-cloud-credentials");
+    assert.deepEqual(rewrapRun?.details, {
+      scanned: 1,
+      rewrapped: 1,
+      failed: 0,
+      conflicts: 0,
+      hasMore: false,
+    });
     assert.equal(
       runs.some((run) => run.id === staleId),
       false,

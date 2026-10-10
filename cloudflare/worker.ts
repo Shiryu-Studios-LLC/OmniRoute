@@ -8,19 +8,25 @@ import { cleanupExpiredCloudGatewayPairings } from "../src/cloud/gatewayPairing"
 import { cleanupExpiredCloudTenantOidcAuthArtifacts } from "../src/cloud/tenantOidcAuth";
 import { cleanupExpiredCloudImageJobs } from "../src/cloud/imageJobs";
 import { cleanupExpiredCloudCustomerHostVerificationChallenges } from "../src/cloud/customerHostVerificationChallenges";
+import { rewrapCloudCredentialRows } from "../src/cloud/credentialRewrapMaintenance";
+import {
+  isCloudCredentialEncryptionKey,
+  type CloudCredentialKeyring,
+} from "../src/cloud/credentialEncryption";
 import type { GatewayImageArtifactBucket } from "../src/cloud/imageJobs";
 import {
   cleanupSettledCloudInferenceReservations,
   cleanupStaleCloudInferenceReservations,
 } from "../src/cloud/inferencePolicy";
 import { cleanupExpiredCloudInferenceResponses } from "../src/cloud/inferenceIdempotency";
-import { runCloudMaintenanceTasks } from "../src/cloud/maintenance";
+import { runCloudMaintenanceTasks, type CloudMaintenanceTask } from "../src/cloud/maintenance";
 import { createCloudRuntime } from "../src/cloud/runtime";
 
 type CloudflareEnv = Env & {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_PROVISIONING_TOKEN?: string;
   OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN?: string;
@@ -28,6 +34,8 @@ type CloudflareEnv = Env & {
   OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID?: string;
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
   OMNIROUTE_FRONT_DESK_CONFIG_TOKEN?: string;
   OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN?: string;
@@ -115,6 +123,7 @@ const worker = {
         OMNIROUTE_ENV: env.OMNIROUTE_ENV,
         OMNIROUTE_BUILD_SHA: env.OMNIROUTE_BUILD_SHA,
         OMNIROUTE_CLOUD_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_ADMIN_TOKEN,
+        OMNIROUTE_CLOUD_PROVISIONING_TOKEN: env.OMNIROUTE_CLOUD_PROVISIONING_TOKEN,
         OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN,
         OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN,
         OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN,
@@ -122,6 +131,10 @@ const worker = {
         OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN,
         OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: env.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN,
         OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+        OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON:
+          env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON,
+        OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID:
+          env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID,
         OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: env.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY,
         OMNIROUTE_FRONT_DESK_CONFIG_TOKEN: env.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN,
         OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: env.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN,
@@ -138,44 +151,66 @@ const worker = {
     }).fetch(request);
   },
   scheduled(_controller: ScheduledController, env: CloudflareEnv, context: ExecutionContext): void {
-    context.waitUntil(
-      runCloudMaintenanceTasks(
-        [
-          { name: "expired-rate-limits", run: () => cleanupExpiredCloudRateLimits(env.DB) },
-          {
-            name: "expired-gateway-pairings",
-            run: () => cleanupExpiredCloudGatewayPairings(env.DB),
-          },
-          {
-            name: "stale-inference-reservations",
-            run: () => cleanupStaleCloudInferenceReservations(env.DB),
-          },
-          {
-            name: "settled-inference-reservations",
-            run: () => cleanupSettledCloudInferenceReservations(env.DB),
-          },
-          {
-            name: "expired-inference-responses",
-            run: () => cleanupExpiredCloudInferenceResponses(env.DB),
-          },
-          {
-            name: "expired-oidc-artifacts",
-            run: () => cleanupExpiredCloudTenantOidcAuthArtifacts(env.DB),
-          },
-          {
-            name: "expired-gateway-image-jobs",
-            run: () => cleanupExpiredCloudImageJobs(env.DB, env.GATEWAY_ARTIFACTS),
-          },
-          {
-            name: "expired-customer-host-challenges",
-            run: () => cleanupExpiredCloudCustomerHostVerificationChallenges(env.DB),
-          },
-        ],
-        undefined,
-        { db: env.DB }
-      )
-    );
+    const tasks: CloudMaintenanceTask[] = [
+      { name: "expired-rate-limits" as const, run: () => cleanupExpiredCloudRateLimits(env.DB) },
+      {
+        name: "expired-gateway-pairings" as const,
+        run: () => cleanupExpiredCloudGatewayPairings(env.DB),
+      },
+      {
+        name: "stale-inference-reservations" as const,
+        run: () => cleanupStaleCloudInferenceReservations(env.DB),
+      },
+      {
+        name: "settled-inference-reservations" as const,
+        run: () => cleanupSettledCloudInferenceReservations(env.DB),
+      },
+      {
+        name: "expired-inference-responses" as const,
+        run: () => cleanupExpiredCloudInferenceResponses(env.DB),
+      },
+      {
+        name: "expired-oidc-artifacts" as const,
+        run: () => cleanupExpiredCloudTenantOidcAuthArtifacts(env.DB),
+      },
+      {
+        name: "expired-gateway-image-jobs" as const,
+        run: () => cleanupExpiredCloudImageJobs(env.DB, env.GATEWAY_ARTIFACTS),
+      },
+      {
+        name: "expired-customer-host-challenges" as const,
+        run: () => cleanupExpiredCloudCustomerHostVerificationChallenges(env.DB),
+      },
+    ];
+    const credentialKeyring = scheduledCredentialKeyring(env);
+    if (credentialKeyring) {
+      tasks.push({
+        name: "rewrap-cloud-credentials",
+        run: () => rewrapCloudCredentialRows(env.DB, credentialKeyring),
+      });
+    }
+    context.waitUntil(runCloudMaintenanceTasks(tasks, undefined, { db: env.DB }));
   },
 };
+
+function scheduledCredentialKeyring(env: CloudflareEnv): CloudCredentialKeyring | undefined {
+  const legacyKey = env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY;
+  const activeKeyId = env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID;
+  const keysJson = env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON;
+  if (!legacyKey || !activeKeyId || !keysJson) return undefined;
+
+  try {
+    const parsed: unknown = JSON.parse(keysJson);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const keyring: CloudCredentialKeyring = {
+      legacyKey,
+      keys: parsed as Record<string, string>,
+      activeKeyId,
+    };
+    return isCloudCredentialEncryptionKey(keyring) ? keyring : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export default worker;

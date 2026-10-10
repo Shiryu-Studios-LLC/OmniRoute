@@ -81,11 +81,84 @@ test("staging OIDC egress stays off unless a dedicated VPC Service and token are
   );
   assert.match(
     workflow,
-    /config\.vpc_services = \[\{ binding: "OIDC_EGRESS", service_id: oidcServiceId \}\]/
+    /vpcServices\.push\(\{ binding: "OIDC_EGRESS", service_id: oidcServiceId \}\)/
   );
   assert.match(workflow, /wrangler secret put OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN/);
   assert.match(workflow, /OIDC_EGRESS_EXPECTED/);
   assert.doesNotMatch(workflow, /config\.services\s*=/);
+});
+
+test("staging MCP egress requires its own VPC Service, secret, and firewall verification", () => {
+  assert.match(workflow, /CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID/);
+  assert.match(workflow, /OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN/);
+  assert.match(workflow, /CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED/);
+  assert.match(workflow, /Boolean\(mcpServiceId\) !== Boolean\(mcpToken\)/);
+  assert.match(workflow, /mcpServiceId && !mcpFirewallVerified/);
+  assert.match(
+    workflow,
+    /mcpFirewallVerified = process\.env\.CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED === "true"/
+  );
+  assert.match(workflow, /mcpServiceId && mcpServiceId === oidcServiceId/);
+  assert.match(workflow, /OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED: mcpServiceId \? "true" : "false"/);
+  assert.match(
+    workflow,
+    /vpcServices\.push\(\{ binding: "MCP_EGRESS", service_id: mcpServiceId \}\)/
+  );
+  assert.match(workflow, /if \(vpcServices\.length\) config\.vpc_services = vpcServices/);
+  assert.match(
+    workflow,
+    /The MCP egress token must be distinct from every operator, runtime, and OIDC egress secret/
+  );
+  assert.match(workflow, /if: \$\{\{ vars\.CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID != '' \}\}/);
+  assert.match(workflow, /wrangler secret put OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN/);
+});
+
+test("staging uses a dedicated provisioning-only credential and rejects owner assertions", () => {
+  assert.match(workflow, /OMNIROUTE_CLOUD_PROVISIONING_TOKEN/);
+  assert.match(workflow, /operator_token_names=\([^\n]*OMNIROUTE_CLOUD_PROVISIONING_TOKEN/);
+  assert.match(workflow, /"OMNIROUTE_CLOUD_PROVISIONING_TOKEN"/);
+  assert.match(
+    workflow,
+    /printf '%s' "\$OMNIROUTE_CLOUD_PROVISIONING_TOKEN" \| npx wrangler secret put OMNIROUTE_CLOUD_PROVISIONING_TOKEN/
+  );
+  assert.match(
+    workflow,
+    /provisioning_out_of_scope=.*ownerPrincipalId.*\$STAGING_URL\/__cloud\/v1\/tenants/
+  );
+  assert.match(workflow, /\[\[ "\$provisioning_out_of_scope" == "403" \]\]/);
+});
+
+test("staging credential keyring is validated and bound only when configured", () => {
+  assert.match(workflow, /OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON/);
+  assert.match(workflow, /OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID/);
+  assert.match(workflow, /activeKeyId && !keyringJson/);
+  assert.match(workflow, /keys = JSON\.parse\(keyringJson\)/);
+  assert.match(workflow, /keys === null \|\| typeof keys !== "object" \|\| Array\.isArray\(keys\)/);
+  assert.match(workflow, /A-Za-z0-9_-\]\{1,64\}/);
+  assert.match(workflow, /decoded\.byteLength === 32 && decoded\.toString\("base64"\) === value/);
+  assert.match(workflow, /activeKeyId && !Object\.hasOwn\(keys, activeKeyId\)/);
+  assert.match(workflow, /const runtimeSecretNames = \[/);
+  assert.match(workflow, /"OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN"/);
+  assert.match(workflow, /"OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY"/);
+  assert.match(workflow, /"OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN"/);
+  assert.match(workflow, /"OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN"/);
+  assert.match(workflow, /runtimeSecretValues\.has\(keyValue\)/);
+  assert.match(workflow, /const seenKeys = new Set\(\)/);
+  assert.match(workflow, /seenKeys\.has\(keyValue\)/);
+  assert.match(
+    workflow,
+    /if \(credentialEncryptionActiveKeyId\)[\s\S]*config\.vars\.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID = credentialEncryptionActiveKeyId/
+  );
+  assert.match(workflow, /if \[\[ -n "\$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON" \]\]/);
+  assert.match(workflow, /wrangler secret put OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON/);
+  assert.doesNotMatch(
+    workflow,
+    /OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID = process\.env\.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID;/
+  );
+  assert.doesNotMatch(
+    workflow,
+    /console\.(?:log|error)\([^\n]*(?:keyringJson|keyValue|legacyKey|keys)\)/
+  );
 });
 
 test("staging verifies the exact R2 artifact bucket before any migration or deployment", () => {
@@ -115,12 +188,15 @@ test("staging secret values are piped to Wrangler and never printed or shell-tra
     "OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN",
     "OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN",
     "OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN",
+    "OMNIROUTE_CLOUD_PROVISIONING_TOKEN",
     "OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN",
     "OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN",
     "OMNIROUTE_CLOUD_MAINTENANCE_TOKEN",
     "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY",
     "OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY",
     "OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN",
+    "OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN",
+    "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON",
   ];
 
   for (const name of secretNames) {

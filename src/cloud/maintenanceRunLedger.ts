@@ -9,10 +9,19 @@ export const CLOUD_MAINTENANCE_TASK_KEYS = [
   "expired-oidc-artifacts",
   "expired-gateway-image-jobs",
   "expired-customer-host-challenges",
+  "rewrap-cloud-credentials",
 ] as const;
 
 export type CloudMaintenanceTaskKey = (typeof CLOUD_MAINTENANCE_TASK_KEYS)[number];
 export type CloudMaintenanceOutcome = "succeeded" | "failed";
+
+export interface CloudMaintenanceRunDetails {
+  scanned: number;
+  rewrapped: number;
+  failed: number;
+  conflicts: number;
+  hasMore: boolean;
+}
 
 export interface CloudMaintenanceRunRecord {
   id: number;
@@ -21,6 +30,7 @@ export interface CloudMaintenanceRunRecord {
   finishedAtMs: number;
   durationMs: number;
   outcome: CloudMaintenanceOutcome;
+  details?: CloudMaintenanceRunDetails;
 }
 
 export interface CloudMaintenanceRunInput {
@@ -29,6 +39,7 @@ export interface CloudMaintenanceRunInput {
   finishedAtMs: number;
   durationMs: number;
   outcome: CloudMaintenanceOutcome;
+  details?: CloudMaintenanceRunDetails;
 }
 
 const MAX_TIMESTAMP_MS = 8_640_000_000_000_000;
@@ -56,6 +67,21 @@ function validateRun(input: CloudMaintenanceRunInput): CloudMaintenanceRunInput 
   if (input.outcome !== "succeeded" && input.outcome !== "failed") {
     throw new TypeError("outcome must be succeeded or failed");
   }
+  if (input.details) {
+    for (const [label, value] of [
+      ["scanned", input.details.scanned],
+      ["rewrapped", input.details.rewrapped],
+      ["failed", input.details.failed],
+      ["conflicts", input.details.conflicts],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new RangeError(`maintenance ${label} detail is invalid`);
+      }
+    }
+    if (typeof input.details.hasMore !== "boolean") {
+      throw new TypeError("maintenance hasMore detail is invalid");
+    }
+  }
   return input;
 }
 
@@ -68,10 +94,17 @@ export async function appendCloudMaintenanceRun(
   const result = await db
     .prepare(
       `INSERT INTO cloud_maintenance_runs (
-        task_key, started_at_ms, finished_at_ms, duration_ms, outcome
-      ) VALUES (?, ?, ?, ?, ?)`
+        task_key, started_at_ms, finished_at_ms, duration_ms, outcome, details_json
+      ) VALUES (?, ?, ?, ?, ?, ?)`
     )
-    .bind(run.taskKey, run.startedAtMs, run.finishedAtMs, run.durationMs, run.outcome)
+    .bind(
+      run.taskKey,
+      run.startedAtMs,
+      run.finishedAtMs,
+      run.durationMs,
+      run.outcome,
+      run.details ? JSON.stringify(run.details) : null
+    )
     .run();
   if (!result.success) throw new Error("D1 maintenance telemetry write failed");
 }
@@ -135,8 +168,9 @@ export async function listCloudMaintenanceRuns(
       finished_at_ms: number;
       duration_ms: number;
       outcome: CloudMaintenanceOutcome;
+      details_json: string | null;
     }>(
-      `SELECT id, task_key, started_at_ms, finished_at_ms, duration_ms, outcome
+      `SELECT id, task_key, started_at_ms, finished_at_ms, duration_ms, outcome, details_json
          FROM cloud_maintenance_runs
         ORDER BY finished_at_ms DESC, id DESC
         LIMIT ?`
@@ -144,12 +178,34 @@ export async function listCloudMaintenanceRuns(
     .bind(limit)
     .all();
   if (!result.success) throw new Error("D1 maintenance telemetry read failed");
-  return result.results.map((row) => ({
-    id: row.id,
-    taskKey: row.task_key,
-    startedAtMs: row.started_at_ms,
-    finishedAtMs: row.finished_at_ms,
-    durationMs: row.duration_ms,
-    outcome: row.outcome,
-  }));
+  return result.results.map((row) => {
+    let details: CloudMaintenanceRunDetails | undefined;
+    if (typeof row.details_json === "string") {
+      try {
+        const parsed: unknown = JSON.parse(row.details_json);
+        if (
+          parsed !== null &&
+          typeof parsed === "object" &&
+          Number.isSafeInteger((parsed as CloudMaintenanceRunDetails).scanned) &&
+          Number.isSafeInteger((parsed as CloudMaintenanceRunDetails).rewrapped) &&
+          Number.isSafeInteger((parsed as CloudMaintenanceRunDetails).failed) &&
+          Number.isSafeInteger((parsed as CloudMaintenanceRunDetails).conflicts) &&
+          typeof (parsed as CloudMaintenanceRunDetails).hasMore === "boolean"
+        ) {
+          details = parsed as CloudMaintenanceRunDetails;
+        }
+      } catch {
+        // Malformed optional telemetry is omitted from the maintenance response.
+      }
+    }
+    return {
+      id: row.id,
+      taskKey: row.task_key,
+      startedAtMs: row.started_at_ms,
+      finishedAtMs: row.finished_at_ms,
+      durationMs: row.duration_ms,
+      outcome: row.outcome,
+      ...(details ? { details } : {}),
+    };
+  });
 }

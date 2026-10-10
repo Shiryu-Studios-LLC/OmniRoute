@@ -73,7 +73,7 @@ const NOW = "2026-10-08T12:00:00.000Z";
 const WRAP_KEY = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
 const SECRET = "sk-test-customer-provider-secret";
 
-async function fixture() {
+async function fixture(options: { keysJson?: string; activeKeyId?: string } = {}) {
   const db = new SqliteCloudDb();
   for (const migration of [
     "0001_cloud_runtime.sql",
@@ -116,7 +116,16 @@ async function fixture() {
     ).token;
   }
   const runtime = createCloudRuntime({
-    env: { DB: db, OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: WRAP_KEY },
+    env: {
+      DB: db,
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: WRAP_KEY,
+      ...(options.keysJson !== undefined
+        ? { OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: options.keysJson }
+        : {}),
+      ...(options.activeKeyId !== undefined
+        ? { OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID: options.activeKeyId }
+        : {}),
+    },
     now: () => new Date(NOW),
     customerProviderBodyTimeoutMs: 10,
   });
@@ -189,6 +198,56 @@ test("customer owners/admins provision only the fixed provider contract and neve
     .bind("tenant-a", "customer.provider_connection.create")
     .first();
   assert.equal(audit?.count, 2);
+});
+
+test("runtime keyring reads v3 keys but only writes v3 when an active key ID is configured", async () => {
+  const keyId = "provider-credential-2026-10";
+  const rotatedKey = Buffer.alloc(32, 17).toString("base64");
+  const keysJson = JSON.stringify({ [keyId]: rotatedKey });
+
+  const legacyWriter = await fixture({ keysJson });
+  try {
+    assert.equal(
+      (
+        await legacyWriter.call(legacyWriter.tokens.owner, "POST", "", {
+          id: "legacy-writer",
+          provider: "openai",
+          apiKey: SECRET,
+        })
+      ).status,
+      201
+    );
+    const stored = await legacyWriter.db
+      .prepare<{ api_key: string }>(
+        "SELECT api_key FROM provider_connections WHERE tenant_id='tenant-a' AND id='legacy-writer'"
+      )
+      .first();
+    assert.match(stored?.api_key ?? "", /^enc:v2:/);
+  } finally {
+    legacyWriter.db.db.close();
+  }
+
+  const keyedWriter = await fixture({ keysJson, activeKeyId: keyId });
+  try {
+    assert.equal(
+      (
+        await keyedWriter.call(keyedWriter.tokens.owner, "POST", "", {
+          id: "keyed-writer",
+          provider: "openai",
+          apiKey: SECRET,
+        })
+      ).status,
+      201
+    );
+    const stored = await keyedWriter.db
+      .prepare<{ api_key: string }>(
+        "SELECT api_key FROM provider_connections WHERE tenant_id='tenant-a' AND id='keyed-writer'"
+      )
+      .first();
+    assert.match(stored?.api_key ?? "", new RegExp(`^enc:v3:${keyId}:`));
+  } finally {
+    keyedWriter.db.db.close();
+  }
 });
 
 test("provider configuration is tenant-isolated and member/viewer keys cannot read or mutate it", async () => {
@@ -278,6 +337,7 @@ test("customer API rejects unsupported providers and contract overrides", async 
     { id: "hosted", provider: "openai", apiKey: SECRET, executionLocation: "shiryu_hosted" },
     { id: "alternate-model", provider: "openai", apiKey: SECRET, defaultModel: "gpt-4.1" },
     { id: "ciphertext", provider: "openai", apiKey: "enc:v2:client-submitted" },
+    { id: "ciphertext-v3", provider: "openai", apiKey: "enc:v3:key-1:client-submitted" },
   ])
     assert.equal((await call(tokens.owner, "POST", "", body)).status, 400);
   assert.equal(

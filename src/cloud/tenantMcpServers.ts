@@ -7,6 +7,7 @@ import {
   decryptCloudCredential,
   encryptCloudCredential,
   isCloudCredentialEnvelope,
+  type CloudCredentialEncryptionKey,
 } from "./credentialEncryption";
 
 export const CLOUD_MCP_TRANSPORTS = ["streamable_http"] as const;
@@ -287,7 +288,7 @@ async function runMutationWithAudit(
 
 async function encryptCredential(
   credential: string | null | undefined,
-  key: string | undefined,
+  key: CloudCredentialEncryptionKey | undefined,
   tenantId: string,
   serverId: string
 ): Promise<string | null> {
@@ -346,7 +347,7 @@ export async function getCloudTenantMcpCredential(
   db: CloudDb,
   tenantId: string,
   id: string,
-  key: string | undefined
+  key: CloudCredentialEncryptionKey | undefined
 ): Promise<string | null> {
   requireId(tenantId, "tenantId");
   requireId(id, "id");
@@ -374,7 +375,7 @@ export async function createCloudTenantMcpServer(
   db: CloudDb,
   input: CloudTenantMcpServerInput,
   context: CloudTenantMcpMutationContext,
-  encryptionKey: string | undefined
+  encryptionKey: CloudCredentialEncryptionKey | undefined
 ): Promise<CloudTenantMcpServer | null> {
   const serverId = crypto.randomUUID();
   const credentialEncrypted = await encryptCredential(
@@ -421,7 +422,7 @@ export async function updateCloudTenantMcpServer(
   id: string,
   input: Partial<CloudTenantMcpServerInput>,
   context: CloudTenantMcpMutationContext,
-  encryptionKey: string | undefined
+  encryptionKey: CloudCredentialEncryptionKey | undefined
 ): Promise<CloudTenantMcpServer | null> {
   requireId(id, "id");
   const assignments: string[] = [];

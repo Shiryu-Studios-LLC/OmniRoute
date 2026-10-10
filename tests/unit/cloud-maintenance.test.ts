@@ -13,6 +13,7 @@ interface StoredRun {
   finishedAt: number;
   duration: number;
   outcome: string;
+  details?: string;
 }
 
 class MaintenanceDb implements CloudDb {
@@ -46,6 +47,7 @@ class MaintenanceDb implements CloudDb {
             finishedAt: Number(values[2]),
             duration: Number(values[3]),
             outcome: String(values[4]),
+            ...(typeof values[5] === "string" ? { details: String(values[5]) } : {}),
           });
           return { success: true, meta: { changes: 1 } };
         }
@@ -127,6 +129,30 @@ test("cloud maintenance reports task-level failures without exposing exception d
   assert.deepEqual(logs, [
     { message: "Cloud maintenance task failed", task: "stale-inference-reservations" },
   ]);
+});
+
+test("maintenance ledger stores only the approved content-free credential rotation counters", async () => {
+  const db = new MaintenanceDb();
+  await runCloudMaintenanceTasks(
+    [
+      {
+        name: "rewrap-cloud-credentials",
+        async run() {
+          return { scanned: 8, rewrapped: 6, failed: 1, conflicts: 1, hasMore: true };
+        },
+      },
+    ],
+    { error() {} },
+    { db, now: () => 2_000 }
+  );
+  assert.equal(db.runs[0]?.task, "rewrap-cloud-credentials");
+  assert.deepEqual(JSON.parse(db.runs[0]?.details ?? "{}"), {
+    scanned: 8,
+    rewrapped: 6,
+    failed: 1,
+    conflicts: 1,
+    hasMore: true,
+  });
 });
 
 test("cloud maintenance resolves when all cleanup tasks succeed", async () => {

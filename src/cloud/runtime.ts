@@ -1,6 +1,11 @@
 import type { CloudDb } from "./db";
 import { handleCloudApiRequest, isDeploymentToken } from "./httpApi";
-import { isCloudCredentialEncryptionKey } from "./credentialEncryption";
+import {
+  isCloudCredentialEncryptionKey,
+  isCloudCredentialKeyId,
+  type CloudCredentialEncryptionKey,
+  type CloudCredentialKeyring,
+} from "./credentialEncryption";
 import { isCloudInferenceIdempotencySecret } from "./inferenceIdempotency";
 import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
@@ -65,6 +70,70 @@ import type {
 
 const CLOUD_TENANT_ADMIN_API_PATH = "/__cloud/v1/tenants";
 
+interface CredentialEncryptionSettings {
+  key?: CloudCredentialEncryptionKey;
+  issue?: "invalid:credentialEncryptionKey" | "invalid:credentialKeyring";
+  secretValues: string[];
+}
+
+function resolveCredentialEncryptionSettings(
+  env: CloudRuntimeEnv | undefined
+): CredentialEncryptionSettings {
+  const legacyKey = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY;
+  const keysJson = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON;
+  const activeKeyId = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID;
+  const hasKeyringConfig = keysJson !== undefined || activeKeyId !== undefined;
+  if (!legacyKey) {
+    return {
+      issue: hasKeyringConfig ? "invalid:credentialKeyring" : undefined,
+      secretValues: [],
+    };
+  }
+  if (!isCloudCredentialEncryptionKey(legacyKey)) {
+    return { issue: "invalid:credentialEncryptionKey", secretValues: [legacyKey] };
+  }
+  if (!hasKeyringConfig) return { key: legacyKey, secretValues: [legacyKey] };
+
+  let keys: Record<string, string> = Object.create(null) as Record<string, string>;
+  if (keysJson !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(keysJson);
+    } catch {
+      return { issue: "invalid:credentialKeyring", secretValues: [legacyKey] };
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { issue: "invalid:credentialKeyring", secretValues: [legacyKey] };
+    }
+    for (const [keyId, secret] of Object.entries(parsed)) {
+      if (!isCloudCredentialKeyId(keyId) || typeof secret !== "string") {
+        return { issue: "invalid:credentialKeyring", secretValues: [legacyKey] };
+      }
+      if (!isCloudCredentialEncryptionKey(secret)) {
+        return { issue: "invalid:credentialKeyring", secretValues: [legacyKey] };
+      }
+      keys[keyId] = secret;
+    }
+  }
+
+  if (
+    activeKeyId !== undefined &&
+    (!isCloudCredentialKeyId(activeKeyId) || !Object.hasOwn(keys, activeKeyId))
+  ) {
+    return {
+      issue: "invalid:credentialKeyring",
+      secretValues: [legacyKey, ...Object.values(keys)],
+    };
+  }
+
+  const keyring: CloudCredentialKeyring = {
+    legacyKey,
+    keys,
+    ...(activeKeyId !== undefined ? { activeKeyId } : {}),
+  };
+  return { key: keyring, secretValues: [legacyKey, ...Object.values(keys)] };
+}
+
 export interface CloudRuntimeEnv {
   OMNIROUTE_ENV?: string;
   OMNIROUTE_BUILD_SHA?: string;
@@ -74,10 +143,13 @@ export interface CloudRuntimeEnv {
   OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN?: string;
+  OMNIROUTE_CLOUD_PROVISIONING_TOKEN?: string;
   OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_MAINTENANCE_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID?: string;
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
   OMNIROUTE_FRONT_DESK_CONFIG_TOKEN?: string;
   OMNIROUTE_CLOUD_PUBLIC_ORIGIN?: string;
@@ -136,6 +208,15 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
     : env?.OIDC_EGRESS && oidcEgressToken && /^[A-Za-z0-9_-]{32,512}$/.test(oidcEgressToken)
       ? "ok"
       : "error";
+  const mcpEgressEnabled = env?.OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED === "true";
+  const mcpEgressToken = env?.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN;
+  const mcpEgressState: "ok" | "disabled" | "error" = !mcpEgressEnabled
+    ? "disabled"
+    : env?.MCP_EGRESS && mcpEgressToken && /^[A-Za-z0-9_-]{32,512}$/.test(mcpEgressToken)
+      ? "ok"
+      : "error";
+  const credentialEncryption = resolveCredentialEncryptionSettings(env);
+  const credentialEncryptionKey = credentialEncryption.key;
 
   const configurationStatus = (): {
     status: "ok" | "unconfigured" | "error";
@@ -145,11 +226,11 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       ["identityAdminToken", env?.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN],
       ["inferenceAdminToken", env?.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN],
       ["lifecycleAdminToken", env?.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN],
+      ["provisioningToken", env?.OMNIROUTE_CLOUD_PROVISIONING_TOKEN],
       ["tenantHostsAdminToken", env?.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN],
       ["frontDeskAdminToken", env?.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN],
       ["maintenanceToken", env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN],
     ] as const;
-    const credentialEncryptionKey = env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY;
     const idempotencyKey = env?.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY;
     const frontDeskConfigToken = env?.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN;
     const issues: string[] = [];
@@ -157,10 +238,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
       if (!token) issues.push(`missing:${name}`);
       else if (!isDeploymentToken(token)) issues.push(`invalid:${name}`);
     }
-    if (!credentialEncryptionKey) issues.push("missing:credentialEncryptionKey");
-    else if (!isCloudCredentialEncryptionKey(credentialEncryptionKey)) {
-      issues.push("invalid:credentialEncryptionKey");
+    if (!env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY) {
+      issues.push("missing:credentialEncryptionKey");
     }
+    if (credentialEncryption.issue) issues.push(credentialEncryption.issue);
     if (!idempotencyKey) issues.push("missing:idempotencyKey");
     else if (!isCloudInferenceIdempotencySecret(idempotencyKey)) {
       issues.push("invalid:idempotencyKey");
@@ -175,12 +256,20 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         issues.push("invalid:oidcEgressToken");
       }
     }
+    if (mcpEgressEnabled) {
+      if (!env?.MCP_EGRESS) issues.push("missing:mcpEgressBinding");
+      if (!mcpEgressToken) issues.push("missing:mcpEgressToken");
+      else if (!/^[A-Za-z0-9_-]{32,512}$/.test(mcpEgressToken)) {
+        issues.push("invalid:mcpEgressToken");
+      }
+    }
     const configuredSecrets = [
       ...scopedTokens.map(([, token]) => token).filter((token): token is string => Boolean(token)),
-      credentialEncryptionKey,
+      ...credentialEncryption.secretValues,
       idempotencyKey,
       ...(frontDeskConfigToken ? [frontDeskConfigToken] : []),
       ...(oidcEgressEnabled && oidcEgressToken ? [oidcEgressToken] : []),
+      ...(mcpEgressEnabled && mcpEgressToken ? [mcpEgressToken] : []),
     ].filter((secret): secret is string => Boolean(secret));
     if (new Set(configuredSecrets).size !== configuredSecrets.length) {
       issues.push("duplicate:operatorOrRuntimeSecret");
@@ -221,7 +310,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
               : (options.env?.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN ??
                 options.env?.OMNIROUTE_CLOUD_ADMIN_TOKEN),
             serviceToken: options.env?.OMNIROUTE_FRONT_DESK_CONFIG_TOKEN,
-            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            credentialEncryptionKey,
             now,
           });
           if (response) return response;
@@ -294,7 +383,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         try {
           const response = await handleCloudCustomerProviderRequest(request, {
             db: options.env?.DB,
-            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            credentialEncryptionKey,
             now,
             bodyReadTimeoutMs: options.customerProviderBodyTimeoutMs,
           });
@@ -329,7 +418,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         try {
           const response = await handleCloudTenantMcpRequest(request, {
             db: options.env?.DB,
-            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            credentialEncryptionKey,
             egressBinding: options.env?.MCP_EGRESS,
             egressProxyToken: options.env?.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN,
             egressEnabled: options.env?.OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED === "true",
@@ -379,7 +468,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
             sessions: options.env?.GATEWAY_SESSIONS,
             publicOrigin: options.env?.OMNIROUTE_CLOUD_PUBLIC_ORIGIN,
             environment: options.env?.OMNIROUTE_ENV,
-            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            credentialEncryptionKey,
             oidcTransport:
               options.env?.OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED === "true"
                 ? (createCloudOidcEgressTransport({
@@ -422,6 +511,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           gateway: "ok" | "unconfigured" | "error";
           artifacts: "ok" | "unconfigured" | "error";
           oidcEgress: "ok" | "disabled" | "error";
+          mcpEgress: "ok" | "disabled" | "error";
           configuration?: "ok" | "unconfigured" | "error";
           configurationIssues?: string[];
         } = {
@@ -429,6 +519,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           gateway: "unconfigured",
           artifacts: "unconfigured",
           oidcEgress: oidcEgressState,
+          mcpEgress: mcpEgressState,
           ...(configuration !== null
             ? {
                 configuration: configuration.status,
@@ -530,7 +621,7 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         try {
           return await handleCloudInferenceCustomerRequest(request, {
             db: options.env?.DB,
-            credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+            credentialEncryptionKey,
             requestHashSecret: options.env?.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY,
             now: () => now().getTime(),
             fetcher: options.fetcher,
@@ -628,9 +719,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
           lifecycleAdminToken: scopedOperatorToken(
             options.env?.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN
           ),
+          provisioningToken: scopedOperatorToken(options.env?.OMNIROUTE_CLOUD_PROVISIONING_TOKEN),
           maintenanceToken: scopedOperatorToken(options.env?.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN),
           environment: options.env?.OMNIROUTE_ENV,
-          credentialEncryptionKey: options.env?.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+          credentialEncryptionKey,
           sessions: options.env?.GATEWAY_SESSIONS,
           now,
           adminRateLimit: options.adminRateLimit,

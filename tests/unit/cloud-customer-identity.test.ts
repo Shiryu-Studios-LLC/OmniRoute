@@ -442,6 +442,84 @@ test("platform admin can provision an explicit OIDC-pending tenant without creat
   }
 });
 
+test("dedicated provisioning token can create only an OIDC-pending tenant", async () => {
+  const { d1, now } = await fixture();
+  const provisioningToken = "provisioning-only-secret-0123456789abcdef";
+  try {
+    const response = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${provisioningToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-provisioning-token",
+          name: "Provisioning Token Customer",
+          slug: "provisioning-token-customer",
+          bootstrapMode: "oidc_pending",
+        }),
+      }),
+      { db: d1, provisioningToken, environment: "production", now: () => new Date(now) }
+    );
+
+    assert.equal(response.status, 201);
+    const provisioned = (await response.json()) as {
+      tenant: { id: string; kind: string };
+      bootstrapMode: string;
+      ownerMembership: unknown;
+      ownerApiKey: unknown;
+    };
+    assert.equal(provisioned.tenant.id, "tenant-provisioning-token");
+    assert.equal(provisioned.tenant.kind, "customer");
+    assert.equal(provisioned.bootstrapMode, "oidc_pending");
+    assert.equal(provisioned.ownerMembership, null);
+    assert.equal(provisioned.ownerApiKey, null);
+
+    const assertedOwner = await handleCloudApiRequest(
+      new Request("https://omniroute.test/__cloud/v1/tenants", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${provisioningToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "tenant-provisioning-asserted-owner",
+          name: "Caller Asserted Owner",
+          slug: "caller-asserted-owner",
+          ownerPrincipalId: "caller-asserted-subject",
+        }),
+      }),
+      { db: d1, provisioningToken, environment: "production", now: () => new Date(now) }
+    );
+    assert.equal(assertedOwner.status, 403);
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM tenants WHERE id = ?")
+        .bind("tenant-provisioning-asserted-owner")
+        .first(),
+      null,
+      "a caller-asserted owner must be rejected before the tenant is inserted"
+    );
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM cloud_customer_memberships WHERE tenant_id = ?")
+        .bind("tenant-provisioning-token")
+        .first(),
+      null
+    );
+    assert.equal(
+      await d1
+        .prepare("SELECT id FROM cloud_customer_api_keys WHERE tenant_id = ?")
+        .bind("tenant-provisioning-token")
+        .first(),
+      null
+    );
+  } finally {
+    d1.db.close();
+  }
+});
+
 test("provisioning rejects unknown or mixed bootstrap modes before creating a tenant", async () => {
   const { d1, now } = await fixture();
   try {
@@ -828,16 +906,15 @@ test("membership and key creation reject non-customer, suspended, and cross-tena
   }
 });
 
-test("lifecycle identity attributes trusted-owner provisioning audits correctly", async () => {
+test("local legacy admin attributes trusted-owner provisioning audits correctly", async () => {
   const { d1, now } = await fixture();
   const adminToken = "platform-admin-secret";
-  const lifecycleAdminToken = "platform-lifecycle-secret";
   try {
     const response = await handleCloudApiRequest(
       new Request("https://omniroute.test/__cloud/v1/tenants", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${lifecycleAdminToken}`,
+          Authorization: `Bearer ${adminToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -850,7 +927,6 @@ test("lifecycle identity attributes trusted-owner provisioning audits correctly"
       {
         db: d1,
         adminToken,
-        lifecycleAdminToken,
         now: () => new Date(now),
       }
     );
@@ -865,8 +941,8 @@ test("lifecycle identity attributes trusted-owner provisioning audits correctly"
     assert.deepEqual(
       auditRows.results.map(({ action, actor, status }) => ({ action, actor, status })),
       [
-        { action: "cloud.api.post", actor: "cloud-lifecycle-admin", status: "attempted" },
-        { action: "customer.provision", actor: "cloud-lifecycle-admin", status: "success" },
+        { action: "cloud.api.post", actor: "cloud-admin", status: "attempted" },
+        { action: "customer.provision", actor: "cloud-admin", status: "success" },
       ]
     );
   } finally {

@@ -16,6 +16,59 @@ export const PROVIDER_EXECUTION_LOCATIONS = [
 
 export type ProviderExecutionLocation = (typeof PROVIDER_EXECUTION_LOCATIONS)[number];
 
+/**
+ * Models accepted by the customer OpenAI Responses bridge. Keep this deliberately
+ * explicit: that bridge only supports plain-text input and the Responses API
+ * count/generation contract, and tenant D1 entitlements must still enable each
+ * model before it can be called.
+ */
+export const CLOUD_OPENAI_RESPONSES_MODELS = [
+  "gpt-4o-mini-2024-07-18",
+  "gpt-4o-mini",
+  "gpt-4o",
+  "gpt-4o-2024-08-06",
+  "gpt-4o-2024-11-20",
+  "gpt-4.1-mini",
+  "gpt-4.1-mini-2025-04-14",
+  "gpt-4.1-nano",
+  "gpt-4.1-nano-2025-04-14",
+  "gpt-4.1",
+  "gpt-4.1-2025-04-14",
+] as const;
+
+export type CloudOpenAiResponsesModel = (typeof CLOUD_OPENAI_RESPONSES_MODELS)[number];
+
+export function isCloudOpenAiResponsesModel(value: unknown): value is CloudOpenAiResponsesModel {
+  return (
+    typeof value === "string" && CLOUD_OPENAI_RESPONSES_MODELS.some((model) => model === value)
+  );
+}
+
+const CLOUD_OPENAI_RESPONSES_MODEL_OUTPUTS: Record<string, readonly string[]> = {
+  "gpt-4o-mini-2024-07-18": ["gpt-4o-mini-2024-07-18"],
+  "gpt-4o-mini": ["gpt-4o-mini", "gpt-4o-mini-2024-07-18"],
+  "gpt-4o": ["gpt-4o", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20"],
+  "gpt-4o-2024-08-06": ["gpt-4o-2024-08-06"],
+  "gpt-4o-2024-11-20": ["gpt-4o-2024-11-20"],
+  "gpt-4.1-mini": ["gpt-4.1-mini", "gpt-4.1-mini-2025-04-14"],
+  "gpt-4.1-mini-2025-04-14": ["gpt-4.1-mini-2025-04-14"],
+  "gpt-4.1-nano": ["gpt-4.1-nano", "gpt-4.1-nano-2025-04-14"],
+  "gpt-4.1-nano-2025-04-14": ["gpt-4.1-nano-2025-04-14"],
+  "gpt-4.1": ["gpt-4.1", "gpt-4.1-2025-04-14"],
+  "gpt-4.1-2025-04-14": ["gpt-4.1-2025-04-14"],
+};
+
+/** Accept only the requested alias or its documented dated snapshot in upstream results. */
+export function isCloudOpenAiResponsesModelResult(
+  requestedModel: string,
+  responseModel: unknown
+): responseModel is CloudOpenAiResponsesModel {
+  return (
+    typeof responseModel === "string" &&
+    CLOUD_OPENAI_RESPONSES_MODEL_OUTPUTS[requestedModel]?.includes(responseModel) === true
+  );
+}
+
 export interface ProviderExecutionContract {
   credentialOwnership: ProviderOwnershipMode;
   executionLocation: ProviderExecutionLocation;

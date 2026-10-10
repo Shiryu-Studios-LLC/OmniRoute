@@ -1,6 +1,7 @@
 import type { CloudDb } from "./db";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import { appendCloudComplianceAudit } from "./complianceAudit";
+import type { CloudCredentialEncryptionKey } from "./credentialEncryption";
 import { createCloudMcpEgressTransport, type CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import {
@@ -27,7 +28,7 @@ const TENANT_RATE_LIMIT = { limit: 60, windowMs: 60_000 };
 
 export interface CloudTenantMcpHttpApiOptions {
   db?: CloudDb;
-  credentialEncryptionKey?: string;
+  credentialEncryptionKey?: CloudCredentialEncryptionKey;
   egressBinding?: CloudMcpEgressBinding;
   egressProxyToken?: string;
   egressEnabled?: boolean;

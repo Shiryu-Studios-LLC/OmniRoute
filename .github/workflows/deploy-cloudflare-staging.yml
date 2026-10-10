@@ -26,6 +26,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_STAGING_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_STAGING_D1_DATABASE_ID }}
       CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID: ${{ vars.CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID }}
+      CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID: ${{ vars.CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID }}
       OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ${{ vars.OMNIROUTE_CLOUD_PUBLIC_ORIGIN }}
 
     steps:
@@ -45,13 +46,19 @@ jobs:
           OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_PROVISIONING_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_PROVISIONING_TOKEN }}
           OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN }}
           OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY }}
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: ${{ secrets.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON }}
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID: ${{ vars.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID }}
           OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: ${{ secrets.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY }}
           OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN }}
+          OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN }}
           CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID: ${{ vars.CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID }}
+          CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID: ${{ vars.CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID }}
+          CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED: ${{ vars.CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED }}
           OMNIROUTE_CLOUD_PUBLIC_ORIGIN: ${{ vars.OMNIROUTE_CLOUD_PUBLIC_ORIGIN }}
         run: |
           set -euo pipefail
@@ -62,7 +69,7 @@ jobs:
           [[ -n "$CLOUDFLARE_API_TOKEN" ]] || { echo "Missing CLOUDFLARE_API_TOKEN in cloudflare-staging environment."; exit 1; }
           [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_ACCOUNT_ID must be a 32-character Cloudflare account ID."; exit 1; }
           [[ "$CLOUDFLARE_STAGING_D1_DATABASE_ID" =~ ^[[:xdigit:]]{32}$ ]] || { echo "CLOUDFLARE_STAGING_D1_DATABASE_ID must be a 32-character staging D1 ID."; exit 1; }
-          operator_token_names=(OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN OMNIROUTE_CLOUD_MAINTENANCE_TOKEN)
+          operator_token_names=(OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN OMNIROUTE_CLOUD_PROVISIONING_TOKEN OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN OMNIROUTE_CLOUD_MAINTENANCE_TOKEN)
           declare -A operator_token_values=()
           for token_name in "${operator_token_names[@]}"; do
             token_value="${!token_name:-}"
@@ -77,6 +84,76 @@ jobs:
             [[ -z "${operator_token_values[$secret_value]+present}" ]] || { echo "$secret_name must be distinct from every operator token."; exit 1; }
             operator_token_values["$secret_value"]="$secret_name"
           done
+          node <<'NODE'
+          const keyringJson = process.env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON ?? "";
+          const activeKeyId = process.env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID ?? "";
+          const legacyKey = process.env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY ?? "";
+          const fail = (message) => {
+            console.error(message);
+            process.exit(1);
+          };
+          const decodeKey = (value) => {
+            if (typeof value !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(value)) return null;
+            const decoded = Buffer.from(value, "base64");
+            return decoded.byteLength === 32 && decoded.toString("base64") === value ? decoded : null;
+          };
+
+          if (activeKeyId && !keyringJson) {
+            fail("OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID requires OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON.");
+          }
+          if (keyringJson) {
+            if (!decodeKey(legacyKey)) {
+              fail("OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY must be a canonical base64-encoded 32-byte key when a keyring is configured.");
+            }
+            if (activeKeyId && !/^[A-Za-z0-9_-]{1,64}$/.test(activeKeyId)) {
+              fail("OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID must be 1–64 letters, digits, underscores, or hyphens.");
+            }
+            let keys;
+            try {
+              keys = JSON.parse(keyringJson);
+            } catch {
+              fail("OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON must contain a valid JSON object.");
+            }
+            if (keys === null || typeof keys !== "object" || Array.isArray(keys)) {
+              fail("OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON must contain a JSON object mapping key IDs to keys.");
+            }
+            if (activeKeyId && !Object.hasOwn(keys, activeKeyId)) {
+              fail("OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID must name a key in the configured keyring.");
+            }
+            const runtimeSecretNames = [
+              "OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN",
+              "OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN",
+              "OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN",
+              "OMNIROUTE_CLOUD_PROVISIONING_TOKEN",
+              "OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN",
+              "OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN",
+              "OMNIROUTE_CLOUD_MAINTENANCE_TOKEN",
+              "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY",
+              "OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY",
+              "OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN",
+              "OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN",
+            ];
+            const runtimeSecretValues = new Set(
+              runtimeSecretNames.map((name) => process.env[name]).filter(Boolean),
+            );
+            const seenKeys = new Set();
+            for (const [keyId, keyValue] of Object.entries(keys)) {
+              if (!/^[A-Za-z0-9_-]{1,64}$/.test(keyId)) {
+                fail("Credential keyring IDs must be 1–64 letters, digits, underscores, or hyphens.");
+              }
+              if (!decodeKey(keyValue)) {
+                fail("Every credential keyring value must be a canonical base64-encoded 32-byte key.");
+              }
+              if (seenKeys.has(keyValue)) {
+                fail("Credential keyring values must be unique and distinct from every configured runtime secret.");
+              }
+              if (runtimeSecretValues.has(keyValue)) {
+                fail("Credential keyring values must be distinct from every configured runtime secret.");
+              }
+              seenKeys.add(keyValue);
+            }
+          }
+          NODE
           if [[ -n "$CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID" ]]; then
             [[ "$CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID must be a VPC Service UUID."; exit 1; }
             [[ "$OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN" =~ ^[A-Za-z0-9_-]{32,512}$ ]] || { echo "OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN must be configured with the dedicated staging VPC Service."; exit 1; }
@@ -84,6 +161,17 @@ jobs:
             operator_token_values["$OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN"]="OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN"
           elif [[ -n "$OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN" ]]; then
             echo "OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN requires CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID; egress stays disabled without the dedicated binding."
+            exit 1
+          fi
+          if [[ -n "$CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID" ]]; then
+            [[ "$CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID must be a dedicated VPC Service UUID."; exit 1; }
+            [[ "$CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID" != "$CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID" ]] || { echo "MCP and OIDC egress require separate dedicated VPC Service IDs."; exit 1; }
+            [[ "$OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN" =~ ^[A-Za-z0-9_-]{32,512}$ ]] || { echo "OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN must be configured with the dedicated staging VPC Service."; exit 1; }
+            [[ "$CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED" == "true" ]] || { echo "Set CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED=true only after verifying the proxy uses a private interface and its outbound firewall blocks private/internal destinations, allowing outbound TCP 443 only."; exit 1; }
+            [[ -z "${operator_token_values[$OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN]+present}" ]] || { echo "The MCP egress token must be distinct from every operator, runtime, and OIDC egress secret."; exit 1; }
+            operator_token_values["$OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN"]="OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN"
+          elif [[ -n "$OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN" ]]; then
+            echo "OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN requires CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID; MCP egress stays disabled without the dedicated binding."
             exit 1
           fi
           [[ "$OMNIROUTE_CLOUD_PUBLIC_ORIGIN" =~ ^https://omniroute-cloud-runtime-staging\.[A-Za-z0-9-]+\.workers\.dev$ ]] || { echo "OMNIROUTE_CLOUD_PUBLIC_ORIGIN must be the exact HTTPS origin for the isolated staging workers.dev host."; exit 1; }
@@ -106,6 +194,10 @@ jobs:
         env:
           CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID: ${{ vars.CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID }}
           OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN }}
+          CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID: ${{ vars.CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID }}
+          OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN }}
+          CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED: ${{ vars.CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED }}
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID: ${{ vars.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID }}
         run: |
           set -euo pipefail
           config="$RUNNER_TEMP/wrangler-cloudflare-staging-${GITHUB_RUN_ID}.json"
@@ -176,11 +268,26 @@ jobs:
 
           const oidcServiceId = process.env.CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID ?? "";
           const oidcToken = process.env.OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN ?? "";
+          const mcpServiceId = process.env.CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID ?? "";
+          const mcpToken = process.env.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN ?? "";
+          const mcpFirewallVerified = process.env.CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED === "true";
           if (Boolean(oidcServiceId) !== Boolean(oidcToken)) {
             throw new Error("OIDC egress requires both the dedicated staging VPC Service ID and token");
           }
           if (oidcServiceId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(oidcServiceId)) {
             throw new Error("Refusing staging config with an invalid OIDC VPC Service ID");
+          }
+          if (Boolean(mcpServiceId) !== Boolean(mcpToken)) {
+            throw new Error("MCP egress requires both the dedicated staging VPC Service ID and token");
+          }
+          if (mcpServiceId && mcpServiceId === oidcServiceId) {
+            throw new Error("MCP and OIDC egress require separate dedicated VPC Service IDs");
+          }
+          if (mcpServiceId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mcpServiceId)) {
+            throw new Error("Refusing staging config with an invalid MCP VPC Service ID");
+          }
+          if (mcpServiceId && !mcpFirewallVerified) {
+            throw new Error("Refusing to enable MCP egress until the proxy private interface and outbound firewall have been verified");
           }
 
           config.name = "omniroute-cloud-runtime-staging";
@@ -198,10 +305,21 @@ jobs:
             OMNIROUTE_BUILD_SHA: process.env.GITHUB_SHA,
             OMNIROUTE_CLOUD_PUBLIC_ORIGIN: process.env.OMNIROUTE_CLOUD_PUBLIC_ORIGIN,
             OMNIROUTE_CLOUD_OIDC_EGRESS_ENABLED: oidcServiceId ? "true" : "false",
+            OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED: mcpServiceId ? "true" : "false",
           };
-          if (oidcServiceId) {
-            config.vpc_services = [{ binding: "OIDC_EGRESS", service_id: oidcServiceId }];
+          const credentialEncryptionActiveKeyId = process.env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID ?? "";
+          if (credentialEncryptionActiveKeyId) {
+            if (!/^[A-Za-z0-9_-]{1,64}$/.test(credentialEncryptionActiveKeyId)) {
+              throw new Error("Refusing staging config with an invalid credential encryption active key ID");
+            }
+            config.vars.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID = credentialEncryptionActiveKeyId;
           }
+          const vpcServices = [];
+          if (oidcServiceId) {
+            vpcServices.push({ binding: "OIDC_EGRESS", service_id: oidcServiceId });
+          }
+          if (mcpServiceId) vpcServices.push({ binding: "MCP_EGRESS", service_id: mcpServiceId });
+          if (vpcServices.length) config.vpc_services = vpcServices;
           config.d1_databases[0].migrations_dir = path.resolve("cloudflare/migrations");
 
           fs.writeFileSync(process.env.CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -337,6 +455,15 @@ jobs:
           set -euo pipefail
           printf '%s' "$OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN --config "$WRANGLER_CONFIG"
 
+      - name: Bind staging tenant provisioning token
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_PROVISIONING_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_PROVISIONING_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_PROVISIONING_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_PROVISIONING_TOKEN --config "$WRANGLER_CONFIG"
+
       - name: Bind staging tenant-hosts admin token
         shell: bash
         env:
@@ -373,6 +500,17 @@ jobs:
           set -euo pipefail
           printf '%s' "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY" | npx wrangler secret put OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY --config "$WRANGLER_CONFIG"
 
+      - name: Bind staging cloud credential encryption keyring
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: ${{ secrets.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON" ]]; then
+            printf '%s' "$OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON" | npx wrangler secret put OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON --config "$WRANGLER_CONFIG"
+          fi
+
       - name: Bind staging cloud idempotency HMAC key
         shell: bash
         env:
@@ -392,6 +530,16 @@ jobs:
           set -euo pipefail
           printf '%s' "$OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_OIDC_EGRESS_TOKEN --config "$WRANGLER_CONFIG"
 
+      - name: Bind staging MCP egress token
+        if: ${{ vars.CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID != '' }}
+        shell: bash
+        env:
+          WRANGLER_CONFIG: ${{ steps.staging-config.outputs.path }}
+          OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN" | npx wrangler secret put OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN --config "$WRANGLER_CONFIG"
+
       - name: Verify staging health and D1 binding
         shell: bash
         env:
@@ -401,6 +549,7 @@ jobs:
           OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN }}
+          OMNIROUTE_CLOUD_PROVISIONING_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_PROVISIONING_TOKEN }}
           OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN }}
           OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: ${{ secrets.OMNIROUTE_CLOUD_MAINTENANCE_TOKEN }}
@@ -414,6 +563,11 @@ jobs:
           lifecycle_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/status")"
           [[ "$lifecycle_authorized" == "404" ]] || {
             echo "Staging Worker lifecycle authorization smoke check returned an unexpected status."
+            exit 1
+          }
+          provisioning_out_of_scope="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_PROVISIONING_TOKEN" --header 'Content-Type: application/json' --data '{"id":"__smoke_owner_assertion__","name":"Scope check","slug":"__smoke-owner-assertion__","ownerPrincipalId":"caller-asserted-subject"}' "$STAGING_URL/__cloud/v1/tenants")"
+          [[ "$provisioning_out_of_scope" == "403" ]] || {
+            echo "Staging Worker provisioning credential accepted an owner assertion or returned an unexpected status."
             exit 1
           }
           identity_authorized="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header "Authorization: Bearer $OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN" "$STAGING_URL/__cloud/v1/tenants/__smoke_missing__/oidc")"

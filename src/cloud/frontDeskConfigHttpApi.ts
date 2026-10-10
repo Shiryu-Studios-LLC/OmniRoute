@@ -6,6 +6,7 @@ import {
   encryptCloudCredential,
   isCloudCredentialEnvelope,
   isCloudCredentialEncryptionKey,
+  type CloudCredentialEncryptionKey,
 } from "./credentialEncryption";
 import { getCloudGatewayDevice, listCloudGatewayDevices } from "./gatewayDevices";
 import { consumeCloudRateLimit } from "./rateLimit";
@@ -38,7 +39,7 @@ export interface CloudFrontDeskConfigApiOptions {
   db?: CloudDb;
   adminToken?: string;
   serviceToken?: string;
-  credentialEncryptionKey?: string;
+  credentialEncryptionKey?: CloudCredentialEncryptionKey;
   now?: () => Date;
   bodyReadTimeoutMs?: number;
 }

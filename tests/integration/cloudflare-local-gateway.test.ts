@@ -551,6 +551,7 @@ test(
       gateway: "ok",
       artifacts: "ok",
       oidcEgress: "disabled",
+      mcpEgress: "disabled",
     });
     const unauthorizedAdminRequest = await requestJson(
       `${baseUrl}/__cloud/v1/tenants/__smoke_missing__/status`

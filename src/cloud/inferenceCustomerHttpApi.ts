@@ -1,5 +1,9 @@
 import { appendCloudComplianceAudit } from "./complianceAudit";
-import { decryptCloudCredential, isCloudCredentialEnvelope } from "./credentialEncryption";
+import {
+  decryptCloudCredential,
+  isCloudCredentialEnvelope,
+  type CloudCredentialEncryptionKey,
+} from "./credentialEncryption";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import type { CloudDb } from "./db";
 import {
@@ -13,6 +17,10 @@ import {
   settleCloudInferenceReservation,
 } from "./inferencePolicy";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
+import {
+  isCloudOpenAiResponsesModel,
+  isCloudOpenAiResponsesModelResult,
+} from "./providerExecution";
 import { getCloudProviderConnections } from "./providers";
 import { appendCloudUsageRecord } from "./usage";
 import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
@@ -40,7 +48,7 @@ const encoder = new TextEncoder();
 
 export interface CloudInferenceCustomerHttpApiOptions {
   db?: CloudDb;
-  credentialEncryptionKey?: string;
+  credentialEncryptionKey?: CloudCredentialEncryptionKey;
   requestHashSecret?: string;
   now?: () => number;
   fetcher?: typeof fetch;
@@ -176,7 +184,7 @@ async function readBoundedJson(
 
 function parseCustomerRequest(body: Record<string, unknown>): CustomerRequest | null {
   if (Object.keys(body).some((key) => !ALLOWED_BODY_FIELDS.has(key))) return null;
-  if (body.model !== CLOUD_INFERENCE_MODEL) return null;
+  if (!isCloudOpenAiResponsesModel(body.model)) return null;
   if (!Array.isArray(body.messages) || body.messages.length !== 1) return null;
   const message = body.messages[0];
   if (
@@ -202,7 +210,7 @@ function parseCustomerRequest(body: Record<string, unknown>): CustomerRequest | 
   }
   if (body.stream !== undefined && typeof body.stream !== "boolean") return null;
   return {
-    model: CLOUD_INFERENCE_MODEL,
+    model: body.model,
     message: content,
     stream: body.stream === true,
     ...(body.max_completion_tokens === undefined
@@ -309,14 +317,14 @@ function parseCountResponse(value: unknown): CountResponse | null {
   return { object: "response.input_tokens", input_tokens: body.input_tokens };
 }
 
-function parseProviderResponse(value: unknown): ProviderResponse | null {
+function parseProviderResponse(value: unknown, expectedModel: string): ProviderResponse | null {
   const body = record(value);
   const usage = record(body?.usage);
   if (
     typeof body?.id !== "string" ||
     body.id.length < 1 ||
     body.id.length > 256 ||
-    body.model !== CLOUD_INFERENCE_MODEL ||
+    !isCloudOpenAiResponsesModelResult(expectedModel, body.model) ||
     (body.status !== "completed" && body.status !== "incomplete") ||
     !Array.isArray(body.output) ||
     !usage ||
@@ -363,7 +371,12 @@ function assistantText(output: unknown[]): string | null {
   return parts.length ? parts.join("") : null;
 }
 
-function chatCompletion(response: ProviderResponse, content: string, requestId: string) {
+function chatCompletion(
+  response: ProviderResponse,
+  content: string,
+  requestId: string,
+  model: string
+) {
   const finishReason =
     response.status === "incomplete" && response.incomplete_details?.reason === "max_output_tokens"
       ? "length"
@@ -372,7 +385,7 @@ function chatCompletion(response: ProviderResponse, content: string, requestId: 
     id: `chatcmpl_${requestId.replace(/-/g, "")}`,
     object: "chat.completion",
     created: response.created_at ?? Math.floor(Date.now() / 1000),
-    model: CLOUD_INFERENCE_MODEL,
+    model,
     choices: [
       {
         index: 0,
@@ -390,7 +403,7 @@ function chatCompletion(response: ProviderResponse, content: string, requestId: 
 
 function requestPayload(request: CustomerRequest) {
   return {
-    model: CLOUD_INFERENCE_MODEL,
+    model: request.model,
     input: request.message,
   };
 }
@@ -411,13 +424,14 @@ function chatChunk(
   requestId: string,
   created: number,
   delta: Record<string, unknown>,
+  model: string,
   finishReason: string | null = null
 ): string {
   return sseData({
     id: `chatcmpl_${requestId.replace(/-/g, "")}`,
     object: "chat.completion.chunk",
     created,
-    model: CLOUD_INFERENCE_MODEL,
+    model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   });
 }
@@ -626,7 +640,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
           return true;
         }
         if (event === "response.completed" || event === "response.incomplete") {
-          providerResult = parseProviderResponse(body?.response);
+          providerResult = parseProviderResponse(body?.response, input.countPayload.model);
           return providerResult !== null;
         }
         if (event === "response.failed" || event === "error") return false;
@@ -635,7 +649,11 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
 
       void (async () => {
         try {
-          if (!emit(chatChunk(claim.requestId, created, { role: "assistant" }))) {
+          if (
+            !emit(
+              chatChunk(claim.requestId, created, { role: "assistant" }, input.countPayload.model)
+            )
+          ) {
             await fail("Inference result exceeds the response limit", true);
             return;
           }
@@ -663,7 +681,16 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
               boundary = buffer.indexOf("\n\n");
             }
             if (pendingDelta && emittedDelta) {
-              if (!emit(chatChunk(claim.requestId, created, { content: pendingDelta }))) {
+              if (
+                !emit(
+                  chatChunk(
+                    claim.requestId,
+                    created,
+                    { content: pendingDelta },
+                    input.countPayload.model
+                  )
+                )
+              ) {
                 await fail("Inference result exceeds the response limit", true);
                 return;
               }
@@ -690,7 +717,14 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
           }
           if (
             pendingDelta &&
-            !emit(chatChunk(claim.requestId, created, { content: pendingDelta }))
+            !emit(
+              chatChunk(
+                claim.requestId,
+                created,
+                { content: pendingDelta },
+                input.countPayload.model
+              )
+            )
           ) {
             await fail("Inference result exceeds the response limit", true);
             return;
@@ -711,7 +745,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
               id: claim.requestId,
               tenantId: input.tenantId,
               provider: CLOUD_INFERENCE_PROVIDER,
-              model: CLOUD_INFERENCE_MODEL,
+              model: input.countPayload.model,
               connectionId: input.connectionId,
               apiKeyId: input.apiKeyId,
               tokensInput: providerResult.usage.input_tokens,
@@ -738,7 +772,8 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
               ? "length"
               : "stop";
           const terminal =
-            chatChunk(claim.requestId, created, {}, finishReason) + "data: [DONE]\n\n";
+            chatChunk(claim.requestId, created, {}, input.countPayload.model, finishReason) +
+            "data: [DONE]\n\n";
           const terminalBytes = outputEncoder.encode(terminal);
           if (transcriptBytes + terminalBytes.byteLength > CLOUD_INFERENCE_MAX_RESPONSE_BYTES) {
             await fail("Inference result exceeds the response limit", true);
@@ -891,7 +926,17 @@ export async function handleCloudInferenceCustomerRequest(
   if (parsedBody.kind !== "ok") return errorResponse("Invalid or oversized JSON body", 400);
   const customerRequest = parseCustomerRequest(parsedBody.body);
   if (!customerRequest) {
-    return errorResponse("Only one plain-text user message for the pinned model is supported", 400);
+    return errorResponse(
+      "Unsupported model or request; one plain-text user message is required",
+      400
+    );
+  }
+  if (
+    customerRequest.model !== CLOUD_INFERENCE_MODEL &&
+    identity.role !== "owner" &&
+    identity.role !== "admin"
+  ) {
+    return errorResponse("Owner or admin membership is required to select an inference model", 403);
   }
 
   if (!options.requestHashSecret || options.requestHashSecret === options.credentialEncryptionKey) {
@@ -995,7 +1040,7 @@ export async function handleCloudInferenceCustomerRequest(
       options.db,
       identity.tenantId,
       CLOUD_INFERENCE_PROVIDER,
-      CLOUD_INFERENCE_MODEL
+      customerRequest.model
     );
   } catch {
     return cache(
@@ -1141,7 +1186,7 @@ export async function handleCloudInferenceCustomerRequest(
       tenantId: identity.tenantId,
       reservationId: claim.requestId,
       provider: CLOUD_INFERENCE_PROVIDER,
-      model: CLOUD_INFERENCE_MODEL,
+      model: customerRequest.model,
       inputTokens,
       maxOutputTokens,
       now: new Date(options.now?.() ?? Date.now()),
@@ -1208,7 +1253,9 @@ export async function handleCloudInferenceCustomerRequest(
       CLOUD_INFERENCE_MAX_RESPONSE_BYTES
     );
     const providerJson = result.body === null ? null : safeParseJson(result.body);
-    providerResult = result.response.ok ? parseProviderResponse(providerJson) : null;
+    providerResult = result.response.ok
+      ? parseProviderResponse(providerJson, customerRequest.model)
+      : null;
     content = providerResult ? assistantText(providerResult.output) : null;
   } catch {
     await settleCloudInferenceReservation(options.db, {
@@ -1273,7 +1320,12 @@ export async function handleCloudInferenceCustomerRequest(
     return errorResponse("Token accounting could not be safely confirmed", 503, claim.requestId);
   }
 
-  const completion = chatCompletion(providerResult, content, claim.requestId);
+  const completion = chatCompletion(
+    providerResult,
+    content,
+    claim.requestId,
+    customerRequest.model
+  );
   const completionJson = safeJsonString(completion);
   if (completionJson === null) {
     await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
@@ -1285,7 +1337,7 @@ export async function handleCloudInferenceCustomerRequest(
       id: claim.requestId,
       tenantId: identity.tenantId,
       provider: CLOUD_INFERENCE_PROVIDER,
-      model: CLOUD_INFERENCE_MODEL,
+      model: customerRequest.model,
       connectionId,
       apiKeyId: identity.apiKeyId,
       tokensInput: providerResult.usage.input_tokens,

@@ -46,7 +46,11 @@ import type {
   GatewayCoordinatorStub,
   GatewayDurableObjectNamespace,
 } from "./connectorGatewayDurableObject";
-import { CloudCredentialEncryptionError, encryptCloudCredential } from "./credentialEncryption";
+import {
+  CloudCredentialEncryptionError,
+  encryptCloudCredential,
+  type CloudCredentialEncryptionKey,
+} from "./credentialEncryption";
 import {
   getCloudInferenceBudgetStatus,
   listCloudInferenceEntitlements,
@@ -90,14 +94,16 @@ export interface CloudApiOptions {
   identityAdminToken?: string;
   /** Production token limited to inference policy administration. */
   inferenceAdminToken?: string;
-  /** Production token limited to tenant provisioning, lifecycle, and maintenance history. */
+  /** Production token limited to tenant lifecycle and maintenance history. */
   lifecycleAdminToken?: string;
+  /** Production token limited to creating OIDC-pending customer tenants. */
+  provisioningToken?: string;
   /** Cloud deployment environment; staging/production enforce deployment token policy. */
   environment?: string;
-  /** Optional token limited to tenant provisioning and lifecycle operations. */
+  /** Optional token limited to tenant lifecycle operations. */
   maintenanceToken?: string;
   /** Base64-encoded 32-byte secret used only by the Worker credential envelope. */
-  credentialEncryptionKey?: string;
+  credentialEncryptionKey?: CloudCredentialEncryptionKey;
   sessions?: GatewayDurableObjectNamespace<GatewayCoordinatorStub>;
   now?: () => Date;
   /** Test override; production defaults are intentionally conservative. */
@@ -313,7 +319,7 @@ function nullableString(value: unknown, field: string): string | null {
 async function connectionInput(
   value: unknown,
   tenantId: string,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   connectionId?: string,
   isPatch = false
 ): Promise<
@@ -407,12 +413,12 @@ async function connectionInput(
 }
 
 function isSubmittedCiphertext(value: string): boolean {
-  return value.startsWith("enc:v1:") || value.startsWith("enc:v2:");
+  return value.startsWith("enc:v1:") || value.startsWith("enc:v2:") || value.startsWith("enc:v3:");
 }
 
 async function encryptCredentialField(
   plaintext: string,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   tenantId: string,
   connectionId: string | undefined,
   field: string
@@ -435,7 +441,7 @@ async function encryptCredentialField(
 async function nodeInput(
   value: unknown,
   tenantId: string,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   nodeId?: string,
   isPatch = false
 ): Promise<CloudProviderNodeInput | Partial<Omit<CloudProviderNodeInput, "id" | "tenantId">>> {
@@ -558,6 +564,7 @@ export async function handleCloudApiRequest(
       options.identityAdminToken,
       options.inferenceAdminToken,
       options.lifecycleAdminToken,
+      options.provisioningToken,
       options.maintenanceToken,
     ].some((token) => token !== undefined && !isDeploymentToken(token))
   ) {
@@ -567,6 +574,7 @@ export async function handleCloudApiRequest(
     options.identityAdminToken,
     options.inferenceAdminToken,
     options.lifecycleAdminToken,
+    options.provisioningToken,
     options.maintenanceToken,
   ].filter((token): token is string => Boolean(token));
   if (
@@ -586,9 +594,8 @@ export async function handleCloudApiRequest(
     segments.length === 2 &&
     segments[1] === "status" &&
     (request.method === "GET" || request.method === "POST");
-  const tenantProvisioningRoute = segments.length === 0 && request.method === "POST";
   const maintenanceRoute = tenantStatusRoute;
-  const lifecycleAdminRoute = tenantStatusRoute || tenantProvisioningRoute;
+  const lifecycleAdminRoute = tenantStatusRoute;
   const isMaintenanceRunsPath =
     segments.length === 2 && segments[0] === "maintenance" && segments[1] === "runs";
   const isCustomerIdentityPath =
@@ -627,6 +634,8 @@ export async function handleCloudApiRequest(
     !!options.inferenceAdminToken && authorized(request, options.inferenceAdminToken);
   const isLifecycleAdminToken =
     !!options.lifecycleAdminToken && authorized(request, options.lifecycleAdminToken);
+  const isProvisioningToken =
+    !!options.provisioningToken && authorized(request, options.provisioningToken);
   let customerIdentity: CloudCustomerIdentity | null = null;
   if (tenantScopedRoute) {
     const authorization = request.headers.get("Authorization") ?? "";
@@ -655,6 +664,7 @@ export async function handleCloudApiRequest(
     !options.identityAdminToken &&
     !options.inferenceAdminToken &&
     !options.lifecycleAdminToken &&
+    !options.provisioningToken &&
     !(maintenanceRoute && options.maintenanceToken)
   ) {
     return json({ error: "Cloud API is not configured" }, 503);
@@ -665,7 +675,8 @@ export async function handleCloudApiRequest(
     ((lifecycleAdminRoute ||
       isMaintenanceRunsPath ||
       (segments.length === 1 && request.method === "GET")) &&
-      isLifecycleAdminToken);
+      isLifecycleAdminToken) ||
+    (segments.length === 0 && request.method === "POST" && isProvisioningToken);
   if (!tenantScopedRoute && !routeHasScopedOperator && !isLegacyAdminToken && !isMaintenanceToken) {
     return json({ error: "Unauthorized" }, 401);
   }
@@ -679,7 +690,9 @@ export async function handleCloudApiRequest(
           ? "cloud-inference-admin"
           : isLifecycleAdminToken
             ? "cloud-lifecycle-admin"
-            : "cloud-admin";
+            : isProvisioningToken
+              ? "cloud-provisioning"
+              : "cloud-admin";
   if (!options.db) return json({ error: "Cloud database is not configured" }, 503);
   if (request.method === "OPTIONS") return json({ error: "Method not allowed" }, 405);
   const db = options.db;
@@ -1273,7 +1286,10 @@ export async function handleCloudApiRequest(
         );
       }
       if (oidcPendingRequested && !isLegacyAdminToken && !isIdentityAdminToken) {
-        return json({ error: "Unauthorized" }, 401);
+        if (!isProvisioningToken) return json({ error: "Unauthorized" }, 401);
+      }
+      if (isProvisioningToken && (!oidcPendingRequested || ownerPrincipalProvided)) {
+        return json({ error: "Provisioning credential only supports OIDC-pending tenants" }, 403);
       }
       const provisioned = await provisionCloudCustomer(db, {
         id: body.id,

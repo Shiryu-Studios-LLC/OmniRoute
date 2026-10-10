@@ -464,6 +464,7 @@ const scopedOperatorTokens = {
   identity: "cloud-identity-admin-token-0123456789",
   inference: "cloud-inference-admin-token-0123456789",
   lifecycle: "cloud-lifecycle-admin-token-0123456789",
+  provisioning: "cloud-provisioning-token-only-0123456789",
   hosts: "cloud-hosts-admin-token-0123456789012345",
   frontDesk: "cloud-frontdesk-admin-token-0123456789",
   maintenance: "cloud-maintenance-token-0123456789012",
@@ -506,6 +507,7 @@ test("production operator tokens are limited to their route families", async () 
       OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: scopedOperatorTokens.identity,
       OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
       OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+      OMNIROUTE_CLOUD_PROVISIONING_TOKEN: scopedOperatorTokens.provisioning,
       OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.hosts,
       OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
       OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
@@ -524,6 +526,36 @@ test("production operator tokens are limited to their route families", async () 
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       })
     );
+
+  assert.equal(
+    (
+      await authorized("/__cloud/v1/tenants", scopedOperatorTokens.provisioning, "POST", {
+        id: "tenant-asserted-owner",
+        name: "Asserted Owner",
+        slug: "asserted-owner",
+        ownerPrincipalId: "caller-asserted-subject",
+      })
+    ).status,
+    403,
+    "provisioning scope cannot assert an owner principal"
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/status", scopedOperatorTokens.provisioning))
+      .status,
+    401,
+    "provisioning scope cannot manage tenant lifecycle"
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.provisioning))
+      .status,
+    401,
+    "provisioning scope cannot administer tenant OIDC"
+  );
+  assert.equal(
+    (await authorized("/__cloud/v1/tenants", scopedOperatorTokens.provisioning)).status,
+    401,
+    "provisioning scope cannot enumerate tenant collection"
+  );
 
   assert.equal(
     (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.identity)).status,
@@ -624,6 +656,7 @@ test("production operator tokens are limited to their route families", async () 
     id: "tenant-new",
     name: "New customer",
     slug: "new-customer",
+    ownerPrincipalId: "principal-owner",
   };
   assert.equal(
     (
@@ -646,8 +679,8 @@ test("production operator tokens are limited to their route families", async () 
         tenantProvisioningBody
       )
     ).status,
-    400,
-    "the lifecycle credential reaches provisioning validation, which still requires a trusted owner"
+    401,
+    "the lifecycle credential must not reach customer provisioning"
   );
   assert.equal(
     (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.maintenance))
@@ -717,6 +750,7 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
     OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: scopedOperatorTokens.identity,
     OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
     OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+    OMNIROUTE_CLOUD_PROVISIONING_TOKEN: scopedOperatorTokens.provisioning,
     OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.hosts,
     OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
     OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
@@ -748,11 +782,13 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
     gateway: "ok",
     artifacts: "ok",
     oidcEgress: "disabled",
+    mcpEgress: "disabled",
     configuration: "unconfigured",
     configurationIssues: [
       "missing:identityAdminToken",
       "missing:inferenceAdminToken",
       "missing:lifecycleAdminToken",
+      "missing:provisioningToken",
       "missing:tenantHostsAdminToken",
       "missing:frontDeskAdminToken",
       "missing:maintenanceToken",
@@ -779,6 +815,45 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
   assert.equal(malformedBody.checks.configuration, "error");
   assert.doesNotMatch(JSON.stringify(malformedBody), /malformed-encryption-key/i);
 
+  for (const keyringEnv of [
+    { OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: "not-json" },
+    {
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: JSON.stringify({
+        "rotate-2026-10": Buffer.alloc(32, 17).toString("base64"),
+      }),
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID: "missing-key-id",
+    },
+    {
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: JSON.stringify({
+        "rotate-2026-10": "malformed-key-material",
+      }),
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID: "rotate-2026-10",
+    },
+    {
+      OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: JSON.stringify({
+        "invalid:key-id": Buffer.alloc(32, 18).toString("base64"),
+      }),
+    },
+  ]) {
+    const invalidKeyring = createCloudRuntime({
+      env: {
+        OMNIROUTE_ENV: "staging",
+        DB: new TestD1(),
+        GATEWAY_SESSIONS: sessions,
+        ...runtimeBindings,
+        ...keyringEnv,
+      },
+    });
+    const invalidResponse = await invalidKeyring.fetch(readinessRequest());
+    assert.equal(invalidResponse.status, 503);
+    const invalidBody = (await invalidResponse.json()) as {
+      checks: { configuration?: string; configurationIssues?: string[] };
+    };
+    assert.equal(invalidBody.checks.configuration, "error");
+    assert.ok(invalidBody.checks.configurationIssues?.includes("invalid:credentialKeyring"));
+    assert.doesNotMatch(JSON.stringify(invalidBody), /malformed-key-material|rotate-2026-10/i);
+  }
+
   const configuredRuntime = createCloudRuntime({
     env: {
       OMNIROUTE_ENV: "staging",
@@ -799,6 +874,7 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
     gateway: "ok",
     artifacts: "ok",
     oidcEgress: "disabled",
+    mcpEgress: "disabled",
     configuration: "ok",
     configurationIssues: [],
   });
@@ -838,6 +914,42 @@ test("staging readiness requires valid cloud runtime secrets without exposing th
     checks: Record<string, string>;
   };
   assert.equal(enabledWithBindingBody.checks.oidcEgress, "ok");
+
+  const mcpEgressToken = "mcp-egress-staging-secret-with-at-least-thirty-two-characters";
+  const mcpEnabledWithoutBinding = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      ...runtimeBindings,
+      OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED: "true",
+      OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: mcpEgressToken,
+    },
+  });
+  const mcpWithoutBindingResponse = await mcpEnabledWithoutBinding.fetch(readinessRequest());
+  assert.equal(mcpWithoutBindingResponse.status, 503);
+  const mcpWithoutBindingBody = await mcpWithoutBindingResponse.text();
+  assert.match(mcpWithoutBindingBody, /"mcpEgress":"error"/);
+  assert.match(mcpWithoutBindingBody, /missing:mcpEgressBinding/);
+  assert.doesNotMatch(mcpWithoutBindingBody, new RegExp(mcpEgressToken));
+
+  const mcpEnabledWithBinding = createCloudRuntime({
+    env: {
+      OMNIROUTE_ENV: "staging",
+      DB: new TestD1(),
+      GATEWAY_SESSIONS: sessions,
+      ...runtimeBindings,
+      MCP_EGRESS: { fetch: async () => new Response(null) },
+      OMNIROUTE_CLOUD_MCP_EGRESS_ENABLED: "true",
+      OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN: mcpEgressToken,
+    },
+  });
+  const mcpWithBindingResponse = await mcpEnabledWithBinding.fetch(readinessRequest());
+  assert.equal(mcpWithBindingResponse.status, 200);
+  const mcpWithBindingBody = (await mcpWithBindingResponse.json()) as {
+    checks: Record<string, string>;
+  };
+  assert.equal(mcpWithBindingBody.checks.mcpEgress, "ok");
 
   const reusedSecretRuntime = createCloudRuntime({
     env: {
@@ -902,6 +1014,7 @@ test("staging and production scoped operator tokens must meet the deployment sec
       OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: "valid-admin.token_0123456789-abcdefgh",
       OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: scopedOperatorTokens.inference,
       OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: scopedOperatorTokens.lifecycle,
+      OMNIROUTE_CLOUD_PROVISIONING_TOKEN: scopedOperatorTokens.provisioning,
       OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: scopedOperatorTokens.hosts,
       OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: scopedOperatorTokens.frontDesk,
       OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: scopedOperatorTokens.maintenance,
@@ -1304,6 +1417,23 @@ test("cloud runtime rejects client-submitted provider credential ciphertext", as
   );
   assert.equal(v2Response.status, 400);
   assert.deepEqual(await v2Response.json(), { error: "apiKey must be submitted as plaintext" });
+
+  const v3Response = await app.fetch(
+    new Request("https://omniroute.test/__cloud/v1/tenants/tenant-a/provider-connections", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "new-connection-v3",
+        provider: "openai",
+        apiKey: "enc:v3:key-1:fake",
+      }),
+    })
+  );
+  assert.equal(v3Response.status, 400);
+  assert.deepEqual(await v3Response.json(), { error: "apiKey must be submitted as plaintext" });
 });
 
 test("provider credential writes fail closed when the Worker wrapping key is missing", async () => {

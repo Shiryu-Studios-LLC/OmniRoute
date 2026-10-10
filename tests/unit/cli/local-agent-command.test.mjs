@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -150,6 +150,40 @@ test("local-agent pair reads its code outside argv and saves the credential priv
       comfyUiUrl: undefined,
       mcpServers: [],
     });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("pairing checks credential storage before consuming the one-time code", async () => {
+  const home = mkdtempSync(join(tmpdir(), "omniroute-agent-pair-storage-"));
+  writeFileSync(join(home, ".config"), "not a directory");
+  let codeRead = false;
+  let networkCalls = 0;
+  try {
+    await assert.rejects(
+      pairLocalAgentCommand(
+        { gatewayUrl: "https://connect.example.test" },
+        {
+          env: { HOME: home },
+          home,
+          readCode: async () => {
+            codeRead = true;
+            return "p".repeat(43);
+          },
+          fetcher: async () => {
+            networkCalls += 1;
+            return Response.json(
+              { version: 1, deviceId: "device_paired", credential: credential },
+              { status: 201 }
+            );
+          },
+        }
+      ),
+      /pairing directory must be private/
+    );
+    assert.equal(codeRead, false);
+    assert.equal(networkCalls, 0);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

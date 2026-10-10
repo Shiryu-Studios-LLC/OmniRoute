@@ -1,7 +1,11 @@
 import { createLocalJWKSet, jwtVerify } from "jose";
 import type { CloudDb } from "./db";
 import type { CloudOidcOutboundTransport } from "./oidcEgressTransport";
-import { encryptCloudCredential, decryptCloudCredential } from "./credentialEncryption";
+import {
+  encryptCloudCredential,
+  decryptCloudCredential,
+  type CloudCredentialEncryptionKey,
+} from "./credentialEncryption";
 import {
   CloudMembershipConflictError,
   CloudLastActiveOwnerError,
@@ -153,7 +157,7 @@ export interface CloudTenantOidcAuthOptions {
   /** Exact origin, for example https://cloud.example.com, with no path or slash. */
   publicOrigin?: string;
   environment?: string;
-  credentialEncryptionKey?: string;
+  credentialEncryptionKey?: CloudCredentialEncryptionKey;
   now?: () => number;
   fetcher?: typeof fetch;
   /** Controlled fixed-binding transport. Required for staging and production login. */

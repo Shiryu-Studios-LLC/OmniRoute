@@ -492,6 +492,61 @@ test("cross-tenant calls, revoked sessions, and expired calls cannot receive res
   );
 });
 
+test("stream producer returns cleanly when its request disappears during backpressure", async () => {
+  const credential = "stream-expiry-agent-credential";
+  let now = 1_800_000_000_000;
+  let requestRemoved = false;
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_stream_expiry",
+      tenantId: "tenant_stream_expiry",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama:chat:test-model"],
+      revokedAt: null,
+    },
+  ]);
+  const getRequest = adapters.coordinator.getRequest.bind(adapters.coordinator);
+  adapters.coordinator.getRequest = async (...args) =>
+    requestRemoved ? null : getRequest(...args);
+  adapters.coordinator.submitStreamEvent = async () => {
+    requestRemoved = true;
+    return false;
+  };
+  const gateway = createConnectorGateway({
+    ...adapters,
+    now: () => now,
+    createId: () => "session_stream_expiry",
+    createToken: () => "session-token-stream-expiry",
+    createRequestId: () => "stream_request_expiry",
+    wait: async (milliseconds) => {
+      now += milliseconds;
+    },
+  });
+  const session = await gateway.connect("device_stream_expiry", credential);
+  assert.ok(session);
+  const started = await gateway.startCapabilityStream({
+    tenantId: "tenant_stream_expiry",
+    deviceId: "device_stream_expiry",
+    capability: "ollama:chat:test-model",
+    payload: { messages: [] },
+    stream: true,
+    timeoutMs: 100,
+  });
+  assert.equal(started.ok, true);
+  if (!started.ok) return;
+
+  assert.equal(
+    await gateway.submitDeviceStreamEvent({
+      deviceId: "device_stream_expiry",
+      sessionToken: session.sessionToken,
+      requestId: started.requestId,
+      sequence: 0,
+      event: { type: "delta", data: { content: "late" } },
+    }),
+    false
+  );
+});
+
 test("request deadline remains authoritative when result storage is slow", async () => {
   const credential = "slow-result-credential";
   const adapters = createMemoryAdapters([

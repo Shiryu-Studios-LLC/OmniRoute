@@ -106,7 +106,17 @@ const ENV_VAR_ALLOWLIST = new Set([
   "CLOUDFLARE_API_TOKEN",
   "CLOUDFLARE_STAGING_D1_DATABASE_ID",
   "CLOUDFLARE_STAGING_OIDC_EGRESS_SERVICE_ID", // Optional VPC Service UUID consumed by deploy-cloudflare-staging.yml
+  // Optional staging MCP VPC binding, its explicit firewall-verification acknowledgement, and
+  // the matching Worker binding/token consumed by the staging workflow and Wrangler runtime.
+  "CLOUDFLARE_STAGING_MCP_EGRESS_SERVICE_ID",
+  "CLOUDFLARE_STAGING_MCP_EGRESS_FIREWALL_VERIFIED",
+  "OMNIROUTE_CLOUD_MCP_EGRESS_TOKEN",
+  "MCP_EGRESS",
+  "MCP_EGRESS_PROXY_TOKEN", // Optional secret consumed by the private cloudflare/mcp-egress-proxy process
   "OIDC_EGRESS_PROXY_TOKEN", // Optional secret consumed by the private cloudflare/mcp-egress-proxy process
+  // Optional staging credential-keyring secret and active write-key selector.
+  "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON",
+  "OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID",
   "OMNIROUTE_BUILD_SHA",
   "OMNIROUTE_URL", // used by ad-hoc tooling, validated elsewhere
   "OMNIROUTE_KEY", // ditto

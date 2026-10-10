@@ -14,6 +14,8 @@ type WorkerEnv = {
   OMNIROUTE_BUILD_SHA?: string;
   OMNIROUTE_CLOUD_ADMIN_TOKEN?: string;
   OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON?: string;
+  OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID?: string;
   OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY?: string;
   GATEWAY_SESSIONS?: Env["GATEWAY_SESSIONS"];
 };
@@ -22,7 +24,7 @@ const MOCK_PROVIDER_KEY = "sk-cloudflare-local-inference-fixture";
 const MOCK_PROVIDER_KEY_B = "sk-cloudflare-local-inference-tenant-b-fixture";
 const MOCK_RESPONSE = {
   id: "resp_local_fixture",
-  model: "gpt-4o-mini-2024-07-18",
+  model: "gpt-4.1-mini-2025-04-14",
   status: "completed",
   created_at: 1_791_459_200,
   output: [
@@ -67,7 +69,7 @@ async function mockProviderFetch(
 
   if (url.href === CLOUD_INFERENCE_COUNT_URL) {
     const body = (await request.json()) as Record<string, unknown>;
-    if (body.model !== "gpt-4o-mini-2024-07-18" || body.input === undefined) {
+    if (body.model !== "gpt-4.1-mini" || body.input === undefined) {
       throw new Error("Mock provider rejected an invalid token-count request");
     }
     return Response.json({ object: "response.input_tokens", input_tokens: 5 });
@@ -76,7 +78,7 @@ async function mockProviderFetch(
   if (url.href === CLOUD_INFERENCE_RESPONSE_URL) {
     const body = (await request.json()) as Record<string, unknown>;
     if (
-      body.model !== "gpt-4o-mini-2024-07-18" ||
+      body.model !== "gpt-4.1-mini" ||
       body.stream !== true ||
       body.store !== false ||
       body.max_output_tokens !== 40
@@ -228,6 +230,10 @@ const worker = {
         OMNIROUTE_BUILD_SHA: env.OMNIROUTE_BUILD_SHA,
         OMNIROUTE_CLOUD_ADMIN_TOKEN: env.OMNIROUTE_CLOUD_ADMIN_TOKEN,
         OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY,
+        OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON:
+          env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON,
+        OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID:
+          env.OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID,
         OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: env.OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY,
         DB: env.DB,
         GATEWAY_SESSIONS: env.GATEWAY_SESSIONS,

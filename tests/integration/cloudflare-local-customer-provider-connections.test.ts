@@ -12,6 +12,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const identityAdminToken = "local-customer-provider-identity-scope-token-123456";
 const inferenceAdminToken = "local-customer-provider-inference-scope-token-123456";
 const lifecycleAdminToken = "local-customer-provider-lifecycle-scope-token-123456";
+const provisioningToken = "local-customer-provider-provision-scope-token-123456";
 const tenantHostsAdminToken = "local-customer-provider-hosts-scope-token-123456";
 const frontDeskAdminToken = "local-customer-provider-frontdesk-scope-token-123456";
 const maintenanceToken = "local-customer-provider-maintenance-scope-token-123456";
@@ -137,6 +138,7 @@ test(
       `OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN=${identityAdminToken}`,
       `OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN=${inferenceAdminToken}`,
       `OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN=${lifecycleAdminToken}`,
+      `OMNIROUTE_CLOUD_PROVISIONING_TOKEN=${provisioningToken}`,
       `OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN=${tenantHostsAdminToken}`,
       `OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN=${frontDeskAdminToken}`,
       `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}`,
@@ -250,15 +252,20 @@ test(
     assert.equal(health.response.status, 200);
     assert.equal(health.body.status, "ok");
 
+    const readiness = await requestJson(`${baseUrl}/__cloud/readiness`);
+    const readinessChecks = readiness.body.checks as Record<string, unknown>;
+    assert.equal(readinessChecks.configuration, "ok", JSON.stringify(readiness.body));
+    assert.deepEqual(readinessChecks.configurationIssues, []);
+
     const provisionTenant = async (label: string) => {
       const tenantId = `provider-${label}-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
       const provisioned = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
-        token: lifecycleAdminToken,
+        token: provisioningToken,
         body: {
           id: tenantId,
           name: `Customer Provider ${label}`,
           slug: tenantId,
-          ownerPrincipalId: `principal-${tenantId}`,
+          bootstrapMode: "oidc_pending",
         },
       });
       assert.equal(
@@ -266,7 +273,31 @@ test(
         201,
         `${label} tenant provisioning failed: ${JSON.stringify(provisioned.body)}\n${output}`
       );
-      const token = (provisioned.body.ownerApiKey as { token?: unknown } | undefined)?.token;
+
+      const membership = await requestJson(
+        `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships`,
+        {
+          token: identityAdminToken,
+          body: { principalId: `principal-${tenantId}`, role: "owner" },
+        }
+      );
+      assert.equal(
+        membership.response.status,
+        201,
+        `${label} owner membership creation failed: ${JSON.stringify(membership.body)}`
+      );
+      const membershipId = membership.body.id;
+      assert.equal(typeof membershipId, "string");
+      const issuedKey = await requestJson(
+        `${baseUrl}/__cloud/v1/tenants/${tenantId}/memberships/${membershipId}/api-keys`,
+        { token: identityAdminToken, body: {} }
+      );
+      assert.equal(
+        issuedKey.response.status,
+        201,
+        `${label} owner API key issuance failed: ${JSON.stringify(issuedKey.body)}`
+      );
+      const token = (issuedKey.body as { token?: unknown }).token;
       assert.equal(typeof token, "string");
       assert.match(token as string, /^orc_live_/);
       return { tenantId, token: token as string };

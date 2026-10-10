@@ -7,6 +7,7 @@ import {
   decryptCloudCredential,
   encryptCloudCredential,
   isCloudCredentialEnvelope,
+  type CloudCredentialEncryptionKey,
 } from "./credentialEncryption";
 
 const DEFAULT_SCOPES = ["openid", "profile", "email"];
@@ -164,7 +165,7 @@ export async function getCloudTenantOidcDraft(
 /** Decrypts a draft only for the current owner/admin session inside the Worker auth flow. */
 export async function getCloudTenantOidcDraftCredentials(
   db: CloudDb,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   authorization: CloudTenantOidcDraftAuthorization,
   expectedUpdatedAt: string
 ): Promise<CloudTenantOidcDraftCredentials | null> {
@@ -497,7 +498,7 @@ export async function recordCloudTenantOidcDraftValidation(
 
 export async function saveCloudTenantOidcDraft(
   db: CloudDb,
-  encryptionKey: string | undefined,
+  encryptionKey: CloudCredentialEncryptionKey | undefined,
   input: {
     authorization: CloudTenantOidcDraftAuthorization;
     issuer: unknown;

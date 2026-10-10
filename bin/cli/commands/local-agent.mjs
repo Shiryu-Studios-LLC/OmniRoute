@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import {
   getLocalAgentSystemdStatus,
@@ -185,6 +185,68 @@ function ensurePrivatePairingDirectory(home) {
   return canonicalHome;
 }
 
+function preflightPairingStorage(home, platform) {
+  let canonicalHome = home;
+  if (platform === "win32") {
+    canonicalHome = resolve(home);
+    let directory = canonicalHome;
+    for (const component of ["AppData", "Roaming", "OmniRoute"]) {
+      directory = join(directory, component);
+      try {
+        mkdirSync(directory, { mode: 0o700 });
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
+      const stats = lstatSync(directory);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        throw new Error("Windows Local Agent pairing directory is unsafe.");
+      }
+    }
+    readWindowsPairedConfig(canonicalHome);
+  } else {
+    canonicalHome = ensurePrivatePairingDirectory(home);
+  }
+
+  const filePath = configPath(canonicalHome, platform);
+  if (platform !== "win32") {
+    try {
+      const stats = lstatSync(filePath);
+      if (
+        !stats.isFile() ||
+        stats.isSymbolicLink() ||
+        stats.nlink !== 1 ||
+        stats.uid !== currentUid() ||
+        (stats.mode & 0o077) !== 0
+      ) {
+        throw new Error("Refusing to replace an unsafe Local Agent pairing config");
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+
+  const temporaryPath = `${filePath}.preflight-${process.pid}-${randomBytes(8).toString("hex")}`;
+  const renamedPath = `${temporaryPath}.renamed`;
+  let fd;
+  try {
+    fd = openSync(
+      temporaryPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600
+    );
+    fchmodSync(fd, 0o600);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temporaryPath, renamedPath);
+  } catch {
+    throw new Error("Local Agent credential storage is not safely writable");
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temporaryPath, { force: true });
+    rmSync(renamedPath, { force: true });
+  }
+}
+
 function writePairedConfig(config, home = homedir(), platform = process.platform) {
   if (platform === "win32") throw new Error("Windows pairing config must use Credential Manager.");
   const canonicalHome = ensurePrivatePairingDirectory(home);
@@ -350,6 +412,7 @@ export async function pairLocalAgentCommand(
   const gatewayUrl = parseGatewayUrl(
     requiredValue(options.gatewayUrl, env.SHIRYU_LOCAL_AGENT_GATEWAY_URL, "gateway URL")
   );
+  preflightPairingStorage(home, platform);
   const code = (await readCode(stdin, stdout)).trim();
   if (!PAIRING_CODE_PATTERN.test(code)) throw new Error("Invalid Local Agent pairing code");
   const response = await fetcher(new URL("/__gateway/v1/device/pair", gatewayUrl), {

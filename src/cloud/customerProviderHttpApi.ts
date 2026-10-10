@@ -1,5 +1,9 @@
 import { prepareCloudComplianceAuditInsert } from "./complianceAudit";
-import { encryptCloudCredential, CloudCredentialEncryptionError } from "./credentialEncryption";
+import {
+  encryptCloudCredential,
+  CloudCredentialEncryptionError,
+  type CloudCredentialEncryptionKey,
+} from "./credentialEncryption";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
 import type { CloudDb } from "./db";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
@@ -25,7 +29,7 @@ const SUPPORTED_MODEL = "gpt-4o-mini-2024-07-18";
 
 export interface CloudCustomerProviderApiOptions {
   db?: CloudDb;
-  credentialEncryptionKey?: string;
+  credentialEncryptionKey?: CloudCredentialEncryptionKey;
   now?: () => Date;
   failedKeyRateLimit?: { limit: number; windowMs: number };
   failedKeyFallbackRateLimit?: { limit: number; windowMs: number };
@@ -152,7 +156,8 @@ function validateBody(
       body.apiKey.length < 1 ||
       body.apiKey.length > 8192 ||
       body.apiKey.startsWith("enc:v1:") ||
-      body.apiKey.startsWith("enc:v2:"))
+      body.apiKey.startsWith("enc:v2:") ||
+      body.apiKey.startsWith("enc:v3:"))
   )
     return null;
   if (

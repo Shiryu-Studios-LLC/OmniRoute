@@ -14,7 +14,7 @@ const encryptionKey = btoa(String.fromCharCode(...new Uint8Array(32).fill(17)));
 const idempotencyKeySecret = btoa(String.fromCharCode(...new Uint8Array(32).fill(23)));
 const mockProviderKey = "sk-cloudflare-local-inference-fixture";
 const mockProviderKeyB = "sk-cloudflare-local-inference-tenant-b-fixture";
-const model = "gpt-4o-mini-2024-07-18";
+const model = "gpt-4.1-mini";
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -374,6 +374,7 @@ test(
     const payloads = frames
       .slice(0, -1)
       .map((frame) => JSON.parse(frame) as Record<string, unknown>);
+    assert.ok(payloads.every((payload) => payload.model === model));
     const deltas = payloads.flatMap((payload) => {
       const choices = payload.choices;
       if (!Array.isArray(choices)) return [];

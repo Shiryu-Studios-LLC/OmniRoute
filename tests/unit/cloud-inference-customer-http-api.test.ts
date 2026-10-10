@@ -15,6 +15,7 @@ import {
   setCloudInferenceMonthlyBudget,
 } from "../../src/cloud/inferencePolicy";
 import {
+  CLOUD_INFERENCE_MODEL,
   CLOUD_INFERENCE_COUNT_URL,
   CLOUD_INFERENCE_RESPONSE_URL,
 } from "../../src/cloud/inferenceCustomerHttpApi";
@@ -82,6 +83,7 @@ async function fixture(
     entitlement?: boolean;
     monthlyTokenLimit?: number;
     role?: "owner" | "admin" | "member" | "viewer";
+    credentialKeyring?: { keys: Record<string, string>; activeKeyId?: string };
   } = {}
 ) {
   const db = new SqliteCloudDb();
@@ -138,7 +140,10 @@ async function fixture(
     });
   }
   const connectionId = "connection-a";
-  const apiKey = await encryptCloudCredential(OPENAI_KEY, WRAP_KEY, {
+  const credentialEncryptionKey = options.credentialKeyring
+    ? { legacyKey: WRAP_KEY, ...options.credentialKeyring }
+    : WRAP_KEY;
+  const apiKey = await encryptCloudCredential(OPENAI_KEY, credentialEncryptionKey, {
     tenantId: TENANT_A,
     connectionId,
     field: "apiKey",
@@ -159,6 +164,19 @@ async function fixture(
       env: {
         DB: db,
         OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: WRAP_KEY,
+        ...(options.credentialKeyring
+          ? {
+              OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: JSON.stringify(
+                options.credentialKeyring.keys
+              ),
+              ...(options.credentialKeyring.activeKeyId !== undefined
+                ? {
+                    OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID:
+                      options.credentialKeyring.activeKeyId,
+                  }
+                : {}),
+            }
+          : {}),
         OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: IDEMPOTENCY_SECRET,
       },
       now: () => new Date(clock),
@@ -182,7 +200,8 @@ function request(
   key = "idempotency-key-0001",
   content = "hello",
   stream = false,
-  path = "/v1/chat/completions"
+  path = "/v1/chat/completions",
+  model = CLOUD_INFERENCE_MODEL
 ) {
   return new Request(`https://cloud.test${path}`, {
     method: "POST",
@@ -192,7 +211,7 @@ function request(
       "idempotency-key": key,
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini-2024-07-18",
+      model,
       messages: [{ role: "user", content }],
       ...(stream ? { stream: true } : {}),
     }),
@@ -275,7 +294,10 @@ test("canonical app chat route uses D1 customer key and role authorization befor
   }
 });
 
-function upstream(): typeof fetch {
+function upstream(
+  requestModel = CLOUD_INFERENCE_MODEL,
+  responseModel = requestModel
+): typeof fetch {
   return async (input, init) => {
     const url = String(input);
     assert.equal(new URL(url).origin, "https://api.openai.com");
@@ -288,12 +310,14 @@ function upstream(): typeof fetch {
       new Headers((init as RequestInit).headers).get("authorization"),
       `Bearer ${OPENAI_KEY}`
     );
+    const requestBody = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+    assert.equal(requestBody.model, requestModel);
     if (url.endsWith("input_tokens"))
       return Response.json({ object: "response.input_tokens", input_tokens: 5 });
     return Response.json({
       id: "resp_123",
       object: "response",
-      model: "gpt-4o-mini-2024-07-18",
+      model: responseModel,
       status: "completed",
       created_at: 10,
       output: [
@@ -355,6 +379,181 @@ test("fixed Responses endpoints, decrypts tenant-bound credential, records usage
   }
 });
 
+test("owner-selected OpenAI Responses model uses its entitlement and is reflected in accounting", async () => {
+  const f = await fixture();
+  const model = "gpt-4.1-mini";
+  try {
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    let calls = 0;
+    const app = f.runtime(async (...args) => {
+      calls += 1;
+      return upstream(model, "gpt-4.1-mini-2025-04-14")(...args);
+    });
+    const first = await app.fetch(
+      request(f.issued.token, "idempotency-select-model-0001", "hello", false, undefined, model)
+    );
+    const firstText = await first.text();
+    assert.equal(first.status, 200, firstText);
+    assert.equal(JSON.parse(firstText).model, model);
+    assert.equal(calls, 2);
+
+    const usage = await f.db
+      .prepare<{ model: string }>("SELECT model FROM cloud_usage_history WHERE tenant_id = ?")
+      .bind(TENANT_A)
+      .first();
+    assert.equal(usage?.model, model);
+    const reservation = await f.db
+      .prepare<{ model: string }>(
+        "SELECT model FROM cloud_inference_reservations WHERE tenant_id = ?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(reservation?.model, model);
+
+    const replay = await app.fetch(
+      request(f.issued.token, "idempotency-select-model-0001", "hello", false, undefined, model)
+    );
+    assert.equal(await replay.text(), firstText);
+    assert.equal(calls, 2, "replay retains the selected model and never redispatches");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("model selection is allowlisted, owner/admin-only, and denied without a tenant entitlement", async () => {
+  const owner = await fixture();
+  const member = await fixture({ role: "member" });
+  try {
+    const selectedModel = "gpt-4.1-mini";
+    await setCloudInferenceEntitlement(owner.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model: selectedModel,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await setCloudInferenceEntitlement(member.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model: selectedModel,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    let calls = 0;
+    const app = owner.runtime(async () => {
+      calls += 1;
+      throw new Error("denied model selection must not call OpenAI");
+    });
+    const unsupported = await app.fetch(
+      request(
+        owner.issued.token,
+        "idempotency-unlisted-model-001",
+        "hello",
+        false,
+        undefined,
+        "gpt-5.6"
+      )
+    );
+    assert.equal(unsupported.status, 400);
+
+    const unentitled = await app.fetch(
+      request(
+        owner.issued.token,
+        "idempotency-no-entitlement-001",
+        "hello",
+        false,
+        undefined,
+        "gpt-4o"
+      )
+    );
+    assert.equal(unentitled.status, 403);
+
+    const memberApp = member.runtime(async () => {
+      calls += 1;
+      throw new Error("member-selected model must not call OpenAI");
+    });
+    const memberSelection = await memberApp.fetch(
+      request(
+        member.issued.token,
+        "idempotency-member-model-001",
+        "hello",
+        false,
+        undefined,
+        selectedModel
+      )
+    );
+    assert.equal(memberSelection.status, 403);
+
+    const adminMembership = await createCloudCustomerMembership(owner.db, {
+      tenantId: TENANT_A,
+      principalId: "admin-a",
+      role: "admin",
+      now: NOW,
+    });
+    const adminKey = await issueCloudCustomerApiKey(owner.db, {
+      tenantId: TENANT_A,
+      membershipId: adminMembership.id,
+      now: NOW,
+    });
+    const adminApp = owner.runtime(upstream(selectedModel));
+    const adminSelection = await adminApp.fetch(
+      request(
+        adminKey.token,
+        "idempotency-admin-model-0001",
+        "hello",
+        false,
+        undefined,
+        selectedModel
+      )
+    );
+    assert.equal(adminSelection.status, 200);
+
+    const tenantBMembership = await createCloudCustomerMembership(owner.db, {
+      tenantId: TENANT_B,
+      principalId: "owner-b",
+      role: "owner",
+      now: NOW,
+    });
+    const tenantBKey = await issueCloudCustomerApiKey(owner.db, {
+      tenantId: TENANT_B,
+      membershipId: tenantBMembership.id,
+      now: NOW,
+    });
+    await setCloudInferenceMonthlyBudget(owner.db, {
+      tenantId: TENANT_B,
+      monthlyTokenLimit: 1000,
+      now: NOW,
+    });
+    const crossTenant = await app.fetch(
+      request(
+        tenantBKey.token,
+        "idempotency-cross-tenant-model-01",
+        "hello",
+        false,
+        undefined,
+        selectedModel
+      )
+    );
+    assert.equal(crossTenant.status, 403, "tenant A's entitlement does not authorize tenant B");
+    assert.equal(calls, 0);
+  } finally {
+    owner.db.db.close();
+    member.db.db.close();
+  }
+});
+
 test("inference skips hosted credentials and dispatches with a customer-managed OpenAI key", async () => {
   const f = await fixture();
   try {
@@ -394,19 +593,104 @@ test("inference skips hosted credentials and dispatches with a customer-managed 
   }
 });
 
-test("streaming inference settles terminal usage before done and replays the exact SSE transcript", async () => {
-  const f = await fixture();
+test("Worker inference decrypts a provider API key selected by its configured key ID", async () => {
+  const keyId = "provider-credential-2026-10";
+  const f = await fixture({
+    credentialKeyring: {
+      activeKeyId: keyId,
+      keys: { [keyId]: Buffer.alloc(32, 17).toString("base64") },
+    },
+  });
+  try {
+    const authorizations: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      authorizations.push(new Headers((init as RequestInit).headers).get("authorization") ?? "");
+      return upstream()(input, init);
+    };
+    const response = await f.runtime(fetcher).fetch(request(f.issued.token));
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(await response.text()).object, "chat.completion");
+    assert.equal(authorizations.length, 2);
+    assert.ok(authorizations.every((authorization) => authorization === `Bearer ${OPENAI_KEY}`));
+    const stored = await f.db
+      .prepare<{ api_key: string }>(
+        "SELECT api_key FROM provider_connections WHERE tenant_id=? AND id='connection-a'"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.match(stored?.api_key ?? "", /^enc:v3:provider-credential-2026-10:/);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("Worker inference fails closed before dispatch when an envelope key ID is absent from the keyring", async () => {
+  const keyId = "provider-credential-2026-10";
+  const key = Buffer.alloc(32, 17).toString("base64");
+  const f = await fixture({ credentialKeyring: { activeKeyId: keyId, keys: { [keyId]: key } } });
   try {
     let calls = 0;
+    const fetcher: typeof fetch = async () => {
+      calls += 1;
+      return upstream()(CLOUD_INFERENCE_RESPONSE_URL);
+    };
+    const response = await f
+      .runtime(fetcher, {
+        env: {
+          DB: f.db,
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY: WRAP_KEY,
+          OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEYS_JSON: JSON.stringify({}),
+          OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY: IDEMPOTENCY_SECRET,
+        },
+      })
+      .fetch(request(f.issued.token));
+    assert.equal(response.status, 503);
+    assert.equal(calls, 0);
+    assert.doesNotMatch(await response.text(), /unconfigured-key-id|provider-credential-2026-10/);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("streaming inference settles terminal usage before done and replays the exact SSE transcript", async () => {
+  const f = await fixture();
+  const model = "gpt-4.1-mini";
+  try {
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    let calls = 0;
     let upstreamStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
-    const terminalEvent =
-      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-4o-mini-2024-07-18","status":"completed","created_at":10,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}\n\n';
+    const terminalEvent = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_stream",
+        model: "gpt-4.1-mini-2025-04-14",
+        status: "completed",
+        created_at: 10,
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "world" }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+      },
+    })}\n\n`;
     const fetcher: typeof fetch = async (input, init) => {
       calls += 1;
       const url = String(input);
+      const requestBody = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+      assert.equal(requestBody.model, model);
       if (url.endsWith("input_tokens"))
         return Response.json({ object: "response.input_tokens", input_tokens: 5 });
-      const requestBody = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
       assert.equal(requestBody.stream, true);
       assert.equal(new Headers((init as RequestInit).headers).get("accept"), "text/event-stream");
       const firstDelta =
@@ -423,7 +707,7 @@ test("streaming inference settles terminal usage before done and replays the exa
     };
     const app = f.runtime(fetcher);
     const first = await app.fetch(
-      request(f.issued.token, "idempotency-stream-success", "hello", true)
+      request(f.issued.token, "idempotency-stream-success", "hello", true, undefined, model)
     );
     assert.equal(first.status, 200);
     assert.match(first.headers.get("content-type") ?? "", /^text\/event-stream/);
@@ -433,6 +717,7 @@ test("streaming inference settles terminal usage before done and replays the exa
     const roleChunk = await streamReader.read();
     assert.equal(roleChunk.done, false);
     transcript += decoder.decode(roleChunk.value);
+    assert.match(transcript, new RegExp(`\\"model\\":\\"${model}\\"`));
     const deltaChunk = await streamReader.read();
     assert.equal(deltaChunk.done, false);
     transcript += decoder.decode(deltaChunk.value);
@@ -466,14 +751,17 @@ test("streaming inference settles terminal usage before done and replays the exa
     assert.equal(settled?.actual_output_tokens, 2);
     assert.equal(settled?.status, "settled");
     const replay = await app.fetch(
-      request(f.issued.token, "idempotency-stream-success", "hello", true)
+      request(f.issued.token, "idempotency-stream-success", "hello", true, undefined, model)
     );
     assert.match(replay.headers.get("content-type") ?? "", /^text\/event-stream/);
     assert.equal(await replay.text(), transcript);
     assert.equal(calls, 2, "a streaming replay does not call the provider again");
     assert.equal(
-      (await app.fetch(request(f.issued.token, "idempotency-stream-success", "hello", false)))
-        .status,
+      (
+        await app.fetch(
+          request(f.issued.token, "idempotency-stream-success", "hello", false, undefined, model)
+        )
+      ).status,
       409,
       "stream and non-stream operations have different fingerprints"
     );

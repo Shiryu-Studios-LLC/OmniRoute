@@ -1133,7 +1133,7 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
       </section>
       <section id="provider-connection-panel" hidden>
         <h2>OpenAI provider connections</h2>
-        <p>Connections use the fixed OmniRoute model gpt-4o-mini-2024-07-18. Credentials are encrypted before storage and are never returned to this page.</p>
+        <p>Inference requests can select supported OpenAI text models enabled by your organization’s platform-admin D1 entitlements. The original gpt-4o-mini-2024-07-18 model remains the default. Credentials are encrypted before storage and are never returned to this page.</p>
         <ul id="provider-connections"></ul>
         <h3>Add an OpenAI connection</h3>
         <form id="provider-connection-form">

@@ -404,6 +404,7 @@ test("identity admin cannot link an unverified OIDC subject to a customer member
   const adminToken = "valid-cloud-admin-token-0123456789";
   const inferenceToken = "valid-cloud-inference-token-0123456789";
   const lifecycleToken = "valid-cloud-lifecycle-token-0123456789";
+  const provisioningToken = "valid-cloud-provisioning-token-0123456789";
   const hostsToken = "valid-cloud-hosts-admin-token-0123456789";
   const frontDeskToken = "valid-cloud-frontdesk-admin-token-0123456789";
   const maintenanceToken = "valid-cloud-maintenance-token-0123456789";
@@ -415,6 +416,7 @@ test("identity admin cannot link an unverified OIDC subject to a customer member
       OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: adminToken,
       OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: inferenceToken,
       OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: lifecycleToken,
+      OMNIROUTE_CLOUD_PROVISIONING_TOKEN: provisioningToken,
       OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN: hostsToken,
       OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: frontDeskToken,
       OMNIROUTE_CLOUD_MAINTENANCE_TOKEN: maintenanceToken,
@@ -612,6 +614,7 @@ function runtime(
             OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN: identityAdminToken,
             OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN: "test-inference-admin-token-for-oidc-cutover",
             OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN: "test-lifecycle-admin-token-for-oidc-cutover",
+            OMNIROUTE_CLOUD_PROVISIONING_TOKEN: "test-provisioning-token-for-oidc-cutover",
             OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN:
               "test-tenant-hosts-admin-token-for-oidc-cutover",
             OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN: "test-front-desk-admin-token-for-oidc-cutover",
