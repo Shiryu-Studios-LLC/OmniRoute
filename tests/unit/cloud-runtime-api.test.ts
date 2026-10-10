@@ -533,7 +533,7 @@ test("production operator tokens are limited to their route families", async () 
     "/__cloud/v1/tenants/tenant-a/oidc/owner-claims",
     scopedOperatorTokens.identity,
     "POST",
-    {}
+    { expectedSubject: "tenant-a-owner-subject" }
   );
   assert.equal(ownerClaim.status, 201);
   assert.equal(db.auditRows.at(-1)?.[3], "customer.oidc.owner.bootstrap.issued");
@@ -550,7 +550,7 @@ test("production operator tokens are limited to their route families", async () 
         "/__cloud/v1/tenants/tenant-a/oidc/owner-claims",
         scopedOperatorTokens.inference,
         "POST",
-        {}
+        { expectedSubject: "tenant-a-owner-subject" }
       )
     ).status,
     401,

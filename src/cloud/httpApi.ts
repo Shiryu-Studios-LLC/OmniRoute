@@ -843,6 +843,21 @@ export async function handleCloudApiRequest(
           if (!isLegacyAdminToken && !isIdentityAdminToken) {
             return json({ error: "Unauthorized" }, 401);
           }
+          const body = validateFields(
+            await readBody(request),
+            ["expectedSubject"],
+            ["expectedSubject"]
+          );
+          if (
+            typeof body.expectedSubject !== "string" ||
+            body.expectedSubject.length < 1 ||
+            body.expectedSubject.length > 512
+          ) {
+            throw new ApiError(
+              400,
+              "expectedSubject must be an OIDC subject between 1 and 512 characters"
+            );
+          }
           const { code, codeHash } = await createCloudTenantOidcOwnerClaimCode();
           const nowMs = now().getTime();
           const expiresAtMs = nowMs + CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS;
@@ -852,6 +867,7 @@ export async function handleCloudApiRequest(
               tenantId,
               code,
               codeHash,
+              expectedSubject: body.expectedSubject,
               nowMs,
               expiresAtMs,
               audit: {

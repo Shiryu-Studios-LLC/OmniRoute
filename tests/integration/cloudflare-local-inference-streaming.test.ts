@@ -341,7 +341,7 @@ test(
       bearerToken = customerKey,
       userContent = "hello from the local inference integration"
     ) =>
-      fetch(`${baseUrl}/v1/chat/completions`, {
+      fetch(`${baseUrl}/api/v1/chat/completions`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${bearerToken}`,
@@ -425,7 +425,11 @@ test(
     assert.equal(usage[0]?.tokens_output, 6);
     assert.equal(usage[0]?.status, "success");
     assert.equal(usage[0]?.success, 1);
-    assert.equal(usage[0]?.endpoint, "/v1/chat/completions");
+    assert.equal(
+      usage[0]?.endpoint,
+      "/v1/chat/completions",
+      "usage records the normalized inference endpoint for both accepted routes"
+    );
     const reservations = state.body.reservations as Array<Record<string, unknown>>;
     assert.equal(reservations.length, 1);
     assert.equal(reservations[0]?.reservation_id, requestId);

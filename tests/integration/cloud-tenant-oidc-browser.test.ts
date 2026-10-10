@@ -96,6 +96,9 @@ async function makeDb() {
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
+    "0031_cloud_tenant_oidc_config_drafts.sql",
+    "0032_cloud_tenant_oidc_promotion_state.sql",
+    "0033_cloud_tenant_oidc_owner_claim_subject.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   }

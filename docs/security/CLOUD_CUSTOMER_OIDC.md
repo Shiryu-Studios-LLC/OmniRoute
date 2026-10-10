@@ -75,6 +75,13 @@ disabled. An administrator cannot attach an unverified issuer/subject to a membe
 identity links are created only by a verified OIDC callback, invitation redemption, or
 first-owner claim.
 
+`POST /__cloud/v1/tenants/<tenant-id>/oidc/owner-claims` requires
+`{ "expectedSubject": "<exact OIDC sub>" }`. The one-use claim is bound to that exact
+issuer subject, so another valid OIDC account cannot redeem it. Before issuing the claim,
+the platform identity administrator must verify the stable `sub` with the customer's identity
+administrator; the Worker cannot verify that an administrator-supplied subject represents
+the intended real-world person. The claim code still needs protected out-of-band delivery.
+
 Platform-admin OIDC configuration can rotate a client ID or secret while keeping the same
 issuer. Changing the issuer is rejected while the tenant has any active owner membership or
 any linked OIDC identity. An issuer change would otherwise remove those identity links without

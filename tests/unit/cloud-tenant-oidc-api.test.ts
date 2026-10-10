@@ -97,6 +97,7 @@ async function makeDb() {
     "0016_cloud_tenant_oidc_sessions.sql",
     "0018_cloud_tenant_membership_invitations.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
+    "0033_cloud_tenant_oidc_owner_claim_subject.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -287,7 +288,11 @@ test("first-owner claims require the platform admin, enabled OIDC, and no existi
     .prepare("UPDATE cloud_customer_memberships SET is_active = 0 WHERE tenant_id = ? AND id = ?")
     .bind("customer-a", ownerA.id)
     .run();
-  const issued = await call(db, "customer-a/oidc/owner-claims", "POST");
+  const missingSubject = await call(db, "customer-a/oidc/owner-claims", "POST", {});
+  assert.equal(missingSubject.status, 400);
+  const issued = await call(db, "customer-a/oidc/owner-claims", "POST", {
+    expectedSubject: "customer-a-owner-subject",
+  });
   assert.equal(issued.status, 201);
   const firstClaim = (await issued.json()) as {
     code: string;
@@ -298,14 +303,22 @@ test("first-owner claims require the platform admin, enabled OIDC, and no existi
   assert.equal(Date.parse(firstClaim.expiresAt), Date.parse(NOW) + 15 * 60 * 1000);
   const stored = db.db
     .prepare(
-      "SELECT code_hash, issuer, expires_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
+      "SELECT code_hash, issuer, expected_subject, expires_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
     )
-    .get("customer-a") as { code_hash: string; issuer: string; expires_at_ms: number };
+    .get("customer-a") as {
+    code_hash: string;
+    issuer: string;
+    expected_subject: string;
+    expires_at_ms: number;
+  };
   assert.equal(stored.code_hash, createHash("sha256").update(firstClaim.code).digest("hex"));
   assert.equal(stored.issuer, "https://id.example.com/tenant-a");
+  assert.equal(stored.expected_subject, "customer-a-owner-subject");
   assert.equal(stored.expires_at_ms, Date.parse(firstClaim.expiresAt));
 
-  const reissued = await call(db, "customer-a/oidc/owner-claims", "POST");
+  const reissued = await call(db, "customer-a/oidc/owner-claims", "POST", {
+    expectedSubject: "reissued-customer-a-owner-subject",
+  });
   assert.equal(reissued.status, 201);
   const replacement = (await reissued.json()) as { code: string };
   assert.notEqual(replacement.code, firstClaim.code);
@@ -316,20 +329,28 @@ test("first-owner claims require the platform admin, enabled OIDC, and no existi
     1,
     "reissue replaces the old pending code"
   );
+  const replacedClaim = db.db
+    .prepare(
+      "SELECT code_hash, expected_subject FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?"
+    )
+    .get("customer-a") as { code_hash: string; expected_subject: string };
   assert.equal(
-    db.db
-      .prepare("SELECT code_hash FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
-      .get("customer-a")?.code_hash,
+    replacedClaim.code_hash,
     createHash("sha256").update(replacement.code).digest("hex")
   );
+  assert.equal(replacedClaim.expected_subject, "reissued-customer-a-owner-subject");
 
   await db
     .prepare("UPDATE cloud_customer_memberships SET is_active = 1 WHERE tenant_id = ? AND id = ?")
     .bind("customer-a", ownerA.id)
     .run();
-  const ownerExists = await call(db, "customer-a/oidc/owner-claims", "POST");
+  const ownerExists = await call(db, "customer-a/oidc/owner-claims", "POST", {
+    expectedSubject: "customer-a-owner-subject",
+  });
   assert.equal(ownerExists.status, 409);
-  const noConfig = await call(db, "customer-b/oidc/owner-claims", "POST");
+  const noConfig = await call(db, "customer-b/oidc/owner-claims", "POST", {
+    expectedSubject: "customer-b-owner-subject",
+  });
   assert.equal(noConfig.status, 409);
 });
 

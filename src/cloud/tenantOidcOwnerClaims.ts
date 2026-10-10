@@ -11,6 +11,7 @@ export const CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS = 15 * 60 * 1000;
 export interface CloudTenantOidcOwnerClaim {
   tenantId: string;
   issuer: string;
+  expectedSubject: string;
   expiresAtMs: number;
 }
 
@@ -49,6 +50,7 @@ export async function issueCloudTenantOidcOwnerClaim(
     tenantId: string;
     code: string;
     codeHash: string;
+    expectedSubject: string;
     nowMs: number;
     expiresAtMs: number;
     audit: CloudComplianceAuditInput;
@@ -58,6 +60,9 @@ export async function issueCloudTenantOidcOwnerClaim(
     !ID_PATTERN.test(input.tenantId) ||
     !/^[A-Za-z0-9_-]{40,128}$/.test(input.code) ||
     !HASH_PATTERN.test(input.codeHash) ||
+    typeof input.expectedSubject !== "string" ||
+    input.expectedSubject.length < 1 ||
+    input.expectedSubject.length > 512 ||
     !Number.isSafeInteger(input.nowMs) ||
     !Number.isSafeInteger(input.expiresAtMs) ||
     input.expiresAtMs <= input.nowMs ||
@@ -73,8 +78,9 @@ export async function issueCloudTenantOidcOwnerClaim(
   const statement = db
     .prepare(
       `INSERT INTO cloud_tenant_oidc_owner_claims
-         (tenant_id, issuer, code_hash, created_at_ms, expires_at_ms, consumed_at_ms, consumed_nonce)
-       SELECT tenant.id, config.issuer, ?, ?, ?, NULL, NULL
+         (tenant_id, issuer, code_hash, expected_subject, created_at_ms, expires_at_ms,
+          consumed_at_ms, consumed_nonce)
+       SELECT tenant.id, config.issuer, ?, ?, ?, ?, NULL, NULL
          FROM tenants AS tenant
          JOIN cloud_tenant_oidc_configs AS config ON config.tenant_id = tenant.id
           AND config.is_enabled = 1
@@ -87,6 +93,7 @@ export async function issueCloudTenantOidcOwnerClaim(
        ON CONFLICT(tenant_id) DO UPDATE SET
          issuer = excluded.issuer,
          code_hash = excluded.code_hash,
+         expected_subject = excluded.expected_subject,
          created_at_ms = excluded.created_at_ms,
          expires_at_ms = excluded.expires_at_ms,
          consumed_at_ms = NULL,
@@ -102,7 +109,7 @@ export async function issueCloudTenantOidcOwnerClaim(
             AND membership.is_active = 1
        )`
     )
-    .bind(input.codeHash, input.nowMs, input.expiresAtMs, input.tenantId);
+    .bind(input.codeHash, input.expectedSubject, input.nowMs, input.expiresAtMs, input.tenantId);
   const audit = prepareCloudComplianceAuditInsert(db, input.audit, {
     requirePreviousStatementChange: true,
   }).statement;
@@ -117,8 +124,13 @@ export async function getPendingCloudTenantOidcOwnerClaim(
 ): Promise<CloudTenantOidcOwnerClaim | null> {
   if (!ID_PATTERN.test(input.tenantId) || !HASH_PATTERN.test(input.codeHash)) return null;
   const row = await db
-    .prepare<{ tenant_id: string; issuer: string; expires_at_ms: number }>(
-      `SELECT claim.tenant_id, claim.issuer, claim.expires_at_ms
+    .prepare<{
+      tenant_id: string;
+      issuer: string;
+      expected_subject: string;
+      expires_at_ms: number;
+    }>(
+      `SELECT claim.tenant_id, claim.issuer, claim.expected_subject, claim.expires_at_ms
          FROM cloud_tenant_oidc_owner_claims AS claim
          JOIN tenants AS tenant ON tenant.id = claim.tenant_id
            AND tenant.kind = 'customer' AND tenant.is_active = 1
@@ -137,7 +149,12 @@ export async function getPendingCloudTenantOidcOwnerClaim(
     .bind(input.tenantId, input.codeHash, input.nowMs)
     .first();
   return row
-    ? { tenantId: row.tenant_id, issuer: row.issuer, expiresAtMs: row.expires_at_ms }
+    ? {
+        tenantId: row.tenant_id,
+        issuer: row.issuer,
+        expectedSubject: row.expected_subject,
+        expiresAtMs: row.expires_at_ms,
+      }
     : null;
 }
 
@@ -148,8 +165,13 @@ export async function getPendingCloudTenantOidcOwnerClaimByHash(
 ): Promise<CloudTenantOidcOwnerClaim | null> {
   if (!HASH_PATTERN.test(codeHash)) return null;
   const row = await db
-    .prepare<{ tenant_id: string; issuer: string; expires_at_ms: number }>(
-      `SELECT claim.tenant_id, claim.issuer, claim.expires_at_ms
+    .prepare<{
+      tenant_id: string;
+      issuer: string;
+      expected_subject: string;
+      expires_at_ms: number;
+    }>(
+      `SELECT claim.tenant_id, claim.issuer, claim.expected_subject, claim.expires_at_ms
          FROM cloud_tenant_oidc_owner_claims AS claim
          JOIN tenants AS tenant ON tenant.id = claim.tenant_id
            AND tenant.kind = 'customer' AND tenant.is_active = 1
@@ -168,7 +190,12 @@ export async function getPendingCloudTenantOidcOwnerClaimByHash(
     .bind(codeHash, nowMs)
     .first();
   return row
-    ? { tenantId: row.tenant_id, issuer: row.issuer, expiresAtMs: row.expires_at_ms }
+    ? {
+        tenantId: row.tenant_id,
+        issuer: row.issuer,
+        expectedSubject: row.expected_subject,
+        expiresAtMs: row.expires_at_ms,
+      }
     : null;
 }
 
@@ -189,6 +216,7 @@ export async function acceptCloudTenantOidcOwnerClaim(
     !HASH_PATTERN.test(input.codeHash) ||
     input.claim.tenantId !== input.tenantId ||
     input.claim.issuer !== input.issuer ||
+    input.claim.expectedSubject !== input.subject ||
     typeof input.subject !== "string" ||
     input.subject.length < 1 ||
     input.subject.length > 512 ||
@@ -209,7 +237,7 @@ export async function acceptCloudTenantOidcOwnerClaim(
   const consume = db
     .prepare(
       `UPDATE cloud_tenant_oidc_owner_claims SET consumed_at_ms = ?, consumed_nonce = ?
-        WHERE tenant_id = ? AND code_hash = ? AND issuer = ?
+        WHERE tenant_id = ? AND code_hash = ? AND issuer = ? AND expected_subject = ?
           AND consumed_at_ms IS NULL AND expires_at_ms > ?
           AND EXISTS (
             SELECT 1 FROM tenants AS tenant
@@ -230,6 +258,7 @@ export async function acceptCloudTenantOidcOwnerClaim(
       input.tenantId,
       input.codeHash,
       input.issuer,
+      input.subject,
       timestampMs,
       input.issuer
     );

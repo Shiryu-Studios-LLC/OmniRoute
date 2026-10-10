@@ -853,7 +853,7 @@ async function callback(
         codeHash: consumed.owner_bootstrap_hash,
         nowMs,
       });
-      if (!claim || claim.issuer !== consumed.issuer) {
+      if (!claim || claim.issuer !== consumed.issuer || claim.expectedSubject !== payload.sub) {
         throw new Error("First-owner claim is unavailable");
       }
       const accepted = await acceptCloudTenantOidcOwnerClaim(db, {

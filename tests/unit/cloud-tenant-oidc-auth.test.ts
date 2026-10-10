@@ -349,6 +349,7 @@ async function setup() {
     "0018_cloud_tenant_membership_invitations.sql",
     "0019_cloud_tenant_mcp_servers.sql",
     "0020_cloud_tenant_oidc_owner_claims.sql",
+    "0033_cloud_tenant_oidc_owner_claim_subject.sql",
     "0025_verified_customer_hosts.sql",
     "0022_provider_execution_contract.sql",
     "0023_cloud_tenant_business_profiles.sql",
@@ -631,13 +632,19 @@ function runtime(
   });
 }
 
-async function issueOwnerClaim(db: CloudDb, tenantId: string, nowMs = NOW) {
+async function issueOwnerClaim(
+  db: CloudDb,
+  tenantId: string,
+  nowMs = NOW,
+  expectedSubject = "initial-owner-subject"
+) {
   const { code, codeHash } = await createCloudTenantOidcOwnerClaimCode();
   const expiresAtMs = nowMs + CLOUD_TENANT_OIDC_OWNER_CLAIM_TTL_MS;
   const result = await issueCloudTenantOidcOwnerClaim(db, {
     tenantId,
     code,
     codeHash,
+    expectedSubject,
     nowMs,
     expiresAtMs,
     audit: {
@@ -2143,6 +2150,57 @@ test("first-owner claim creates one owner only after verified OIDC and cannot be
   assert.equal(replay?.status, 400);
 });
 
+test("first-owner claim rejects a valid OIDC login for a different subject without consuming the claim", async () => {
+  const { db, tenant } = await unownedTenant();
+  const claim = await issueOwnerClaim(db, tenant.id, NOW, "preselected-customer-subject");
+  const attackerState: { nonce?: string; tokenRequests: URLSearchParams[] } = {
+    tokenRequests: [],
+  };
+  const attackerFlow = await redeemOwnerCode(
+    db,
+    claim.code,
+    await makeProvider(attackerState, { subject: "different-valid-oidc-subject" })
+  );
+  assert.equal(attackerFlow.redeem.status, 200);
+  const attackerCallback = await finishOidcLogin(
+    attackerFlow.app,
+    attackerFlow.redeem,
+    attackerState
+  );
+  assert.equal(attackerCallback.status, 401);
+  assert.equal(
+    db.raw
+      .prepare("SELECT consumed_at_ms FROM cloud_tenant_oidc_owner_claims WHERE tenant_id = ?")
+      .get(tenant.id)?.consumed_at_ms,
+    null,
+    "a subject mismatch must leave the claim pending for its intended OIDC account"
+  );
+  assert.equal(
+    db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_customer_memberships WHERE tenant_id = ? AND role = 'owner' AND is_active = 1"
+      )
+      .get(tenant.id)?.count,
+    0
+  );
+
+  const intendedState: { nonce?: string; tokenRequests: URLSearchParams[] } = {
+    tokenRequests: [],
+  };
+  const intendedFlow = await redeemOwnerCode(
+    db,
+    claim.code,
+    await makeProvider(intendedState, { subject: "preselected-customer-subject" })
+  );
+  assert.equal(intendedFlow.redeem.status, 200);
+  const intendedCallback = await finishOidcLogin(
+    intendedFlow.app,
+    intendedFlow.redeem,
+    intendedState
+  );
+  assert.equal(intendedCallback.status, 303);
+});
+
 test("first-owner claim expires, binds issuer and tenant, and rejects an owner added during login", async () => {
   const { db, tenant } = await unownedTenant();
   const expiredClaim = await issueOwnerClaim(db, tenant.id);
@@ -2202,7 +2260,7 @@ test("first-owner claim expires, binds issuer and tenant, and rejects an owner a
     0
   );
 
-  const raceClaim = await issueOwnerClaim(db, tenant.id);
+  const raceClaim = await issueOwnerClaim(db, tenant.id, NOW, "claim-race-subject");
   const raceState: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
   const raceFetcher = await makeProvider(raceState, { subject: "claim-race-subject" });
   const raceFlow = await redeemOwnerCode(db, raceClaim.code, raceFetcher);
@@ -2237,7 +2295,7 @@ test("first-owner claim expires, binds issuer and tenant, and rejects an owner a
 
 test("first-owner claim acceptance rolls back claim, owner, identity, and audit together", async () => {
   const { db, tenant } = await unownedTenant();
-  const claim = await issueOwnerClaim(db, tenant.id);
+  const claim = await issueOwnerClaim(db, tenant.id, NOW, "rollback-owner-subject");
   const state: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
   const fetcher = await makeProvider(state, { subject: "rollback-owner-subject" });
   const flow = await redeemOwnerCode(db, claim.code, fetcher);
@@ -2277,7 +2335,7 @@ test("first-owner claim acceptance rolls back claim, owner, identity, and audit 
 
 test("concurrent first-owner callbacks serialize so exactly one claim creates an owner", async () => {
   const { db, tenant } = await unownedTenant();
-  const claimResult = await issueOwnerClaim(db, tenant.id);
+  const claimResult = await issueOwnerClaim(db, tenant.id, NOW, "concurrent-owner-a");
   const claim = await getPendingCloudTenantOidcOwnerClaim(db, {
     tenantId: tenant.id,
     codeHash: claimResult.codeHash,
@@ -2299,7 +2357,7 @@ test("concurrent first-owner callbacks serialize so exactly one claim creates an
       codeHash: claimResult.codeHash,
       claim,
       issuer: ISSUER,
-      subject: "concurrent-owner-b",
+      subject: "concurrent-owner-a",
       nowMs: NOW,
     }),
   ]);
