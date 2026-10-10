@@ -43,6 +43,8 @@ class MockStatement<T = unknown> implements CloudDbStatement<T> {
 class MockD1 implements CloudDb {
   connections: Row[] = [];
   nodes: Row[] = [];
+  failNextAll = false;
+  failRunPrefix: string | null = null;
 
   prepare<T = unknown>(sql: string) {
     return new MockStatement<T>(this, sql);
@@ -71,6 +73,10 @@ class MockD1 implements CloudDb {
   }
 
   async all<U>(sql: string, values: unknown[]): Promise<{ results: U[]; success: boolean }> {
+    if (this.failNextAll) {
+      this.failNextAll = false;
+      return { results: [], success: false };
+    }
     if (sql.includes("FROM provider_connections")) {
       const tenantId = values[0];
       const provider = values[1];
@@ -90,6 +96,10 @@ class MockD1 implements CloudDb {
   }
 
   async run(sql: string, values: unknown[]) {
+    if (this.failRunPrefix && sql.startsWith(this.failRunPrefix)) {
+      this.failRunPrefix = null;
+      return { success: false, meta: { changes: 0 } };
+    }
     if (sql.startsWith("INSERT INTO provider_connections")) {
       const [
         id,
@@ -383,4 +393,87 @@ test("cloud provider node CRUD is tenant-scoped", async () => {
 
   assert.equal(await deleteCloudProviderNode(db, "tenant-a", "node-b"), false);
   assert.equal(await deleteCloudProviderNode(db, "tenant-b", "node-b"), true);
+});
+
+test("provider connection and node listings reject unsuccessful D1 reads", async () => {
+  const db = new MockD1();
+  db.failNextAll = true;
+  await assert.rejects(
+    getCloudProviderConnections(db, "tenant-a"),
+    /D1 provider connection read failed/
+  );
+
+  db.failNextAll = true;
+  await assert.rejects(getCloudProviderNodes(db, "tenant-a"), /D1 provider node read failed/);
+});
+
+test("provider connection mutations reject unsuccessful D1 results", async () => {
+  const db = new MockD1();
+  db.failRunPrefix = "INSERT INTO provider_connections";
+  await assert.rejects(
+    createCloudProviderConnection(db, {
+      id: "failed-connection",
+      tenantId: "tenant-a",
+      provider: "openai",
+    }),
+    /D1 provider connection write failed/
+  );
+  assert.equal(db.connections.length, 0);
+
+  await createCloudProviderConnection(db, {
+    id: "connection",
+    tenantId: "tenant-a",
+    provider: "openai",
+  });
+  db.failRunPrefix = "UPDATE provider_connections";
+  await assert.rejects(
+    updateCloudProviderConnection(db, "tenant-a", "connection", { name: "not persisted" }),
+    /D1 provider connection update failed/
+  );
+  assert.equal((await getCloudProviderConnectionById(db, "tenant-a", "connection"))?.name, null);
+
+  db.failRunPrefix = "DELETE FROM provider_connections";
+  await assert.rejects(
+    deleteCloudProviderConnection(db, "tenant-a", "connection"),
+    /D1 provider connection delete failed/
+  );
+  assert.equal(
+    (await getCloudProviderConnectionById(db, "tenant-a", "connection"))?.id,
+    "connection"
+  );
+});
+
+test("provider node mutations reject unsuccessful D1 results", async () => {
+  const db = new MockD1();
+  db.failRunPrefix = "INSERT INTO provider_nodes";
+  await assert.rejects(
+    createCloudProviderNode(db, {
+      id: "failed-node",
+      tenantId: "tenant-a",
+      type: "openai-compatible",
+      name: "failed",
+    }),
+    /D1 provider node write failed/
+  );
+  assert.equal(db.nodes.length, 0);
+
+  await createCloudProviderNode(db, {
+    id: "node",
+    tenantId: "tenant-a",
+    type: "openai-compatible",
+    name: "original",
+  });
+  db.failRunPrefix = "UPDATE provider_nodes";
+  await assert.rejects(
+    updateCloudProviderNode(db, "tenant-a", "node", { name: "not persisted" }),
+    /D1 provider node update failed/
+  );
+  assert.equal((await getCloudProviderNodeById(db, "tenant-a", "node"))?.name, "original");
+
+  db.failRunPrefix = "DELETE FROM provider_nodes";
+  await assert.rejects(
+    deleteCloudProviderNode(db, "tenant-a", "node"),
+    /D1 provider node delete failed/
+  );
+  assert.equal((await getCloudProviderNodeById(db, "tenant-a", "node"))?.id, "node");
 });

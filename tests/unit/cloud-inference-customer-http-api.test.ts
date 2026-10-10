@@ -177,8 +177,14 @@ async function fixture(
   };
 }
 
-function request(token: string, key = "idempotency-key-0001", content = "hello", stream = false) {
-  return new Request("https://cloud.test/v1/chat/completions", {
+function request(
+  token: string,
+  key = "idempotency-key-0001",
+  content = "hello",
+  stream = false,
+  path = "/v1/chat/completions"
+) {
+  return new Request(`https://cloud.test${path}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
@@ -192,6 +198,82 @@ function request(token: string, key = "idempotency-key-0001", content = "hello",
     }),
   });
 }
+
+test("canonical app chat route uses D1 customer key and role authorization before dispatch", async () => {
+  const member = await fixture({ role: "member" });
+  const viewer = await fixture({ role: "viewer" });
+  try {
+    const tenantBMembership = await createCloudCustomerMembership(member.db, {
+      tenantId: TENANT_B,
+      principalId: "member-b",
+      role: "owner",
+      now: NOW,
+    });
+    const tenantBKey = await issueCloudCustomerApiKey(member.db, {
+      tenantId: TENANT_B,
+      membershipId: tenantBMembership.id,
+      now: NOW,
+    });
+    let providerCalls = 0;
+    const memberApp = member.runtime(async (...args) => {
+      providerCalls += 1;
+      return upstream()(...args);
+    });
+    const apiPath = "/api/v1/chat/completions";
+
+    assert.equal(
+      (await memberApp.fetch(request("", "idempotency-missing-auth", "hello", false, apiPath)))
+        .status,
+      401
+    );
+    assert.equal(
+      (
+        await memberApp.fetch(
+          request("invalid", "idempotency-invalid-auth", "hello", false, apiPath)
+        )
+      ).status,
+      401
+    );
+    assert.equal(providerCalls, 0);
+
+    const wrongTenant = await memberApp.fetch(
+      request(tenantBKey.token, "idempotency-cross-tenant-api-route", "hello", false, apiPath)
+    );
+    assert.equal(wrongTenant.status, 403);
+    assert.equal(providerCalls, 0);
+
+    const authorized = await memberApp.fetch(
+      request(member.issued.token, "idempotency-canonical-api-route", "hello", false, apiPath)
+    );
+    assert.equal(authorized.status, 200);
+    assert.equal(providerCalls, 2);
+
+    const viewerApp = viewer.runtime(async () => {
+      providerCalls += 1;
+      return Response.json({});
+    });
+    const denied = await viewerApp.fetch(
+      request(viewer.issued.token, "idempotency-viewer-api-route", "hello", false, apiPath)
+    );
+    assert.equal(denied.status, 403);
+    assert.equal(providerCalls, 2);
+
+    const nearMatch = await memberApp.fetch(
+      request(
+        member.issued.token,
+        "idempotency-near-match-api-route",
+        "hello",
+        false,
+        `${apiPath}-extra`
+      )
+    );
+    assert.equal(nearMatch.status, 404);
+    assert.equal(providerCalls, 2);
+  } finally {
+    member.db.db.close();
+    viewer.db.db.close();
+  }
+});
 
 function upstream(): typeof fetch {
   return async (input, init) => {

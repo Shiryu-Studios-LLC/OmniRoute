@@ -1,5 +1,6 @@
 import type { CloudDb } from "./db";
 import { authenticateCloudCustomerApiKey } from "./customerIdentity";
+import { appendCloudComplianceAudit } from "./complianceAudit";
 import { createCloudMcpEgressTransport, type CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import {
@@ -284,6 +285,15 @@ export async function handleCloudTenantMcpRequest(
       }
       const principal = { subject: identity.principalId };
       if (route.action === "discover") {
+        await appendCloudComplianceAudit(options.db, {
+          id: crypto.randomUUID(),
+          tenantId: identity.tenantId,
+          action: "cloud.mcp_server.discover.requested",
+          actor: identity.principalId,
+          target: route.id!,
+          resourceType: "mcp-server",
+          status: "requested",
+        });
         const discovery = await remoteMcp.discoverTools(principal, route.id!);
         return json({ discovery });
       }
@@ -301,6 +311,16 @@ export async function handleCloudTenantMcpRequest(
       ) {
         return json({ error: "Tool arguments must be a JSON object" }, 400);
       }
+      await appendCloudComplianceAudit(options.db, {
+        id: crypto.randomUUID(),
+        tenantId: identity.tenantId,
+        action: "cloud.mcp_server.invoke.requested",
+        actor: identity.principalId,
+        target: route.id!,
+        resourceType: "mcp-server",
+        status: "requested",
+        metadata: { toolName: route.toolName },
+      });
       const result = await remoteMcp.invokeTool(
         principal,
         route.id!,

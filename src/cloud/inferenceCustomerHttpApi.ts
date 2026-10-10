@@ -18,6 +18,7 @@ import { appendCloudUsageRecord } from "./usage";
 import { CLOUD_PLATFORM_TENANT_ID } from "./tenants";
 
 export const CLOUD_INFERENCE_CHAT_PATH = "/v1/chat/completions";
+export const CLOUD_INFERENCE_CHAT_API_PATH = "/api/v1/chat/completions";
 export const CLOUD_INFERENCE_PROVIDER = "openai";
 export const CLOUD_INFERENCE_MODEL = "gpt-4o-mini-2024-07-18";
 export const CLOUD_INFERENCE_COUNT_URL = "https://api.openai.com/v1/responses/input_tokens";
@@ -806,7 +807,12 @@ export async function handleCloudInferenceCustomerRequest(
   options: CloudInferenceCustomerHttpApiOptions
 ): Promise<Response> {
   const url = new URL(request.url);
-  if (url.pathname !== CLOUD_INFERENCE_CHAT_PATH) return errorResponse("Not found", 404);
+  if (
+    url.pathname !== CLOUD_INFERENCE_CHAT_PATH &&
+    url.pathname !== CLOUD_INFERENCE_CHAT_API_PATH
+  ) {
+    return errorResponse("Not found", 404);
+  }
   if (!options.db) return errorResponse("Cloud inference is unavailable", 503);
 
   const nowMs = options.now?.() ?? Date.now();

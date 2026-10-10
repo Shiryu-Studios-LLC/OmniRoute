@@ -221,6 +221,7 @@ export async function getCloudProviderConnections(
     .bind(...values)
     .all<Record<string, unknown>>();
 
+  if (!result.success) throw new Error("D1 provider connection read failed");
   return result.results.map(connectionFromRow);
 }
 
@@ -241,7 +242,11 @@ export async function createCloudProviderConnection(
   db: CloudDb,
   input: CloudProviderConnectionInput
 ): Promise<CloudProviderConnection> {
-  await prepareCloudProviderConnectionInsert(db, input).run();
+  const result = await prepareCloudProviderConnectionInsert(db, input).run();
+  if (!result.success) throw new Error("D1 provider connection write failed");
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("D1 provider connection insert returned invalid state");
+  }
 
   const created = await getCloudProviderConnectionById(db, input.tenantId, input.id);
   if (!created) throw new Error("Provider connection was inserted but could not be read back");
@@ -317,7 +322,13 @@ export async function updateCloudProviderConnection(
     tenantId,
     updatedAt: new Date().toISOString(),
   };
-  await prepareCloudProviderConnectionUpdate(db, tenantId, id, merged).run();
+  const result = await prepareCloudProviderConnectionUpdate(db, tenantId, id, merged).run();
+  if (!result.success) throw new Error("D1 provider connection update failed");
+  const changes = Number(result.meta?.changes ?? 0);
+  if (!Number.isSafeInteger(changes) || changes < 0 || changes > 1) {
+    throw new Error("D1 provider connection update returned invalid state");
+  }
+  if (changes === 0) return null;
   return getCloudProviderConnectionById(db, tenantId, id);
 }
 
@@ -399,7 +410,12 @@ export async function deleteCloudProviderConnection(
   id: string
 ): Promise<boolean> {
   const result = await prepareCloudProviderConnectionDelete(db, tenantId, id).run();
-  return result.success && Number(result.meta?.changes ?? 0) > 0;
+  if (!result.success) throw new Error("D1 provider connection delete failed");
+  const changes = Number(result.meta?.changes ?? 0);
+  if (!Number.isSafeInteger(changes) || changes < 0 || changes > 1) {
+    throw new Error("D1 provider connection delete returned invalid state");
+  }
+  return changes === 1;
 }
 
 /** Build the tenant-qualified provider delete for atomic D1 mutation+audit batches. */
@@ -441,6 +457,7 @@ export async function getCloudProviderNodes(
     .bind(tenantId)
     .all<Record<string, unknown>>();
 
+  if (!result.success) throw new Error("D1 provider node read failed");
   return result.results.map(nodeFromRow);
 }
 
@@ -465,7 +482,7 @@ export async function createCloudProviderNode(
   const now = input.updatedAt ?? input.createdAt ?? new Date().toISOString();
   const createdAt = input.createdAt ?? now;
 
-  await db
+  const result = await db
     .prepare(
       `INSERT INTO provider_nodes (
         id, tenant_id, type, name, prefix, api_type, base_url,
@@ -491,6 +508,10 @@ export async function createCloudProviderNode(
       now
     )
     .run();
+  if (!result.success) throw new Error("D1 provider node write failed");
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("D1 provider node insert returned invalid state");
+  }
 
   const created = await getCloudProviderNodeById(db, input.tenantId, input.id);
   if (!created) throw new Error("Provider node was inserted but could not be read back");
@@ -515,7 +536,7 @@ export async function updateCloudProviderNode(
   };
   const executionContract = validateProviderExecutionContract(merged);
 
-  await db
+  const result = await db
     .prepare(
       `UPDATE provider_nodes SET
         type = ?, name = ?, prefix = ?, api_type = ?, base_url = ?,
@@ -540,6 +561,12 @@ export async function updateCloudProviderNode(
       id
     )
     .run();
+  if (!result.success) throw new Error("D1 provider node update failed");
+  const changes = Number(result.meta?.changes ?? 0);
+  if (!Number.isSafeInteger(changes) || changes < 0 || changes > 1) {
+    throw new Error("D1 provider node update returned invalid state");
+  }
+  if (changes === 0) return null;
 
   return getCloudProviderNodeById(db, tenantId, id);
 }
@@ -553,5 +580,10 @@ export async function deleteCloudProviderNode(
     .prepare("DELETE FROM provider_nodes WHERE tenant_id = ? AND id = ?")
     .bind(tenantId, id)
     .run();
-  return result.success && Number(result.meta?.changes ?? 0) > 0;
+  if (!result.success) throw new Error("D1 provider node delete failed");
+  const changes = Number(result.meta?.changes ?? 0);
+  if (!Number.isSafeInteger(changes) || changes < 0 || changes > 1) {
+    throw new Error("D1 provider node delete returned invalid state");
+  }
+  return changes === 1;
 }

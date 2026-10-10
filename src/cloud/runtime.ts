@@ -6,7 +6,11 @@ import { handleGatewayDeviceRequest } from "./gatewayHttpApi";
 import { handleGatewayCustomerRequest } from "./gatewayCustomerHttpApi";
 import { handleGatewayImageJobRequest } from "./gatewayImageJobHttpApi";
 import type { GatewayImageArtifactBucket } from "./imageJobs";
-import { handleCloudInferenceCustomerRequest } from "./inferenceCustomerHttpApi";
+import {
+  CLOUD_INFERENCE_CHAT_API_PATH,
+  CLOUD_INFERENCE_CHAT_PATH,
+  handleCloudInferenceCustomerRequest,
+} from "./inferenceCustomerHttpApi";
 import {
   CLOUD_CUSTOMER_BUSINESS_PROFILE_PATH,
   handleCloudCustomerBusinessProfileRequest,
@@ -519,7 +523,10 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         );
       }
 
-      if (url.pathname === "/v1/chat/completions") {
+      if (
+        url.pathname === CLOUD_INFERENCE_CHAT_PATH ||
+        url.pathname === CLOUD_INFERENCE_CHAT_API_PATH
+      ) {
         try {
           return await handleCloudInferenceCustomerRequest(request, {
             db: options.env?.DB,

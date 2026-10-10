@@ -19,6 +19,7 @@ type WorkerEnv = {
 };
 
 const MOCK_PROVIDER_KEY = "sk-cloudflare-local-inference-fixture";
+const MOCK_PROVIDER_KEY_B = "sk-cloudflare-local-inference-tenant-b-fixture";
 const MOCK_RESPONSE = {
   id: "resp_local_fixture",
   model: "gpt-4o-mini-2024-07-18",
@@ -48,9 +49,21 @@ async function mockProviderFetch(
   if (request.method !== "POST" || request.redirect !== "manual") {
     throw new Error("Mock provider rejected an unsupported request");
   }
-  if (request.headers.get("authorization") !== `Bearer ${MOCK_PROVIDER_KEY}`) {
+  const authorization = request.headers.get("authorization");
+  const credentialId =
+    authorization === `Bearer ${MOCK_PROVIDER_KEY}`
+      ? "tenant-a"
+      : authorization === `Bearer ${MOCK_PROVIDER_KEY_B}`
+        ? "tenant-b"
+        : null;
+  if (!credentialId) {
     throw new Error("Mock provider rejected an unexpected credential");
   }
+  await env.DB.prepare(
+    "INSERT INTO cloud_test_mock_provider_credential_calls (credential_id) VALUES (?)"
+  )
+    .bind(credentialId)
+    .run();
 
   if (url.href === CLOUD_INFERENCE_COUNT_URL) {
     const body = (await request.json()) as Record<string, unknown>;
@@ -137,13 +150,22 @@ const worker = {
       ) {
         return json({ error: "Unauthorized" }, 401);
       }
-      const row = await env.DB.prepare<{ call_count: number; last_error: string | null }>(
-        "SELECT call_count, last_error FROM cloud_test_mock_provider_calls WHERE id = ?"
-      )
-        .bind("inference")
-        .first();
+      const [row, credentialCalls] = await Promise.all([
+        env.DB.prepare<{ call_count: number; last_error: string | null }>(
+          "SELECT call_count, last_error FROM cloud_test_mock_provider_calls WHERE id = ?"
+        )
+          .bind("inference")
+          .first(),
+        env.DB.prepare<{ credential_id: string }>(
+          "SELECT credential_id FROM cloud_test_mock_provider_credential_calls ORDER BY id"
+        ).all(),
+      ]);
       return row
-        ? json({ callCount: row.call_count, lastError: row.last_error })
+        ? json({
+            callCount: row.call_count,
+            lastError: row.last_error,
+            credentialIds: credentialCalls.results.map((entry) => entry.credential_id),
+          })
         : json({ error: "Not found" }, 404);
     }
     if (url.pathname === "/__test/inference/state" && request.method === "GET") {

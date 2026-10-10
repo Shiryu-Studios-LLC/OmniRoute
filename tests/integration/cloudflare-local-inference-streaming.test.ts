@@ -13,6 +13,7 @@ const adminToken = "local-inference-integration-admin-token-only";
 const encryptionKey = btoa(String.fromCharCode(...new Uint8Array(32).fill(17)));
 const idempotencyKeySecret = btoa(String.fromCharCode(...new Uint8Array(32).fill(23)));
 const mockProviderKey = "sk-cloudflare-local-inference-fixture";
+const mockProviderKeyB = "sk-cloudflare-local-inference-tenant-b-fixture";
 const model = "gpt-4o-mini-2024-07-18";
 
 function delay(milliseconds: number): Promise<void> {
@@ -226,7 +227,7 @@ test(
         safeEnvPath,
         "--yes",
         "--command",
-        "CREATE TABLE cloud_test_mock_provider_calls (id TEXT PRIMARY KEY, call_count INTEGER NOT NULL, last_error TEXT, fail_generation_count INTEGER NOT NULL DEFAULT 0); INSERT INTO cloud_test_mock_provider_calls (id, call_count, last_error, fail_generation_count) VALUES ('inference', 0, NULL, 0);",
+        "CREATE TABLE cloud_test_mock_provider_calls (id TEXT PRIMARY KEY, call_count INTEGER NOT NULL, last_error TEXT, fail_generation_count INTEGER NOT NULL DEFAULT 0); INSERT INTO cloud_test_mock_provider_calls (id, call_count, last_error, fail_generation_count) VALUES ('inference', 0, NULL, 0); CREATE TABLE cloud_test_mock_provider_credential_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT NOT NULL);",
       ],
       {
         cwd: tempDir,
@@ -328,6 +329,11 @@ test(
       }
     );
     assert.equal(connection.response.status, 201, JSON.stringify(connection.body));
+    assert.equal(
+      JSON.stringify(connection.body).includes(mockProviderKey),
+      false,
+      "provider connection responses must not disclose the stored API key"
+    );
 
     const idempotencyKey = `cloud-local-inference-${crypto.randomUUID()}`;
     const inferenceRequest = (
@@ -401,6 +407,11 @@ test(
       mockState.body.lastError,
       null,
       "both fixed mock upstream calls should be accepted"
+    );
+    assert.deepEqual(
+      mockState.body.credentialIds,
+      ["tenant-a", "tenant-a"],
+      "tenant A must dispatch both upstream requests with its own provider connection"
     );
 
     const state = await requestJson(
@@ -519,10 +530,15 @@ test(
       `${baseUrl}/__cloud/v1/tenants/${tenantBId}/provider-connections`,
       {
         token: adminToken,
-        body: { id: "mock-openai", provider: "openai", apiKey: mockProviderKey },
+        body: { id: "mock-openai", provider: "openai", apiKey: mockProviderKeyB },
       }
     );
     assert.equal(tenantBConnection.response.status, 201, JSON.stringify(tenantBConnection.body));
+    assert.equal(
+      JSON.stringify(tenantBConnection.body).includes(mockProviderKeyB),
+      false,
+      "tenant B provider connection responses must not disclose its stored API key"
+    );
 
     const tenantBResponse = await inferenceRequest(idempotencyKey, customerBKey);
     assert.equal(
@@ -558,6 +574,11 @@ test(
       4,
       "tenant B should make its own count and generation calls"
     );
+    assert.deepEqual(
+      afterTenantBStats.body.credentialIds,
+      ["tenant-a", "tenant-a", "tenant-b", "tenant-b"],
+      "tenant B must use its own provider connection instead of tenant A's credential"
+    );
 
     const tenantAReplayAfterB = await inferenceRequest(idempotencyKey, customerKey);
     assert.equal(tenantAReplayAfterB.status, 200);
@@ -570,6 +591,11 @@ test(
       afterTenantAReplayStats.body.callCount,
       4,
       "tenant A replay must remain isolated from B"
+    );
+    assert.deepEqual(
+      afterTenantAReplayStats.body.credentialIds,
+      ["tenant-a", "tenant-a", "tenant-b", "tenant-b"],
+      "tenant A replay must not dispatch using either tenant's provider connection"
     );
 
     const armFailure = spawnSync(

@@ -468,7 +468,9 @@ test("MCP discovery and invocation require explicit controlled-egress enablement
 
     const invoked = await call(
       db,
-      request(owner.token, "POST", `${serverPath}/tools/lookup`, { arguments: {} }),
+      request(owner.token, "POST", `${serverPath}/tools/lookup`, {
+        arguments: { query: "sensitive-tool-argument" },
+      }),
       {
         egressEnabled: true,
         egressBinding,
@@ -478,6 +480,60 @@ test("MCP discovery and invocation require explicit controlled-egress enablement
     assert.equal(invoked?.status, 200);
     assert.equal(proxyCalls, 7);
     assert.match(await invoked!.text(), /"text":"ok"/);
+
+    const egressAudit = await db
+      .prepare<{
+        action: string;
+        actor: string | null;
+        target: string | null;
+        metadata_json: string | null;
+      }>(
+        `SELECT action, actor, target, metadata_json
+           FROM cloud_compliance_audit
+          WHERE tenant_id = ? AND action IN (
+            'cloud.mcp_server.discover.requested',
+            'cloud.mcp_server.invoke.requested'
+          )
+          ORDER BY timestamp, rowid`
+      )
+      .bind(owner.tenantId)
+      .all();
+    assert.deepEqual(
+      egressAudit.results.map((entry) => entry.action),
+      ["cloud.mcp_server.discover.requested", "cloud.mcp_server.invoke.requested"]
+    );
+    assert.ok(egressAudit.results.every((entry) => entry.actor === owner.principalId));
+    assert.ok(egressAudit.results.every((entry) => entry.target === server.server.id));
+    assert.doesNotMatch(
+      JSON.stringify(egressAudit.results),
+      /tenant-server-secret|sensitive-tool-argument/
+    );
+    assert.match(egressAudit.results[1]?.metadata_json ?? "", /lookup/);
+
+    await db.exec(`CREATE TRIGGER fail_mcp_egress_audit BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action IN (
+        'cloud.mcp_server.discover.requested',
+        'cloud.mcp_server.invoke.requested'
+      )
+      BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;`);
+    const unauditedDiscovery = await call(db, request(owner.token, "GET", `${serverPath}/tools`), {
+      egressEnabled: true,
+      egressBinding,
+      egressProxyToken: "proxy-token-" + "x".repeat(32),
+    });
+    assert.equal(unauditedDiscovery?.status, 503);
+    const unauditedInvocation = await call(
+      db,
+      request(owner.token, "POST", `${serverPath}/tools/lookup`, { arguments: {} }),
+      {
+        egressEnabled: true,
+        egressBinding,
+        egressProxyToken: "proxy-token-" + "x".repeat(32),
+      }
+    );
+    assert.equal(unauditedInvocation?.status, 503);
+    assert.equal(proxyCalls, 7, "egress must not continue after its required audit fails");
+    await db.exec("DROP TRIGGER fail_mcp_egress_audit");
 
     const invokedByOtherTenant = await call(
       db,
