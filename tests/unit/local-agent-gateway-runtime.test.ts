@@ -11,6 +11,7 @@ import type {
   LocalAgentGatewaySession,
 } from "../../src/lib/localAgent/gatewayProtocol";
 import { createConnectorGatewayTransport } from "../../src/lib/localAgent/gatewayProtocol";
+import { createHttpLocalAgentGatewayTransport } from "../../src/lib/localAgent/httpGatewayTransport";
 
 const config: LocalAgentRunnerConfig = {
   gatewayUrl: "https://gateway.example.test",
@@ -472,6 +473,43 @@ test("gateway runner clears an offline session, backs off, and reconnects before
     "poll:session-after-outage",
   ]);
   assert.deepEqual(delays, [5, 1_000]);
+});
+
+test("gateway runner stops when HTTP connect returns a credential rejection", async () => {
+  const events: string[] = [];
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...values: unknown[]) => logged.push(values.join(" "));
+  const gateway = createHttpLocalAgentGatewayTransport(config.gatewayUrl, {
+    fetch: async (_input, init) => {
+      assert.equal(init?.method, "POST");
+      events.push("connect");
+      return Response.json({ error: "Device authentication failed" }, { status: 401 });
+    },
+  });
+  try {
+    await runLocalAgentWithGateway(
+      { ...config, retryBaseMs: 1, retryMaxMs: 1 },
+      {
+        gateway,
+        fetch: async () => Response.json({}),
+        discover: async () => ({
+          heartbeat: { status: "online", capabilities: ["ollama:chat:local"] },
+          services: [],
+        }),
+        sleep: async () => {
+          events.push("retry");
+        },
+      },
+      new AbortController().signal
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.deepEqual(events, ["connect"]);
+  assert.match(logged.join(" "), /re-enroll the device/);
+  assert.doesNotMatch(logged.join(" "), new RegExp(config.credential));
 });
 
 test("gateway runner polls within invocation deadlines and drains queued work between discovery refreshes", async () => {

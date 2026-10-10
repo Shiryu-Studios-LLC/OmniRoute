@@ -260,6 +260,55 @@ test("Durable Object rejects requests whose deadline is not after creation", asy
   );
 });
 
+test("invalid protocol timestamps cannot purge queued work or complete a request", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  const request: GatewayDeviceRequest = {
+    requestId: "invalid_clock_request",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:00:30.000Z",
+    status: "pending",
+  };
+  assert.equal(await coordinator.enqueueRequest("device_A", request), true);
+
+  assert.equal(
+    await coordinator.getRequest("device_A", request.requestId, "invalid-clock"),
+    null,
+    "an invalid clock must not be treated as a valid queue expiry comparison"
+  );
+  assert.deepEqual(
+    await coordinator.getRequest("device_A", request.requestId, request.createdAt),
+    request,
+    "invalid expiry input must not delete retained work"
+  );
+
+  assert.equal(
+    (await coordinator.takeRequests("device_A", "session_A", request.createdAt)).length,
+    1
+  );
+  assert.equal(
+    await coordinator.submitRequestResult(
+      "device_A",
+      "session_A",
+      request.requestId,
+      "{}",
+      "invalid-clock"
+    ),
+    false,
+    "an invalid clock must not bypass session or request expiry checks"
+  );
+  assert.equal(
+    (await coordinator.getRequest("device_A", request.requestId, request.createdAt))?.status,
+    "delivered",
+    "rejecting invalid time must leave the request available for a valid response"
+  );
+});
+
 test("Durable Object stream queue allows one ordered event and acknowledges only on consume", async () => {
   const { namespace } = makeNamespace();
   const coordinator = new DurableObjectGatewayCoordinator(namespace);

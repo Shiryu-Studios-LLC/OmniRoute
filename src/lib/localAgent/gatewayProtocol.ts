@@ -1,6 +1,13 @@
 /** Versioned envelope for the injected device-side gateway transport. */
 export const LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION = 1 as const;
 
+export class LocalAgentCredentialRejectedError extends Error {
+  constructor() {
+    super("Local Agent device credential was rejected by the gateway");
+    this.name = "LocalAgentCredentialRejectedError";
+  }
+}
+
 export interface LocalAgentGatewayRequest {
   version: typeof LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION;
   requestId: string;

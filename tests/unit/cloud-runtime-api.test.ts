@@ -3,6 +3,7 @@ import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "@/cloud/db";
 import { decryptCloudCredential, isCloudCredentialEnvelope } from "@/cloud/credentialEncryption";
 import { createCloudRuntime } from "@/cloud/runtime";
+import { LOCAL_ONLY_API_PREFIXES } from "../../src/shared/authz/localOnlyRoutes.ts";
 
 const adminToken = "test-cloud-admin-secret";
 const tenants = [
@@ -132,6 +133,9 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
   }
 
   async first<U = T>(): Promise<U | null> {
+    if (this.sql.trim().toUpperCase() === "SELECT 1 AS OK") {
+      return { ok: 1 } as U;
+    }
     if (this.sql.includes("FROM tenants")) {
       const row = this.database.tenants.find((tenant) => tenant.id === this.values[0]);
       return (row ?? null) as U | null;
@@ -278,6 +282,7 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
       ];
       const row = Object.fromEntries(fields.map((field, index) => [field, this.values[index]]));
       this.database.providerRows.push(row);
+      return { success: true, meta: { changes: 1 } };
     }
     if (this.sql.startsWith("UPDATE provider_connections")) {
       const fields = [
@@ -317,6 +322,16 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
         fields.forEach((field, index) => {
           row[field] = this.values[index];
         });
+      return { success: true, meta: { changes: row ? 1 : 0 } };
+    }
+    if (this.sql.startsWith("DELETE FROM provider_connections")) {
+      const [tenantId, id] = this.values;
+      const before = this.database.providerRows.length;
+      const remaining = this.database.providerRows.filter(
+        (connection) => connection.tenant_id !== tenantId || connection.id !== id
+      );
+      this.database.providerRows.splice(0, this.database.providerRows.length, ...remaining);
+      return { success: true, meta: { changes: before - remaining.length } };
     }
     if (this.sql.startsWith("INSERT INTO provider_nodes")) {
       const fields = [
@@ -339,6 +354,41 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
       this.database.providerNodeRows.push(
         Object.fromEntries(fields.map((field, index) => [field, this.values[index]]))
       );
+      return { success: true, meta: { changes: 1 } };
+    }
+    if (this.sql.startsWith("UPDATE provider_nodes")) {
+      const fields = [
+        "type",
+        "name",
+        "prefix",
+        "api_type",
+        "base_url",
+        "chat_path",
+        "models_path",
+        "icon_url",
+        "custom_headers_json",
+        "credential_ownership",
+        "execution_location",
+        "updated_at",
+      ];
+      const [tenantId, id] = this.values.slice(fields.length);
+      const row = this.database.providerNodeRows.find(
+        (node) => node.tenant_id === tenantId && node.id === id
+      );
+      if (row)
+        fields.forEach((field, index) => {
+          row[field] = this.values[index];
+        });
+      return { success: true, meta: { changes: row ? 1 : 0 } };
+    }
+    if (this.sql.startsWith("DELETE FROM provider_nodes")) {
+      const [tenantId, id] = this.values;
+      const before = this.database.providerNodeRows.length;
+      const remaining = this.database.providerNodeRows.filter(
+        (node) => node.tenant_id !== tenantId || node.id !== id
+      );
+      this.database.providerNodeRows.splice(0, this.database.providerNodeRows.length, ...remaining);
+      return { success: true, meta: { changes: before - remaining.length } };
     }
     if (this.sql.includes("INSERT INTO cloud_compliance_audit")) {
       this.database.auditRows.push(this.values);
@@ -897,6 +947,42 @@ test("cloud runtime sends only the tenant admin API path boundary to the D1 admi
   );
   assert.equal(collectionResponse.status, 400, "the tenant collection POST must remain routed");
   assert.ok(db.prepareCount > 0, "tenant collection creation must still reach the D1 handler");
+});
+
+test("Cloudflare runtime never dispatches local-only process routes or dynamic variants", async () => {
+  const db = new TestD1();
+  const app = runtime(db);
+  const prefixPaths = LOCAL_ONLY_API_PREFIXES.map((prefix) =>
+    prefix.endsWith("/") ? `${prefix}remote-probe` : prefix
+  );
+  const dynamicPaths = [
+    "/api/providers/openai/login",
+    "/api/providers/openai/refresh-cursor",
+    "/api/providers/volcengine-plan/connect",
+    "/api/providers/openai/chatgpt-web-codex-doctor",
+  ];
+
+  for (const path of [...prefixPaths, ...dynamicPaths]) {
+    for (const method of ["GET", "POST"]) {
+      const response = await app.fetch(
+        new Request(`https://omniroute.test${path}`, {
+          method,
+          headers: { Authorization: `Bearer ${adminToken}` },
+        })
+      );
+      assert.equal(
+        response.status,
+        404,
+        `${method} ${path} must not be reachable in the cloud runtime`
+      );
+      assert.equal(await response.text(), "Not Found");
+    }
+  }
+  assert.equal(
+    db.prepareCount,
+    0,
+    "local-only routes must be rejected before any tenant/admin D1 operation"
+  );
 });
 
 test("cloud admin API bounds chunked JSON bodies while reading and cancels oversized streams", async () => {

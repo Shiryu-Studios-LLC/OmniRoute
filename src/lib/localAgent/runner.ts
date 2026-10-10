@@ -19,6 +19,7 @@ import {
 import type { LocalMcpDependencies } from "./localMcp";
 import {
   LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
+  LocalAgentCredentialRejectedError,
   type LocalAgentGatewayRequest,
   type LocalAgentGatewayResult,
   type LocalAgentGatewaySession,
@@ -169,6 +170,7 @@ async function sendHeartbeat(
       payload: discovered.heartbeat,
     }),
   });
+  if (response.status === 401) throw new LocalAgentCredentialRejectedError();
   if (!response.ok) throw new Error(`Local agent heartbeat returned HTTP ${response.status}`);
 }
 
@@ -209,6 +211,7 @@ export async function runLocalAgentGatewayCycle(
   }
   if (!session) {
     session = (await dependencies.gateway.connect(config.deviceId, config.credential)) ?? undefined;
+    if (!session) throw new LocalAgentCredentialRejectedError();
     if (
       session &&
       !(await dependencies.gateway.heartbeat(
@@ -564,8 +567,14 @@ export async function runLocalAgent(
       await runLocalAgentCycle(config, dependencies);
       failureCount = 0;
       await sleep(interval, signal);
-    } catch {
+    } catch (error) {
       if (signal.aborted) break;
+      if (error instanceof LocalAgentCredentialRejectedError) {
+        console.error(
+          "[Local Agent] Gateway rejected the device credential; re-enroll the device before restarting."
+        );
+        break;
+      }
       const delay = Math.min(retryMax, retryBase * 2 ** Math.min(failureCount, 30));
       failureCount += 1;
       await sleep(delay, signal);
@@ -638,8 +647,14 @@ export async function runLocalAgentWithGateway(
       session = cycle.session;
       failureCount = 0;
       await sleep(DEFAULT_GATEWAY_POLL_INTERVAL_MS, signal);
-    } catch {
+    } catch (error) {
       if (signal.aborted) break;
+      if (error instanceof LocalAgentCredentialRejectedError) {
+        console.error(
+          "[Local Agent] Gateway rejected the device credential; re-enroll the device before restarting."
+        );
+        break;
+      }
       session = undefined;
       const delay = Math.min(retryMax, retryBase * 2 ** Math.min(failureCount, 30));
       failureCount += 1;

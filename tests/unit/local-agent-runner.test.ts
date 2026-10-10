@@ -102,6 +102,37 @@ test("retries with capped exponential backoff and stops when aborted", async () 
   assert.deepEqual(delays, [10, 20, 25]);
 });
 
+test("stops retrying when the gateway rejects a revoked device credential", async () => {
+  let calls = 0;
+  let sleeps = 0;
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...values: unknown[]) => logged.push(values.join(" "));
+  try {
+    await runLocalAgent(
+      { ...config, retryBaseMs: 1, retryMaxMs: 1, heartbeatIntervalMs: 1 },
+      {
+        discover,
+        fetch: async () => {
+          calls += 1;
+          return new Response("{}", { status: 401 });
+        },
+        sleep: async () => {
+          sleeps += 1;
+        },
+      },
+      new AbortController().signal
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(calls, 1);
+  assert.equal(sleeps, 0);
+  assert.match(logged.join(" "), /re-enroll the device/);
+  assert.doesNotMatch(logged.join(" "), new RegExp(config.credential));
+});
+
 test("rejects invalid credentials and unsafe gateway URLs before network access", async () => {
   let calls = 0;
   await assert.rejects(

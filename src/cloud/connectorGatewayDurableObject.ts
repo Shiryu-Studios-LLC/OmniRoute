@@ -339,7 +339,13 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     limit = MAX_PENDING_REQUESTS
   ): Promise<GatewayDeviceRequest[]> {
     assertDeviceId(deviceId);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PENDING_REQUESTS) return [];
+    if (
+      !isTimestamp(now) ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_PENDING_REQUESTS
+    )
+      return [];
     return this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
       const sessionValue = await transaction.get<unknown>(SESSION_KEY);
@@ -381,6 +387,7 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     assertDeviceId(deviceId);
     if (
       !SESSION_ID_PATTERN.test(requestId) ||
+      !isTimestamp(now) ||
       new TextEncoder().encode(result).byteLength > MAX_REQUEST_BYTES
     ) {
       return false;
@@ -427,6 +434,7 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     if (
       !SESSION_ID_PATTERN.test(requestId) ||
       !SESSION_ID_PATTERN.test(sessionId) ||
+      !isTimestamp(now) ||
       !Number.isSafeInteger(sequence) ||
       sequence < 0 ||
       sequence > 100_000 ||
@@ -516,6 +524,7 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     if (
       !SESSION_ID_PATTERN.test(requestId) ||
       !SESSION_ID_PATTERN.test(sessionId) ||
+      !isTimestamp(now) ||
       !Number.isSafeInteger(sequence) ||
       sequence < 0
     )
@@ -567,6 +576,7 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     if (
       !SESSION_ID_PATTERN.test(requestId) ||
       !SESSION_ID_PATTERN.test(sessionId) ||
+      !isTimestamp(now) ||
       !Number.isSafeInteger(sequence) ||
       sequence < 0
     )
@@ -622,7 +632,12 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     now: string
   ): Promise<boolean> {
     assertDeviceId(deviceId);
-    if (!SESSION_ID_PATTERN.test(requestId) || !SESSION_ID_PATTERN.test(sessionId)) return false;
+    if (
+      !SESSION_ID_PATTERN.test(requestId) ||
+      !SESSION_ID_PATTERN.test(sessionId) ||
+      !isTimestamp(now)
+    )
+      return false;
     return this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
       const session = await transaction.get<unknown>(SESSION_KEY);
@@ -656,6 +671,7 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     now: string
   ): Promise<GatewayDeviceRequest | null> {
     assertDeviceId(deviceId);
+    if (!isTimestamp(now)) return null;
     return this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
       const rows = await this.readRequests(transaction);
