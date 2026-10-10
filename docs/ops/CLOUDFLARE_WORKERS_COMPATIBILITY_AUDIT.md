@@ -154,4 +154,4 @@ fetch handler; it does not replace application authorization.
 - OpenNext is configured as the initial Next.js integration target without replacing the existing local build.
 - The full Next.js graph remains explicitly tracked as **not yet cloud-compatible** rather than being incorrectly treated as Worker-ready.
 
-The asynchronous D1-capable boundary now exists for the isolated Worker APIs. The remaining Phase 12 blocker is the full Next/OpenNext request graph described above. Phase-by-phase implementation, test, deployment, and acceptance evidence is maintained in [`PHASE_3_TO_15_PROGRESS.md`](./PHASE_3_TO_15_PROGRESS.md) and [`CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md`](./CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md).
+The asynchronous D1-capable boundary now exists for the isolated Worker APIs. The remaining Phase 12 blocker is the full Next/OpenNext request graph described above. Phase-by-phase implementation, test, deployment, and acceptance evidence is maintained in [`PHASE_PROGRESS.md`](./PHASE_PROGRESS.md) and [`CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md`](./CLOUDFLARE_WORKERS_PRODUCTION_PLAN.md).

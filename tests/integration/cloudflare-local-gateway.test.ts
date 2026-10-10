@@ -1233,32 +1233,43 @@ test(
 
         const frontDeskHost = "tenant-ollama.frontdesk.test";
         const frontDeskPort = await getUnusedPort();
-        const frontDeskKeyEnv = "FRONT_DESK_LOCAL_OLLAMA_KEY";
-        const frontDeskDashboardEnv = "FRONT_DESK_LOCAL_OLLAMA_DASHBOARD";
-        const frontDeskTenants = [
-          {
-            host: frontDeskHost,
-            tenantId: ollamaCustomer.tenantId,
-            dashboardTokenEnv: frontDeskDashboardEnv,
+        // Exercise the customer setup path: Front Desk receives only the verified-host
+        // registry URL and service token, then resolves its tenant config from Worker D1.
+        const hostRegistration = await requestJson(`${baseUrl}/__cloud/v1/tenant-hosts`, {
+          token: adminToken,
+          body: { tenantId: ollamaCustomer.tenantId, hostname: frontDeskHost },
+        });
+        assert.equal(
+          hostRegistration.response.status,
+          201,
+          `Worker should register the local Ollama Front Desk host: ${JSON.stringify(hostRegistration.body)}`
+        );
+        const dashboardToken = "local-ollama-dashboard-token-for-integration";
+        const savedFrontDeskConfig = await requestJson(`${baseUrl}/__cloud/v1/front-desk/configs`, {
+          method: "PUT",
+          token: adminToken,
+          body: {
+            hostname: frontDeskHost,
+            customerApiKey: ollamaCustomer.customerKey,
+            dashboardToken,
             gateway: {
               baseUrl,
-              customerApiKeyEnv: frontDeskKeyEnv,
               deviceId: ollamaCustomer.deviceId,
               ollamaModel: model,
-            },
-            business: {
-              name: "Loopback Ollama Integration",
-              description: "Isolated local model test",
-              hours: "Always",
-              services: [],
-              assistant: {
-                name: "Local model assistant",
-                tone: "helpful",
-                handoff: "Offer a follow-up.",
-              },
+              imageGeneration: null,
             },
           },
-        ];
+        });
+        assert.equal(
+          savedFrontDeskConfig.response.status,
+          200,
+          `Worker should save the local Ollama Front Desk config in D1: ${JSON.stringify(savedFrontDeskConfig.body)}`
+        );
+        assert.equal(
+          JSON.stringify(savedFrontDeskConfig.body).includes(ollamaCustomer.customerKey),
+          false
+        );
+        assert.equal(JSON.stringify(savedFrontDeskConfig.body).includes(dashboardToken), false);
         const frontDeskChild = spawn(process.execPath, ["server.js"], {
           cwd: frontDeskTempDir,
           env: {
@@ -1267,9 +1278,8 @@ test(
             NODE_ENV: "test",
             NO_COLOR: "1",
             PORT: String(frontDeskPort),
-            FRONT_DESK_TENANTS_JSON: JSON.stringify(frontDeskTenants),
-            [frontDeskKeyEnv]: ollamaCustomer.customerKey,
-            [frontDeskDashboardEnv]: "local-ollama-dashboard-token",
+            FRONT_DESK_HOST_REGISTRY_URL: baseUrl,
+            FRONT_DESK_CONFIG_TOKEN: frontDeskConfigToken,
           },
           stdio: ["ignore", "pipe", "pipe"],
         });

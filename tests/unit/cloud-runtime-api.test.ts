@@ -119,6 +119,14 @@ class Statement<T = unknown> implements CloudDbStatement<T> {
     private readonly values: unknown[] = []
   ) {}
 
+  get testSql(): string {
+    return this.sql;
+  }
+
+  get testValues(): unknown[] {
+    return this.values;
+  }
+
   bind(...values: unknown[]) {
     return new Statement<T>(this.database, this.sql, values);
   }
@@ -374,7 +382,18 @@ class TestD1 implements CloudDb {
     return new Statement<T>(this, sql);
   }
 
-  async batch() {
+  async batch(statements: CloudDbStatement[]) {
+    const prepared = statements as Statement[];
+    if (prepared[0]?.testSql.startsWith("INSERT INTO cloud_tenant_oidc_owner_claims")) {
+      const audit = prepared[1];
+      if (audit?.testSql.includes("INSERT INTO cloud_compliance_audit")) {
+        this.auditRows.push(audit.testValues);
+      }
+      return [
+        { success: true, meta: { changes: 1 } },
+        { success: true, meta: { changes: 1 } },
+      ];
+    }
     return [];
   }
 
@@ -459,6 +478,33 @@ test("production operator tokens are limited to their route families", async () 
   assert.equal(
     (await authorized("/__cloud/v1/tenants/tenant-a/oidc", scopedOperatorTokens.identity)).status,
     200
+  );
+  const ownerClaim = await authorized(
+    "/__cloud/v1/tenants/tenant-a/oidc/owner-claims",
+    scopedOperatorTokens.identity,
+    "POST",
+    {}
+  );
+  assert.equal(ownerClaim.status, 201);
+  assert.equal(db.auditRows.at(-1)?.[3], "customer.oidc.owner.bootstrap.issued");
+  assert.equal(
+    db.auditRows.at(-1)?.[4],
+    "cloud-identity-admin",
+    "owner-claim issuance audit must retain the verified operator scope"
+  );
+  assert.equal(db.auditRows.at(-1)?.[1], "tenant_shiryu_admin");
+  assert.equal(JSON.stringify(db.auditRows).includes(scopedOperatorTokens.identity), false);
+  assert.equal(
+    (
+      await authorized(
+        "/__cloud/v1/tenants/tenant-a/oidc/owner-claims",
+        scopedOperatorTokens.inference,
+        "POST",
+        {}
+      )
+    ).status,
+    401,
+    "inference policy token must not bootstrap customer identity"
   );
   assert.equal(
     (

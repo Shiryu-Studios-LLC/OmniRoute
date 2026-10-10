@@ -859,7 +859,7 @@ export async function handleCloudApiRequest(
                 tenantId: CLOUD_PLATFORM_TENANT_ID,
                 timestamp,
                 action: "customer.oidc.owner.bootstrap.issued",
-                actor: "cloud-admin",
+                actor: auditActor,
                 target: tenantId,
                 resourceType: "customer-oidc-owner-claim",
                 status: "success",
