@@ -89,7 +89,7 @@ The Cloudflare boundary checker now scans the Worker entry graph and all src/clo
 
 Cloud provider connection and node records also carry `credentialOwnership` and `executionLocation`. `credentialOwnership` is `customer_managed`, `shiryu_hosted`, or `third_party`; `executionLocation` is `customer_environment`, `shiryu_hosted`, or `third_party`. The server-side cloud CRUD API validates and returns these fields. Migration `0022_provider_execution_contract.sql` gives existing customer credentials the backward-compatible `customer_managed` plus `third_party` defaults. `shiryu_hosted` is currently an explicit placement value only; it does not enable or route to Shiryu-hosted GPU infrastructure.
 
-### 3. Multi-tenant provider isolation — NEXT
+### 3. Multi-tenant provider isolation — COMPLETE
 
 Complete the existing `multi-tenant` foundation:
 
@@ -102,6 +102,14 @@ Complete the existing `multi-tenant` foundation:
 - Prevent cross-tenant credential/provider leakage.
 
 **Exit:** automated A/B tenant isolation tests pass for every provider/routing path.
+
+**Completion evidence:** local and Cloud D1 provider connections, provider nodes,
+combos, quota state, reasoning cache, usage, and protected runtime state are
+tenant-scoped. Migrations `182` and `183` assign tenant ownership to provider
+quota state and reasoning-cache records. A/B regressions cover scoped CRUD,
+authorization, cache/idempotency isolation, and tenant-aware provider selection.
+Global process controls remain platform-admin-only. Phase 15 continues to add
+integrated acceptance coverage for these surfaces.
 
 ### 4. API keys, authentication, authorization
 
@@ -387,6 +395,11 @@ to the platform-admin token; maintenance credentials cannot read the ledger.
 Migration `0021_cloud_maintenance_runs.sql` must be applied before scheduled
 maintenance telemetry is enabled.
 
+Cloud image-job admission checks the D1 insert result before looking up the
+idempotency record. Known tenant/device/retention caps remain `429`; a failed
+D1 write returns `503` so persistence outages are not presented as exhausted
+customer capacity. The image-job suite covers both paths.
+
 ### 12. Bundle and feature isolation
 
 - Keep the Worker bundle below the applicable Cloudflare limits.
@@ -635,9 +648,19 @@ Two-tenant test:
 - Customer B works.
 - A cannot access B.
 - B cannot access A.
+- Provider connections and provider nodes stay tenant-scoped, including customer owner/admin access.
 - Device revocation immediately blocks access.
 - Maintenance can diagnose/fix with audit trail.
 - Customer compute can later be replaced by Shiryu-hosted compute without changing Front Desk APIs.
+
+The local Wrangler provider-resource integration exercises tenant A/B provider
+connection and provider-node reads against real local D1. It verifies node
+headers are encrypted at rest and omitted from responses, that tenant B cannot
+read tenant A's node, and that customer API keys operate only within their
+tenant under staging authorization rules. Run it with
+`RUN_CLOUDFLARE_CUSTOMER_PROVIDER_INT=1 node --import tsx/esm --test tests/integration/cloudflare-local-customer-provider-connections.test.ts`.
+This is local Worker/D1 evidence; it does not verify staging bindings or deployed
+operator-secret isolation.
 
 ## Updated execution order
 

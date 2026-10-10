@@ -26,6 +26,7 @@ import {
   failCloudImageJob,
   getCloudImageJob,
   getCloudImageJobByIdempotencyHash,
+  isCloudImageJobCapacityError,
   markCloudImageJobRunning,
   releaseCloudImageArtifactUpload,
   reserveCloudImageArtifactUpload,
@@ -394,8 +395,10 @@ async function handleCustomer(
         expiresAt,
         retentionExpiresAt,
       });
-    } catch {
-      return json({ error: "Image-job capacity is unavailable" }, 429);
+    } catch (error) {
+      return isCloudImageJobCapacityError(error)
+        ? json({ error: "Image-job capacity is unavailable" }, 429)
+        : json({ error: "Image-job storage is unavailable" }, 503);
     }
     if (!created.job) return json({ error: "Image-job capacity is unavailable" }, 429);
     if (!created.created) {

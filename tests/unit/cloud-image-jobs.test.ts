@@ -425,6 +425,40 @@ test("image job creates once, uploads private binary, completes, and replays its
   }
 });
 
+test("image-job insert failure is reported as unavailable rather than exhausted capacity", async () => {
+  const fixture = await createFixture();
+  const response = await handleGatewayImageJobRequest(
+    new Request("https://cloud.test/__gateway/v1/customer/image-jobs", {
+      method: "POST",
+      headers: {
+        ...customerHeaders(fixture.keyA.token, "image-job-storage-failure"),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        deviceId: fixture.deviceId,
+        prompt: "a red apple on a table",
+        width: 512,
+        height: 512,
+        steps: 20,
+        cfg: 7,
+        seed: 42,
+      }),
+    }),
+    {
+      db: failRunForSqlPrefix(fixture.db, "INSERT OR IGNORE INTO cloud_gateway_image_jobs"),
+      sessions: fixture.sessions,
+      artifacts: fixture.bucket,
+      now: () => fixture.currentTime(),
+    }
+  );
+  assert.equal(response?.status, 503);
+  assert.deepEqual(await response?.json(), { error: "Image-job storage is unavailable" });
+  const stored = fixture.db.db
+    .prepare("SELECT COUNT(*) AS count FROM cloud_gateway_image_jobs")
+    .get() as { count: number };
+  assert.equal(stored.count, 0);
+});
+
 test("image job rejects mismatched idempotency input and cancellation rejects late artifacts", async () => {
   const fixture = await createFixture();
   const first = await createJob(fixture);

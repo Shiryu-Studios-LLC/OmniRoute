@@ -4,6 +4,18 @@ import { CLOUD_IMAGE_MAX_ARTIFACT_BYTES } from "../shared/imageJobContract";
 export const CLOUD_IMAGE_JOB_TIMEOUT_MS = 5 * 60_000;
 export const CLOUD_IMAGE_JOB_RETENTION_MS = 24 * 60 * 60_000;
 
+const CLOUD_IMAGE_JOB_CAPACITY_ERRORS = new Set([
+  "gateway image job tenant capacity reached",
+  "gateway image job device capacity reached",
+  "gateway image job tenant retention capacity reached",
+  "gateway image job global retention capacity reached",
+]);
+
+/** Capacity triggers are expected admission failures; other D1 errors indicate service failure. */
+export function isCloudImageJobCapacityError(error: unknown): boolean {
+  return error instanceof Error && CLOUD_IMAGE_JOB_CAPACITY_ERRORS.has(error.message);
+}
+
 export type CloudImageJobState =
   "queued" | "running" | "succeeded" | "failed" | "cancelled" | "expired";
 
@@ -106,7 +118,7 @@ export async function createCloudImageJob(
   input: NewCloudImageJob
 ): Promise<{ created: boolean; job: CloudImageJob | null }> {
   await expireStaleCloudImageJobs(db, input.createdAt, 500);
-  await db
+  const insert = await db
     .prepare(
       `INSERT OR IGNORE INTO cloud_gateway_image_jobs (
          job_id, tenant_id, principal_id, api_key_id, device_id, session_id,
@@ -130,6 +142,16 @@ export async function createCloudImageJob(
       input.retentionExpiresAt
     )
     .run();
+  const changes = insert.meta?.changes;
+  if (
+    !insert.success ||
+    typeof changes !== "number" ||
+    !Number.isSafeInteger(changes) ||
+    changes < 0 ||
+    changes > 1
+  ) {
+    throw new Error("D1 gateway image-job insert failed");
+  }
   const job = await getCloudImageJobByIdempotencyHash(db, input.idempotencyHash);
   return { created: job?.jobId === input.jobId, job };
 }

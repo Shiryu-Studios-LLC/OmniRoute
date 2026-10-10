@@ -60,6 +60,13 @@ function isPrivateOrLoopback(address: string): boolean {
   return normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd");
 }
 
+function isLoopback(address: string): boolean {
+  const version = isIP(address);
+  if (version === 4) return address.split(".")[0] === "127";
+  if (version !== 6) return false;
+  return address.toLowerCase().split("%")[0] === "::1";
+}
+
 async function validateLocalEndpoint(
   rawUrl: string,
   resolveHost: (hostname: string) => Promise<string[]>
@@ -80,6 +87,16 @@ async function validateLocalEndpoint(
   const addresses = await resolveHost(hostname);
   if (addresses.length === 0 || addresses.some((address) => !isPrivateOrLoopback(address))) {
     throw new Error("Local service URL must resolve only to a private or loopback address");
+  }
+  if (hostname === "localhost") {
+    const loopback = addresses.find(isLoopback);
+    if (!loopback || addresses.some((address) => !isLoopback(address))) {
+      throw new Error("Localhost must resolve only to loopback addresses");
+    }
+    // Fetching "localhost" would resolve the host again after this check. Pin
+    // it to the validated address so a hosts-file or resolver change cannot
+    // redirect discovery to a different machine between validation and use.
+    url.hostname = isIP(loopback) === 6 ? `[${loopback}]` : loopback;
   }
   return url;
 }

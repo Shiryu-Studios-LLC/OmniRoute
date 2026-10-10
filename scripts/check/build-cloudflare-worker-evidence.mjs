@@ -8,20 +8,23 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const wranglerBin = fs.realpathSync(path.join(repoRoot, "node_modules/.bin/wrangler"));
-const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-cloudflare-worker-"));
+const builds = [];
 
-try {
-  const metaFile = path.join(outputDir, "bundle-meta.json");
-  const result = spawnSync(
-    process.execPath,
-    [wranglerBin, "deploy", "--dry-run", "--outdir", outputDir, "--metafile", metaFile],
-    { cwd: repoRoot, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
-  );
-  if (result.stdout) process.stdout.write(result.stdout);
-  if (result.stderr) process.stderr.write(result.stderr);
-  if (result.error) throw result.error;
-  if (result.status !== 0) process.exitCode = result.status ?? 1;
-  else {
+function buildWorker(index) {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), `omniroute-cloudflare-worker-${index}-`));
+  try {
+    const metaFile = path.join(outputDir, "bundle-meta.json");
+    const result = spawnSync(
+      process.execPath,
+      [wranglerBin, "deploy", "--dry-run", "--outdir", outputDir, "--metafile", metaFile],
+      { cwd: repoRoot, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      throw new Error(`Wrangler dry run ${index} failed with status ${result.status ?? "unknown"}`);
+    }
     const workerFile = path.join(outputDir, "worker.js");
     if (!fs.existsSync(workerFile) || !fs.existsSync(metaFile)) {
       throw new Error("Wrangler dry run did not produce worker.js and bundle metadata.");
@@ -42,17 +45,35 @@ try {
     if (external.length) {
       throw new Error("Worker bundle contains unresolved external imports: " + external.join(", "));
     }
-    console.log("Cloudflare Worker dry-run bundle evidence:");
-    console.log("  entry: cloudflare/worker.ts (wrangler.jsonc)");
-    console.log("  bundled inputs: " + inputCount);
-    console.log("  bundle bytes: " + bundle.byteLength);
-    console.log("  gzip bytes: " + compressed.byteLength);
-    console.log("  sha256: " + createHash("sha256").update(bundle).digest("hex"));
-    console.log("  deployment: skipped (--dry-run)");
+    return {
+      inputCount,
+      bundleBytes: bundle.byteLength,
+      gzipBytes: compressed.byteLength,
+      sha256: createHash("sha256").update(bundle).digest("hex"),
+    };
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
   }
+}
+
+try {
+  builds.push(buildWorker(1));
+  builds.push(buildWorker(2));
+  if (JSON.stringify(builds[0]) !== JSON.stringify(builds[1])) {
+    throw new Error(
+      `Cloudflare Worker dry-run output is not reproducible: ${JSON.stringify(builds)}`
+    );
+  }
+  const evidence = builds[0];
+  console.log("Cloudflare Worker reproducible dry-run bundle evidence:");
+  console.log("  entry: cloudflare/worker.ts (wrangler.jsonc)");
+  console.log("  repeat builds: 2 (identical)");
+  console.log("  bundled inputs: " + evidence.inputCount);
+  console.log("  bundle bytes: " + evidence.bundleBytes);
+  console.log("  gzip bytes: " + evidence.gzipBytes);
+  console.log("  sha256: " + evidence.sha256);
+  console.log("  deployment: skipped (--dry-run)");
 } catch (error) {
   console.error("Cloudflare Worker bundle evidence failed:", error);
   process.exitCode = 1;
-} finally {
-  fs.rmSync(outputDir, { recursive: true, force: true });
 }

@@ -9,8 +9,14 @@ import test from "node:test";
 
 const enabled = process.env.RUN_CLOUDFLARE_CUSTOMER_PROVIDER_INT === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const adminToken = "local-customer-provider-integration-admin-token-only";
+const identityAdminToken = "local-customer-provider-identity-scope-token-123456";
+const inferenceAdminToken = "local-customer-provider-inference-scope-token-123456";
+const lifecycleAdminToken = "local-customer-provider-lifecycle-scope-token-123456";
+const tenantHostsAdminToken = "local-customer-provider-hosts-scope-token-123456";
+const frontDeskAdminToken = "local-customer-provider-frontdesk-scope-token-123456";
+const maintenanceToken = "local-customer-provider-maintenance-scope-token-123456";
 const encryptionKey = btoa(String.fromCharCode(...new Uint8Array(32).fill(37)));
+const idempotencyKeySecret = btoa(String.fromCharCode(...new Uint8Array(32).fill(43)));
 const originalApiKey = "sk-local-customer-provider-integration-original-secret";
 const replacementApiKey = "sk-local-customer-provider-integration-replacement-secret";
 
@@ -57,6 +63,19 @@ async function requestJson(
   }
   assert.ok(body !== null && typeof body === "object" && !Array.isArray(body));
   return { response, body: body as Record<string, unknown> };
+}
+
+async function requestJsonArray(
+  url: string,
+  token: string
+): Promise<{ response: Response; body: Array<Record<string, unknown>> }> {
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body: unknown = await response.json();
+  assert.ok(Array.isArray(body));
+  return { response, body: body as Array<Record<string, unknown>> };
 }
 
 async function waitForWorker(
@@ -115,9 +134,15 @@ test(
     const baseUrl = `http://127.0.0.1:${await getUnusedPort()}`;
     const wranglerBin = path.join(repoRoot, "node_modules", ".bin", "wrangler");
     const vars = [
-      `OMNIROUTE_CLOUD_ADMIN_TOKEN=${adminToken}`,
+      `OMNIROUTE_CLOUD_IDENTITY_ADMIN_TOKEN=${identityAdminToken}`,
+      `OMNIROUTE_CLOUD_INFERENCE_ADMIN_TOKEN=${inferenceAdminToken}`,
+      `OMNIROUTE_CLOUD_LIFECYCLE_ADMIN_TOKEN=${lifecycleAdminToken}`,
+      `OMNIROUTE_CLOUD_TENANT_HOSTS_ADMIN_TOKEN=${tenantHostsAdminToken}`,
+      `OMNIROUTE_CLOUD_FRONT_DESK_ADMIN_TOKEN=${frontDeskAdminToken}`,
+      `OMNIROUTE_CLOUD_MAINTENANCE_TOKEN=${maintenanceToken}`,
       `OMNIROUTE_CLOUD_CREDENTIAL_ENCRYPTION_KEY=${encryptionKey}`,
-      "OMNIROUTE_ENV=local-customer-provider-integration",
+      `OMNIROUTE_CLOUD_IDEMPOTENCY_HMAC_KEY=${idempotencyKeySecret}`,
+      "OMNIROUTE_ENV=staging",
     ].join("\n");
     await writeFile(path.join(tempDir, ".dev.vars"), `${vars}\n`, { mode: 0o600 });
     await writeFile(path.join(tempDir, ".env"), `${vars}\n`, { mode: 0o600 });
@@ -228,7 +253,7 @@ test(
     const provisionTenant = async (label: string) => {
       const tenantId = `provider-${label}-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
       const provisioned = await requestJson(`${baseUrl}/__cloud/v1/tenants`, {
-        token: adminToken,
+        token: lifecycleAdminToken,
         body: {
           id: tenantId,
           name: `Customer Provider ${label}`,
@@ -250,6 +275,41 @@ test(
     const customerB = await provisionTenant("b");
     const collectionUrl = `${baseUrl}/__cloud/v1/customer/provider-connections`;
     const connectionId = `openai-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+
+    // Provider nodes are available to tenant owners in staging, and both their
+    // rows and encrypted headers must remain tenant-qualified in D1.
+    const nodeId = `node-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+    const nodeAUrl = `${baseUrl}/__cloud/v1/tenants/${customerA.tenantId}/provider-nodes`;
+    const nodeBUrl = `${baseUrl}/__cloud/v1/tenants/${customerB.tenantId}/provider-nodes`;
+    const nodeSecret = "x-customer-a-node-secret";
+    const createdNode = await requestJson(nodeAUrl, {
+      token: customerA.token,
+      body: {
+        id: nodeId,
+        type: "openai-compatible",
+        name: "Customer A node",
+        prefix: "customer-a",
+        baseUrl: "https://api.example.invalid/v1",
+        customHeadersJson: JSON.stringify({ "x-api-key": nodeSecret }),
+      },
+    });
+    assert.equal(createdNode.response.status, 201, JSON.stringify(createdNode.body));
+    assert.equal(createdNode.body.tenantId, customerA.tenantId);
+    assert.equal(createdNode.body.hasCustomHeaders, true);
+    assert.equal(JSON.stringify(createdNode.body).includes(nodeSecret), false);
+
+    const listedNodesA = await requestJsonArray(nodeAUrl, customerA.token);
+    assert.equal(listedNodesA.response.status, 200);
+    assert.deepEqual(
+      listedNodesA.body.map((node) => node.id),
+      [nodeId]
+    );
+    assert.equal(JSON.stringify(listedNodesA.body).includes(nodeSecret), false);
+    const listedNodesB = await requestJsonArray(nodeBUrl, customerB.token);
+    assert.equal(listedNodesB.response.status, 200);
+    assert.deepEqual(listedNodesB.body, []);
+    const crossTenantNode = await requestJson(`${nodeBUrl}/${nodeId}`, { token: customerB.token });
+    assert.equal(crossTenantNode.response.status, 404);
 
     const created = await requestJson(collectionUrl, {
       token: customerA.token,
@@ -305,7 +365,7 @@ test(
           "--yes",
           "--json",
           "--command",
-          `SELECT tenant_id, id, api_key FROM provider_connections WHERE tenant_id = '${customerA.tenantId}' AND id = '${connectionId}'; SELECT action, metadata_json FROM cloud_compliance_audit WHERE tenant_id = '${customerA.tenantId}' AND resource_type = 'cloud-provider-connection';`,
+          `SELECT tenant_id, id, api_key FROM provider_connections WHERE tenant_id = '${customerA.tenantId}' AND id = '${connectionId}'; SELECT tenant_id, id, custom_headers_json FROM provider_nodes WHERE tenant_id = '${customerA.tenantId}' AND id = '${nodeId}'; SELECT action, metadata_json FROM cloud_compliance_audit WHERE tenant_id = '${customerA.tenantId}' AND resource_type = 'cloud-provider-connection';`,
         ],
         30_000
       );
@@ -329,6 +389,14 @@ test(
     assert.match(encrypted as string, /^enc:v[12]:/);
     assert.notEqual(encrypted, originalApiKey);
     assert.notEqual(encrypted, replacementApiKey);
+    const nodeRows = storedState
+      .flatMap((result) => result.results ?? [])
+      .filter((row) => Object.hasOwn(row, "custom_headers_json"));
+    assert.equal(nodeRows.length, 1);
+    assert.equal(nodeRows[0].tenant_id, customerA.tenantId);
+    assert.equal(nodeRows[0].id, nodeId);
+    assert.match(String(nodeRows[0].custom_headers_json), /^enc:v[12]:/);
+    assert.equal(String(nodeRows[0].custom_headers_json).includes(nodeSecret), false);
     const auditRows = storedState
       .flatMap((result) => result.results ?? [])
       .filter((row) => Object.hasOwn(row, "metadata_json"));

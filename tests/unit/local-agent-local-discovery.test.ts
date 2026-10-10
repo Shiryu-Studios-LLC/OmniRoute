@@ -47,8 +47,45 @@ test("discovers installed Ollama IDs and only reports verified model capabilitie
     false
   );
   assert.equal(requested.length, 3);
-  assert.match(requested[0], /^GET http:\/\/localhost:11434\/api\/tags$/);
-  assert.match(requested[1], /^POST http:\/\/localhost:11434\/api\/show$/);
+  assert.match(requested[0], /^GET http:\/\/127\.0\.0\.1:11434\/api\/tags$/);
+  assert.match(requested[1], /^POST http:\/\/127\.0\.0\.1:11434\/api\/show$/);
+});
+
+test("pins localhost to its validated loopback address before fetching", async () => {
+  const requested: string[] = [];
+  const result = await discoverLocalCapabilities(
+    { ollamaUrl: "http://localhost:11434" },
+    {
+      resolveHost: async () => ["::1"],
+      fetch: async (input) => {
+        requested.push(String(input));
+        return jsonResponse({ models: [] });
+      },
+    }
+  );
+
+  assert.equal(result.services[0]?.reachable, true);
+  assert.equal(requested[0], "http://[::1]:11434/api/tags");
+});
+
+test("rejects localhost that resolves to a non-loopback private address", async () => {
+  const requested: string[] = [];
+  const result = await discoverLocalCapabilities(
+    { ollamaUrl: "http://localhost:11434" },
+    {
+      resolveHost: async () => ["127.0.0.1", "192.168.1.10"],
+      fetch: async (input) => {
+        requested.push(String(input));
+        return jsonResponse({ models: [] });
+      },
+    }
+  );
+
+  assert.equal(
+    requested.some((url) => url.includes(":11434/")),
+    false
+  );
+  assert.equal(result.services[0]?.reachable, false);
 });
 
 test("discovers ComfyUI checkpoint IDs and only executable image capability", async () => {
