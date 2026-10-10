@@ -200,6 +200,55 @@ test("customer owners/admins provision only the fixed provider contract and neve
   assert.equal(audit?.count, 2);
 });
 
+test("customer provider credentials accept only the fixed Anthropic adapter contract", async () => {
+  const { db, tokens, call } = await fixture();
+  try {
+    const response = await call(tokens.owner, "POST", "", {
+      id: "anthropic-a",
+      provider: "anthropic",
+      apiKey: "sk-ant-test-customer-secret",
+      name: "Team Anthropic",
+    });
+    assert.equal(response.status, 201);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.equal(body.provider, "anthropic");
+    assert.equal(body.defaultModel, "claude-sonnet-4-6");
+    assert.equal(body.hasCredentials, true);
+    assert.equal(JSON.stringify(body).includes("sk-ant-test-customer-secret"), false);
+
+    const stored = await db
+      .prepare<{ api_key: string; provider: string; default_model: string }>(
+        "SELECT api_key,provider,default_model FROM provider_connections WHERE tenant_id=? AND id=?"
+      )
+      .bind("tenant-a", "anthropic-a")
+      .first();
+    assert.ok(stored && isCloudCredentialEnvelope(stored.api_key));
+    assert.equal(stored?.provider, "anthropic");
+    assert.equal(stored?.default_model, "claude-sonnet-4-6");
+    assert.equal(
+      await decryptCloudCredential(stored!.api_key, WRAP_KEY, {
+        tenantId: "tenant-a",
+        connectionId: "anthropic-a",
+        field: "apiKey",
+      }),
+      "sk-ant-test-customer-secret"
+    );
+    assert.equal((await call(tokens.owner, "GET")).status, 200);
+    assert.equal(
+      (
+        await call(tokens.owner, "POST", "", {
+          id: "anthropic-compatible",
+          provider: "anthropic-compatible",
+          apiKey: "sk-ant-nope",
+        })
+      ).status,
+      400
+    );
+  } finally {
+    db.db.close();
+  }
+});
+
 test("runtime keyring reads v3 keys but only writes v3 when an active key ID is configured", async () => {
   const keyId = "provider-credential-2026-10";
   const rotatedKey = Buffer.alloc(32, 17).toString("base64");
@@ -333,7 +382,7 @@ test("provider configuration is tenant-isolated and member/viewer keys cannot re
 test("customer API rejects unsupported providers and contract overrides", async () => {
   const { tokens, call } = await fixture();
   for (const body of [
-    { id: "claude", provider: "anthropic", apiKey: SECRET },
+    { id: "unsupported", provider: "openrouter", apiKey: SECRET },
     { id: "hosted", provider: "openai", apiKey: SECRET, executionLocation: "shiryu_hosted" },
     { id: "alternate-model", provider: "openai", apiKey: SECRET, defaultModel: "gpt-4.1" },
     { id: "ciphertext", provider: "openai", apiKey: "enc:v2:client-submitted" },

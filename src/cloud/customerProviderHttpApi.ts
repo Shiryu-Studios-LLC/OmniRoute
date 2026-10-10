@@ -24,8 +24,15 @@ const BODY_READ_TIMEOUT_MS = 5_000;
 const AUTH_RATE_LIMIT = { limit: 600, windowMs: 60_000 };
 const AUTH_FALLBACK_RATE_LIMIT = { limit: 20, windowMs: 60_000 };
 const CUSTOMER_RATE_LIMIT = { limit: 60, windowMs: 60_000 };
-const SUPPORTED_PROVIDER = "openai";
-const SUPPORTED_MODEL = "gpt-4o-mini-2024-07-18";
+const DEFAULT_MODELS = {
+  openai: "gpt-4o-mini-2024-07-18",
+  anthropic: "claude-sonnet-4-6",
+} as const;
+const SUPPORTED_PROVIDERS: ReadonlySet<string> = new Set(Object.keys(DEFAULT_MODELS));
+
+function isSupportedProvider(value: unknown): value is keyof typeof DEFAULT_MODELS {
+  return typeof value === "string" && SUPPORTED_PROVIDERS.has(value);
+}
 
 export interface CloudCustomerProviderApiOptions {
   db?: CloudDb;
@@ -68,7 +75,9 @@ function isCustomerManagedSupportedConnection(
   connection: CloudProviderConnection | null
 ): connection is CloudProviderConnection {
   return (
-    connection?.provider === SUPPORTED_PROVIDER &&
+    connection !== null &&
+    connection !== undefined &&
+    isSupportedProvider(connection.provider) &&
     connection.credentialOwnership === "customer_managed" &&
     connection.executionLocation === "third_party"
   );
@@ -146,7 +155,7 @@ function validateBody(
       : ["apiKey", "name", "priority", "isActive"]
   );
   if (Object.keys(body).some((field) => !allowed.has(field))) return null;
-  if (mode === "create" && body.provider !== SUPPORTED_PROVIDER) return null;
+  if (mode === "create" && !isSupportedProvider(body.provider)) return null;
   if (mode === "create" && !validId(body.id)) return null;
   if (mode === "create" && typeof body.apiKey !== "string") return null;
   if (
@@ -329,9 +338,7 @@ async function handleCloudCustomerProviderRequestCore(
           ? json(safeConnection(connection))
           : json({ error: "Not found" }, 404);
       }
-      const connections = await getCloudProviderConnections(options.db, identity.tenantId, {
-        provider: SUPPORTED_PROVIDER,
-      });
+      const connections = await getCloudProviderConnections(options.db, identity.tenantId, {});
       return json({
         connections: connections.filter(isCustomerManagedSupportedConnection).map(safeConnection),
       });
@@ -347,6 +354,7 @@ async function handleCloudCustomerProviderRequestCore(
       if (!body) return json({ error: "Invalid provider connection" }, 400);
       const timestamp = now().toISOString();
       const id = body.id as string;
+      const provider = body.provider as keyof typeof DEFAULT_MODELS;
       if (await getCloudProviderConnectionById(options.db, identity.tenantId, id)) {
         return json({ error: "Provider connection already exists" }, 409);
       }
@@ -354,13 +362,13 @@ async function handleCloudCustomerProviderRequestCore(
       const input: CloudProviderConnectionInput = {
         id,
         tenantId: identity.tenantId,
-        provider: SUPPORTED_PROVIDER,
+        provider,
         authType: "api_key",
         apiKey: apiKey ?? null,
         name: (body.name as string | null | undefined) ?? null,
         priority: (body.priority as number | undefined) ?? 0,
         isActive: (body.isActive as boolean | undefined) ?? true,
-        defaultModel: SUPPORTED_MODEL,
+        defaultModel: DEFAULT_MODELS[provider],
         credentialOwnership: "customer_managed",
         executionLocation: "third_party",
         createdAt: timestamp,
@@ -376,7 +384,7 @@ async function handleCloudCustomerProviderRequestCore(
             "customer.provider_connection.create",
             id,
             timestamp,
-            { provider: SUPPORTED_PROVIDER, hasCredentials: true }
+            { provider, hasCredentials: true }
           ),
         ]);
       } catch (error) {
@@ -420,7 +428,7 @@ async function handleCloudCustomerProviderRequestCore(
       };
       const results = await options.db.batch([
         prepareCloudProviderConnectionUpdate(options.db, identity.tenantId, connectionId, merged, {
-          provider: SUPPORTED_PROVIDER,
+          provider: existing.provider,
           credentialOwnership: "customer_managed",
           executionLocation: "third_party",
         }),
@@ -431,7 +439,7 @@ async function handleCloudCustomerProviderRequestCore(
           "customer.provider_connection.update",
           connectionId,
           timestamp,
-          { provider: SUPPORTED_PROVIDER, credentialsUpdated: body.apiKey !== undefined }
+          { provider: existing.provider, credentialsUpdated: body.apiKey !== undefined }
         ),
       ]);
       if (!mutationChanged(results[0])) return json({ error: "Not found" }, 404);
@@ -445,7 +453,7 @@ async function handleCloudCustomerProviderRequestCore(
 
     const results = await options.db.batch([
       prepareCloudProviderConnectionDelete(options.db, identity.tenantId, connectionId, {
-        provider: SUPPORTED_PROVIDER,
+        provider: existing.provider,
         credentialOwnership: "customer_managed",
         executionLocation: "third_party",
       }),
@@ -456,7 +464,7 @@ async function handleCloudCustomerProviderRequestCore(
         "customer.provider_connection.delete",
         connectionId,
         timestamp,
-        { provider: SUPPORTED_PROVIDER }
+        { provider: existing.provider }
       ),
     ]);
     if (!mutationChanged(results[0])) return json({ error: "Not found" }, 404);

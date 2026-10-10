@@ -219,6 +219,24 @@ async function storeCombo(
     .run();
 }
 
+async function addAnthropicConnection(db: SqliteCloudDb, tenantId = TENANT_A) {
+  const connectionId = `anthropic-${tenantId}`;
+  const apiKey = await encryptCloudCredential("sk-ant-test-provider-key", WRAP_KEY, {
+    tenantId,
+    connectionId,
+    field: "apiKey",
+  });
+  return createCloudProviderConnection(db, {
+    id: connectionId,
+    tenantId,
+    provider: "anthropic",
+    apiKey,
+    authType: "api_key",
+    createdAt: NOW,
+    updatedAt: NOW,
+  });
+}
+
 function request(
   token: string,
   key = "idempotency-key-0001",
@@ -447,6 +465,297 @@ test("owner-selected OpenAI Responses model uses its entitlement and is reflecte
     );
     assert.equal(await replay.text(), firstText);
     assert.equal(calls, 2, "replay retains the selected model and never redispatches");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("fixed Anthropic Messages route uses tenant credentials, entitlements, accounting, and replay", async () => {
+  const f = await fixture();
+  const model = "claude-sonnet-4-6";
+  try {
+    await addAnthropicConnection(f.db);
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "anthropic",
+      model,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    let calls = 0;
+    const app = f.runtime(async (input, init) => {
+      calls += 1;
+      const url = new URL(String(input));
+      const headers = new Headers((init as RequestInit).headers);
+      assert.equal(url.origin, "https://api.anthropic.com");
+      assert.equal(headers.get("x-api-key"), "sk-ant-test-provider-key");
+      assert.equal(headers.get("anthropic-version"), "2023-06-01");
+      assert.equal(headers.get("authorization"), null);
+      const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+      assert.equal(body.model, model);
+      assert.deepEqual(body.messages, [{ role: "user", content: "hello" }]);
+      if (url.pathname === "/v1/messages/count_tokens") {
+        assert.equal(body.max_tokens, undefined);
+        return Response.json({ input_tokens: 5 });
+      }
+      assert.equal(url.pathname, "/v1/messages");
+      assert.equal(body.max_tokens, 40);
+      assert.equal(body.stream, undefined);
+      return Response.json({
+        id: "msg_anthropic_001",
+        type: "message",
+        role: "assistant",
+        model,
+        content: [{ type: "text", text: "bonjour" }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 2 },
+      });
+    });
+    const first = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-anthropic-direct-001",
+        "hello",
+        false,
+        undefined,
+        `anthropic/${model}`
+      )
+    );
+    const firstText = await first.text();
+    assert.equal(first.status, 200, firstText);
+    const completion = JSON.parse(firstText) as {
+      model: string;
+      choices: { message: { content: string }; finish_reason: string }[];
+      usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+    };
+    assert.equal(completion.model, `anthropic/${model}`);
+    assert.equal(completion.choices[0]?.message.content, "bonjour");
+    assert.equal(completion.choices[0]?.finish_reason, "stop");
+    assert.deepEqual(completion.usage, { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
+    assert.equal(calls, 2);
+
+    const usage = await f.db
+      .prepare<{ provider: string; model: string; connection_id: string; status: string }>(
+        "SELECT provider,model,connection_id,status FROM cloud_usage_history WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(usage?.provider, "anthropic");
+    assert.equal(usage?.model, model);
+    assert.equal(usage?.connection_id, `anthropic-${TENANT_A}`);
+    assert.equal(usage?.status, "success");
+    const reservation = await f.db
+      .prepare<{ provider: string; model: string; status: string }>(
+        "SELECT provider,model,status FROM cloud_inference_reservations WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .first();
+    assert.equal(reservation?.provider, "anthropic");
+    assert.equal(reservation?.model, model);
+    assert.equal(reservation?.status, "settled");
+
+    const replay = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-anthropic-direct-001",
+        "hello",
+        false,
+        undefined,
+        `anthropic/${model}`
+      )
+    );
+    assert.equal(await replay.text(), firstText);
+    assert.equal(calls, 2, "replay must not dispatch to Anthropic again");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("priority combo can cross from an explicit OpenAI rejection to Anthropic with separate accounting", async () => {
+  const f = await fixture();
+  const anthropicModel = "claude-sonnet-4-6";
+  try {
+    await addAnthropicConnection(f.db);
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model: "gpt-4o-mini-2024-07-18",
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "anthropic",
+      model: anthropicModel,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await storeCombo(f.db, TENANT_A, "cross-provider", {
+      models: [
+        "openai/gpt-4o-mini-2024-07-18",
+        { kind: "model", provider: "anthropic", model: anthropicModel },
+      ],
+      strategy: "priority",
+      isActive: true,
+    });
+    let calls = 0;
+    const app = f.runtime(async (input, init) => {
+      calls += 1;
+      const url = new URL(String(input));
+      if (url.origin === "https://api.openai.com") {
+        if (url.pathname.endsWith("input_tokens"))
+          return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+        return Response.json(
+          { error: { message: "model rejected before generation" } },
+          { status: 400 }
+        );
+      }
+      assert.equal(url.origin, "https://api.anthropic.com");
+      const headers = new Headers((init as RequestInit).headers);
+      assert.equal(headers.get("x-api-key"), "sk-ant-test-provider-key");
+      const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+      assert.equal(body.model, anthropicModel);
+      if (url.pathname === "/v1/messages/count_tokens") return Response.json({ input_tokens: 5 });
+      assert.equal(url.pathname, "/v1/messages");
+      return Response.json({
+        id: "msg_combo_001",
+        type: "message",
+        role: "assistant",
+        model: anthropicModel,
+        content: [{ type: "text", text: "anthropic fallback" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 5, output_tokens: 3 },
+      });
+    });
+    const alias = "combo:cross-provider";
+    const first = await app.fetch(
+      request(f.issued.token, "idempotency-cross-provider-001", "hello", false, undefined, alias)
+    );
+    const firstText = await first.text();
+    assert.equal(first.status, 200, firstText);
+    assert.equal(JSON.parse(firstText).choices[0].message.content, "anthropic fallback");
+    assert.equal(calls, 4);
+
+    const usage = await f.db
+      .prepare<{ provider: string; model: string; status: string; success: number }>(
+        "SELECT provider,model,status,success FROM cloud_usage_history WHERE tenant_id=? ORDER BY id"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.deepEqual(
+      usage.results.map((row) => [row.provider, row.model, row.status, row.success]),
+      [
+        ["openai", "gpt-4o-mini-2024-07-18", "fallback", 0],
+        ["anthropic", anthropicModel, "success", 1],
+      ]
+    );
+    const reservations = await f.db
+      .prepare<{ provider: string; model: string; status: string }>(
+        "SELECT provider,model,status FROM cloud_inference_reservations WHERE tenant_id=? ORDER BY provider"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.deepEqual(
+      reservations.results.map((row) => [row.provider, row.model, row.status]),
+      [
+        ["anthropic", anthropicModel, "settled"],
+        ["openai", "gpt-4o-mini-2024-07-18", "settled"],
+      ]
+    );
+    const replay = await app.fetch(
+      request(f.issued.token, "idempotency-cross-provider-001", "hello", false, undefined, alias)
+    );
+    assert.equal(await replay.text(), firstText);
+    assert.equal(calls, 4, "exact replay must not dispatch to either provider");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("Anthropic streaming requests fail before any provider fetch", async () => {
+  const f = await fixture();
+  const model = "claude-sonnet-4-6";
+  try {
+    await addAnthropicConnection(f.db);
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "anthropic",
+      model,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await storeCombo(f.db, TENANT_A, "anthropic-stream", {
+      models: [{ kind: "model", provider: "anthropic", model }],
+      strategy: "priority",
+      isActive: true,
+    });
+    let calls = 0;
+    const app = f.runtime(async () => {
+      calls += 1;
+      return Response.json({});
+    });
+    for (const [key, target] of [
+      ["idempotency-anthropic-direct-stream", `anthropic/${model}`],
+      ["idempotency-anthropic-combo-stream", "combo:anthropic-stream"],
+    ]) {
+      const response = await app.fetch(
+        request(f.issued.token, key, "hello", true, undefined, target)
+      );
+      assert.equal(response.status, 400);
+    }
+    assert.equal(calls, 0);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("Anthropic ambiguous generation failures never fall through to another combo provider", async () => {
+  const f = await fixture();
+  const anthropicModel = "claude-sonnet-4-6";
+  try {
+    await addAnthropicConnection(f.db);
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "anthropic",
+      model: anthropicModel,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await storeCombo(f.db, TENANT_A, "anthropic-ambiguous", {
+      models: [`anthropic/${anthropicModel}`, "openai/gpt-4o-mini-2024-07-18"],
+      strategy: "priority",
+      isActive: true,
+    });
+    let calls = 0;
+    const app = f.runtime(async (input) => {
+      calls += 1;
+      const url = new URL(String(input));
+      assert.equal(url.origin, "https://api.anthropic.com");
+      if (url.pathname === "/v1/messages/count_tokens") return Response.json({ input_tokens: 5 });
+      return Response.json({ error: { message: "upstream failed" } }, { status: 503 });
+    });
+    const key = "idempotency-anthropic-ambiguous-001";
+    const response = await app.fetch(
+      request(f.issued.token, key, "hello", false, undefined, "combo:anthropic-ambiguous")
+    );
+    assert.equal(response.status, 502);
+    assert.equal(calls, 2, "the OpenAI fallback must not be dispatched after Anthropic 503");
+    const replay = await app.fetch(
+      request(f.issued.token, key, "hello", false, undefined, "combo:anthropic-ambiguous")
+    );
+    assert.equal(replay.status, 503);
+    assert.equal(calls, 2, "an ambiguous result remains tombstoned for this idempotency key");
   } finally {
     f.db.db.close();
   }

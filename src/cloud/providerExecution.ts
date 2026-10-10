@@ -38,6 +38,19 @@ export const CLOUD_OPENAI_RESPONSES_MODELS = [
 
 export type CloudOpenAiResponsesModel = (typeof CLOUD_OPENAI_RESPONSES_MODELS)[number];
 
+/** Exact Anthropic model IDs supported by the narrow cloud Messages adapter. */
+export const CLOUD_ANTHROPIC_MESSAGES_MODELS = ["claude-sonnet-4-6"] as const;
+
+export type CloudAnthropicMessagesModel = (typeof CLOUD_ANTHROPIC_MESSAGES_MODELS)[number];
+
+export function isCloudAnthropicMessagesModel(
+  value: unknown
+): value is CloudAnthropicMessagesModel {
+  return (
+    typeof value === "string" && CLOUD_ANTHROPIC_MESSAGES_MODELS.some((model) => model === value)
+  );
+}
+
 export function isCloudOpenAiResponsesModel(value: unknown): value is CloudOpenAiResponsesModel {
   return (
     typeof value === "string" && CLOUD_OPENAI_RESPONSES_MODELS.some((model) => model === value)

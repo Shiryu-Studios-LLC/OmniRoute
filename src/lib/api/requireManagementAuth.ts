@@ -32,7 +32,7 @@ export function hasManageScope(scopes: string[] = []): boolean {
   return hasManageScopeShared(scopes);
 }
 
-interface RequireManagementAuthOptions {
+export interface RequireManagementAuthOptions {
   alwaysRequireAuth?: boolean;
   invalidApiKeyStatus?: 401 | 403;
   /**
@@ -193,13 +193,14 @@ export async function withManagementTenantContext<T>(
   request: Request,
   handler: () => Promise<T>,
   resolveContextApiKeyMetadata: typeof getApiKeyMetadata = getApiKeyMetadata,
-  acceptTrustedPlatformRequest?: (request: Request) => boolean
+  acceptTrustedPlatformRequest?: (request: Request) => boolean,
+  authOptions: RequireManagementAuthOptions = {}
 ): Promise<T | Response> {
   const acceptedPrincipal: { value: AcceptedManagementPrincipal | null } = { value: null };
   const trustedPlatformRequest = acceptTrustedPlatformRequest?.(request) === true;
   const authError = trustedPlatformRequest
     ? null
-    : await requireManagementAuth(request, {}, (principal) => {
+    : await requireManagementAuth(request, authOptions, (principal) => {
         acceptedPrincipal.value = principal;
       });
   if (trustedPlatformRequest) acceptedPrincipal.value = { kind: "platform" };
@@ -290,16 +291,23 @@ export async function withManagementTenantContext<T>(
  */
 export async function withPlatformAdminManagementContext<T>(
   request: Request,
-  handler: () => Promise<T>
+  handler: () => Promise<T>,
+  authOptions: RequireManagementAuthOptions = {}
 ): Promise<T | Response> {
-  return withManagementTenantContext(request, async () => {
-    if (getCurrentTenantId() !== SHIRYU_ADMIN_TENANT_ID) {
-      return createErrorResponse({
-        status: 403,
-        message: "Platform administrator required",
-        type: "invalid_request",
-      });
-    }
-    return handler();
-  });
+  return withManagementTenantContext(
+    request,
+    async () => {
+      if (getCurrentTenantId() !== SHIRYU_ADMIN_TENANT_ID) {
+        return createErrorResponse({
+          status: 403,
+          message: "Platform administrator required",
+          type: "invalid_request",
+        });
+      }
+      return handler();
+    },
+    getApiKeyMetadata,
+    undefined,
+    authOptions
+  );
 }

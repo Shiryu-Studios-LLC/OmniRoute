@@ -11,7 +11,7 @@ process.env.JWT_SECRET = "cloud-write-auth-jwt";
 process.env.INITIAL_PASSWORD = "bootstrap-password";
 process.env.API_KEY_SECRET = "cloud-write-auth-api-key-secret";
 
-type ApiKeyRecord = { key: string };
+type ApiKeyRecord = { id: string; key: string };
 type ProviderConnectionRecord = {
   id: string;
   accessToken?: string | null;
@@ -23,6 +23,7 @@ const core = await import("../../src/lib/db/core.ts");
 const localDb = await import("../../src/lib/localDb.ts");
 const tenantProvisioning =
   await import("../../src/lib/tenantProvisioning/provisionCustomerTenant.ts");
+const dbTenantProvisioning = await import("../../src/lib/db/tenantProvisioning.ts");
 const tenantContext = await import("../../src/lib/tenantContext.ts");
 const credentialsRoute = await import("../../src/app/api/cloud/credentials/update/route.ts");
 const aliasRoute = await import("../../src/app/api/cloud/models/alias/route.ts");
@@ -217,6 +218,44 @@ test("PUT /api/cloud/credentials/update accepts API key with manage scope", asyn
   assert.equal(connection.accessToken, "new-access-secret");
   assert.equal(connection.refreshToken, "new-refresh-secret");
   assert.notEqual(connection.expiresAt, "2026-01-01T00:00:00.000Z");
+});
+
+test("PUT /api/cloud/credentials/update denies customer manage keys and preserves both tenants", async () => {
+  const platformConnection = await createActiveConnection();
+  const customer = await tenantProvisioning.provisionCustomerTenant({
+    name: "Customer Credential Writer",
+    slug: "customer-credential-writer",
+    owner: { principalId: "customer-credential-writer-owner", identityVerified: true },
+    provisionedBy: "platform-cloud-credential-update-test",
+  });
+  const customerContext = {
+    tenantId: customer.tenant.id,
+    principalId: "customer-credential-writer-admin",
+    role: "owner" as const,
+  };
+  const customerConnection = await tenantContext.runWithTenantContext(customerContext, () =>
+    createActiveConnection()
+  );
+  const customerManageKey = await tenantContext.runWithTenantContext(customerContext, () =>
+    createKey(["manage"])
+  );
+  dbTenantProvisioning.createTenantMembership(customer.tenant.id, customerManageKey.id, "owner");
+
+  const response = await credentialsRoute.PUT(cloudCredentialsRequest(customerManageKey.key));
+  const platformAfter = await readActiveConnection();
+  const customerAfter = await tenantContext.runWithTenantContext(customerContext, () =>
+    readActiveConnection()
+  );
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(
+    [platformAfter.id, platformAfter.accessToken, platformAfter.refreshToken],
+    [platformConnection.id, "old-access-token", "old-refresh-token"]
+  );
+  assert.deepEqual(
+    [customerAfter.id, customerAfter.accessToken, customerAfter.refreshToken],
+    [customerConnection?.id, "old-access-token", "old-refresh-token"]
+  );
 });
 
 test("PUT /api/cloud/models/alias accepts API key with manage scope", async () => {

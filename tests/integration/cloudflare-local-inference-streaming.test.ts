@@ -227,7 +227,7 @@ test(
         safeEnvPath,
         "--yes",
         "--command",
-        "CREATE TABLE cloud_test_mock_provider_calls (id TEXT PRIMARY KEY, call_count INTEGER NOT NULL, last_error TEXT, fail_generation_count INTEGER NOT NULL DEFAULT 0); INSERT INTO cloud_test_mock_provider_calls (id, call_count, last_error, fail_generation_count) VALUES ('inference', 0, NULL, 0); CREATE TABLE cloud_test_mock_provider_credential_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT NOT NULL);",
+        "CREATE TABLE cloud_test_mock_provider_calls (id TEXT PRIMARY KEY, call_count INTEGER NOT NULL, last_error TEXT, fail_generation_count INTEGER NOT NULL DEFAULT 0); INSERT INTO cloud_test_mock_provider_calls (id, call_count, last_error, fail_generation_count) VALUES ('inference', 0, NULL, 0); CREATE TABLE cloud_test_mock_provider_credential_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT NOT NULL); CREATE TABLE cloud_test_mock_provider_model_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, operation TEXT NOT NULL, path TEXT NOT NULL, auth_header TEXT NOT NULL, version_header TEXT, max_tokens INTEGER, stream INTEGER, response_status INTEGER NOT NULL);",
       ],
       {
         cwd: tempDir,

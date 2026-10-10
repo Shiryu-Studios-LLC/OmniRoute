@@ -18,8 +18,10 @@ import {
 } from "./inferencePolicy";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import {
+  isCloudAnthropicMessagesModel,
   isCloudOpenAiResponsesModel,
   isCloudOpenAiResponsesModelResult,
+  type CloudAnthropicMessagesModel,
   type CloudOpenAiResponsesModel,
 } from "./providerExecution";
 import { getCloudProviderConnections } from "./providers";
@@ -32,6 +34,9 @@ export const CLOUD_INFERENCE_PROVIDER = "openai";
 export const CLOUD_INFERENCE_MODEL = "gpt-4o-mini-2024-07-18";
 export const CLOUD_INFERENCE_COUNT_URL = "https://api.openai.com/v1/responses/input_tokens";
 export const CLOUD_INFERENCE_RESPONSE_URL = "https://api.openai.com/v1/responses";
+export const CLOUD_ANTHROPIC_PROVIDER = "anthropic";
+export const CLOUD_ANTHROPIC_COUNT_URL = "https://api.anthropic.com/v1/messages/count_tokens";
+export const CLOUD_ANTHROPIC_RESPONSE_URL = "https://api.anthropic.com/v1/messages";
 export const CLOUD_INFERENCE_MAX_REQUEST_BYTES = 32 * 1024;
 export const CLOUD_INFERENCE_MAX_COUNT_RESPONSE_BYTES = 4 * 1024;
 export const CLOUD_INFERENCE_MAX_RESPONSE_BYTES = 128 * 1024;
@@ -49,7 +54,10 @@ const CLOUD_COMBO_MODEL_PREFIX = "combo:";
 const CLOUD_COMBO_MAX_TARGETS = 10;
 // These statuses reject the requested model before response generation. Throttles,
 // timeouts, redirects, server errors, and malformed successes can have unknown outcomes.
-const CLOUD_COMBO_RETRYABLE_REJECTIONS = new Set([400, 401, 403, 404, 422]);
+const CLOUD_COMBO_RETRYABLE_REJECTIONS: Readonly<Record<string, ReadonlySet<number>>> = {
+  openai: new Set([400, 401, 403, 404, 422]),
+  anthropic: new Set([400, 401, 403, 404]),
+};
 const encoder = new TextEncoder();
 
 export interface CloudInferenceCustomerHttpApiOptions {
@@ -75,7 +83,8 @@ interface CustomerRequest {
 }
 
 interface CloudInferenceTarget {
-  model: CloudOpenAiResponsesModel;
+  provider: typeof CLOUD_INFERENCE_PROVIDER | typeof CLOUD_ANTHROPIC_PROVIDER;
+  model: CloudOpenAiResponsesModel | CloudAnthropicMessagesModel;
   entitlement: NonNullable<Awaited<ReturnType<typeof getCloudInferenceEntitlement>>>;
 }
 
@@ -196,12 +205,12 @@ async function readBoundedJson(
 
 function parseCustomerRequest(body: Record<string, unknown>): CustomerRequest | null {
   if (Object.keys(body).some((key) => !ALLOWED_BODY_FIELDS.has(key))) return null;
-  const comboName =
-    typeof body.model === "string" && body.model.startsWith(CLOUD_COMBO_MODEL_PREFIX)
-      ? body.model.slice(CLOUD_COMBO_MODEL_PREFIX.length)
-      : null;
+  if (typeof body.model !== "string") return null;
+  const comboName = body.model.startsWith(CLOUD_COMBO_MODEL_PREFIX)
+    ? body.model.slice(CLOUD_COMBO_MODEL_PREFIX.length)
+    : null;
   if (
-    !isCloudOpenAiResponsesModel(body.model) &&
+    !parseCloudInferenceModel(body.model) &&
     (comboName === null || !/^[\w./\-[\] ]{1,100}$/.test(comboName.trim()))
   )
     return null;
@@ -247,38 +256,52 @@ type CloudTargetResolution =
   | { kind: "unavailable" }
   | { kind: "not_entitled" };
 
-function comboTargetModel(value: unknown): CloudOpenAiResponsesModel | null {
+type CloudInferenceProvider = typeof CLOUD_INFERENCE_PROVIDER | typeof CLOUD_ANTHROPIC_PROVIDER;
+type CloudInferenceModel = CloudOpenAiResponsesModel | CloudAnthropicMessagesModel;
+
+function parseCloudInferenceModel(
+  value: unknown
+): { provider: CloudInferenceProvider; model: CloudInferenceModel } | null {
   if (typeof value === "string") {
-    const model = value.startsWith("openai/") ? value.slice("openai/".length) : value;
-    return isCloudOpenAiResponsesModel(model) ? model : null;
+    const anthropicPrefix = `${CLOUD_ANTHROPIC_PROVIDER}/`;
+    if (value.startsWith(anthropicPrefix)) {
+      const model = value.slice(anthropicPrefix.length);
+      return isCloudAnthropicMessagesModel(model)
+        ? { provider: CLOUD_ANTHROPIC_PROVIDER, model }
+        : null;
+    }
+    const openAiPrefix = `${CLOUD_INFERENCE_PROVIDER}/`;
+    const model = value.startsWith(openAiPrefix) ? value.slice(openAiPrefix.length) : value;
+    return isCloudOpenAiResponsesModel(model)
+      ? { provider: CLOUD_INFERENCE_PROVIDER, model }
+      : null;
   }
   const target = record(value);
-  if (
-    !target ||
-    Object.keys(target).length !== 3 ||
-    target.kind !== "model" ||
-    target.provider !== "openai" ||
-    !isCloudOpenAiResponsesModel(target.model)
-  ) {
-    return null;
+  if (!target || Object.keys(target).length !== 3 || target.kind !== "model") return null;
+  if (target.provider === CLOUD_INFERENCE_PROVIDER && isCloudOpenAiResponsesModel(target.model))
+    return { provider: CLOUD_INFERENCE_PROVIDER, model: target.model };
+  if (target.provider === CLOUD_ANTHROPIC_PROVIDER && isCloudAnthropicMessagesModel(target.model)) {
+    return { provider: CLOUD_ANTHROPIC_PROVIDER, model: target.model };
   }
-  return target.model;
+  return null;
 }
 
 /**
- * Cloud inference deliberately supports only priority combos of direct, allowlisted
- * OpenAI Responses targets. Nested combos, other strategies/providers, and config
- * semantics are rejected until their routing and accounting contracts are implemented.
+ * Cloud inference supports only priority combos of direct, allowlisted OpenAI
+ * Responses and Anthropic Messages targets. Anthropic streaming, nested combos,
+ * other strategies/providers, and config semantics remain unsupported.
  */
 async function resolveCloudInferenceTargets(
   db: CloudDb,
   tenantId: string,
   request: CustomerRequest
 ): Promise<CloudTargetResolution> {
-  let models: CloudOpenAiResponsesModel[];
+  let models: Array<{ provider: CloudInferenceProvider; model: CloudInferenceModel }>;
   let strategy: "priority" | null = null;
   if (!request.comboName) {
-    models = [request.model as CloudOpenAiResponsesModel];
+    const target = parseCloudInferenceModel(request.model);
+    if (!target) return { kind: "unsupported" };
+    models = [target];
   } else {
     let row: Record<string, unknown> | null;
     try {
@@ -336,20 +359,26 @@ async function resolveCloudInferenceTargets(
     models = [];
     const seen = new Set<string>();
     for (const item of data.models) {
-      const model = comboTargetModel(item);
-      if (!model || seen.has(model)) return { kind: "unsupported" };
-      seen.add(model);
-      models.push(model);
+      const target = parseCloudInferenceModel(item);
+      const targetKey = target ? `${target.provider}/${target.model}` : "";
+      if (!target || seen.has(targetKey)) return { kind: "unsupported" };
+      seen.add(targetKey);
+      models.push(target);
     }
     strategy = "priority";
   }
 
   const targets: CloudInferenceTarget[] = [];
   try {
-    for (const model of models) {
-      const entitlement = await getCloudInferenceEntitlement(db, tenantId, "openai", model);
+    for (const target of models) {
+      const entitlement = await getCloudInferenceEntitlement(
+        db,
+        tenantId,
+        target.provider,
+        target.model
+      );
       if (!entitlement?.enabled) return { kind: "not_entitled" };
-      targets.push({ model, entitlement });
+      targets.push({ ...target, entitlement });
     }
   } catch {
     return { kind: "unavailable" };
@@ -495,6 +524,12 @@ function parseCountResponse(value: unknown): CountResponse | null {
   return { object: "response.input_tokens", input_tokens: body.input_tokens };
 }
 
+function parseAnthropicCountResponse(value: unknown): CountResponse | null {
+  const body = record(value);
+  if (!isTokenCount(body?.input_tokens)) return null;
+  return { object: "response.input_tokens", input_tokens: body.input_tokens };
+}
+
 function parseProviderResponse(value: unknown, expectedModel: string): ProviderResponse | null {
   const body = record(value);
   const usage = record(body?.usage);
@@ -526,6 +561,60 @@ function parseProviderResponse(value: unknown, expectedModel: string): ProviderR
     },
     incomplete_details: record(body.incomplete_details) as { reason?: string } | null,
   };
+}
+
+function parseAnthropicProviderResponse(
+  value: unknown,
+  expectedModel: string
+): ProviderResponse | null {
+  const body = record(value);
+  const usage = record(body?.usage);
+  if (
+    typeof body?.id !== "string" ||
+    body.id.length < 1 ||
+    body.id.length > 256 ||
+    body.type !== "message" ||
+    body.role !== "assistant" ||
+    body.model !== expectedModel ||
+    !Array.isArray(body.content) ||
+    !usage ||
+    !isTokenCount(usage.input_tokens) ||
+    !isTokenCount(usage.output_tokens) ||
+    (body.stop_reason !== "end_turn" && body.stop_reason !== "max_tokens")
+  ) {
+    return null;
+  }
+  const content: Array<{ type: "output_text"; text: string }> = [];
+  for (const value of body.content) {
+    const block = record(value);
+    if (block?.type !== "text" || typeof block.text !== "string") return null;
+    content.push({ type: "output_text", text: block.text });
+  }
+  if (content.length === 0) return null;
+  const totalTokens = usage.input_tokens + usage.output_tokens;
+  if (!Number.isSafeInteger(totalTokens)) return null;
+  return {
+    id: body.id,
+    model: expectedModel,
+    status: body.stop_reason === "max_tokens" ? "incomplete" : "completed",
+    output: [{ type: "message", role: "assistant", content }],
+    usage: {
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      total_tokens: totalTokens,
+    },
+    incomplete_details: body.stop_reason === "max_tokens" ? { reason: "max_output_tokens" } : null,
+  };
+}
+
+function parseCloudProviderResponse(
+  provider: CloudInferenceProvider,
+  value: unknown,
+  expectedModel: string
+): ProviderResponse | null {
+  if (provider === CLOUD_ANTHROPIC_PROVIDER)
+    return parseAnthropicProviderResponse(value, expectedModel);
+  return parseProviderResponse(value, expectedModel);
 }
 
 function assistantText(output: unknown[]): string | null {
@@ -579,19 +668,49 @@ function chatCompletion(
   };
 }
 
-function requestPayload(request: CustomerRequest, targetModel = request.model) {
-  return {
-    model: targetModel,
-    input: request.message,
-  };
+function requestPayload(
+  request: CustomerRequest,
+  provider: CloudInferenceProvider,
+  targetModel: CloudInferenceModel
+): Record<string, unknown> & { model: string } {
+  return provider === CLOUD_ANTHROPIC_PROVIDER
+    ? { model: targetModel, messages: [{ role: "user", content: request.message }] }
+    : { model: targetModel, input: request.message };
 }
 
-function requestHeaders(apiKey: string): HeadersInit {
-  return {
-    Authorization: `Bearer ${apiKey}`,
+function providerEndpoint(
+  provider: CloudInferenceProvider,
+  operation: "count" | "generate"
+): string {
+  if (provider === CLOUD_ANTHROPIC_PROVIDER) {
+    return operation === "count" ? CLOUD_ANTHROPIC_COUNT_URL : CLOUD_ANTHROPIC_RESPONSE_URL;
+  }
+  return operation === "count" ? CLOUD_INFERENCE_COUNT_URL : CLOUD_INFERENCE_RESPONSE_URL;
+}
+
+function requestHeaders(provider: CloudInferenceProvider, apiKey: string): HeadersInit {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json",
   };
+  if (provider === CLOUD_ANTHROPIC_PROVIDER) {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  return headers;
+}
+
+function generationPayload(
+  provider: CloudInferenceProvider,
+  countPayload: Record<string, unknown> & { model: string },
+  maxOutputTokens: number
+): Record<string, unknown> {
+  if (provider === CLOUD_ANTHROPIC_PROVIDER) {
+    return { ...countPayload, max_tokens: maxOutputTokens };
+  }
+  return { ...countPayload, max_output_tokens: maxOutputTokens, store: false };
 }
 
 function sseData(value: unknown): string {
@@ -1218,6 +1337,29 @@ export async function handleCloudInferenceCustomerRequest(
   }
 
   const targets = targetResolution.targets;
+  if (
+    customerRequest.stream &&
+    targets.some((target) => target.provider === CLOUD_ANTHROPIC_PROVIDER)
+  ) {
+    try {
+      await audit("denied", {
+        reason: "provider_streaming_unsupported",
+        provider: CLOUD_ANTHROPIC_PROVIDER,
+      });
+    } catch {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Inference audit is unavailable", 503, claim.requestId);
+    }
+    return cache(
+      {
+        error: {
+          message: "Streaming is not supported for this provider target",
+          type: "cloud_inference_error",
+        },
+      },
+      400
+    );
+  }
   const maxEntitledOutputTokens = Math.min(
     ...targets.map((target) => target.entitlement.maxOutputTokens)
   );
@@ -1242,38 +1384,43 @@ export async function handleCloudInferenceCustomerRequest(
     );
   }
 
-  let apiKey: string | null = null;
-  let connectionId: string | null = null;
+  const credentials = new Map<string, { apiKey: string; connectionId: string }>();
   try {
-    const connections = await getCloudProviderConnections(options.db, identity.tenantId, {
-      provider: CLOUD_INFERENCE_PROVIDER,
-      isActive: true,
-    });
-    for (const connection of connections) {
-      // This route dispatches directly to OpenAI using an API-key header. Hosted
-      // credentials are metadata-only until hosted dispatch and billing exist.
-      // Null authType is accepted for pre-contract API-key rows; OAuth and other
-      // auth modes must never be treated as an API key merely because apiKey is set.
-      if (
-        connection.credentialOwnership !== "customer_managed" ||
-        connection.executionLocation !== "third_party" ||
-        (connection.authType !== null && connection.authType !== "api_key")
-      ) {
-        continue;
-      }
-      if (!connection.apiKey || !isCloudCredentialEnvelope(connection.apiKey)) continue;
-      apiKey = await decryptCloudCredential(connection.apiKey, options.credentialEncryptionKey, {
-        tenantId: identity.tenantId,
-        connectionId: connection.id,
-        field: "apiKey",
+    for (const provider of new Set(targets.map((target) => target.provider))) {
+      const connections = await getCloudProviderConnections(options.db, identity.tenantId, {
+        provider,
+        isActive: true,
       });
-      connectionId = connection.id;
-      break;
+      for (const connection of connections) {
+        // Cloud dispatch supports only customer-managed API keys sent directly to
+        // the provider. Hosted credentials and OAuth modes remain metadata-only.
+        // Null authType is accepted for pre-contract API-key rows.
+        if (
+          connection.provider !== provider ||
+          connection.credentialOwnership !== "customer_managed" ||
+          connection.executionLocation !== "third_party" ||
+          (connection.authType !== null && connection.authType !== "api_key")
+        ) {
+          continue;
+        }
+        if (!connection.apiKey || !isCloudCredentialEnvelope(connection.apiKey)) continue;
+        const apiKey = await decryptCloudCredential(
+          connection.apiKey,
+          options.credentialEncryptionKey,
+          {
+            tenantId: identity.tenantId,
+            connectionId: connection.id,
+            field: "apiKey",
+          }
+        );
+        credentials.set(provider, { apiKey, connectionId: connection.id });
+        break;
+      }
     }
   } catch {
-    apiKey = null;
+    credentials.clear();
   }
-  if (!apiKey || !connectionId) {
+  if (credentials.size !== new Set(targets.map((target) => target.provider)).size) {
     try {
       await audit("unavailable", { reason: "provider_credential_unavailable" });
     } catch {
@@ -1291,16 +1438,22 @@ export async function handleCloudInferenceCustomerRequest(
 
   for (let index = 0; index < targets.length; index += 1) {
     const target = targets[index];
+    const targetCredential = credentials.get(target.provider);
+    if (!targetCredential) {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Provider credentials are unavailable", 503, claim.requestId);
+    }
+    const { apiKey, connectionId } = targetCredential;
     const attemptStartedAt = performance.now();
-    const countPayload = requestPayload(customerRequest, target.model);
+    const countPayload = requestPayload(customerRequest, target.provider, target.model);
     let countResponse: TimedResponseBody;
     try {
       countResponse = await fetchTimedBody(
         fetcher,
-        CLOUD_INFERENCE_COUNT_URL,
+        providerEndpoint(target.provider, "count"),
         {
           method: "POST",
-          headers: requestHeaders(apiKey),
+          headers: requestHeaders(target.provider, apiKey),
           body: JSON.stringify(countPayload),
         },
         options.countTimeoutMs ?? CLOUD_INFERENCE_COUNT_TIMEOUT_MS,
@@ -1319,12 +1472,17 @@ export async function handleCloudInferenceCustomerRequest(
       return errorResponse("Input token count could not be confirmed", 504, claim.requestId);
     }
     const countJson = countResponse.body === null ? null : safeParseJson(countResponse.body);
-    const countResult = countResponse.response.ok ? parseCountResponse(countJson) : null;
+    const countResult = countResponse.response.ok
+      ? target.provider === CLOUD_ANTHROPIC_PROVIDER
+        ? parseAnthropicCountResponse(countJson)
+        : parseCountResponse(countJson)
+      : null;
     if (!countResult) {
-      if (CLOUD_COMBO_RETRYABLE_REJECTIONS.has(countResponse.response.status)) {
+      if (CLOUD_COMBO_RETRYABLE_REJECTIONS[target.provider].has(countResponse.response.status)) {
         rejectedTargets += 1;
         try {
           await audit("target_fallback", {
+            provider: target.provider,
             model: target.model,
             reason: "token_count_rejected",
             upstreamStatus: countResponse.response.status,
@@ -1342,8 +1500,12 @@ export async function handleCloudInferenceCustomerRequest(
       await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
       try {
         await audit("count_outcome_unavailable", {
+          provider: target.provider,
           model: target.model,
-          endpoint: "/v1/responses/input_tokens",
+          endpoint:
+            target.provider === CLOUD_ANTHROPIC_PROVIDER
+              ? "/v1/messages/count_tokens"
+              : "/v1/responses/input_tokens",
           upstreamStatus: countResponse.response.status,
         });
       } catch {
@@ -1357,6 +1519,7 @@ export async function handleCloudInferenceCustomerRequest(
       inputCapFailures += 1;
       try {
         await audit("target_skipped", {
+          provider: target.provider,
           model: target.model,
           reason: "input_cap_exceeded",
           inputTokens,
@@ -1382,7 +1545,7 @@ export async function handleCloudInferenceCustomerRequest(
       reservation = await reserveCloudInferenceTokens(options.db, {
         tenantId: identity.tenantId,
         reservationId,
-        provider: CLOUD_INFERENCE_PROVIDER,
+        provider: target.provider,
         model: target.model,
         inputTokens,
         maxOutputTokens,
@@ -1395,6 +1558,7 @@ export async function handleCloudInferenceCustomerRequest(
     if (reservation.kind === "denied" || reservation.kind === "conflict") {
       try {
         await audit("denied", {
+          provider: target.provider,
           model: target.model,
           reason: "token_budget_or_policy_denied",
           inputTokens,
@@ -1434,7 +1598,7 @@ export async function handleCloudInferenceCustomerRequest(
       await appendCloudUsageRecord(options.db!, {
         id: reservationId,
         tenantId: identity.tenantId,
-        provider: CLOUD_INFERENCE_PROVIDER,
+        provider: target.provider,
         model: target.model,
         connectionId,
         apiKeyId: identity.apiKeyId,
@@ -1450,6 +1614,7 @@ export async function handleCloudInferenceCustomerRequest(
         timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
       });
       await audit(targetResolution.strategy ? "target_fallback" : "target_rejected", {
+        provider: target.provider,
         model: target.model,
         reason: "upstream_rejected_before_generation",
         upstreamStatus,
@@ -1465,6 +1630,7 @@ export async function handleCloudInferenceCustomerRequest(
       await markCloudInferenceOutcomeUnavailable(options.db!, claim, options.now?.() ?? Date.now());
       try {
         await audit(status, {
+          provider: target.provider,
           model: target.model,
           inputTokens,
           outputTokensReserved: maxOutputTokens,
@@ -1481,14 +1647,12 @@ export async function handleCloudInferenceCustomerRequest(
       try {
         streamStart = await fetchTimedStreamHeaders(
           fetcher,
-          CLOUD_INFERENCE_RESPONSE_URL,
+          providerEndpoint(target.provider, "generate"),
           {
             method: "POST",
-            headers: { ...requestHeaders(apiKey), Accept: "text/event-stream" },
+            headers: { ...requestHeaders(target.provider, apiKey), Accept: "text/event-stream" },
             body: JSON.stringify({
-              ...countPayload,
-              max_output_tokens: maxOutputTokens,
-              store: false,
+              ...generationPayload(target.provider, countPayload, maxOutputTokens),
               stream: true,
             }),
           },
@@ -1502,7 +1666,7 @@ export async function handleCloudInferenceCustomerRequest(
           claim.requestId
         );
       }
-      if (CLOUD_COMBO_RETRYABLE_REJECTIONS.has(streamStart.response.status)) {
+      if (CLOUD_COMBO_RETRYABLE_REJECTIONS[target.provider].has(streamStart.response.status)) {
         clearTimeout(streamStart.timer);
         await streamStart.response.body?.cancel().catch(() => undefined);
         try {
@@ -1557,15 +1721,11 @@ export async function handleCloudInferenceCustomerRequest(
     try {
       result = await fetchTimedBody(
         fetcher,
-        CLOUD_INFERENCE_RESPONSE_URL,
+        providerEndpoint(target.provider, "generate"),
         {
           method: "POST",
-          headers: requestHeaders(apiKey),
-          body: JSON.stringify({
-            ...countPayload,
-            max_output_tokens: maxOutputTokens,
-            store: false,
-          }),
+          headers: requestHeaders(target.provider, apiKey),
+          body: JSON.stringify(generationPayload(target.provider, countPayload, maxOutputTokens)),
         },
         options.generationTimeoutMs ?? CLOUD_INFERENCE_GENERATION_TIMEOUT_MS,
         CLOUD_INFERENCE_MAX_RESPONSE_BYTES
@@ -1578,7 +1738,7 @@ export async function handleCloudInferenceCustomerRequest(
         claim.requestId
       );
     }
-    if (CLOUD_COMBO_RETRYABLE_REJECTIONS.has(result.response.status)) {
+    if (CLOUD_COMBO_RETRYABLE_REJECTIONS[target.provider].has(result.response.status)) {
       try {
         await recordRejectedAttempt(result.response.status);
       } catch {
@@ -1594,7 +1754,7 @@ export async function handleCloudInferenceCustomerRequest(
 
     const providerJson = result.body === null ? null : safeParseJson(result.body);
     const providerResult = result.response.ok
-      ? parseProviderResponse(providerJson, target.model)
+      ? parseCloudProviderResponse(target.provider, providerJson, target.model)
       : null;
     const content = providerResult ? assistantText(providerResult.output) : null;
     if (
@@ -1631,7 +1791,7 @@ export async function handleCloudInferenceCustomerRequest(
       await appendCloudUsageRecord(options.db, {
         id: reservationId,
         tenantId: identity.tenantId,
-        provider: CLOUD_INFERENCE_PROVIDER,
+        provider: target.provider,
         model: target.model,
         connectionId,
         apiKeyId: identity.apiKeyId,
@@ -1646,6 +1806,7 @@ export async function handleCloudInferenceCustomerRequest(
         timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
       });
       await audit("success", {
+        provider: target.provider,
         model: target.model,
         inputTokens: providerResult.usage.input_tokens,
         outputTokens: providerResult.usage.output_tokens,
