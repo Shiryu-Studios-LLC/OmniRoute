@@ -5,11 +5,12 @@ import {
   getTenantMembership,
   isTenantApiKeyPrincipal,
   removeTenantMembership,
+  runTenantMembershipMutationWithAudit,
+  TenantMembershipAuditPersistenceError,
   updateTenantMembershipRole,
 } from "@/lib/db/tenantMemberships";
 import type { TenantRole } from "@/lib/db/tenants";
 import { authorizeTenantMembershipRequest } from "../_auth";
-import { auditTenantMembershipChange } from "../_audit";
 
 const updateSchema = z
   .object({
@@ -38,20 +39,20 @@ export async function PATCH(request: Request, routeContext: RouteContext) {
     return createErrorResponse({ status: 400, message: "Invalid tenant role" });
   }
   try {
-    const member = updateTenantMembershipRole(
-      tenantId,
-      principalId,
-      parsed.data.role as TenantRole
-    );
-    if (!member) return createErrorResponse({ status: 404, message: "Tenant member not found" });
-    auditTenantMembershipChange(
+    const member = runTenantMembershipMutationWithAudit(
       auth.principal,
       "tenantMembership.role.update",
-      member.principalId,
-      member.role
+      () => updateTenantMembershipRole(tenantId, principalId, parsed.data.role as TenantRole)
     );
+    if (!member) return createErrorResponse({ status: 404, message: "Tenant member not found" });
     return NextResponse.json({ member });
   } catch (error) {
+    if (error instanceof TenantMembershipAuditPersistenceError) {
+      return createErrorResponse({
+        status: 503,
+        message: "Membership change could not be audited",
+      });
+    }
     if (error instanceof Error && error.message.includes("last tenant owner")) {
       return createErrorResponse({ status: 409, message: error.message });
     }
@@ -68,18 +69,26 @@ export async function DELETE(request: Request, routeContext: RouteContext) {
     return createErrorResponse({ status: 404, message: "Tenant API-key principal not found" });
   }
   try {
-    const previousMember = getTenantMembership(tenantId, principalId);
-    if (!previousMember || !removeTenantMembership(tenantId, principalId)) {
-      return createErrorResponse({ status: 404, message: "Tenant member not found" });
-    }
-    auditTenantMembershipChange(
+    const previousMember = runTenantMembershipMutationWithAudit(
       auth.principal,
       "tenantMembership.remove",
-      previousMember.principalId,
-      previousMember.role
+      () => {
+        const member = getTenantMembership(tenantId, principalId);
+        if (!member || !removeTenantMembership(tenantId, principalId)) return null;
+        return member;
+      }
     );
+    if (!previousMember) {
+      return createErrorResponse({ status: 404, message: "Tenant member not found" });
+    }
     return NextResponse.json({ deleted: true });
   } catch (error) {
+    if (error instanceof TenantMembershipAuditPersistenceError) {
+      return createErrorResponse({
+        status: 503,
+        message: "Membership change could not be audited",
+      });
+    }
     if (error instanceof Error && error.message.includes("last tenant owner")) {
       return createErrorResponse({ status: 409, message: error.message });
     }

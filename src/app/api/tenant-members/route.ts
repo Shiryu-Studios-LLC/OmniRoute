@@ -5,10 +5,11 @@ import {
   addTenantMembership,
   isTenantApiKeyPrincipal,
   listTenantMemberships,
+  runTenantMembershipMutationWithAudit,
+  TenantMembershipAuditPersistenceError,
 } from "@/lib/db/tenantMemberships";
 import type { TenantRole } from "@/lib/db/tenants";
 import { authorizeTenantMembershipRequest } from "./_auth";
-import { auditTenantMembershipChange } from "./_audit";
 
 const createSchema = z
   .object({
@@ -45,19 +46,19 @@ export async function POST(request: Request) {
     return createErrorResponse({ status: 404, message: "Tenant API-key principal not found" });
   }
   try {
-    const member = addTenantMembership(
-      tenantId,
-      parsed.data.principalId,
-      parsed.data.role as TenantRole
-    );
-    auditTenantMembershipChange(
+    const member = runTenantMembershipMutationWithAudit(
       auth.principal,
       "tenantMembership.create",
-      member.principalId,
-      member.role
+      () => addTenantMembership(tenantId, parsed.data.principalId, parsed.data.role as TenantRole)
     );
     return NextResponse.json({ member }, { status: 201 });
   } catch (error) {
+    if (error instanceof TenantMembershipAuditPersistenceError) {
+      return createErrorResponse({
+        status: 503,
+        message: "Membership change could not be audited",
+      });
+    }
     const message = error instanceof Error ? error.message : "";
     if (message.includes("UNIQUE constraint failed")) {
       return createErrorResponse({ status: 409, message: "Tenant membership already exists" });

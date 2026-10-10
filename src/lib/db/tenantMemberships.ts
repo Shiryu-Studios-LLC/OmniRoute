@@ -1,6 +1,8 @@
 import { randomUUID } from "crypto";
 import { getDbInstance } from "./core";
 import type { TenantRole } from "./tenants";
+import { logAuditEvent } from "@/lib/compliance";
+import { runWithTenantContext } from "@/lib/tenantContext";
 
 export interface TenantMembershipRecord {
   principalId: string;
@@ -17,6 +19,48 @@ interface MembershipRow {
 }
 
 const VALID_ROLES = new Set<TenantRole>(["owner", "admin", "member", "maintenance"]);
+
+export class TenantMembershipAuditPersistenceError extends Error {
+  constructor() {
+    super("Tenant membership audit could not be persisted");
+    this.name = "TenantMembershipAuditPersistenceError";
+  }
+}
+
+/** Run a membership mutation and its audit write in one SQLite transaction. */
+export function runTenantMembershipMutationWithAudit<T extends TenantMembershipRecord | null>(
+  actor: { tenantId: string; principalId: string; role: TenantRole },
+  action: "tenantMembership.create" | "tenantMembership.role.update" | "tenantMembership.remove",
+  mutation: () => T
+): T {
+  const db = getDbInstance();
+  const timestamp = new Date().toISOString();
+  const requestId = randomUUID();
+
+  return db.transaction(() => {
+    const result = mutation();
+    if (!result) return result;
+
+    runWithTenantContext(actor, () => {
+      logAuditEvent({
+        action,
+        actor: actor.principalId,
+        target: result.principalId,
+        details: { principalId: result.principalId, role: result.role },
+        resourceType: "tenant_member",
+        status: "success",
+        createdAt: timestamp,
+        requestId,
+      });
+    });
+
+    const persisted = db
+      .prepare("SELECT 1 AS present FROM audit_log WHERE request_id = ? AND action = ? LIMIT 1")
+      .get(requestId, action) as { present?: number } | undefined;
+    if (persisted?.present !== 1) throw new TenantMembershipAuditPersistenceError();
+    return result;
+  })();
+}
 
 function isTenantRole(value: string): value is TenantRole {
   return VALID_ROLES.has(value as TenantRole);

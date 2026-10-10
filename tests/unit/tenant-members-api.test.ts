@@ -196,3 +196,42 @@ test("tenant members API prevents deleting or demoting the last owner and allows
   );
   assert.equal(maintenanceMutation.status, 403);
 });
+
+test("tenant membership mutations roll back when their audit record cannot be persisted", async () => {
+  const owner = await createManagementKey("tenant-members-a", "owner");
+  const member = await createManagementKey("tenant-members-a", "member");
+  const ownerId = await addRole("tenant-members-a", owner.key, "owner");
+  const memberId = (await apiKeys.getApiKeyMetadata(member.key))!.id;
+  await addRole("tenant-members-a", member.key, "member");
+
+  compliance.initAuditLog();
+  core.getDbInstance().exec(`CREATE TRIGGER fail_tenant_membership_audit BEFORE INSERT ON audit_log
+      WHEN NEW.action LIKE 'tenantMembership.%'
+      BEGIN SELECT RAISE(ABORT, 'test audit failure'); END`);
+
+  const createKey = await createManagementKey("tenant-members-a", "new-member");
+  const createId = (await apiKeys.getApiKeyMetadata(createKey.key))!.id;
+  const createResponse = await collection.POST(
+    asRequest("/api/tenant-members", "POST", owner.key, {
+      principalId: createId,
+      role: "member",
+    })
+  );
+  assert.equal(createResponse.status, 503);
+  assert.equal(tenants.getTenantMemberRole("tenant-members-a", createId), null);
+
+  const updateResponse = await item.PATCH(
+    asRequest(`/api/tenant-members/${memberId}`, "PATCH", owner.key, { role: "admin" }),
+    { params: Promise.resolve({ principalId: memberId }) }
+  );
+  assert.equal(updateResponse.status, 503);
+  assert.equal(tenants.getTenantMemberRole("tenant-members-a", memberId), "member");
+
+  const deleteResponse = await item.DELETE(
+    asRequest(`/api/tenant-members/${memberId}`, "DELETE", owner.key),
+    { params: Promise.resolve({ principalId: memberId }) }
+  );
+  assert.equal(deleteResponse.status, 503);
+  assert.equal(tenants.getTenantMemberRole("tenant-members-a", memberId), "member");
+  assert.equal(tenants.getTenantMemberRole("tenant-members-a", ownerId), "owner");
+});
