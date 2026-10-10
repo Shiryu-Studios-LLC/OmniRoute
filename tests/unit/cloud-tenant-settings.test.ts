@@ -11,7 +11,7 @@ import {
 import { provisionCloudCustomer } from "../../src/cloud/provisioning";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 import { handleCloudCustomerSettingsRequest } from "../../src/cloud/tenantSettingsHttpApi";
-import { getCloudTenantSettings } from "../../src/cloud/tenantSettings";
+import { getCloudTenantSettings, updateCloudTenantSettings } from "../../src/cloud/tenantSettings";
 
 class SqliteStatement<T = unknown> implements CloudDbStatement<T> {
   private values: unknown[] = [];
@@ -79,6 +79,17 @@ class SqliteCloudDb implements CloudDb {
   async exec(sql: string): Promise<unknown> {
     return this.db.exec(sql);
   }
+}
+
+function failingBatchDb(db: CloudDb): CloudDb {
+  return {
+    prepare: (sql) => db.prepare(sql),
+    batch: async () => [
+      { success: false, meta: { changes: 0 } },
+      { success: false, meta: { changes: 0 } },
+    ],
+    exec: (sql) => db.exec(sql),
+  };
 }
 
 async function migratedDb(): Promise<SqliteCloudDb> {
@@ -276,6 +287,211 @@ test("customer settings are tenant-derived, role-gated, and audited atomically",
       ).localAiEnabled,
       true
     );
+  } finally {
+    db.db.close();
+  }
+});
+
+test("customer settings reports a failed D1 update batch as unavailable, not forbidden", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provisionCloudCustomer(db, {
+      id: "settings-d1-failure",
+      name: "Settings D1 Failure",
+      slug: "settings-d1-failure",
+      ownerPrincipalId: "settings-d1-failure-owner",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const response = await handleCloudCustomerSettingsRequest(
+      new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${owner.ownerApiKey.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ localAiEnabled: false, mcpEnabled: true }),
+      }),
+      {
+        db: failingBatchDb(db),
+        now: () => new Date("2026-10-08T12:01:00.000Z"),
+      }
+    );
+
+    assert.equal(response?.status, 503);
+    assert.deepEqual(await response?.json(), { error: "Customer settings could not be updated" });
+    assert.deepEqual(await getCloudTenantSettings(db, "settings-d1-failure"), {
+      tenantId: "settings-d1-failure",
+      localAiEnabled: false,
+      mcpEnabled: false,
+      createdAt: "2026-10-08T12:00:00.000Z",
+      updatedAt: "2026-10-08T12:00:00.000Z",
+    });
+  } finally {
+    db.db.close();
+  }
+});
+
+test("customer settings does not report success when D1 ignores its audit insert", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provisionCloudCustomer(db, {
+      id: "settings-audit-ignored",
+      name: "Settings Audit Ignored",
+      slug: "settings-audit-ignored",
+      ownerPrincipalId: "settings-audit-ignored-owner",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    await db.exec(`CREATE TRIGGER ignore_settings_audit
+      BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action = 'customer.settings.update'
+      BEGIN SELECT RAISE(IGNORE); END;`);
+    const response = await handleCloudCustomerSettingsRequest(
+      new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${owner.ownerApiKey.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ localAiEnabled: false, mcpEnabled: true }),
+      }),
+      {
+        db,
+        now: () => new Date("2026-10-08T12:01:00.000Z"),
+      }
+    );
+
+    assert.equal(response?.status, 503);
+    assert.deepEqual(await response?.json(), { error: "Customer settings could not be updated" });
+    assert.deepEqual(await getCloudTenantSettings(db, "settings-audit-ignored"), {
+      tenantId: "settings-audit-ignored",
+      localAiEnabled: false,
+      mcpEnabled: false,
+      createdAt: "2026-10-08T12:00:00.000Z",
+      updatedAt: "2026-10-08T12:00:00.000Z",
+    });
+    assert.equal(
+      (
+        await db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = ?"
+          )
+          .bind("settings-audit-ignored", "customer.settings.update")
+          .first<{ count: number }>()
+      )?.count,
+      0
+    );
+  } finally {
+    db.db.close();
+  }
+});
+
+test("customer settings rolls back audit when D1 ignores its update", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provisionCloudCustomer(db, {
+      id: "settings-update-ignored",
+      name: "Settings Update Ignored",
+      slug: "settings-update-ignored",
+      ownerPrincipalId: "settings-update-ignored-owner",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    await db.exec(`CREATE TRIGGER ignore_settings_update
+      BEFORE UPDATE ON cloud_tenant_settings
+      WHEN OLD.tenant_id = 'settings-update-ignored'
+      BEGIN SELECT RAISE(IGNORE); END;`);
+    const response = await handleCloudCustomerSettingsRequest(
+      new Request("https://omniroute.test/__cloud/v1/customer/settings", {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${owner.ownerApiKey.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ localAiEnabled: true, mcpEnabled: true }),
+      }),
+      { db, now: () => new Date("2026-10-08T12:01:00.000Z") }
+    );
+
+    assert.equal(response?.status, 503);
+    assert.deepEqual(await response?.json(), { error: "Customer settings could not be updated" });
+    assert.deepEqual(await getCloudTenantSettings(db, "settings-update-ignored"), {
+      tenantId: "settings-update-ignored",
+      localAiEnabled: false,
+      mcpEnabled: false,
+      createdAt: "2026-10-08T12:00:00.000Z",
+      updatedAt: "2026-10-08T12:00:00.000Z",
+    });
+    assert.equal(
+      (
+        await db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND action = ?"
+          )
+          .bind("settings-update-ignored", "customer.settings.update")
+          .first<{ count: number }>()
+      )?.count,
+      0
+    );
+  } finally {
+    db.db.close();
+  }
+});
+
+test("a pre-existing matching audit ID cannot authorize an ignored settings audit insert", async () => {
+  const db = await migratedDb();
+  try {
+    const owner = await provisionCloudCustomer(db, {
+      id: "settings-audit-collision",
+      name: "Settings Audit Collision",
+      slug: "settings-audit-collision",
+      ownerPrincipalId: "settings-audit-collision-owner",
+      now: "2026-10-08T12:00:00.000Z",
+    });
+    const auditId = "pre-existing-settings-audit";
+    await db
+      .prepare(
+        `INSERT INTO cloud_compliance_audit (id, tenant_id, timestamp, action)
+         VALUES (?, ?, ?, ?)`
+      )
+      .bind(auditId, owner.tenant.id, "2026-10-08T12:00:30.000Z", "customer.settings.update")
+      .run();
+    await db.exec(`CREATE TRIGGER ignore_settings_audit_collision
+      BEFORE INSERT ON cloud_compliance_audit
+      WHEN NEW.action = 'customer.settings.update'
+      BEGIN SELECT RAISE(IGNORE); END;`);
+
+    await assert.rejects(
+      updateCloudTenantSettings(db, {
+        tenantId: owner.tenant.id,
+        membershipId: owner.ownerMembership.id,
+        authorization: { type: "api_key", apiKeyId: owner.ownerApiKey.id },
+        localAiEnabled: true,
+        mcpEnabled: true,
+        updatedAt: "2026-10-08T12:01:00.000Z",
+        audit: {
+          id: auditId,
+          tenantId: owner.tenant.id,
+          timestamp: "2026-10-08T12:01:00.000Z",
+          action: "customer.settings.update",
+          status: "success",
+        },
+      }),
+      /UNIQUE constraint failed: cloud_tenant_settings\.tenant_id/
+    );
+
+    assert.deepEqual(await getCloudTenantSettings(db, owner.tenant.id), {
+      tenantId: owner.tenant.id,
+      localAiEnabled: false,
+      mcpEnabled: false,
+      createdAt: "2026-10-08T12:00:00.000Z",
+      updatedAt: "2026-10-08T12:00:00.000Z",
+    });
+    const preservedAudit = await db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_compliance_audit WHERE tenant_id = ? AND id = ?"
+      )
+      .bind(owner.tenant.id, auditId)
+      .first<{ count: number }>();
+    assert.equal(preservedAudit?.count, 1);
   } finally {
     db.db.close();
   }

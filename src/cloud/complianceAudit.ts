@@ -201,7 +201,10 @@ export async function appendCloudComplianceAudit(
 export function prepareCloudComplianceAuditInsert(
   db: CloudDb,
   input: CloudComplianceAuditInput,
-  options: { requirePreviousStatementChange?: boolean } = {}
+  options: {
+    requirePreviousStatementChange?: boolean;
+    where?: { sql: string; values?: readonly unknown[] };
+  } = {}
 ): { record: CloudComplianceAuditRecord; statement: CloudDbStatement } {
   requireId(input.id, "id");
   requireId(input.tenantId, "tenantId");
@@ -232,26 +235,32 @@ export function prepareCloudComplianceAuditInsert(
         id, tenant_id, timestamp, action, actor, target, details_json,
         ip_address, resource_type, status, request_id, metadata_json
       )`;
+  if (options.requirePreviousStatementChange && options.where) {
+    throw new TypeError("Audit insert cannot have both a previous-change and custom WHERE clause");
+  }
   const sql = options.requirePreviousStatementChange
     ? `${columns}
        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1`
-    : `${columns} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-  const statement = db
-    .prepare(sql)
-    .bind(
-      record.id,
-      record.tenantId,
-      record.timestamp,
-      record.action,
-      record.actor,
-      record.target,
-      detailsJson,
-      record.ipAddress,
-      record.resourceType,
-      record.status,
-      record.requestId,
-      metadataJson
-    );
+    : options.where
+      ? `${columns}
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${options.where.sql}`
+      : `${columns} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const values = [
+    record.id,
+    record.tenantId,
+    record.timestamp,
+    record.action,
+    record.actor,
+    record.target,
+    detailsJson,
+    record.ipAddress,
+    record.resourceType,
+    record.status,
+    record.requestId,
+    metadataJson,
+    ...(options.where?.values ?? []),
+  ];
+  const statement = db.prepare(sql).bind(...values);
   return { record, statement };
 }
 

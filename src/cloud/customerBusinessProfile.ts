@@ -65,34 +65,50 @@ export async function updateCloudCustomerBusinessProfile(
   input: {
     tenantId: string;
     membershipId: string;
-    apiKeyId?: string;
+    authorization:
+      { type: "api_key"; apiKeyId: string } | { type: "oidc_session"; sessionTokenHash: string };
     profile: Omit<CloudCustomerBusinessProfile, "tenantId" | "createdAt" | "updatedAt">;
     updatedAt: string;
     audit: CloudComplianceAuditInput;
   }
 ): Promise<CloudCustomerBusinessProfile | null> {
   const profile = input.profile;
+  if (input.audit.tenantId !== input.tenantId) {
+    throw new TypeError("Business profile audit tenant must match the target tenant");
+  }
+  const authorization = profileAuthorizationPredicate("profile", input, input.updatedAt);
+  const authorizedTarget = `EXISTS (
+    SELECT 1 FROM cloud_tenant_business_profiles profile
+     WHERE profile.tenant_id = ? AND ${authorization.sql}
+  )`;
+  const canUpdate = await db
+    .prepare<{ allowed: number }>(
+      `SELECT 1 AS allowed FROM cloud_tenant_business_profiles profile
+        WHERE profile.tenant_id = ? AND ${authorization.sql} LIMIT 1`
+    )
+    .bind(input.tenantId, ...authorization.values)
+    .first();
+  if (!canUpdate) return null;
+
+  const preparedAudit = prepareCloudComplianceAuditInsert(db, input.audit, {
+    where: { sql: authorizedTarget, values: [input.tenantId, ...authorization.values] },
+  });
   const result = await db.batch([
+    preparedAudit.statement,
     db
       .prepare(
-        `UPDATE cloud_tenant_business_profiles
+        `UPDATE cloud_tenant_business_profiles AS profile
             SET name = ?, description = ?, hours = ?, services_json = ?, assistant_name = ?,
                 assistant_tone = ?, assistant_handoff = ?, updated_at = ?,
                 configured_at = COALESCE(configured_at, ?)
-          WHERE tenant_id = ?
+          WHERE profile.tenant_id = ?
+            AND ${authorization.sql}
+            AND changes() = 1
             AND EXISTS (
-              SELECT 1 FROM cloud_customer_memberships m
-              JOIN tenants t ON t.id = m.tenant_id
-              WHERE m.tenant_id = cloud_tenant_business_profiles.tenant_id
-                AND m.id = ? AND m.is_active = 1 AND m.role IN ('owner', 'admin')
-                AND t.kind = 'customer' AND t.is_active = 1
-            )
-            AND (? IS NULL OR EXISTS (
-              SELECT 1 FROM cloud_customer_api_keys k
-              WHERE k.tenant_id = cloud_tenant_business_profiles.tenant_id
-                AND k.membership_id = ? AND k.id = ? AND k.revoked_at IS NULL
-                AND (k.expires_at IS NULL OR k.expires_at > ?)
-            ))`
+              SELECT 1 FROM cloud_compliance_audit audit
+               WHERE audit.id = ? AND audit.tenant_id = profile.tenant_id
+                 AND audit.action = ?
+            )`
       )
       .bind(
         profile.name,
@@ -105,20 +121,109 @@ export async function updateCloudCustomerBusinessProfile(
         input.updatedAt,
         input.updatedAt,
         input.tenantId,
-        input.membershipId,
-        input.apiKeyId ?? null,
-        input.membershipId,
-        input.apiKeyId ?? null,
-        input.updatedAt
+        ...authorization.values,
+        preparedAudit.record.id,
+        preparedAudit.record.action
       ),
-    prepareCloudComplianceAuditInsert(db, input.audit, {
-      requirePreviousStatementChange: true,
-    }).statement,
+    db
+      .prepare(
+        `INSERT INTO cloud_tenant_business_profiles (
+           tenant_id, name, description, hours, services_json, assistant_name,
+           assistant_tone, assistant_handoff, created_at, updated_at, configured_at
+         )
+         SELECT profile.tenant_id, profile.name, profile.description, profile.hours,
+                profile.services_json, profile.assistant_name, profile.assistant_tone,
+                profile.assistant_handoff, profile.created_at, profile.updated_at,
+                profile.configured_at
+           FROM cloud_tenant_business_profiles profile
+          WHERE profile.tenant_id = ? AND changes() != 1
+            AND EXISTS (
+              SELECT 1 FROM cloud_compliance_audit audit
+               WHERE audit.id = ? AND audit.tenant_id = profile.tenant_id
+                 AND audit.action = ?
+            )`
+      )
+      .bind(input.tenantId, preparedAudit.record.id, preparedAudit.record.action),
   ]);
+  const auditResult = result[0];
+  const updateResult = result[1];
+  const guardResult = result[2];
+  if (
+    result.length !== 3 ||
+    !isSuccessfulBatchResult(auditResult) ||
+    !isSuccessfulBatchResult(updateResult) ||
+    !isSuccessfulBatchResult(guardResult)
+  ) {
+    throw new Error("D1 customer business profile update batch failed");
+  }
   const changes =
-    typeof result[0] === "object" && result[0] !== null && "meta" in result[0]
-      ? Number((result[0] as { meta?: { changes?: unknown } }).meta?.changes)
+    "meta" in updateResult && typeof updateResult.meta === "object" && updateResult.meta !== null
+      ? Number((updateResult.meta as { changes?: unknown }).changes)
       : Number.NaN;
-  if (changes !== 1) return null;
+  if (!Number.isSafeInteger(changes) || changes < 0) {
+    throw new Error("D1 customer business profile update returned invalid state");
+  }
+  const auditChanges =
+    "meta" in auditResult && typeof auditResult.meta === "object" && auditResult.meta !== null
+      ? (auditResult.meta as { changes?: unknown }).changes
+      : undefined;
+  const guardChanges =
+    "meta" in guardResult && typeof guardResult.meta === "object" && guardResult.meta !== null
+      ? (guardResult.meta as { changes?: unknown }).changes
+      : undefined;
+  if (changes !== 1 || auditChanges !== 1 || guardChanges !== 0) {
+    throw new Error("D1 customer business profile audit and update were not completed together");
+  }
   return getCloudCustomerBusinessProfile(db, input.tenantId);
+}
+
+function profileAuthorizationPredicate(
+  profileAlias: string,
+  input: {
+    membershipId: string;
+    authorization:
+      { type: "api_key"; apiKeyId: string } | { type: "oidc_session"; sessionTokenHash: string };
+  },
+  now: string
+): { sql: string; values: unknown[] } {
+  const credentialCheck =
+    input.authorization.type === "api_key"
+      ? `EXISTS (
+          SELECT 1 FROM cloud_customer_api_keys api_key
+           WHERE api_key.tenant_id = membership.tenant_id
+             AND api_key.membership_id = membership.id
+             AND api_key.id = ? AND api_key.revoked_at IS NULL
+             AND (api_key.expires_at IS NULL OR api_key.expires_at > ?)
+        )`
+      : `EXISTS (
+          SELECT 1 FROM cloud_tenant_oidc_sessions session
+           WHERE session.tenant_id = membership.tenant_id
+             AND session.membership_id = membership.id
+             AND session.token_hash = ? AND session.revoked_at_ms IS NULL
+             AND session.expires_at_ms > ?
+        )`;
+  return {
+    sql: `EXISTS (
+      SELECT 1 FROM cloud_customer_memberships membership
+      JOIN tenants tenant ON tenant.id = membership.tenant_id
+       WHERE membership.tenant_id = ${profileAlias}.tenant_id
+         AND membership.id = ? AND membership.is_active = 1
+         AND membership.role IN ('owner', 'admin')
+         AND tenant.kind = 'customer' AND tenant.is_active = 1
+         AND ${credentialCheck}
+    )`,
+    values: [
+      input.membershipId,
+      input.authorization.type === "api_key"
+        ? input.authorization.apiKeyId
+        : input.authorization.sessionTokenHash,
+      input.authorization.type === "api_key" ? now : Date.parse(now),
+    ],
+  };
+}
+
+function isSuccessfulBatchResult(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && "success" in value && value.success === true
+  );
 }

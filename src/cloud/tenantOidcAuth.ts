@@ -1105,6 +1105,7 @@ async function customerBusinessProfilePortal(
   const result = await updateCloudCustomerBusinessProfile(db, {
     tenantId: session.tenant_id,
     membershipId: session.membership_id,
+    authorization: { type: "oidc_session", sessionTokenHash: session.session_token_hash },
     profile,
     updatedAt,
     audit: {

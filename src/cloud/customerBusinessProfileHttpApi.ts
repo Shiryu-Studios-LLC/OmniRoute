@@ -185,7 +185,7 @@ export async function handleCloudCustomerBusinessProfileRequest(
     const result = await updateCloudCustomerBusinessProfile(options.db, {
       tenantId: identity.tenantId,
       membershipId: identity.membershipId,
-      apiKeyId: identity.apiKeyId,
+      authorization: { type: "api_key", apiKeyId: identity.apiKeyId },
       profile,
       updatedAt,
       audit: {
