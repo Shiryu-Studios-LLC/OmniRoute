@@ -43,7 +43,7 @@ test("returns the LAST known egress IP when events share the same timestamp", ()
     connectionId: "conn-a",
   });
   proxyLogger.flushProxyLogsSync(); // persist the enqueued batch before the DB-backed lookup
-  const eventAt = "2026-10-08T18:35:51.506Z";
+  const eventAt = new Date(Date.now() - 1000).toISOString();
   core
     .getDbInstance()
     .prepare("UPDATE proxy_logs SET timestamp = ? WHERE connection_id = ?")

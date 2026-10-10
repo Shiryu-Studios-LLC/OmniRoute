@@ -1201,7 +1201,7 @@ test("provider-nodes validate route reports unexpected upstream failures", async
 test("provider-nodes list route exposes CC flag state from server env", async () => {
   process.env.ENABLE_CC_COMPATIBLE_PROVIDER = "true";
 
-  const response = await providerNodesRoute.GET();
+  const response = await providerNodesRoute.GET(new Request("http://localhost/api/provider-nodes"));
   assert.equal(response.status, 200);
 
   const data = (await response.json()) as any;

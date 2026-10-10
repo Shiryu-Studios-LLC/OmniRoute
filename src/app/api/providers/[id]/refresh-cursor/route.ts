@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import { updateProviderConnection } from "@/lib/db/providers";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
@@ -72,98 +73,100 @@ function evictExpiredManualRefreshAttempts(now: number): void {
  * intentionally remains remote-reachable.
  */
 export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
-  try {
-    const { id } = await params;
+  return withManagementTenantContext(_request, async () => {
+    try {
+      const { id } = await params;
 
-    const connection = (await getCachedProviderConnectionById(id)) as CursorConnectionLike | null;
-    if (!connection) {
-      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
-    }
-
-    if (connection.provider !== "cursor") {
-      return NextResponse.json(
-        { error: "This route only supports Cursor connections" },
-        { status: 400 }
-      );
-    }
-
-    const now = Date.now();
-    evictExpiredManualRefreshAttempts(now);
-
-    const lastAttempt = lastManualRefreshAttemptAt.get(connection.id) ?? 0;
-    const elapsedMs = now - lastAttempt;
-    if (elapsedMs < MANUAL_REFRESH_COOLDOWN_MS) {
-      const retryAfterMs = MANUAL_REFRESH_COOLDOWN_MS - elapsedMs;
-      return NextResponse.json(
-        {
-          error: "Refresh already attempted recently — please wait before retrying.",
-          retryAfterMs,
-        },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) },
-        }
-      );
-    }
-    // Set immediately before invoking renewCursorConnection() — regardless of
-    // outcome — so rapid repeated clicks are throttled either way.
-    lastManualRefreshAttemptAt.set(connection.id, now);
-
-    return await runCursorRenewalExclusive(connection.id, async () => {
-      const result = await renewCursorConnection(
-        {
-          accessToken: connection.accessToken ?? "",
-          machineId: connection.providerSpecificData?.machineId as string | null | undefined,
-        },
-        { tryIdeAuth: uncachedTryIdeAuth }
-      );
-
-      switch (result.status) {
-        case "renewed": {
-          const nowIso = new Date().toISOString();
-          const update = buildCursorRenewedUpdate(connection, result, nowIso);
-          await updateProviderConnection(connection.id, update);
-          return NextResponse.json({
-            success: true,
-            connectionId: connection.id,
-            provider: "cursor",
-            expiresAt: update.expiresAt as string,
-            refreshedAt: nowIso,
-          });
-        }
-        case "unchanged": {
-          return NextResponse.json({
-            success: true,
-            unchanged: true,
-            connectionId: connection.id,
-            provider: "cursor",
-            expiresAt: connection.expiresAt ?? null,
-            refreshedAt: new Date().toISOString(),
-            message: "Cursor session is already current — no newer token found on this host.",
-          });
-        }
-        case "error": {
-          return NextResponse.json(
-            {
-              error: "Token refresh failed — provider returned no new token",
-              details: result.error,
-            },
-            { status: 502 }
-          );
-        }
-        default: {
-          const _exhaustive: never = result;
-          throw new Error(`Unhandled CursorRenewalResult status: ${JSON.stringify(_exhaustive)}`);
-        }
+      const connection = (await getCachedProviderConnectionById(id)) as CursorConnectionLike | null;
+      if (!connection) {
+        return NextResponse.json({ error: "Connection not found" }, { status: 404 });
       }
-    });
-  } catch (error) {
-    return NextResponse.json(
-      {
-        error: "Token refresh failed",
-        details: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-      },
-      { status: 500 }
-    );
-  }
+
+      if (connection.provider !== "cursor") {
+        return NextResponse.json(
+          { error: "This route only supports Cursor connections" },
+          { status: 400 }
+        );
+      }
+
+      const now = Date.now();
+      evictExpiredManualRefreshAttempts(now);
+
+      const lastAttempt = lastManualRefreshAttemptAt.get(connection.id) ?? 0;
+      const elapsedMs = now - lastAttempt;
+      if (elapsedMs < MANUAL_REFRESH_COOLDOWN_MS) {
+        const retryAfterMs = MANUAL_REFRESH_COOLDOWN_MS - elapsedMs;
+        return NextResponse.json(
+          {
+            error: "Refresh already attempted recently — please wait before retrying.",
+            retryAfterMs,
+          },
+          {
+            status: 429,
+            headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) },
+          }
+        );
+      }
+      // Set immediately before invoking renewCursorConnection() — regardless of
+      // outcome — so rapid repeated clicks are throttled either way.
+      lastManualRefreshAttemptAt.set(connection.id, now);
+
+      return await runCursorRenewalExclusive(connection.id, async () => {
+        const result = await renewCursorConnection(
+          {
+            accessToken: connection.accessToken ?? "",
+            machineId: connection.providerSpecificData?.machineId as string | null | undefined,
+          },
+          { tryIdeAuth: uncachedTryIdeAuth }
+        );
+
+        switch (result.status) {
+          case "renewed": {
+            const nowIso = new Date().toISOString();
+            const update = buildCursorRenewedUpdate(connection, result, nowIso);
+            await updateProviderConnection(connection.id, update);
+            return NextResponse.json({
+              success: true,
+              connectionId: connection.id,
+              provider: "cursor",
+              expiresAt: update.expiresAt as string,
+              refreshedAt: nowIso,
+            });
+          }
+          case "unchanged": {
+            return NextResponse.json({
+              success: true,
+              unchanged: true,
+              connectionId: connection.id,
+              provider: "cursor",
+              expiresAt: connection.expiresAt ?? null,
+              refreshedAt: new Date().toISOString(),
+              message: "Cursor session is already current — no newer token found on this host.",
+            });
+          }
+          case "error": {
+            return NextResponse.json(
+              {
+                error: "Token refresh failed — provider returned no new token",
+                details: result.error,
+              },
+              { status: 502 }
+            );
+          }
+          default: {
+            const _exhaustive: never = result;
+            throw new Error(`Unhandled CursorRenewalResult status: ${JSON.stringify(_exhaustive)}`);
+          }
+        }
+      });
+    } catch (error) {
+      return NextResponse.json(
+        {
+          error: "Token refresh failed",
+          details: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+        },
+        { status: 500 }
+      );
+    }
+  });
 }

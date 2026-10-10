@@ -71,6 +71,7 @@ test("tenant discovery returns only active registered servers for the authentica
 test("remote tool discovery is tenant-authorized and never sends stored credentials", async () => {
   const requests: Array<{ url: string; init: RequestInit }> = [];
   let dnsChecks = 0;
+  let sseResponseCancelled = false;
   const runtimeInstance = runtime({
     transport: {
       fetch: async (input, init = {}) => {
@@ -94,6 +95,25 @@ test("remote tool discovery is tenant-authorized and never sends stored credenti
         }
         if (request.method === "notifications/initialized")
           return new Response(null, { status: 202 });
+        if (request.method === "tools/list") {
+          const encoder = new TextEncoder();
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode(
+                    'event: message\ndata: {"jsonrpc":"2.0","id":999,"result":{}}\n\n' +
+                      'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup","description":"Lookup a record","inputSchema":{"type":"object","properties":{"id":{"type":"string"}}}}]}}\n\n'
+                  )
+                );
+              },
+              cancel() {
+                sseResponseCancelled = true;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream; charset=utf-8" } }
+          );
+        }
         return Response.json({
           jsonrpc: "2.0",
           id: request.id,
@@ -117,10 +137,13 @@ test("remote tool discovery is tenant-authorized and never sends stored credenti
   assert.equal(discovered.tools[0]?.name, "lookup");
   assert.equal(requests.length, 3);
   assert.equal(dnsChecks, 3);
+  assert.equal(sseResponseCancelled, true, "the matching SSE response should cancel its stream");
   for (const [index, { init }] of requests.entries()) {
     const headers = new Headers(init.headers);
     assert.equal(headers.has("Authorization"), false);
     assert.equal(headers.get("Mcp-Session-Id"), index === 0 ? null : "session-123");
+    assert.equal(headers.get("Accept"), "application/json, text/event-stream");
+    assert.equal(headers.get("MCP-Protocol-Version"), index === 0 ? null : "2024-11-05");
     assert.equal(init.redirect, "manual");
   }
 
@@ -162,6 +185,64 @@ test("cloud discovery refuses stdio and unsafe endpoint URLs", async () => {
       unsafeRuntime.discoverTools(principal("a"), serverA.id),
       "MCP_OUTBOUND_TARGET_REJECTED"
     );
+  }
+});
+
+test("subsequent MCP requests use the negotiated version and retain session authentication", async () => {
+  const requests: Array<{ method: string; headers: Headers }> = [];
+  const runtimeInstance = runtime({
+    getCredential: async () => "upstream-secret",
+    transport: {
+      fetch: async (_input, init = {}) => {
+        const request = JSON.parse(String(init.body)) as { id?: number; method: string };
+        const headers = new Headers(init.headers);
+        requests.push({ method: request.method, headers });
+        if (request.method === "initialize") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: request.id,
+              result: {
+                protocolVersion: "2025-11-25",
+                serverInfo: { name: "Versioned MCP" },
+                capabilities: { tools: {} },
+              },
+            },
+            { headers: { "Mcp-Session-Id": "session-versioned" } }
+          );
+        }
+        if (request.method === "notifications/initialized")
+          return new Response(null, { status: 202 });
+        if (request.method === "tools/list") {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { tools: [{ name: "lookup" }] },
+          });
+        }
+        return Response.json({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { content: [{ type: "text", text: "ok" }] },
+        });
+      },
+    },
+  });
+
+  const result = await runtimeInstance.invokeTool(principal("a"), serverA.id, "lookup", {});
+  assert.deepEqual(result, { content: [{ type: "text", text: "ok" }] });
+  assert.deepEqual(
+    requests.map(({ method }) => method),
+    ["initialize", "notifications/initialized", "tools/list", "tools/call"]
+  );
+  assert.equal(requests[0]?.headers.get("MCP-Protocol-Version"), null);
+  for (const { headers } of requests) {
+    assert.equal(headers.get("Accept"), "application/json, text/event-stream");
+    assert.equal(headers.get("Authorization"), "Bearer upstream-secret");
+  }
+  for (const { headers } of requests.slice(1)) {
+    assert.equal(headers.get("MCP-Protocol-Version"), "2025-11-25");
+    assert.equal(headers.get("Mcp-Session-Id"), "session-versioned");
   }
 });
 
@@ -222,6 +303,29 @@ test("upstream timeouts are bounded and invocation requires a valid remote proto
     runtime().invokeTool(principal("a"), serverB.id, "lookup", {}),
     "TENANT_FORBIDDEN"
   );
+});
+
+test("SSE response streams are cancelled when the MCP request deadline expires", async () => {
+  let streamCancelled = false;
+  const timedOutRuntime = runtime({
+    timeoutMs: 100,
+    transport: {
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              streamCancelled = true;
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } }
+        ),
+    },
+  });
+  await assertRuntimeError(
+    timedOutRuntime.discoverTools(principal("a"), serverA.id),
+    "MCP_UPSTREAM_TIMEOUT"
+  );
+  assert.equal(streamCancelled, true);
 });
 
 test("remote MCP discovery rejects JSON-RPC responses with a mismatched ID or version", async () => {

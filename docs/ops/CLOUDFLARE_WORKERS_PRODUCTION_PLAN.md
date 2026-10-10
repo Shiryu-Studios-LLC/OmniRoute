@@ -1,7 +1,7 @@
 ---
 title: "OmniRoute Cloudflare Workers Production Plan"
 version: 3.8.50
-lastUpdated: 2026-10-08
+lastUpdated: 2026-10-10
 ---
 
 ## Objective
@@ -120,19 +120,25 @@ active tenant with enabled OIDC and no active owner. The Worker stores only the
 claim digest. Redemption starts the tenant's configured OIDC flow; after the
 existing issuer, signature, audience, nonce, and PKCE checks pass, D1 atomically
 consumes the claim and creates the first owner, exact issuer/subject link, and
-audit row. OIDC issuer configuration remains platform-admin-managed until
-customer-controlled issuer setup has safe outbound resolution and recovery
-controls. The platform-admin path remains the break-glass recovery path.
+audit row. The platform-admin path remains the break-glass recovery path.
 Migration `0020_cloud_tenant_oidc_owner_claims.sql` must be applied before
 issuing or redeeming claims.
 
-Tenant owners and admins can also save, review, replace, or delete an encrypted
-pending issuer draft in the OIDC portal. Drafts are stored separately from the
-active OIDC configuration; the Worker does not test the issuer, make outbound
-discovery/token/JWKS requests, or use draft values for login. Migration
-`0031_cloud_tenant_oidc_config_drafts.sql` must be applied before using this
-portal feature. Activating a customer-managed issuer remains blocked on
-controlled public egress and owner recovery.
+Tenant owners and admins can save, review, replace, or delete an encrypted
+pending issuer draft in the OIDC portal. Both roles can test the draft's
+discovery document through the controlled OIDC egress transport. Only the
+active owner can preview impact and start promotion. Promotion requires a
+same-origin confirmation and a successful callback from the new issuer; the
+callback rechecks the owner session, membership, draft/config revisions, and
+previewed impact before atomically activating the new issuer, revoking old
+sessions, replacing identity links, deleting the draft, and writing a
+content-free audit event. Failed or stale promotions leave the active issuer
+unchanged. Admins cannot promote issuers. Migrations
+`0031_cloud_tenant_oidc_config_drafts.sql` and
+`0032_cloud_tenant_oidc_promotion_state.sql` must be applied before using the
+draft and promotion features. Customer-managed issuer activation is implemented
+but still requires isolated staging validation of controlled egress and a real
+external identity-provider callback.
 
 ### 5. MCP cloud runtime
 
@@ -165,6 +171,7 @@ service or staging account is configured, so discovery
 and invocation remain disabled in deployed environments pending isolated
 staging validation. Migration
 `0019_cloud_tenant_mcp_servers.sql` must be applied before using the registry.
+The remote Streamable HTTP client advertises both JSON and SSE response formats, parses either format with bounded response size and request deadlines, selects the matching JSON-RPC response ID from SSE events, and sends the negotiated MCP protocol version on subsequent requests. Session and authentication headers are retained across requests.
 
 The Worker and Node proxy receive the same signing secret through their
 respective runtime configuration, and the Worker binding must target the

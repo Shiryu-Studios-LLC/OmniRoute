@@ -6,9 +6,13 @@ import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
 import { evaluateAccessTokenAuth } from "@/server/authz/accessTokenAuth";
 import { isTrustedLoopbackInternalServiceRequest } from "@/lib/api/internalServiceAuth";
 import { AUTHZ_HEADER_AUTH_KIND, AUTHZ_HEADER_AUTH_LABEL } from "@/server/authz/headers";
-import { enterTenantContext } from "@/lib/tenantContext";
+import { enterTenantContext, getCurrentTenantId, runWithTenantContext } from "@/lib/tenantContext";
 import { enterApiKeyTenantContext } from "@/server/authz/tenantMembership";
-import { SHIRYU_ADMIN_TENANT_ID } from "@/lib/db/tenants";
+import { getTenantById, getTenantMemberRole, SHIRYU_ADMIN_TENANT_ID } from "@/lib/db/tenants";
+import {
+  getTenantManagementPermission,
+  hasTenantManagementPermission,
+} from "@/server/authz/tenantPermissions";
 import {
   MANAGE_SCOPE,
   MCP_CONNECT_SCOPE,
@@ -40,6 +44,8 @@ interface RequireManagementAuthOptions {
   acceptMcpConnectScope?: boolean;
 }
 
+type AcceptedManagementPrincipal = { kind: "platform" } | { kind: "api_key"; apiKey: string };
+
 function invalidManagementTokenResponse(options: RequireManagementAuthOptions): Response {
   const status = options.invalidApiKeyStatus ?? 403;
   return createErrorResponse({
@@ -51,9 +57,11 @@ function invalidManagementTokenResponse(options: RequireManagementAuthOptions): 
 
 export async function requireManagementAuth(
   request: Request,
-  options: RequireManagementAuthOptions = {}
+  options: RequireManagementAuthOptions = {},
+  onAccepted?: (principal: AcceptedManagementPrincipal) => void
 ): Promise<Response | null> {
   if (!options.alwaysRequireAuth && !(await isAuthRequired(request))) {
+    onAccepted?.({ kind: "platform" });
     return null;
   }
 
@@ -63,10 +71,12 @@ export async function requireManagementAuth(
       principalId: "dashboard",
       role: "owner",
     });
+    onAccepted?.({ kind: "platform" });
     return null;
   }
 
   if (isTrustedLoopbackInternalServiceRequest(request)) {
+    onAccepted?.({ kind: "platform" });
     return null;
   }
 
@@ -76,12 +86,14 @@ export async function requireManagementAuth(
     request.headers.get(AUTHZ_HEADER_AUTH_KIND) === "management_key" &&
     request.headers.get(AUTHZ_HEADER_AUTH_LABEL) === "local-cli-token"
   ) {
+    onAccepted?.({ kind: "platform" });
     return null;
   }
 
   // Direct/raw-Node callers without the central pipeline can still validate the
   // CLI token here, including the trusted peer-locality stamp path.
   if (await isCliTokenAuthValid(request)) {
+    onAccepted?.({ kind: "platform" });
     return null;
   }
 
@@ -93,6 +105,7 @@ export async function requireManagementAuth(
   const accessVerdict = evaluateAccessTokenAuth(request);
   switch (accessVerdict.kind) {
     case "ok":
+      onAccepted?.({ kind: "platform" });
       return null;
     case "error":
       return createErrorResponse({
@@ -150,6 +163,7 @@ export async function requireManagementAuth(
         ? hasMcpConnectOrManageScope(meta.scopes)
         : hasManageScope(meta.scopes))
     ) {
+      onAccepted?.({ kind: "api_key", apiKey });
       return null;
     }
 
@@ -166,5 +180,126 @@ export async function requireManagementAuth(
     status: 401,
     message: "Authentication required",
     type: "invalid_request",
+  });
+}
+
+/**
+ * Authenticate a management request and execute its handler inside the
+ * authenticated tenant's async context. `enterTenantContext()` called from
+ * this async helper does not reliably flow back to a caller that resumes after
+ * awaiting it, so tenant-scoped handlers must use this callback form.
+ */
+export async function withManagementTenantContext<T>(
+  request: Request,
+  handler: () => Promise<T>,
+  resolveContextApiKeyMetadata: typeof getApiKeyMetadata = getApiKeyMetadata,
+  acceptTrustedPlatformRequest?: (request: Request) => boolean
+): Promise<T | Response> {
+  const acceptedPrincipal: { value: AcceptedManagementPrincipal | null } = { value: null };
+  const trustedPlatformRequest = acceptTrustedPlatformRequest?.(request) === true;
+  const authError = trustedPlatformRequest
+    ? null
+    : await requireManagementAuth(request, {}, (principal) => {
+        acceptedPrincipal.value = principal;
+      });
+  if (trustedPlatformRequest) acceptedPrincipal.value = { kind: "platform" };
+  if (authError) return authError;
+
+  if (acceptedPrincipal.value?.kind === "api_key") {
+    try {
+      // Re-read metadata after authentication so a key revoked/deleted between
+      // auth and context setup cannot fall through to platform access.
+      const metadata = await resolveContextApiKeyMetadata(acceptedPrincipal.value.apiKey);
+      if (
+        !metadata?.id ||
+        !metadata.tenantId ||
+        !hasManageScope(metadata.scopes) ||
+        metadata.isActive === false ||
+        metadata.isBanned === true ||
+        Boolean(metadata.revokedAt) ||
+        Boolean(metadata.expiresAt && new Date(metadata.expiresAt).getTime() <= Date.now())
+      ) {
+        return createErrorResponse({
+          status: 403,
+          message: "API key tenant is not available",
+          type: "invalid_request",
+        });
+      }
+
+      const tenant = getTenantById(metadata.tenantId);
+      if (!tenant || !tenant.isActive) {
+        return createErrorResponse({
+          status: 403,
+          message: "API key tenant is not available",
+          type: "invalid_request",
+        });
+      }
+
+      const role = getTenantMemberRole(metadata.tenantId, metadata.id);
+      if (tenant.kind === "customer" && !role) {
+        return createErrorResponse({
+          status: 403,
+          message: "Tenant membership is required for customer management access",
+          type: "invalid_request",
+        });
+      }
+
+      const requiredPermission = getTenantManagementPermission(
+        new URL(request.url).pathname,
+        request.method
+      );
+      if (role && requiredPermission && !hasTenantManagementPermission(role, requiredPermission)) {
+        return createErrorResponse({
+          status: 403,
+          message: "Tenant role does not permit this operation",
+          type: "invalid_request",
+        });
+      }
+
+      return runWithTenantContext(
+        {
+          tenantId: metadata.tenantId,
+          principalId: metadata.id,
+          ...(role ? { role } : {}),
+        },
+        handler
+      );
+    } catch {
+      return createErrorResponse({
+        status: 503,
+        message: "Service temporarily unavailable",
+        type: "server_error",
+      });
+    }
+  }
+
+  // Authentication precedence is captured by requireManagementAuth. Dashboard,
+  // access-token, CLI, trusted internal, and system-stamped credentials remain
+  // platform principals even if a request also carries an unrelated API key.
+  // `requireLogin=false` also preserves the legacy single-operator mode.
+  return runWithTenantContext(
+    { tenantId: SHIRYU_ADMIN_TENANT_ID, principalId: "management" },
+    handler
+  );
+}
+
+/**
+ * Authenticate and run a process-wide management operation as the platform
+ * tenant only. Use this for settings and runtime state that have no tenant
+ * partition, so a customer key cannot read or mutate shared state.
+ */
+export async function withPlatformAdminManagementContext<T>(
+  request: Request,
+  handler: () => Promise<T>
+): Promise<T | Response> {
+  return withManagementTenantContext(request, async () => {
+    if (getCurrentTenantId() !== SHIRYU_ADMIN_TENANT_ID) {
+      return createErrorResponse({
+        status: 403,
+        message: "Platform administrator required",
+        type: "invalid_request",
+      });
+    }
+    return handler();
   });
 }

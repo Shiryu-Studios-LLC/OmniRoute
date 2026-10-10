@@ -11,6 +11,7 @@ import { isCcCompatibleProviderEnabled } from "@/shared/utils/featureFlags";
 import { createProviderNodeSchema, paginationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { validateProviderNodeBaseUrl } from "./urlGuard";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 
 const OPENAI_COMPATIBLE_DEFAULTS = {
   baseUrl: "https://api.openai.com/v1",
@@ -62,151 +63,158 @@ function sanitizeClaudeCodeCompatibleBaseUrl(baseUrl: string) {
     .replace(/\/(?:v\d+\/)?messages(?:\?[^#]*)?$/i, "");
 }
 
-export async function GET(request?: Request) {
-  try {
-    const url = new URL(request?.url ?? "http://localhost/api/provider-nodes");
-    const raw = {
-      offset: url.searchParams.get("offset") || undefined,
-      limit: url.searchParams.get("limit") || undefined,
-    };
-    const validation = validateBody(paginationSchema, raw);
-    if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
-    }
-    const { limit: parsedLimit, offset: parsedOffset } = validation.data;
-    const limit =
-      Number.isInteger(parsedLimit) && parsedLimit && parsedLimit > 0 ? parsedLimit : undefined;
-    const offset =
-      Number.isInteger(parsedOffset) && parsedOffset && parsedOffset > 0 ? parsedOffset : 0;
+export async function GET(request: Request) {
+  return withManagementTenantContext(request, async () => {
+    try {
+      const url = new URL(request?.url ?? "http://localhost/api/provider-nodes");
+      const raw = {
+        offset: url.searchParams.get("offset") || undefined,
+        limit: url.searchParams.get("limit") || undefined,
+      };
+      const validation = validateBody(paginationSchema, raw);
+      if (isValidationFailure(validation)) {
+        return NextResponse.json({ error: validation.error }, { status: 400 });
+      }
+      const { limit: parsedLimit, offset: parsedOffset } = validation.data;
+      const limit =
+        Number.isInteger(parsedLimit) && parsedLimit && parsedLimit > 0 ? parsedLimit : undefined;
+      const offset =
+        Number.isInteger(parsedOffset) && parsedOffset && parsedOffset > 0 ? parsedOffset : 0;
 
-    const total = getProviderNodesCount();
-    const nodes = await getProviderNodes({}, limit, offset);
-    return NextResponse.json({
-      nodes,
-      total,
-      ccCompatibleProviderEnabled: isCcCompatibleProviderEnabled(),
-    });
-  } catch (error) {
-    console.log("Error fetching provider nodes:", error);
-    return NextResponse.json({ error: "Failed to fetch provider nodes" }, { status: 500 });
-  }
+      const total = getProviderNodesCount();
+      const nodes = await getProviderNodes({}, limit, offset);
+      return NextResponse.json({
+        nodes,
+        total,
+        ccCompatibleProviderEnabled: isCcCompatibleProviderEnabled(),
+      });
+    } catch (error) {
+      console.log("Error fetching provider nodes:", error);
+      return NextResponse.json({ error: "Failed to fetch provider nodes" }, { status: 500 });
+    }
+  });
 }
 
 // POST /api/provider-nodes - Create provider node
 export async function POST(request) {
-  let rawBody;
-  try {
-    rawBody = await request.json();
-  } catch {
-    return NextResponse.json(
-      {
-        error: {
-          message: "Invalid request",
-          details: [{ field: "body", message: "Invalid JSON body" }],
+  return withManagementTenantContext(request, async () => {
+    let rawBody;
+    try {
+      rawBody = await request.json();
+    } catch {
+      return NextResponse.json(
+        {
+          error: {
+            message: "Invalid request",
+            details: [{ field: "body", message: "Invalid JSON body" }],
+          },
         },
-      },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const validation = validateBody(createProviderNodeSchema, rawBody);
-    if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
-    }
-    const {
-      name,
-      prefix,
-      apiType,
-      baseUrl,
-      type,
-      compatMode,
-      preset,
-      chatPath,
-      modelsPath,
-      customHeaders,
-      iconUrl,
-    } = validation.data;
-
-    if (preset === "vibeproxy-openai") {
-      // Schema guarantees baseUrl is non-empty for this preset.
-      const sanitizedBaseUrl = sanitizeVibeProxyBaseUrl(baseUrl as string);
-      const baseUrlError = validateProviderNodeBaseUrl(sanitizedBaseUrl);
-      if (baseUrlError) return baseUrlError;
-
-      const node = await createProviderNode({
-        id: `${OPENAI_COMPATIBLE_PREFIX}${VIBEPROXY_OPENAI_DEFAULTS.apiType}-${generateId()}`,
-        type: "openai-compatible",
-        prefix: (prefix?.trim() || VIBEPROXY_OPENAI_DEFAULTS.prefix).trim(),
-        apiType: apiType || VIBEPROXY_OPENAI_DEFAULTS.apiType,
-        baseUrl: sanitizedBaseUrl,
-        name: (name?.trim() || VIBEPROXY_OPENAI_DEFAULTS.name).trim(),
-        chatPath: chatPath || null,
-        modelsPath: modelsPath || null,
-        iconUrl: iconUrl?.trim() || null,
-        customHeaders: customHeaders || null,
-      });
-      return NextResponse.json({ node }, { status: 201 });
+        { status: 400 }
+      );
     }
 
-    // Determine type
-    const nodeType = type || "openai-compatible";
-
-    if (nodeType === "openai-compatible") {
-      const resolvedName = (name || "").trim();
-      const resolvedPrefix = (prefix || "").trim();
-      const resolvedBaseUrl = (baseUrl || OPENAI_COMPATIBLE_DEFAULTS.baseUrl).trim();
-      const baseUrlError = validateProviderNodeBaseUrl(resolvedBaseUrl);
-      if (baseUrlError) return baseUrlError;
-
-      const node = await createProviderNode({
-        id: `${OPENAI_COMPATIBLE_PREFIX}${apiType}-${generateId()}`,
-        type: "openai-compatible",
-        prefix: resolvedPrefix,
+    try {
+      const validation = validateBody(createProviderNodeSchema, rawBody);
+      if (isValidationFailure(validation)) {
+        return NextResponse.json({ error: validation.error }, { status: 400 });
+      }
+      const {
+        name,
+        prefix,
         apiType,
-        baseUrl: resolvedBaseUrl,
-        name: resolvedName,
-        chatPath: chatPath || null,
-        modelsPath: modelsPath || null,
-        iconUrl: iconUrl?.trim() || null,
-        customHeaders: customHeaders || null,
-      });
-      return NextResponse.json({ node }, { status: 201 });
-    }
+        baseUrl,
+        type,
+        compatMode,
+        preset,
+        chatPath,
+        modelsPath,
+        customHeaders,
+        iconUrl,
+      } = validation.data;
 
-    if (nodeType === "anthropic-compatible") {
-      if (compatMode === "cc" && !isCcCompatibleProviderEnabled()) {
-        return NextResponse.json({ error: "CC Compatible provider is disabled" }, { status: 403 });
+      if (preset === "vibeproxy-openai") {
+        // Schema guarantees baseUrl is non-empty for this preset.
+        const sanitizedBaseUrl = sanitizeVibeProxyBaseUrl(baseUrl as string);
+        const baseUrlError = validateProviderNodeBaseUrl(sanitizedBaseUrl);
+        if (baseUrlError) return baseUrlError;
+
+        const node = await createProviderNode({
+          id: `${OPENAI_COMPATIBLE_PREFIX}${VIBEPROXY_OPENAI_DEFAULTS.apiType}-${generateId()}`,
+          type: "openai-compatible",
+          prefix: (prefix?.trim() || VIBEPROXY_OPENAI_DEFAULTS.prefix).trim(),
+          apiType: apiType || VIBEPROXY_OPENAI_DEFAULTS.apiType,
+          baseUrl: sanitizedBaseUrl,
+          name: (name?.trim() || VIBEPROXY_OPENAI_DEFAULTS.name).trim(),
+          chatPath: chatPath || null,
+          modelsPath: modelsPath || null,
+          iconUrl: iconUrl?.trim() || null,
+          customHeaders: customHeaders || null,
+        });
+        return NextResponse.json({ node }, { status: 201 });
       }
 
-      const rawBaseUrl = baseUrl || ANTHROPIC_COMPATIBLE_DEFAULTS.baseUrl;
-      const sanitizedBaseUrl =
-        compatMode === "cc"
-          ? sanitizeClaudeCodeCompatibleBaseUrl(rawBaseUrl)
-          : sanitizeAnthropicBaseUrl(rawBaseUrl);
-      const baseUrlError = validateProviderNodeBaseUrl(sanitizedBaseUrl);
-      if (baseUrlError) return baseUrlError;
+      // Determine type
+      const nodeType = type || "openai-compatible";
 
-      const node = await createProviderNode({
-        id:
+      if (nodeType === "openai-compatible") {
+        const resolvedName = (name || "").trim();
+        const resolvedPrefix = (prefix || "").trim();
+        const resolvedBaseUrl = (baseUrl || OPENAI_COMPATIBLE_DEFAULTS.baseUrl).trim();
+        const baseUrlError = validateProviderNodeBaseUrl(resolvedBaseUrl);
+        if (baseUrlError) return baseUrlError;
+
+        const node = await createProviderNode({
+          id: `${OPENAI_COMPATIBLE_PREFIX}${apiType}-${generateId()}`,
+          type: "openai-compatible",
+          prefix: resolvedPrefix,
+          apiType,
+          baseUrl: resolvedBaseUrl,
+          name: resolvedName,
+          chatPath: chatPath || null,
+          modelsPath: modelsPath || null,
+          iconUrl: iconUrl?.trim() || null,
+          customHeaders: customHeaders || null,
+        });
+        return NextResponse.json({ node }, { status: 201 });
+      }
+
+      if (nodeType === "anthropic-compatible") {
+        if (compatMode === "cc" && !isCcCompatibleProviderEnabled()) {
+          return NextResponse.json(
+            { error: "CC Compatible provider is disabled" },
+            { status: 403 }
+          );
+        }
+
+        const rawBaseUrl = baseUrl || ANTHROPIC_COMPATIBLE_DEFAULTS.baseUrl;
+        const sanitizedBaseUrl =
           compatMode === "cc"
-            ? `${CLAUDE_CODE_COMPATIBLE_PREFIX}${generateId()}`
-            : `${ANTHROPIC_COMPATIBLE_PREFIX}${generateId()}`,
-        type: "anthropic-compatible",
-        prefix: (prefix || "").trim(),
-        baseUrl: sanitizedBaseUrl,
-        name: (name || "").trim(),
-        chatPath: chatPath || null,
-        modelsPath: compatMode === "cc" ? null : modelsPath || null,
-        iconUrl: iconUrl?.trim() || null,
-        customHeaders: customHeaders || null,
-      });
-      return NextResponse.json({ node }, { status: 201 });
-    }
+            ? sanitizeClaudeCodeCompatibleBaseUrl(rawBaseUrl)
+            : sanitizeAnthropicBaseUrl(rawBaseUrl);
+        const baseUrlError = validateProviderNodeBaseUrl(sanitizedBaseUrl);
+        if (baseUrlError) return baseUrlError;
 
-    return NextResponse.json({ error: "Invalid provider node type" }, { status: 400 });
-  } catch (error) {
-    console.log("Error creating provider node:", error);
-    return NextResponse.json({ error: "Failed to create provider node" }, { status: 500 });
-  }
+        const node = await createProviderNode({
+          id:
+            compatMode === "cc"
+              ? `${CLAUDE_CODE_COMPATIBLE_PREFIX}${generateId()}`
+              : `${ANTHROPIC_COMPATIBLE_PREFIX}${generateId()}`,
+          type: "anthropic-compatible",
+          prefix: (prefix || "").trim(),
+          baseUrl: sanitizedBaseUrl,
+          name: (name || "").trim(),
+          chatPath: chatPath || null,
+          modelsPath: compatMode === "cc" ? null : modelsPath || null,
+          iconUrl: iconUrl?.trim() || null,
+          customHeaders: customHeaders || null,
+        });
+        return NextResponse.json({ node }, { status: 201 });
+      }
+
+      return NextResponse.json({ error: "Invalid provider node type" }, { status: 400 });
+    } catch (error) {
+      console.log("Error creating provider node:", error);
+      return NextResponse.json({ error: "Failed to create provider node" }, { status: 500 });
+    }
+  });
 }

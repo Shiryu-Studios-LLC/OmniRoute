@@ -58,6 +58,7 @@ function envelope(
       accept: "application/json, text/event-stream",
       contentType: "application/json",
       mcpSessionId: "session-123",
+      mcpProtocolVersion: "2025-11-25",
       upstreamAuthorization: "Bearer upstream-secret",
     },
     body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
@@ -102,6 +103,7 @@ test("authenticated forward calls only the pinned transport and returns selected
   assert.equal(headers.get("accept"), "application/json, text/event-stream");
   assert.equal(headers.get("content-type"), "application/json");
   assert.equal(headers.get("mcp-session-id"), "session-123");
+  assert.equal(headers.get("mcp-protocol-version"), "2025-11-25");
   assert.equal(headers.get("authorization"), "Bearer upstream-secret");
   assert.equal(headers.has("set-cookie"), false);
 });

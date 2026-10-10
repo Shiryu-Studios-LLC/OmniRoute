@@ -19,7 +19,7 @@ import { NextResponse } from "next/server";
 import { discoverZedCredentials, isZedInstalled } from "@/lib/zed-oauth/keychain-reader";
 import { partitionZedCredentials } from "@/lib/zed-oauth/importUtils";
 import { fingerprintZedCredential } from "@/lib/zed-oauth/credentialFingerprint";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withPlatformAdminManagementContext } from "@/lib/api/requireManagementAuth";
 import { isRunningInDocker } from "@/lib/zed-oauth/dockerDetect";
 
 interface DiscoverCandidate {
@@ -40,78 +40,77 @@ interface DiscoverResponse {
 }
 
 export async function POST(request: Request): Promise<NextResponse<DiscoverResponse> | Response> {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  return withPlatformAdminManagementContext(request, async () => {
+    try {
+      if (isRunningInDocker()) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "OmniRoute is running inside Docker and cannot access the host keychain. " +
+              "Use the Manual Token Import tab to paste your API key directly.",
+            zedInstalled: false,
+            zedDockerEnvironment: true,
+          },
+          { status: 422 }
+        );
+      }
 
-  try {
-    if (isRunningInDocker()) {
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "OmniRoute is running inside Docker and cannot access the host keychain. " +
-            "Use the Manual Token Import tab to paste your API key directly.",
-          zedInstalled: false,
-          zedDockerEnvironment: true,
-        },
-        { status: 422 }
-      );
-    }
+      const zedInstalled = await isZedInstalled();
+      if (!zedInstalled) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Zed IDE does not appear to be installed on this system.",
+            zedInstalled: false,
+            zedDockerEnvironment: false,
+          },
+          { status: 404 }
+        );
+      }
 
-    const zedInstalled = await isZedInstalled();
-    if (!zedInstalled) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Zed IDE does not appear to be installed on this system.",
-          zedInstalled: false,
-          zedDockerEnvironment: false,
-        },
-        { status: 404 }
-      );
-    }
+      const credentials = await discoverZedCredentials();
+      const { importable, skipped } = partitionZedCredentials(credentials);
 
-    const credentials = await discoverZedCredentials();
-    const { importable, skipped } = partitionZedCredentials(credentials);
-
-    const candidates: DiscoverCandidate[] = importable.map((cred) => ({
-      provider: cred.provider,
-      service: cred.service,
-      account: cred.account,
-      fingerprint: fingerprintZedCredential(cred.service, cred.account, cred.token),
-    }));
-
-    return NextResponse.json({
-      success: true,
-      zedInstalled: true,
-      count: candidates.length,
-      candidates,
-      skipped: skipped.map((cred) => ({
+      const candidates: DiscoverCandidate[] = importable.map((cred) => ({
         provider: cred.provider,
         service: cred.service,
         account: cred.account,
-        reason: cred.token ? "unsupported provider" : "missing token",
-      })),
-    });
-  } catch (error: any) {
-    console.error("[Zed Discover] Error reading keychain:", error);
+        fingerprint: fingerprintZedCredential(cred.service, cred.account, cred.token),
+      }));
 
-    if (error?.message?.includes("User canceled") || error?.message?.includes("denied")) {
+      return NextResponse.json({
+        success: true,
+        zedInstalled: true,
+        count: candidates.length,
+        candidates,
+        skipped: skipped.map((cred) => ({
+          provider: cred.provider,
+          service: cred.service,
+          account: cred.account,
+          reason: cred.token ? "unsupported provider" : "missing token",
+        })),
+      });
+    } catch (error: any) {
+      console.error("[Zed Discover] Error reading keychain:", error);
+
+      if (error?.message?.includes("User canceled") || error?.message?.includes("denied")) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Keychain access denied. Please grant permission when prompted by your OS.",
+          },
+          { status: 403 }
+        );
+      }
+
       return NextResponse.json(
         {
           success: false,
-          error: "Keychain access denied. Please grant permission when prompted by your OS.",
+          error: "Failed to discover Zed credentials",
         },
-        { status: 403 }
+        { status: 500 }
       );
     }
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: "Failed to discover Zed credentials",
-      },
-      { status: 500 }
-    );
-  }
+  });
 }

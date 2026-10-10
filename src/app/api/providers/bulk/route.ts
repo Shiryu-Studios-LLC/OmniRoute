@@ -24,7 +24,7 @@ import {
   normalizeProviderSpecificData,
   sanitizeProviderSpecificDataForResponse,
 } from "@/lib/providers/requestDefaults";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { isManagedProviderConnectionId } from "@/lib/providers/catalog";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { validateProviderApiKey } from "@/lib/providers/validation";
@@ -36,193 +36,192 @@ import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 // response always returns 200 with per-entry results so callers can show which
 // lines failed without rolling back the successful ones.
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  return withManagementTenantContext(request, async () => {
+    const auditContext = getAuditRequestContext(request);
 
-  const auditContext = getAuditRequestContext(request);
-
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const validation = validateBody(bulkCreateProviderSchema, body);
-  if (isValidationFailure(validation)) {
-    return NextResponse.json({ error: validation.error }, { status: 400 });
-  }
-
-  const {
-    provider,
-    entries,
-    priority,
-    globalPriority,
-    providerSpecificData: incomingPsd,
-    validateKeys,
-  } = validation.data;
-
-  const isManagedOrCompatible =
-    isManagedProviderConnectionId(provider) ||
-    isOpenAICompatibleProvider(provider) ||
-    isAnthropicCompatibleProvider(provider);
-
-  if (!isManagedOrCompatible) {
-    return NextResponse.json({ error: "Invalid provider" }, { status: 400 });
-  }
-
-  if (!supportsBulkApiKey(provider)) {
-    return NextResponse.json(
-      { error: "Bulk add is not supported for this provider" },
-      { status: 400 }
-    );
-  }
-
-  let baseProviderSpecificData: Record<string, unknown> | null = incomingPsd || null;
-  if (isOpenAICompatibleProvider(provider) || isAnthropicCompatibleProvider(provider)) {
-    const node: any = await getProviderNodeById(provider);
-    if (!node) {
-      return NextResponse.json({ error: "Provider node not found" }, { status: 404 });
-    }
-    baseProviderSpecificData = {
-      ...(baseProviderSpecificData || {}),
-      prefix: node.prefix,
-      ...(node.apiType ? { apiType: node.apiType } : {}),
-      baseUrl: node.baseUrl,
-      nodeName: node.name,
-      ...(node.chatPath ? { chatPath: node.chatPath } : {}),
-      ...(node.modelsPath ? { modelsPath: node.modelsPath } : {}),
-    };
-  }
-
-  baseProviderSpecificData =
-    normalizeProviderSpecificData(provider, baseProviderSpecificData) || null;
-
-  // Resolve proxy once for all entries — we call validateProviderApiKey directly
-  // instead of round-tripping through /api/providers/validate over HTTP. Direct
-  // invocation avoids SSRF risk from `new URL(request.url).origin` being driven
-  // by a spoofable Host header (CodeQL js/request-forgery #243).
-  const proxyToUse = validateKeys
-    ? (await resolveProxyForProvider(provider)) ||
-      (await getProxyForLevel("provider", provider)) ||
-      (await getProxyForLevel("global")) ||
-      null
-    : null;
-
-  // #2587 — createProviderConnection upserts apikey connections BY NAME, so a
-  // bulk-add name that collides with an already-saved connection (or with
-  // another entry in the same batch) would silently REPLACE that connection's
-  // apiKey/priority/testStatus instead of inserting a new one. Resolve every
-  // collision up front by gap-filling a free "<name> <n>" suffix so each entry
-  // reaches createProviderConnection as a genuine insert.
-  const existingConnections = await getProviderConnections({ provider, authType: "apikey" });
-  const existingNames = existingConnections
-    .map((c) => (typeof c.name === "string" ? c.name : null))
-    .filter((n): n is string => !!n);
-  const resolvedEntries = resolveBulkNameCollisions(entries, existingNames);
-
-  const created: Array<Record<string, unknown>> = [];
-  const errors: Array<{ index: number; name: string; message: string }> = [];
-
-  for (let i = 0; i < resolvedEntries.length; i++) {
-    const entry = resolvedEntries[i];
+    let body: unknown;
     try {
-      // Per-entry copy so each connection gets its own providerSpecificData. Cloudflare
-      // Workers AI carries a per-key accountId (name|accountId|apiKey) that must NOT bleed
-      // across entries — never mutate/reuse the shared base object here.
-      const entryProviderSpecificData: Record<string, unknown> = {
-        ...(baseProviderSpecificData || {}),
-        ...(entry.accountId ? { accountId: entry.accountId } : {}),
-      };
-      const hasEntryPsd = Object.keys(entryProviderSpecificData).length > 0;
-
-      let testStatus: "active" | "unknown" | "failed" = "unknown";
-
-      if (validateKeys) {
-        const probe = await runWithProxyContext(proxyToUse, () =>
-          validateProviderApiKey({
-            provider,
-            apiKey: entry.apiKey,
-            providerSpecificData: entryProviderSpecificData,
-          })
-        );
-        testStatus = probe?.valid ? "active" : "failed";
-      }
-
-      const newConnection = await createProviderConnection({
-        provider,
-        authType: "apikey",
-        name: entry.name,
-        apiKey: entry.apiKey,
-        priority: priority || 1,
-        globalPriority: globalPriority || null,
-        defaultModel: null,
-        providerSpecificData: hasEntryPsd ? entryProviderSpecificData : baseProviderSpecificData,
-        isActive: true,
-        testStatus,
-      });
-
-      const safe: Record<string, unknown> = { ...newConnection };
-      delete safe.apiKey;
-      if (safe.providerSpecificData) {
-        safe.providerSpecificData = sanitizeProviderSpecificDataForResponse(
-          safe.providerSpecificData as Record<string, unknown>
-        );
-      }
-      created.push(safe);
-
-      logAuditEvent({
-        action: "provider.credentials.created",
-        actor: "admin",
-        target: getProviderAuditTarget(newConnection),
-        resourceType: "provider_credentials",
-        status: "success",
-        ipAddress: auditContext.ipAddress || undefined,
-        requestId: auditContext.requestId,
-        metadata: {
-          provider,
-          via: "bulk",
-          connection: summarizeProviderConnectionForAudit(newConnection),
-        },
-      });
-    } catch (err) {
-      errors.push({
-        index: i,
-        name: entry.name,
-        message: sanitizeErrorMessage(err) || "Failed to create connection",
-      });
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
-  }
 
-  if (created.length > 0) {
-    await syncToCloudIfEnabled();
-  }
+    const validation = validateBody(bulkCreateProviderSchema, body);
+    if (isValidationFailure(validation)) {
+      return NextResponse.json({ error: validation.error }, { status: 400 });
+    }
 
-  logAuditEvent({
-    action: "provider.credentials.bulk_created",
-    actor: "admin",
-    resourceType: "provider_credentials",
-    status: errors.length === entries.length ? "failure" : "success",
-    ipAddress: auditContext.ipAddress || undefined,
-    requestId: auditContext.requestId,
-    metadata: {
+    const {
       provider,
-      total: entries.length,
-      success: created.length,
-      failed: errors.length,
-    },
-  });
+      entries,
+      priority,
+      globalPriority,
+      providerSpecificData: incomingPsd,
+      validateKeys,
+    } = validation.data;
 
-  return NextResponse.json(
-    {
-      success: created.length,
-      failed: errors.length,
-      total: entries.length,
-      created,
-      errors,
-    },
-    { status: 200 }
-  );
+    const isManagedOrCompatible =
+      isManagedProviderConnectionId(provider) ||
+      isOpenAICompatibleProvider(provider) ||
+      isAnthropicCompatibleProvider(provider);
+
+    if (!isManagedOrCompatible) {
+      return NextResponse.json({ error: "Invalid provider" }, { status: 400 });
+    }
+
+    if (!supportsBulkApiKey(provider)) {
+      return NextResponse.json(
+        { error: "Bulk add is not supported for this provider" },
+        { status: 400 }
+      );
+    }
+
+    let baseProviderSpecificData: Record<string, unknown> | null = incomingPsd || null;
+    if (isOpenAICompatibleProvider(provider) || isAnthropicCompatibleProvider(provider)) {
+      const node: any = await getProviderNodeById(provider);
+      if (!node) {
+        return NextResponse.json({ error: "Provider node not found" }, { status: 404 });
+      }
+      baseProviderSpecificData = {
+        ...(baseProviderSpecificData || {}),
+        prefix: node.prefix,
+        ...(node.apiType ? { apiType: node.apiType } : {}),
+        baseUrl: node.baseUrl,
+        nodeName: node.name,
+        ...(node.chatPath ? { chatPath: node.chatPath } : {}),
+        ...(node.modelsPath ? { modelsPath: node.modelsPath } : {}),
+      };
+    }
+
+    baseProviderSpecificData =
+      normalizeProviderSpecificData(provider, baseProviderSpecificData) || null;
+
+    // Resolve proxy once for all entries — we call validateProviderApiKey directly
+    // instead of round-tripping through /api/providers/validate over HTTP. Direct
+    // invocation avoids SSRF risk from `new URL(request.url).origin` being driven
+    // by a spoofable Host header (CodeQL js/request-forgery #243).
+    const proxyToUse = validateKeys
+      ? (await resolveProxyForProvider(provider)) ||
+        (await getProxyForLevel("provider", provider)) ||
+        (await getProxyForLevel("global")) ||
+        null
+      : null;
+
+    // #2587 — createProviderConnection upserts apikey connections BY NAME, so a
+    // bulk-add name that collides with an already-saved connection (or with
+    // another entry in the same batch) would silently REPLACE that connection's
+    // apiKey/priority/testStatus instead of inserting a new one. Resolve every
+    // collision up front by gap-filling a free "<name> <n>" suffix so each entry
+    // reaches createProviderConnection as a genuine insert.
+    const existingConnections = await getProviderConnections({ provider, authType: "apikey" });
+    const existingNames = existingConnections
+      .map((c) => (typeof c.name === "string" ? c.name : null))
+      .filter((n): n is string => !!n);
+    const resolvedEntries = resolveBulkNameCollisions(entries, existingNames);
+
+    const created: Array<Record<string, unknown>> = [];
+    const errors: Array<{ index: number; name: string; message: string }> = [];
+
+    for (let i = 0; i < resolvedEntries.length; i++) {
+      const entry = resolvedEntries[i];
+      try {
+        // Per-entry copy so each connection gets its own providerSpecificData. Cloudflare
+        // Workers AI carries a per-key accountId (name|accountId|apiKey) that must NOT bleed
+        // across entries — never mutate/reuse the shared base object here.
+        const entryProviderSpecificData: Record<string, unknown> = {
+          ...(baseProviderSpecificData || {}),
+          ...(entry.accountId ? { accountId: entry.accountId } : {}),
+        };
+        const hasEntryPsd = Object.keys(entryProviderSpecificData).length > 0;
+
+        let testStatus: "active" | "unknown" | "failed" = "unknown";
+
+        if (validateKeys) {
+          const probe = await runWithProxyContext(proxyToUse, () =>
+            validateProviderApiKey({
+              provider,
+              apiKey: entry.apiKey,
+              providerSpecificData: entryProviderSpecificData,
+            })
+          );
+          testStatus = probe?.valid ? "active" : "failed";
+        }
+
+        const newConnection = await createProviderConnection({
+          provider,
+          authType: "apikey",
+          name: entry.name,
+          apiKey: entry.apiKey,
+          priority: priority || 1,
+          globalPriority: globalPriority || null,
+          defaultModel: null,
+          providerSpecificData: hasEntryPsd ? entryProviderSpecificData : baseProviderSpecificData,
+          isActive: true,
+          testStatus,
+        });
+
+        const safe: Record<string, unknown> = { ...newConnection };
+        delete safe.apiKey;
+        if (safe.providerSpecificData) {
+          safe.providerSpecificData = sanitizeProviderSpecificDataForResponse(
+            safe.providerSpecificData as Record<string, unknown>
+          );
+        }
+        created.push(safe);
+
+        logAuditEvent({
+          action: "provider.credentials.created",
+          actor: "admin",
+          target: getProviderAuditTarget(newConnection),
+          resourceType: "provider_credentials",
+          status: "success",
+          ipAddress: auditContext.ipAddress || undefined,
+          requestId: auditContext.requestId,
+          metadata: {
+            provider,
+            via: "bulk",
+            connection: summarizeProviderConnectionForAudit(newConnection),
+          },
+        });
+      } catch (err) {
+        errors.push({
+          index: i,
+          name: entry.name,
+          message: sanitizeErrorMessage(err) || "Failed to create connection",
+        });
+      }
+    }
+
+    if (created.length > 0) {
+      await syncToCloudIfEnabled();
+    }
+
+    logAuditEvent({
+      action: "provider.credentials.bulk_created",
+      actor: "admin",
+      resourceType: "provider_credentials",
+      status: errors.length === entries.length ? "failure" : "success",
+      ipAddress: auditContext.ipAddress || undefined,
+      requestId: auditContext.requestId,
+      metadata: {
+        provider,
+        total: entries.length,
+        success: created.length,
+        failed: errors.length,
+      },
+    });
+
+    return NextResponse.json(
+      {
+        success: created.length,
+        failed: errors.length,
+        total: entries.length,
+        created,
+        errors,
+      },
+      { status: 200 }
+    );
+  });
 }
 
 async function syncToCloudIfEnabled() {

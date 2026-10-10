@@ -16,6 +16,7 @@ import type {
   ConnectionState,
   BreakerWithHistory,
 } from "@/types/resilience";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 
 // Explicit column whitelist -- getRawProviderConnections() DEFAULTS TO SELECT *,
 // so passing columns is MANDATORY to avoid leaking api_key, access_token,
@@ -117,6 +118,10 @@ function toConnectionState(
 }
 
 export async function GET(req: NextRequest) {
+  return withManagementTenantContext(req, () => getResilienceConnections(req));
+}
+
+async function getResilienceConnections(req: NextRequest) {
   try {
     const params = querySchema.safeParse(Object.fromEntries(new URL(req.url).searchParams));
     if (!params.success) {

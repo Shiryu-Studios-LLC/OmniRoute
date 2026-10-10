@@ -2,6 +2,22 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
+function hasManagementGuard(content: string): boolean {
+  return (
+    content.includes("requireManagementAuth(") ||
+    /with(?:PlatformAdmin)?Management(?:Tenant)?Context\(request,/.test(content)
+  );
+}
+
+function managementGuardIndex(content: string): number {
+  const indexes = [
+    content.indexOf("requireManagementAuth(request)"),
+    content.indexOf("withManagementTenantContext(request"),
+    content.indexOf("withPlatformAdminManagementContext(request"),
+  ].filter((index) => index >= 0);
+  return indexes.length > 0 ? Math.min(...indexes) : -1;
+}
+
 test("Codex apply-local auth route requires management authentication before local writes", () => {
   const content = fs.readFileSync(
     "src/app/api/providers/[id]/codex-auth/apply-local/route.ts",
@@ -9,11 +25,10 @@ test("Codex apply-local auth route requires management authentication before loc
   );
 
   assert.ok(content.includes('from "@/lib/api/requireManagementAuth"'));
-  assert.ok(content.includes("const authError = await requireManagementAuth(request);"));
-  assert.ok(content.includes("if (authError) return authError;"));
+  assert.ok(hasManagementGuard(content));
   assert.ok(
-    content.indexOf("requireManagementAuth(request)") <
-      content.indexOf("ensureCliConfigWriteAllowed()")
+    content.indexOf("withManagementTenantContext(request") <
+      content.indexOf("const writeGuard = ensureCliConfigWriteAllowed()")
   );
 });
 
@@ -86,13 +101,9 @@ test("provider validation routes require management authentication before readin
   for (const routePath of routePaths) {
     const content = fs.readFileSync(routePath, "utf8");
     assert.ok(content.includes('from "@/lib/api/requireManagementAuth"'), routePath);
+    assert.ok(hasManagementGuard(content), routePath);
     assert.ok(
-      content.includes("const authError = await requireManagementAuth(request);"),
-      routePath
-    );
-    assert.ok(content.includes("if (authError) return authError;"), routePath);
-    assert.ok(
-      content.indexOf("requireManagementAuth(request)") < content.indexOf("request.json()"),
+      managementGuardIndex(content) < content.indexOf("request.json()"),
       `${routePath} should authenticate before parsing submitted provider credentials`
     );
   }
@@ -116,12 +127,8 @@ test("provider param-filters route requires management authentication on GET/PUT
       nextHandlerStart === -1 ? content.length : nextHandlerStart
     );
     assert.ok(
-      handlerBody.includes("const authError = await requireManagementAuth(request);"),
+      hasManagementGuard(handlerBody),
       `${routePath} ${handler} handler must call requireManagementAuth(request)`
-    );
-    assert.ok(
-      handlerBody.includes("if (authError) return authError;"),
-      `${routePath} ${handler} handler must short-circuit on authError`
     );
   }
 });
@@ -135,13 +142,9 @@ test("Antigravity CLI (agy) credential import routes require management authenti
   for (const routePath of jsonBodyRoutes) {
     const content = fs.readFileSync(routePath, "utf8");
     assert.ok(content.includes('from "@/lib/api/requireManagementAuth"'), routePath);
+    assert.ok(hasManagementGuard(content), routePath);
     assert.ok(
-      content.includes("const authError = await requireManagementAuth(request);"),
-      routePath
-    );
-    assert.ok(content.includes("if (authError) return authError;"), routePath);
-    assert.ok(
-      content.indexOf("requireManagementAuth(request)") < content.indexOf("request.json()"),
+      managementGuardIndex(content) < content.indexOf("request.json()"),
       `${routePath} should authenticate before parsing the submitted token`
     );
   }
@@ -153,11 +156,7 @@ test("Antigravity CLI (agy) credential import routes require management authenti
   for (const routePath of otherBodyRoutes) {
     const content = fs.readFileSync(routePath, "utf8");
     assert.ok(content.includes('from "@/lib/api/requireManagementAuth"'), routePath);
-    assert.ok(
-      content.includes("const authError = await requireManagementAuth(request);"),
-      routePath
-    );
-    assert.ok(content.includes("if (authError) return authError;"), routePath);
+    assert.ok(hasManagementGuard(content), routePath);
   }
 });
 

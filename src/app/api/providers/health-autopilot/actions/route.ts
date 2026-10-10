@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { executeProviderHealthAutopilotAction } from "@/lib/monitoring/providerHealthAutopilot";
+import { getCurrentTenantId } from "@/lib/tenantContext";
+import { SHIRYU_ADMIN_TENANT_ID } from "@/lib/db/tenants";
 import { validateBody } from "@/shared/validation/helpers";
 
 const actionSchema = z.object({
@@ -25,34 +27,43 @@ const actionSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
-
-  // Origin validation for browser mutations is centralized in the authz pipeline
-  // (src/server/authz/pipeline.ts) for MANAGEMENT routes — see PR #5278. Do NOT
-  // re-check origin here: the pipeline strips PEER_IP_HEADER before forwarding,
-  // so a duplicate per-route check cannot resolve the LAN "direct-local-host"
-  // candidate and spuriously rejects same-origin LAN/Docker requests (#6277).
-  try {
-    let rawBody: unknown;
+  return withManagementTenantContext(request, async () => {
+    // Origin validation for browser mutations is centralized in the authz pipeline
+    // (src/server/authz/pipeline.ts) for MANAGEMENT routes — see PR #5278. Do NOT
+    // re-check origin here: the pipeline strips PEER_IP_HEADER before forwarding,
+    // so a duplicate per-route check cannot resolve the LAN "direct-local-host"
+    // candidate and spuriously rejects same-origin LAN/Docker requests (#6277).
     try {
-      rawBody = await request.json();
-    } catch {
-      return NextResponse.json({ error: { message: "Invalid JSON body" } }, { status: 400 });
-    }
+      let rawBody: unknown;
+      try {
+        rawBody = await request.json();
+      } catch {
+        return NextResponse.json({ error: { message: "Invalid JSON body" } }, { status: 400 });
+      }
 
-    const validation = validateBody(actionSchema, rawBody);
-    if (!validation.success) {
-      return NextResponse.json({ error: { message: validation.error } }, { status: 400 });
-    }
+      const validation = validateBody(actionSchema, rawBody);
+      if (!validation.success) {
+        return NextResponse.json({ error: { message: validation.error } }, { status: 400 });
+      }
 
-    const result = await executeProviderHealthAutopilotAction(validation.data);
-    return NextResponse.json(result.body, { status: result.status });
-  } catch (error) {
-    console.error("[API] POST /api/providers/health-autopilot/actions error:", error);
-    return NextResponse.json(
-      { error: { message: "Failed to apply provider health autopilot action" } },
-      { status: 500 }
-    );
-  }
+      if (
+        validation.data.type === "clear_provider_breaker" &&
+        getCurrentTenantId() !== SHIRYU_ADMIN_TENANT_ID
+      ) {
+        return NextResponse.json(
+          { error: { message: "Platform administrator required to clear provider breakers" } },
+          { status: 403 }
+        );
+      }
+
+      const result = await executeProviderHealthAutopilotAction(validation.data);
+      return NextResponse.json(result.body, { status: result.status });
+    } catch (error) {
+      console.error("[API] POST /api/providers/health-autopilot/actions error:", error);
+      return NextResponse.json(
+        { error: { message: "Failed to apply provider health autopilot action" } },
+        { status: 500 }
+      );
+    }
+  });
 }

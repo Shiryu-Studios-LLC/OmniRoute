@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { ClaudeAuthFileError } from "@/lib/oauth/utils/claudeAuthFile";
 import {
   parseAndValidateClaudeAuth,
@@ -26,74 +26,73 @@ function sanitizeConnectionForResponse(connection: Record<string, unknown>) {
 }
 
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  return withManagementTenantContext(request, async () => {
+    const auditContext = getAuditRequestContext(request);
 
-  const auditContext = getAuditRequestContext(request);
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
+    const parsedBody = validateBody(importClaudeAuthSchema, body);
+    if (isValidationFailure(parsedBody)) {
+      return NextResponse.json({ error: parsedBody.error }, { status: 400 });
+    }
 
-  const parsedBody = validateBody(importClaudeAuthSchema, body);
-  if (isValidationFailure(parsedBody)) {
-    return NextResponse.json({ error: parsedBody.error }, { status: 400 });
-  }
+    const { source, name, email, overwriteExisting } = parsedBody.data;
 
-  const { source, name, email, overwriteExisting } = parsedBody.data;
-
-  let rawJson: unknown;
-  try {
-    rawJson = source.kind === "json" ? source.json : JSON.parse(source.text);
-  } catch {
-    return NextResponse.json(
-      { error: "Could not parse the content as JSON", code: "invalid_json" },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const parsed = parseAndValidateClaudeAuth(rawJson);
-    const enriched = await enrichWithBootstrap(parsed);
-    const { connection, created } = await createConnectionFromAuthFile(enriched, {
-      name,
-      email,
-      overwriteExisting,
-    });
-
-    logAuditEvent({
-      action: "provider.credentials.imported",
-      actor: "admin",
-      target: getProviderAuditTarget(connection),
-      resourceType: "provider_credentials",
-      status: "success",
-      ipAddress: auditContext.ipAddress || undefined,
-      requestId: auditContext.requestId,
-      metadata: {
-        provider: "claude",
-        created,
-        email: enriched.email || email,
-        hasAccountUUID: !!enriched.accountUUID,
-      },
-    });
-
-    return NextResponse.json({
-      connection: sanitizeConnectionForResponse(connection as Record<string, unknown>),
-      created,
-    });
-  } catch (error) {
-    if (error instanceof ClaudeAuthFileError) {
+    let rawJson: unknown;
+    try {
+      rawJson = source.kind === "json" ? source.json : JSON.parse(source.text);
+    } catch {
       return NextResponse.json(
-        { error: error.message, code: error.code },
-        { status: error.status }
+        { error: "Could not parse the content as JSON", code: "invalid_json" },
+        { status: 400 }
       );
     }
-    return NextResponse.json(
-      { error: sanitizeErrorMessage(error) || "Failed to import Claude auth" },
-      { status: 500 }
-    );
-  }
+
+    try {
+      const parsed = parseAndValidateClaudeAuth(rawJson);
+      const enriched = await enrichWithBootstrap(parsed);
+      const { connection, created } = await createConnectionFromAuthFile(enriched, {
+        name,
+        email,
+        overwriteExisting,
+      });
+
+      logAuditEvent({
+        action: "provider.credentials.imported",
+        actor: "admin",
+        target: getProviderAuditTarget(connection),
+        resourceType: "provider_credentials",
+        status: "success",
+        ipAddress: auditContext.ipAddress || undefined,
+        requestId: auditContext.requestId,
+        metadata: {
+          provider: "claude",
+          created,
+          email: enriched.email || email,
+          hasAccountUUID: !!enriched.accountUUID,
+        },
+      });
+
+      return NextResponse.json({
+        connection: sanitizeConnectionForResponse(connection as Record<string, unknown>),
+        created,
+      });
+    } catch (error) {
+      if (error instanceof ClaudeAuthFileError) {
+        return NextResponse.json(
+          { error: error.message, code: error.code },
+          { status: error.status }
+        );
+      }
+      return NextResponse.json(
+        { error: sanitizeErrorMessage(error) || "Failed to import Claude auth" },
+        { status: 500 }
+      );
+    }
+  });
 }

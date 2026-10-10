@@ -161,6 +161,8 @@ test("providers validate route blocks private baseUrl values when local provider
       route: "/api/providers/validate",
       reason: "Blocked private or local provider URL",
       baseUrl: "http://127.0.0.1:8080",
+      tenantId: "tenant_shiryu_admin",
+      principalId: "management",
     });
   } finally {
     globalThis.fetch = originalFetch;

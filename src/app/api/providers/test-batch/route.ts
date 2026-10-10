@@ -19,7 +19,7 @@ import {
 import { testSingleConnection } from "../[id]/test/route";
 import { providersBatchTestSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 // Determine auth type group for a provider id
@@ -66,196 +66,197 @@ function getSafeErrorMessage(error: unknown, fallback = "Test failed") {
 
 // POST /api/providers/test-batch - Test multiple connections by group
 export async function POST(request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
-
-  let rawBody;
-  try {
-    rawBody = await request.json();
-  } catch {
-    return NextResponse.json(
-      {
-        error: {
-          message: "Invalid request",
-          details: [{ field: "body", message: "Invalid JSON body" }],
-        },
-      },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const validation = validateBody(providersBatchTestSchema, rawBody);
-    if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
-    }
-    const { mode, providerId, connectionIds } = validation.data;
-
-    // Fetch connections to test. mode=selected targets explicit IDs and must
-    // also reach inactive connections (matching single-connection retest);
-    // every other mode tests active connections only.
-    const allConnections =
-      mode === "selected"
-        ? await getProviderConnections()
-        : await getProviderConnections({ isActive: true });
-
-    // Filter based on mode
-    let connectionsToTest = [];
-    if (mode === "selected") {
-      const idSet = new Set(connectionIds || []);
-      connectionsToTest = allConnections.filter((c) => idSet.has(c.id));
-    } else if (mode === "provider" && providerId) {
-      const familyProviderIds = new Set(getProviderConnectionFamilyIds(providerId));
-      connectionsToTest = allConnections.filter((c) => familyProviderIds.has(c.provider));
-    } else if (mode === "oauth") {
-      connectionsToTest = allConnections.filter((c) => {
-        const authGroup = getAuthGroup(c.provider);
-        return authGroup === "oauth";
-      });
-    } else if (mode === "free") {
-      connectionsToTest = allConnections.filter((c) => providerHasFreeTier(c.provider));
-    } else if (mode === "no-auth") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "no-auth");
-    } else if (mode === "apikey") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "apikey");
-    } else if (mode === "web-cookie") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "web-cookie");
-    } else if (mode === "search") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "search");
-    } else if (mode === "audio") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "audio");
-    } else if (mode === "local") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "local");
-    } else if (mode === "upstream-proxy") {
-      connectionsToTest = allConnections.filter(
-        (c) => getAuthGroup(c.provider) === "upstream-proxy"
-      );
-    } else if (mode === "cloud-agent") {
-      connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "cloud-agent");
-    } else if (mode === "ide") {
-      connectionsToTest = allConnections.filter((c) => IDE_PROVIDER_IDS.has(c.provider));
-    } else if (mode === "compatible") {
-      connectionsToTest = allConnections.filter((c) => isCompatibleProvider(c.provider));
-    } else if (mode === "all") {
-      connectionsToTest = allConnections;
-    } else {
+  return withManagementTenantContext(request, async () => {
+    let rawBody;
+    try {
+      rawBody = await request.json();
+    } catch {
       return NextResponse.json(
         {
-          error:
-            "Invalid mode. Use: provider, oauth, free, no-auth, apikey, compatible, all, web-cookie, search, audio, local, upstream-proxy, cloud-agent, ide, selected",
+          error: {
+            message: "Invalid request",
+            details: [{ field: "body", message: "Invalid JSON body" }],
+          },
         },
         { status: 400 }
       );
     }
 
-    if (connectionsToTest.length === 0) {
-      // Include a summary so consumers gated on `summary` still get feedback
-      // (e.g. mode=selected where the chosen ids were deleted before testing).
+    try {
+      const validation = validateBody(providersBatchTestSchema, rawBody);
+      if (isValidationFailure(validation)) {
+        return NextResponse.json({ error: validation.error }, { status: 400 });
+      }
+      const { mode, providerId, connectionIds } = validation.data;
+
+      // Fetch connections to test. mode=selected targets explicit IDs and must
+      // also reach inactive connections (matching single-connection retest);
+      // every other mode tests active connections only.
+      const allConnections =
+        mode === "selected"
+          ? await getProviderConnections()
+          : await getProviderConnections({ isActive: true });
+
+      // Filter based on mode
+      let connectionsToTest = [];
+      if (mode === "selected") {
+        const idSet = new Set(connectionIds || []);
+        connectionsToTest = allConnections.filter((c) => idSet.has(c.id));
+      } else if (mode === "provider" && providerId) {
+        const familyProviderIds = new Set(getProviderConnectionFamilyIds(providerId));
+        connectionsToTest = allConnections.filter((c) => familyProviderIds.has(c.provider));
+      } else if (mode === "oauth") {
+        connectionsToTest = allConnections.filter((c) => {
+          const authGroup = getAuthGroup(c.provider);
+          return authGroup === "oauth";
+        });
+      } else if (mode === "free") {
+        connectionsToTest = allConnections.filter((c) => providerHasFreeTier(c.provider));
+      } else if (mode === "no-auth") {
+        connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "no-auth");
+      } else if (mode === "apikey") {
+        connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "apikey");
+      } else if (mode === "web-cookie") {
+        connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "web-cookie");
+      } else if (mode === "search") {
+        connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "search");
+      } else if (mode === "audio") {
+        connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "audio");
+      } else if (mode === "local") {
+        connectionsToTest = allConnections.filter((c) => getAuthGroup(c.provider) === "local");
+      } else if (mode === "upstream-proxy") {
+        connectionsToTest = allConnections.filter(
+          (c) => getAuthGroup(c.provider) === "upstream-proxy"
+        );
+      } else if (mode === "cloud-agent") {
+        connectionsToTest = allConnections.filter(
+          (c) => getAuthGroup(c.provider) === "cloud-agent"
+        );
+      } else if (mode === "ide") {
+        connectionsToTest = allConnections.filter((c) => IDE_PROVIDER_IDS.has(c.provider));
+      } else if (mode === "compatible") {
+        connectionsToTest = allConnections.filter((c) => isCompatibleProvider(c.provider));
+      } else if (mode === "all") {
+        connectionsToTest = allConnections;
+      } else {
+        return NextResponse.json(
+          {
+            error:
+              "Invalid mode. Use: provider, oauth, free, no-auth, apikey, compatible, all, web-cookie, search, audio, local, upstream-proxy, cloud-agent, ide, selected",
+          },
+          { status: 400 }
+        );
+      }
+
+      if (connectionsToTest.length === 0) {
+        // Include a summary so consumers gated on `summary` still get feedback
+        // (e.g. mode=selected where the chosen ids were deleted before testing).
+        return NextResponse.json({
+          mode,
+          providerId: providerId || null,
+          results: [],
+          testedAt: new Date().toISOString(),
+          summary: { total: 0, passed: 0, failed: 0 },
+        });
+      }
+
+      // Test each connection with timeout and concurrency limits (prevents server crash on large groups)
+      const PER_CONNECTION_TIMEOUT = 30_000; // 30s per connection
+      const CONCURRENCY = 5; // max parallel tests
+
+      const testOne = async (conn: Record<string, unknown>) => {
+        try {
+          const result = await Promise.race([
+            testSingleConnection(conn.id),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Connection test timed out after 30s")),
+                PER_CONNECTION_TIMEOUT
+              )
+            ),
+          ]);
+          const data = result as {
+            valid: boolean;
+            latencyMs?: number;
+            error?: string | null;
+            diagnosis?: unknown;
+            statusCode?: number | null;
+            testedAt?: string;
+          };
+          return {
+            provider: conn.provider,
+            connectionId: conn.id,
+            connectionName: conn.name || conn.email || conn.provider,
+            authType: conn.authType || getAuthGroup(conn.provider),
+            valid: data.valid,
+            latencyMs: data.latencyMs || 0,
+            error: data.error || null,
+            diagnosis: data.diagnosis || null,
+            statusCode: data.statusCode || null,
+            testedAt: data.testedAt || new Date().toISOString(),
+          };
+        } catch (error) {
+          const message = getSafeErrorMessage(error, "Connection test failed");
+          return {
+            provider: conn.provider,
+            connectionId: conn.id,
+            connectionName: conn.name || conn.email || conn.provider,
+            authType: conn.authType || getAuthGroup(conn.provider),
+            valid: false,
+            latencyMs: 0,
+            error: message,
+            diagnosis: { type: "network_error", source: "local", code: null, message },
+            statusCode: null,
+            testedAt: new Date().toISOString(),
+          };
+        }
+      };
+
+      // Execute with concurrency limit
+      const results = [];
+      for (let i = 0; i < connectionsToTest.length; i += CONCURRENCY) {
+        const batch = connectionsToTest.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.allSettled(batch.map(testOne));
+        for (const r of batchResults) {
+          const message = r.status === "rejected" ? getSafeErrorMessage(r.reason) : null;
+          results.push(
+            r.status === "fulfilled"
+              ? r.value
+              : {
+                  provider: "unknown",
+                  connectionId: "unknown",
+                  connectionName: "unknown",
+                  authType: "unknown",
+                  valid: false,
+                  latencyMs: 0,
+                  error: message,
+                  diagnosis: {
+                    type: "network_error",
+                    source: "local",
+                    code: null,
+                    message,
+                  },
+                  statusCode: null,
+                  testedAt: new Date().toISOString(),
+                }
+          );
+        }
+      }
+
       return NextResponse.json({
         mode,
         providerId: providerId || null,
-        results: [],
+        results,
         testedAt: new Date().toISOString(),
-        summary: { total: 0, passed: 0, failed: 0 },
+        summary: {
+          total: results.length,
+          passed: results.filter((r) => r.valid).length,
+          failed: results.filter((r) => !r.valid).length,
+        },
       });
+    } catch (error) {
+      console.log("Error in batch test:", error);
+      return NextResponse.json({ error: "Batch test failed" }, { status: 500 });
     }
-
-    // Test each connection with timeout and concurrency limits (prevents server crash on large groups)
-    const PER_CONNECTION_TIMEOUT = 30_000; // 30s per connection
-    const CONCURRENCY = 5; // max parallel tests
-
-    const testOne = async (conn: Record<string, unknown>) => {
-      try {
-        const result = await Promise.race([
-          testSingleConnection(conn.id),
-          new Promise((_, reject) =>
-            setTimeout(
-              () => reject(new Error("Connection test timed out after 30s")),
-              PER_CONNECTION_TIMEOUT
-            )
-          ),
-        ]);
-        const data = result as {
-          valid: boolean;
-          latencyMs?: number;
-          error?: string | null;
-          diagnosis?: unknown;
-          statusCode?: number | null;
-          testedAt?: string;
-        };
-        return {
-          provider: conn.provider,
-          connectionId: conn.id,
-          connectionName: conn.name || conn.email || conn.provider,
-          authType: conn.authType || getAuthGroup(conn.provider),
-          valid: data.valid,
-          latencyMs: data.latencyMs || 0,
-          error: data.error || null,
-          diagnosis: data.diagnosis || null,
-          statusCode: data.statusCode || null,
-          testedAt: data.testedAt || new Date().toISOString(),
-        };
-      } catch (error) {
-        const message = getSafeErrorMessage(error, "Connection test failed");
-        return {
-          provider: conn.provider,
-          connectionId: conn.id,
-          connectionName: conn.name || conn.email || conn.provider,
-          authType: conn.authType || getAuthGroup(conn.provider),
-          valid: false,
-          latencyMs: 0,
-          error: message,
-          diagnosis: { type: "network_error", source: "local", code: null, message },
-          statusCode: null,
-          testedAt: new Date().toISOString(),
-        };
-      }
-    };
-
-    // Execute with concurrency limit
-    const results = [];
-    for (let i = 0; i < connectionsToTest.length; i += CONCURRENCY) {
-      const batch = connectionsToTest.slice(i, i + CONCURRENCY);
-      const batchResults = await Promise.allSettled(batch.map(testOne));
-      for (const r of batchResults) {
-        const message = r.status === "rejected" ? getSafeErrorMessage(r.reason) : null;
-        results.push(
-          r.status === "fulfilled"
-            ? r.value
-            : {
-                provider: "unknown",
-                connectionId: "unknown",
-                connectionName: "unknown",
-                authType: "unknown",
-                valid: false,
-                latencyMs: 0,
-                error: message,
-                diagnosis: {
-                  type: "network_error",
-                  source: "local",
-                  code: null,
-                  message,
-                },
-                statusCode: null,
-                testedAt: new Date().toISOString(),
-              }
-        );
-      }
-    }
-
-    return NextResponse.json({
-      mode,
-      providerId: providerId || null,
-      results,
-      testedAt: new Date().toISOString(),
-      summary: {
-        total: results.length,
-        passed: results.filter((r) => r.valid).length,
-        failed: results.filter((r) => !r.valid).length,
-      },
-    });
-  } catch (error) {
-    console.log("Error in batch test:", error);
-    return NextResponse.json({ error: "Batch test failed" }, { status: 500 });
-  }
+  });
 }

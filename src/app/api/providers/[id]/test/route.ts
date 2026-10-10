@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { z } from "zod";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
@@ -1144,7 +1145,11 @@ export async function testSingleConnection(connectionId: string, validationModel
     lastError: clearErrorState ? null : result.valid ? connection.lastError : result.error,
     lastErrorAt: clearErrorState ? null : result.valid ? connection.lastErrorAt : now,
     lastTested: now,
-    lastErrorType: clearErrorState ? null : result.valid ? connection.lastErrorType : diagnosis.type,
+    lastErrorType: clearErrorState
+      ? null
+      : result.valid
+        ? connection.lastErrorType
+        : diagnosis.type,
     lastErrorSource: clearErrorState
       ? null
       : result.valid
@@ -1249,30 +1254,32 @@ export async function testSingleConnection(connectionId: string, validationModel
 
 // POST /api/providers/[id]/test - Test connection
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  try {
-    const { id } = await params;
-
-    let rawBody: unknown = {};
+  return withManagementTenantContext(request, async () => {
     try {
-      rawBody = await request.json();
-    } catch {
-      // Empty or non-JSON body — treat as {}
-    }
-    const validation = validateBody(providerConnectionTestBodySchema, rawBody);
-    if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
-    }
-    const { validationModelId } = validation.data;
+      const { id } = await params;
 
-    const data = await testSingleConnection(id, validationModelId);
+      let rawBody: unknown = {};
+      try {
+        rawBody = await request.json();
+      } catch {
+        // Empty or non-JSON body — treat as {}
+      }
+      const validation = validateBody(providerConnectionTestBodySchema, rawBody);
+      if (isValidationFailure(validation)) {
+        return NextResponse.json({ error: validation.error }, { status: 400 });
+      }
+      const { validationModelId } = validation.data;
 
-    if (data.error === "Connection not found") {
-      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+      const data = await testSingleConnection(id, validationModelId);
+
+      if (data.error === "Connection not found") {
+        return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+      }
+
+      return NextResponse.json(data);
+    } catch (error) {
+      console.log("Error testing connection:", error);
+      return NextResponse.json({ error: "Test failed" }, { status: 500 });
     }
-
-    return NextResponse.json(data);
-  } catch (error) {
-    console.log("Error testing connection:", error);
-    return NextResponse.json({ error: "Test failed" }, { status: 500 });
-  }
+  });
 }

@@ -827,6 +827,7 @@ const PORTAL_SCRIPT = `
     byId("oidc-draft-client-secret").value = "";
     byId("delete-oidc-draft").disabled = !draft;
     byId("test-oidc-draft").disabled = !draft;
+    byId("promote-oidc-draft").disabled = !draft || window.customerPortalRole !== "owner";
   };
 
   byId("oidc-draft-form").addEventListener("submit", async (event) => {
@@ -880,6 +881,41 @@ const PORTAL_SCRIPT = `
           : "Issuer discovery could not be confirmed. Check the issuer setup and try again.",
         true
       );
+    } finally { button.disabled = false; }
+  });
+
+  byId("promote-oidc-draft").addEventListener("click", async () => {
+    const button = byId("promote-oidc-draft");
+    button.disabled = true;
+    try {
+      const preview = await api("/__cloud/auth/oidc-draft/promotion", {
+        method: "POST",
+        body: JSON.stringify({ action: "preview" }),
+      });
+      const count = Number(preview.otherIdentityLinkCount);
+      const noun = count === 1 ? "other identity link" : "other identity links";
+      const confirmed = window.confirm(
+        "Switch organization sign-in to the pending issuer? " + count + " " + noun +
+          " will be invalidated. Other affected members will need to be re-invited and sign in again. Your owner account will be verified with the new issuer. Existing memberships and API keys stay in place. Continue?"
+      );
+      if (!confirmed) {
+        setStatus("Issuer switch cancelled. The active sign-in setup is unchanged.");
+        return;
+      }
+      const result = await api("/__cloud/auth/oidc-draft/promotion", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "confirm",
+          draftUpdatedAt: preview.draftUpdatedAt,
+          configUpdatedAt: preview.configUpdatedAt,
+          otherIdentityLinkCount: count,
+        }),
+      });
+      const authorizationUrl = new URL(result.authorizationUrl);
+      if (authorizationUrl.protocol !== "https:") throw new Error("Invalid sign-in destination");
+      window.location.assign(authorizationUrl.href);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not start issuer verification.", true);
     } finally { button.disabled = false; }
   });
 
@@ -1190,7 +1226,7 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
       <section id="oidc-draft-panel" hidden>
         <h2>Pending organization sign-in setup</h2>
         <p id="oidc-draft-status" aria-live="polite"></p>
-        <p>This securely saves issuer details for review. Testing checks issuer discovery only; it does not test sign-in or change how anyone signs in.</p>
+        <p>Owners and admins can save issuer details and test discovery. Only an owner can switch sign-in, which requires verified sign-in with the new issuer and explicit confirmation. Other linked users will need to be re-invited; their memberships and API keys remain.</p>
         <form id="oidc-draft-form">
           <label for="oidc-draft-issuer">Issuer URL</label>
           <input id="oidc-draft-issuer" type="url" maxlength="500" required>
@@ -1202,6 +1238,7 @@ export function handleCloudCustomerPortalRequest(request: Request): Response | n
           <input id="oidc-draft-scopes" maxlength="2000" value="openid profile email" required>
           <button id="save-oidc-draft" type="submit">Save pending sign-in setup</button>
           <button id="test-oidc-draft" type="button" disabled>Test issuer discovery</button>
+          <button id="promote-oidc-draft" type="button" disabled>Verify and switch sign-in</button>
           <button id="delete-oidc-draft" type="button" disabled>Delete pending setup</button>
         </form>
       </section>

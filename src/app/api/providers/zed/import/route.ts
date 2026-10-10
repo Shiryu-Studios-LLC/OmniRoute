@@ -30,7 +30,7 @@ import {
   filterCredentialsByConfirmation,
   parseConfirmedAccounts,
 } from "@/lib/zed-oauth/confirmedAccounts";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { createProviderConnection } from "@/lib/db/providers";
 import { isRunningInDocker } from "@/lib/zed-oauth/dockerDetect";
 
@@ -52,174 +52,173 @@ interface ImportResponse {
 }
 
 export async function POST(request: Request): Promise<NextResponse<ImportResponse> | Response> {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  return withManagementTenantContext(request, async () => {
+    let body: unknown = null;
+    try {
+      const raw = await request.text();
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      // Fall through — null body is acceptable only when LEGACY_ONE_STEP_ENABLED is on.
+    }
 
-  let body: unknown = null;
-  try {
-    const raw = await request.text();
-    body = raw ? JSON.parse(raw) : null;
-  } catch {
-    // Fall through — null body is acceptable only when LEGACY_ONE_STEP_ENABLED is on.
-  }
+    const confirmed = parseConfirmedAccounts(body);
 
-  const confirmed = parseConfirmedAccounts(body);
-
-  if (!LEGACY_ONE_STEP_ENABLED && confirmed === null) {
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          "confirmedAccounts is required. Call POST /api/providers/zed/discover first, " +
-          "let the user pick which credentials to import, then POST the chosen list as " +
-          "{ confirmedAccounts: [{ service, account, fingerprint }, ...] }.",
-      },
-      { status: 400 }
-    );
-  }
-
-  try {
-    if (isRunningInDocker()) {
+    if (!LEGACY_ONE_STEP_ENABLED && confirmed === null) {
       return NextResponse.json(
         {
           success: false,
           error:
-            "OmniRoute is running inside Docker and cannot access the host keychain. " +
-            "Use the Manual Token Import tab to paste your API key directly.",
-          zedInstalled: false,
-          zedDockerEnvironment: true,
+            "confirmedAccounts is required. Call POST /api/providers/zed/discover first, " +
+            "let the user pick which credentials to import, then POST the chosen list as " +
+            "{ confirmedAccounts: [{ service, account, fingerprint }, ...] }.",
         },
-        { status: 422 }
+        { status: 400 }
       );
     }
 
-    const zedInstalled = await isZedInstalled();
-    if (!zedInstalled) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Zed IDE does not appear to be installed on this system.",
-          zedInstalled: false,
-          zedDockerEnvironment: false,
-        },
-        { status: 404 }
-      );
-    }
-
-    // Re-read the keychain on the server side so the import set comes from
-    // the live OS state, not from whatever the client claims to have seen.
-    console.log("[Zed Import] Re-reading Zed credentials from keychain for confirmation");
-    const allCredentials = await discoverZedCredentials();
-    const { importable, skipped, duplicatesDropped } = partitionZedCredentials(allCredentials);
-
-    // Filter to the user-confirmed subset by (service, account, fingerprint).
-    // If LEGACY_ONE_STEP_ENABLED, import everything (the historic v3.8.5
-    // behaviour) but log a warning so operators know they're on the wide-open
-    // path.
-    let toImport = importable;
-    if (confirmed !== null) {
-      toImport = filterCredentialsByConfirmation(importable, confirmed);
-    } else if (LEGACY_ONE_STEP_ENABLED) {
-      console.warn(
-        "[Zed Import] OMNIROUTE_ZED_IMPORT_LEGACY_ONE_STEP=true — importing all keychain credentials without per-account confirmation. This mode is deprecated and will be removed in v3.9."
-      );
-    }
-
-    if (toImport.length === 0) {
-      if (allCredentials.length > 0) {
-        console.warn(
-          "[Zed Import] %d keychain credential(s) found, but the confirmed-accounts list did not match any supported entry",
-          allCredentials.length
+    try {
+      if (isRunningInDocker()) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "OmniRoute is running inside Docker and cannot access the host keychain. " +
+              "Use the Manual Token Import tab to paste your API key directly.",
+            zedInstalled: false,
+            zedDockerEnvironment: true,
+          },
+          { status: 422 }
         );
       }
+
+      const zedInstalled = await isZedInstalled();
+      if (!zedInstalled) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Zed IDE does not appear to be installed on this system.",
+            zedInstalled: false,
+            zedDockerEnvironment: false,
+          },
+          { status: 404 }
+        );
+      }
+
+      // Re-read the keychain on the server side so the import set comes from
+      // the live OS state, not from whatever the client claims to have seen.
+      console.log("[Zed Import] Re-reading Zed credentials from keychain for confirmation");
+      const allCredentials = await discoverZedCredentials();
+      const { importable, skipped, duplicatesDropped } = partitionZedCredentials(allCredentials);
+
+      // Filter to the user-confirmed subset by (service, account, fingerprint).
+      // If LEGACY_ONE_STEP_ENABLED, import everything (the historic v3.8.5
+      // behaviour) but log a warning so operators know they're on the wide-open
+      // path.
+      let toImport = importable;
+      if (confirmed !== null) {
+        toImport = filterCredentialsByConfirmation(importable, confirmed);
+      } else if (LEGACY_ONE_STEP_ENABLED) {
+        console.warn(
+          "[Zed Import] OMNIROUTE_ZED_IMPORT_LEGACY_ONE_STEP=true — importing all keychain credentials without per-account confirmation. This mode is deprecated and will be removed in v3.9."
+        );
+      }
+
+      if (toImport.length === 0) {
+        if (allCredentials.length > 0) {
+          console.warn(
+            "[Zed Import] %d keychain credential(s) found, but the confirmed-accounts list did not match any supported entry",
+            allCredentials.length
+          );
+        }
+        return NextResponse.json({
+          success: true,
+          count: 0,
+          providers: [],
+          credentials: [],
+          zedInstalled: true,
+        });
+      }
+
+      let savedCount = 0;
+      for (const cred of toImport) {
+        try {
+          await createProviderConnection({
+            provider: cred.provider,
+            authType: "apikey",
+            apiKey: cred.token,
+            name: "Zed Import (" + (cred.account || cred.service) + ")",
+            isActive: true,
+          });
+          savedCount++;
+        } catch (err) {
+          console.error("[Zed Import] Failed to save credential for %s:", cred.provider, err);
+        }
+      }
+
+      if (skipped.length > 0 || duplicatesDropped > 0) {
+        console.log(
+          "[Zed Import] Skipped %d unsupported credential(s) and dropped %d duplicate credential(s)",
+          skipped.length,
+          duplicatesDropped
+        );
+      }
+
+      const credentialSummary = toImport.map((cred) => ({
+        provider: cred.provider,
+        service: cred.service,
+        account: cred.account,
+        hasToken: Boolean(cred.token),
+      }));
+
+      const importedProviders = toImport.map((c) => c.provider);
+      const uniqueProviders = [...new Set(importedProviders)];
+
+      console.log(
+        "[Zed Import] Discovered %d credentials, confirmed %d, saved %d for %d providers",
+        allCredentials.length,
+        toImport.length,
+        savedCount,
+        uniqueProviders.length
+      );
+
       return NextResponse.json({
         success: true,
-        count: 0,
-        providers: [],
-        credentials: [],
+        count: savedCount,
+        providers: uniqueProviders,
+        credentials: credentialSummary,
         zedInstalled: true,
       });
-    }
+    } catch (error: any) {
+      console.error("[Zed Import] Error importing credentials:", error);
 
-    let savedCount = 0;
-    for (const cred of toImport) {
-      try {
-        await createProviderConnection({
-          provider: cred.provider,
-          authType: "apikey",
-          apiKey: cred.token,
-          name: "Zed Import (" + (cred.account || cred.service) + ")",
-          isActive: true,
-        });
-        savedCount++;
-      } catch (err) {
-        console.error("[Zed Import] Failed to save credential for %s:", cred.provider, err);
+      if (error?.message?.includes("User canceled") || error?.message?.includes("denied")) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Keychain access denied. Please grant permission when prompted by your OS.",
+          },
+          { status: 403 }
+        );
       }
-    }
 
-    if (skipped.length > 0 || duplicatesDropped > 0) {
-      console.log(
-        "[Zed Import] Skipped %d unsupported credential(s) and dropped %d duplicate credential(s)",
-        skipped.length,
-        duplicatesDropped
-      );
-    }
+      if (error?.message?.includes("not found") || error?.message?.includes("ENOENT")) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "Keychain service not available on this system. On Linux, install libsecret-1-dev.",
+          },
+          { status: 404 }
+        );
+      }
 
-    const credentialSummary = toImport.map((cred) => ({
-      provider: cred.provider,
-      service: cred.service,
-      account: cred.account,
-      hasToken: Boolean(cred.token),
-    }));
-
-    const importedProviders = toImport.map((c) => c.provider);
-    const uniqueProviders = [...new Set(importedProviders)];
-
-    console.log(
-      "[Zed Import] Discovered %d credentials, confirmed %d, saved %d for %d providers",
-      allCredentials.length,
-      toImport.length,
-      savedCount,
-      uniqueProviders.length
-    );
-
-    return NextResponse.json({
-      success: true,
-      count: savedCount,
-      providers: uniqueProviders,
-      credentials: credentialSummary,
-      zedInstalled: true,
-    });
-  } catch (error: any) {
-    console.error("[Zed Import] Error importing credentials:", error);
-
-    if (error?.message?.includes("User canceled") || error?.message?.includes("denied")) {
       return NextResponse.json(
         {
           success: false,
-          error: "Keychain access denied. Please grant permission when prompted by your OS.",
+          error: "Failed to import credentials",
         },
-        { status: 403 }
+        { status: 500 }
       );
     }
-
-    if (error?.message?.includes("not found") || error?.message?.includes("ENOENT")) {
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "Keychain service not available on this system. On Linux, install libsecret-1-dev.",
-        },
-        { status: 404 }
-      );
-    }
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: "Failed to import credentials",
-      },
-      { status: 500 }
-    );
-  }
+  });
 }

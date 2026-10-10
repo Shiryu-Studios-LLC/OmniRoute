@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { getCachedProviderConnectionById } from "@/lib/localDb";
 import {
   deleteImportedCustomModels,
@@ -402,372 +403,382 @@ async function fetchProviderModelsForSync(request: Request, connectionId: string
  * - Manual trigger from UI
  */
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const start = Date.now();
-  const { id } = await params;
-  const requestUrl = new URL(request.url);
-  const mode = (
-    requestUrl.searchParams.get("mode") === "import" ? "merge" : "sync"
-  ) as ManagedModelImportMode;
-  // quiet=1: boot revalidation path — skip chatty ModelSync console lines
-  const quiet = requestUrl.searchParams.get("quiet") === "1";
-  let logProvider = "unknown";
-  let channelLabel: string | null = null;
+  return withManagementTenantContext(
+    request,
+    async () => {
+      const start = Date.now();
+      const { id } = await params;
+      const requestUrl = new URL(request.url);
+      const mode = (
+        requestUrl.searchParams.get("mode") === "import" ? "merge" : "sync"
+      ) as ManagedModelImportMode;
+      // quiet=1: boot revalidation path — skip chatty ModelSync console lines
+      const quiet = requestUrl.searchParams.get("quiet") === "1";
+      let logProvider = "unknown";
+      let channelLabel: string | null = null;
 
-  try {
-    if (!(await isAuthenticated(request)) && !isModelSyncInternalRequest(request)) {
-      return NextResponse.json(
-        { error: { message: "Authentication required", type: "invalid_api_key" } },
-        { status: 401 }
-      );
-    }
-
-    const connection = await getCachedProviderConnectionById(id);
-    if (!connection) {
-      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
-    }
-
-    logProvider = toNonEmptyString(connection.provider) || "unknown";
-    channelLabel = getModelSyncChannelLabel(connection);
-
-    // Volcano Ark plan providers: discover models live from the console API
-    // (cookie+csrf captured at bind time). The chat API has no /models
-    // endpoint, so the default discovery path below cannot serve them.
-    const volcPlanKind = providerToVolcPlanKind(logProvider);
-    if (volcPlanKind) {
-      const psd =
-        connection.providerSpecificData && typeof connection.providerSpecificData === "object"
-          ? (connection.providerSpecificData as JsonRecord)
-          : {};
-      const cookie = toNonEmptyString(psd.volcConsoleCookie) || "";
-      const csrf = toNonEmptyString(psd.volcCsrfToken) || "";
-      const duration = Date.now() - start;
-      let discovered;
       try {
-        discovered = await fetchVolcPlanModels(volcPlanKind, cookie, csrf);
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        await saveCallLog({
-          method: "POST",
-          path: `/api/providers/${id}/sync-models`,
-          status: 401,
-          model: "model-sync",
-          provider: logProvider,
-          sourceFormat: "-",
-          connectionId: id,
-          duration,
-          error: message,
-          requestType: "model-sync",
-          ...(channelLabel ? { responseBody: { channel: channelLabel } } : {}),
-        }).catch(() => undefined);
-        return NextResponse.json(
-          { error: sanitizeErrorMessage(message) || "Volcano plan discovery failed" },
-          { status: 401 }
+        if (!(await isAuthenticated(request)) && !isModelSyncInternalRequest(request)) {
+          return NextResponse.json(
+            { error: { message: "Authentication required", type: "invalid_api_key" } },
+            { status: 401 }
+          );
+        }
+
+        const connection = await getCachedProviderConnectionById(id);
+        if (!connection) {
+          return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+        }
+
+        logProvider = toNonEmptyString(connection.provider) || "unknown";
+        channelLabel = getModelSyncChannelLabel(connection);
+
+        // Volcano Ark plan providers: discover models live from the console API
+        // (cookie+csrf captured at bind time). The chat API has no /models
+        // endpoint, so the default discovery path below cannot serve them.
+        const volcPlanKind = providerToVolcPlanKind(logProvider);
+        if (volcPlanKind) {
+          const psd =
+            connection.providerSpecificData && typeof connection.providerSpecificData === "object"
+              ? (connection.providerSpecificData as JsonRecord)
+              : {};
+          const cookie = toNonEmptyString(psd.volcConsoleCookie) || "";
+          const csrf = toNonEmptyString(psd.volcCsrfToken) || "";
+          const duration = Date.now() - start;
+          let discovered;
+          try {
+            discovered = await fetchVolcPlanModels(volcPlanKind, cookie, csrf);
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            await saveCallLog({
+              method: "POST",
+              path: `/api/providers/${id}/sync-models`,
+              status: 401,
+              model: "model-sync",
+              provider: logProvider,
+              sourceFormat: "-",
+              connectionId: id,
+              duration,
+              error: message,
+              requestType: "model-sync",
+              ...(channelLabel ? { responseBody: { channel: channelLabel } } : {}),
+            }).catch(() => undefined);
+            return NextResponse.json(
+              { error: sanitizeErrorMessage(message) || "Volcano plan discovery failed" },
+              { status: 401 }
+            );
+          }
+          const previous = await getSyncedAvailableModelsForConnection(logProvider, id);
+          const synced = await replaceSyncedAvailableModelsForConnection(
+            logProvider,
+            id,
+            discovered
+          );
+          const prevIds = new Set(previous.map((m) => String(m.id)));
+          const added = synced.filter((m) => !prevIds.has(String(m.id))).length;
+          const removed = previous.filter(
+            (m) => !synced.some((n) => String(n.id) === String(m.id))
+          ).length;
+          await saveCallLog({
+            method: "GET",
+            path: `/api/providers/${id}/models`,
+            status: 200,
+            model: "model-sync",
+            provider: logProvider,
+            sourceFormat: "console-discovery",
+            connectionId: id,
+            duration: Date.now() - start,
+            requestType: "model-sync",
+            responseBody: {
+              source: "volcengine-plan-console-discovery",
+              plan: volcPlanKind,
+              syncedModels: synced.length,
+              added,
+              removed,
+              provider: logProvider,
+              channel: channelLabel,
+              mode,
+            },
+          }).catch(() => undefined);
+          return NextResponse.json({
+            ok: true,
+            provider: logProvider,
+            connectionId: id,
+            source: "volcengine-plan-console-discovery",
+            plan: volcPlanKind,
+            mode,
+            syncedModels: synced.length,
+            availableModelsCount: synced.length,
+            modelChanges: { added, removed, total: added + removed },
+            models: synced,
+          });
+        }
+
+        if (providerUsesCuratedModelsOnly(logProvider)) {
+          const [removedSyncedLists, removedImportedModelIds] = await Promise.all([
+            deleteSyncedAvailableModelsForProvider(logProvider),
+            deleteImportedCustomModels(logProvider),
+          ]);
+          return NextResponse.json({
+            provider: logProvider,
+            connectionId: id,
+            source: "curated",
+            skipped: "curated-models-only",
+            syncedModels: 0,
+            availableModelsCount: 0,
+            models: [],
+            cleanup: {
+              removedSyncedLists,
+              removedImportedModels: removedImportedModelIds.length,
+            },
+          });
+        }
+        const previousSyncedAvailableModelsForConnection =
+          await getSyncedAvailableModelsForConnection(logProvider, id);
+
+        const modelsRes = await fetchProviderModelsForSync(request, id);
+
+        const duration = Date.now() - start;
+        const { data: modelsData, parseError } = await readJsonResponse(modelsRes);
+        const payloadError = getErrorMessageFromPayload(modelsData);
+
+        if (!modelsRes.ok || parseError) {
+          const responseStatus = modelsRes.ok ? 502 : modelsRes.status;
+          const logError = payloadError || parseError || `HTTP ${modelsRes.status}`;
+          const responseError = payloadError || parseError || "Failed to fetch models";
+          // Log the failed attempt
+          await saveCallLog({
+            method: "GET",
+            path: `/api/providers/${id}/models`,
+            status: modelsRes.status,
+            model: "model-sync",
+            provider: logProvider,
+            sourceFormat: "-",
+            connectionId: id,
+            duration,
+            error: logError,
+            requestType: "model-sync",
+            ...(parseError
+              ? {
+                  responseBody: {
+                    upstreamStatus: modelsRes.status,
+                    parseError,
+                  },
+                }
+              : {}),
+          });
+
+          return NextResponse.json(
+            {
+              error: responseError,
+              ...(parseError ? { upstreamStatus: modelsRes.status } : {}),
+            },
+            { status: responseStatus }
+          );
+        }
+
+        const modelSource = toNonEmptyString(modelsData.source)?.toLowerCase() || "unknown";
+        const modelWarning = toNonEmptyString(modelsData.warning);
+        if (isDegradedDiscovery(modelsData)) {
+          const responseError =
+            modelWarning || "Remote model discovery failed; catalog fallback not synced";
+          await saveCallLog({
+            method: "GET",
+            path: `/api/providers/${id}/models`,
+            status: 502,
+            model: "model-sync",
+            provider: logProvider,
+            sourceFormat: "-",
+            connectionId: id,
+            duration,
+            error: responseError,
+            requestType: "model-sync",
+            responseBody: {
+              source: modelSource,
+              warning: modelWarning,
+              provider: logProvider,
+              channel: channelLabel,
+            },
+          });
+
+          return NextResponse.json(
+            {
+              error: responseError,
+              source: modelSource,
+              ...(modelWarning ? { warning: modelWarning } : {}),
+            },
+            { status: 502 }
+          );
+        }
+
+        const allFetchedModels = modelsData.models || [];
+        const importFreeOnly = Boolean(
+          (connection.providerSpecificData as Record<string, unknown> | undefined)
+            ?.importFreeModelsOnly
         );
-      }
-      const previous = await getSyncedAvailableModelsForConnection(logProvider, id);
-      const synced = await replaceSyncedAvailableModelsForConnection(logProvider, id, discovered);
-      const prevIds = new Set(previous.map((m) => String(m.id)));
-      const added = synced.filter((m) => !prevIds.has(String(m.id))).length;
-      const removed = previous.filter(
-        (m) => !synced.some((n) => String(n.id) === String(m.id))
-      ).length;
-      await saveCallLog({
-        method: "GET",
-        path: `/api/providers/${id}/models`,
-        status: 200,
-        model: "model-sync",
-        provider: logProvider,
-        sourceFormat: "console-discovery",
-        connectionId: id,
-        duration: Date.now() - start,
-        requestType: "model-sync",
-        responseBody: {
-          source: "volcengine-plan-console-discovery",
-          plan: volcPlanKind,
-          syncedModels: synced.length,
-          added,
-          removed,
-          provider: logProvider,
-          channel: channelLabel,
+        const { models: fetchedModels, freeFilterEmpty } = selectModelsForImport(
+          logProvider,
+          allFetchedModels,
+          importFreeOnly
+        );
+        const {
+          previousModels,
+          previousSyncedAvailableModels,
+          persistedModels,
+          importedModels,
+          discoveredModels,
+          syncedAvailableModels,
+          syncedAliases,
+          importedChanges,
+        } = await importManagedModels({
+          providerId: logProvider,
+          connectionId: id,
+          fetchedModels,
           mode,
-        },
-      }).catch(() => undefined);
-      return NextResponse.json({
-        ok: true,
-        provider: logProvider,
-        connectionId: id,
-        source: "volcengine-plan-console-discovery",
-        plan: volcPlanKind,
-        mode,
-        syncedModels: synced.length,
-        availableModelsCount: synced.length,
-        modelChanges: { added, removed, total: added + removed },
-        models: synced,
-      });
-    }
+          previousSyncedAvailableModels: previousSyncedAvailableModelsForConnection,
+        });
 
-    if (providerUsesCuratedModelsOnly(logProvider)) {
-      const [removedSyncedLists, removedImportedModelIds] = await Promise.all([
-        deleteSyncedAvailableModelsForProvider(logProvider),
-        deleteImportedCustomModels(logProvider),
-      ]);
-      return NextResponse.json({
-        provider: logProvider,
-        connectionId: id,
-        source: "curated",
-        skipped: "curated-models-only",
-        syncedModels: 0,
-        availableModelsCount: 0,
-        models: [],
-        cleanup: {
-          removedSyncedLists,
-          removedImportedModels: removedImportedModelIds.length,
-        },
-      });
-    }
-    const previousSyncedAvailableModelsForConnection = await getSyncedAvailableModelsForConnection(
-      logProvider,
-      id
-    );
+        const effectiveAvailableModels =
+          discoveredModels.length > 0 ? discoveredModels : syncedAvailableModels;
+        const modelChanges = summarizeModelChanges(
+          previousSyncedAvailableModels,
+          effectiveAvailableModels
+        );
+        const customModelChanges = summarizeModelChanges(previousModels, persistedModels);
+        const syncedModelsCount =
+          effectiveAvailableModels.length > 0
+            ? effectiveAvailableModels.length
+            : persistedModels.filter((model) => isManagedSyncedModel(model)).length;
+        const availableModelsCount = new Set(
+          [...persistedModels, ...effectiveAvailableModels]
+            .map((model) => toNonEmptyString(asRecord(model).id))
+            .filter((modelId): modelId is string => Boolean(modelId))
+        ).size;
+        const importedCount = importedChanges.added;
+        const updatedCount = importedChanges.updated;
+        const shouldLog = modelChanges.total > 0 || customModelChanges.total > 0;
 
-    const modelsRes = await fetchProviderModelsForSync(request, id);
+        if (shouldLog && !quiet) {
+          void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
+            .then((syncResult) => {
+              if (syncResult.ok) {
+                console.log(
+                  `[ModelSync] Codex profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
+                );
+              } else {
+                console.log(
+                  `[ModelSync] Codex profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
+                );
+              }
+            })
+            .catch((err) => {
+              console.log(
+                `[ModelSync] Codex profile auto-sync failed for ${logProvider}:`,
+                err?.message || err
+              );
+            });
 
-    const duration = Date.now() - start;
-    const { data: modelsData, parseError } = await readJsonResponse(modelsRes);
-    const payloadError = getErrorMessageFromPayload(modelsData);
+          void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
+            .then((syncResult) => {
+              if (syncResult.ok) {
+                console.log(
+                  `[ModelSync] Claude profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
+                );
+              } else {
+                console.log(
+                  `[ModelSync] Claude profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
+                );
+              }
+            })
+            .catch((err) => {
+              console.log(
+                `[ModelSync] Claude profile auto-sync failed for ${logProvider}:`,
+                err?.message || err
+              );
+            });
+        } else if (shouldLog && quiet) {
+          // Still update profiles; suppress console noise from boot revalidation.
+          void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`).catch(
+            () => undefined
+          );
+          void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`).catch(
+            () => undefined
+          );
+        }
 
-    if (!modelsRes.ok || parseError) {
-      const responseStatus = modelsRes.ok ? 502 : modelsRes.status;
-      const logError = payloadError || parseError || `HTTP ${modelsRes.status}`;
-      const responseError = payloadError || parseError || "Failed to fetch models";
-      // Log the failed attempt
-      await saveCallLog({
-        method: "GET",
-        path: `/api/providers/${id}/models`,
-        status: modelsRes.status,
-        model: "model-sync",
-        provider: logProvider,
-        sourceFormat: "-",
-        connectionId: id,
-        duration,
-        error: logError,
-        requestType: "model-sync",
-        ...(parseError
-          ? {
-              responseBody: {
-                upstreamStatus: modelsRes.status,
-                parseError,
-              },
-            }
-          : {}),
-      });
+        if (shouldLog) {
+          await saveCallLog({
+            method: "GET",
+            path: `/api/providers/${id}/models`,
+            status: 200,
+            model: "model-sync",
+            provider: logProvider,
+            sourceFormat: "-",
+            connectionId: id,
+            duration: Date.now() - start,
+            requestType: "model-sync",
+            responseBody: {
+              syncedModels: syncedModelsCount,
+              availableModelsCount,
+              syncedAliases,
+              provider: logProvider,
+              channel: channelLabel,
+              modelChanges,
+              customModelChanges,
+              importedCount,
+              updatedCount,
+              mode,
+            },
+          });
+        }
 
-      return NextResponse.json(
-        {
-          error: responseError,
-          ...(parseError ? { upstreamStatus: modelsRes.status } : {}),
-        },
-        { status: responseStatus }
-      );
-    }
-
-    const modelSource = toNonEmptyString(modelsData.source)?.toLowerCase() || "unknown";
-    const modelWarning = toNonEmptyString(modelsData.warning);
-    if (isDegradedDiscovery(modelsData)) {
-      const responseError =
-        modelWarning || "Remote model discovery failed; catalog fallback not synced";
-      await saveCallLog({
-        method: "GET",
-        path: `/api/providers/${id}/models`,
-        status: 502,
-        model: "model-sync",
-        provider: logProvider,
-        sourceFormat: "-",
-        connectionId: id,
-        duration,
-        error: responseError,
-        requestType: "model-sync",
-        responseBody: {
-          source: modelSource,
-          warning: modelWarning,
+        return NextResponse.json({
+          ok: true,
           provider: logProvider,
-          channel: channelLabel,
-        },
-      });
-
-      return NextResponse.json(
-        {
-          error: responseError,
-          source: modelSource,
-          ...(modelWarning ? { warning: modelWarning } : {}),
-        },
-        { status: 502 }
-      );
-    }
-
-    const allFetchedModels = modelsData.models || [];
-    const importFreeOnly = Boolean(
-      (connection.providerSpecificData as Record<string, unknown> | undefined)?.importFreeModelsOnly
-    );
-    const { models: fetchedModels, freeFilterEmpty } = selectModelsForImport(
-      logProvider,
-      allFetchedModels,
-      importFreeOnly
-    );
-    const {
-      previousModels,
-      previousSyncedAvailableModels,
-      persistedModels,
-      importedModels,
-      discoveredModels,
-      syncedAvailableModels,
-      syncedAliases,
-      importedChanges,
-    } = await importManagedModels({
-      providerId: logProvider,
-      connectionId: id,
-      fetchedModels,
-      mode,
-      previousSyncedAvailableModels: previousSyncedAvailableModelsForConnection,
-    });
-
-    const effectiveAvailableModels =
-      discoveredModels.length > 0 ? discoveredModels : syncedAvailableModels;
-    const modelChanges = summarizeModelChanges(
-      previousSyncedAvailableModels,
-      effectiveAvailableModels
-    );
-    const customModelChanges = summarizeModelChanges(previousModels, persistedModels);
-    const syncedModelsCount =
-      effectiveAvailableModels.length > 0
-        ? effectiveAvailableModels.length
-        : persistedModels.filter((model) => isManagedSyncedModel(model)).length;
-    const availableModelsCount = new Set(
-      [...persistedModels, ...effectiveAvailableModels]
-        .map((model) => toNonEmptyString(asRecord(model).id))
-        .filter((modelId): modelId is string => Boolean(modelId))
-    ).size;
-    const importedCount = importedChanges.added;
-    const updatedCount = importedChanges.updated;
-    const shouldLog = modelChanges.total > 0 || customModelChanges.total > 0;
-
-    if (shouldLog && !quiet) {
-      void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
-        .then((syncResult) => {
-          if (syncResult.ok) {
-            console.log(
-              `[ModelSync] Codex profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
-            );
-          } else {
-            console.log(
-              `[ModelSync] Codex profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
-            );
-          }
-        })
-        .catch((err) => {
-          console.log(
-            `[ModelSync] Codex profile auto-sync failed for ${logProvider}:`,
-            err?.message || err
-          );
-        });
-
-      void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`)
-        .then((syncResult) => {
-          if (syncResult.ok) {
-            console.log(
-              `[ModelSync] Claude profile auto-sync wrote ${syncResult.written} profile(s), skipped ${syncResult.skipped} (${logProvider})`
-            );
-          } else {
-            console.log(
-              `[ModelSync] Claude profile auto-sync skipped for ${logProvider}: ${syncResult.reason}`
-            );
-          }
-        })
-        .catch((err) => {
-          console.log(
-            `[ModelSync] Claude profile auto-sync failed for ${logProvider}:`,
-            err?.message || err
-          );
-        });
-    } else if (shouldLog && quiet) {
-      // Still update profiles; suppress console noise from boot revalidation.
-      void autoSyncCodexProfilesFromLiveCatalog(request, `model-sync:${logProvider}`).catch(
-        () => undefined
-      );
-      void autoSyncClaudeProfilesFromLiveCatalog(request, `model-sync:${logProvider}`).catch(
-        () => undefined
-      );
-    }
-
-    if (shouldLog) {
-      await saveCallLog({
-        method: "GET",
-        path: `/api/providers/${id}/models`,
-        status: 200,
-        model: "model-sync",
-        provider: logProvider,
-        sourceFormat: "-",
-        connectionId: id,
-        duration: Date.now() - start,
-        requestType: "model-sync",
-        responseBody: {
+          mode,
+          importFreeOnly,
+          freeFilterEmpty,
           syncedModels: syncedModelsCount,
           availableModelsCount,
           syncedAliases,
-          provider: logProvider,
-          channel: channelLabel,
           modelChanges,
           customModelChanges,
           importedCount,
           updatedCount,
-          mode,
-        },
-      });
-    }
+          importedChanges,
+          logged: shouldLog,
+          models: persistedModels,
+          importedModels,
+        });
+      } catch (error: any) {
+        // Log error
+        await saveCallLog({
+          method: "POST",
+          path: `/api/providers/${id}/sync-models`,
+          status: 500,
+          model: "model-sync",
+          provider: logProvider,
+          sourceFormat: "-",
+          connectionId: id,
+          duration: Date.now() - start,
+          error: error.message || "Sync failed",
+          requestType: "model-sync",
+          ...(channelLabel
+            ? {
+                responseBody: {
+                  channel: channelLabel,
+                },
+              }
+            : {}),
+        }).catch(() => {});
 
-    return NextResponse.json({
-      ok: true,
-      provider: logProvider,
-      mode,
-      importFreeOnly,
-      freeFilterEmpty,
-      syncedModels: syncedModelsCount,
-      availableModelsCount,
-      syncedAliases,
-      modelChanges,
-      customModelChanges,
-      importedCount,
-      updatedCount,
-      importedChanges,
-      logged: shouldLog,
-      models: persistedModels,
-      importedModels,
-    });
-  } catch (error: any) {
-    // Log error
-    await saveCallLog({
-      method: "POST",
-      path: `/api/providers/${id}/sync-models`,
-      status: 500,
-      model: "model-sync",
-      provider: logProvider,
-      sourceFormat: "-",
-      connectionId: id,
-      duration: Date.now() - start,
-      error: error.message || "Sync failed",
-      requestType: "model-sync",
-      ...(channelLabel
-        ? {
-            responseBody: {
-              channel: channelLabel,
-            },
-          }
-        : {}),
-    }).catch(() => {});
-
-    return NextResponse.json(
-      { error: sanitizeErrorMessage(error) || "Failed to sync models" },
-      { status: 500 }
-    );
-  }
+        return NextResponse.json(
+          { error: sanitizeErrorMessage(error) || "Failed to sync models" },
+          { status: 500 }
+        );
+      }
+    },
+    undefined,
+    isModelSyncInternalRequest
+  );
 }

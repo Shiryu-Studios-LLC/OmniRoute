@@ -5,7 +5,7 @@ import {
   setCcAliasModelSetting,
   getCcAliasSettingsBulk,
 } from "@/lib/db/ccDiscoveryAliases";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withPlatformAdminManagementContext } from "@/lib/api/requireManagementAuth";
 import { updateCcAliasSettingSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
@@ -20,26 +20,25 @@ import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/
  * setting").
  */
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  return withPlatformAdminManagementContext(request, async () => {
+    try {
+      const { id } = await params;
+      const provider = getCcAliasProviderSetting(id);
 
-  try {
-    const { id } = await params;
-    const provider = getCcAliasProviderSetting(id);
-
-    const { models: allModels } = getCcAliasSettingsBulk();
-    const prefix = `${id}/`;
-    const models: Record<string, "on" | "off"> = {};
-    for (const [key, value] of allModels) {
-      if (key.startsWith(prefix)) {
-        models[key.slice(prefix.length)] = value;
+      const { models: allModels } = getCcAliasSettingsBulk();
+      const prefix = `${id}/`;
+      const models: Record<string, "on" | "off"> = {};
+      for (const [key, value] of allModels) {
+        if (key.startsWith(prefix)) {
+          models[key.slice(prefix.length)] = value;
+        }
       }
-    }
 
-    return NextResponse.json({ provider, models });
-  } catch (error) {
-    return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });
-  }
+      return NextResponse.json({ provider, models });
+    } catch (error) {
+      return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });
+    }
+  });
 }
 
 /**
@@ -51,32 +50,31 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
  *     | { scope: "model", modelId: string, value: "on"|"off"|null }
  */
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
-
-  let rawBody: unknown;
-  try {
-    rawBody = await request.json();
-  } catch {
-    return NextResponse.json(buildErrorBody(400, "Invalid JSON body"), { status: 400 });
-  }
-
-  try {
-    const { id } = await params;
-    const validation = validateBody(updateCcAliasSettingSchema, rawBody);
-    if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
-    }
-    const body = validation.data;
-
-    if (body.scope === "provider") {
-      setCcAliasProviderSetting(id, body.value);
-    } else {
-      setCcAliasModelSetting(id, body.modelId, body.value);
+  return withPlatformAdminManagementContext(request, async () => {
+    let rawBody: unknown;
+    try {
+      rawBody = await request.json();
+    } catch {
+      return NextResponse.json(buildErrorBody(400, "Invalid JSON body"), { status: 400 });
     }
 
-    return NextResponse.json({ success: true });
-  } catch (error) {
-    return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });
-  }
+    try {
+      const { id } = await params;
+      const validation = validateBody(updateCcAliasSettingSchema, rawBody);
+      if (isValidationFailure(validation)) {
+        return NextResponse.json({ error: validation.error }, { status: 400 });
+      }
+      const body = validation.data;
+
+      if (body.scope === "provider") {
+        setCcAliasProviderSetting(id, body.value);
+      } else {
+        setCcAliasModelSetting(id, body.modelId, body.value);
+      }
+
+      return NextResponse.json({ success: true });
+    } catch (error) {
+      return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });
+    }
+  });
 }

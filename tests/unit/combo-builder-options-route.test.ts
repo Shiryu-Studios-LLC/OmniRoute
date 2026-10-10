@@ -128,7 +128,7 @@ test("combo builder options route aggregates providers, connections, models and 
     isHidden: true,
   });
 
-  const response = await route.GET();
+  const response = await route.GET(new Request("http://localhost/api/combos/builder/options"));
   const body = (await response.json()) as any;
 
   assert.equal(response.status, 200);
@@ -203,7 +203,7 @@ test("combo builder options route aggregates providers, connections, models and 
 
 test("combo builder options route includes no-auth provider (opencode) even without provider_connections rows", async () => {
   // No connections seeded — opencode has noAuth: true and never gets a provider_connections row.
-  const response = await route.GET();
+  const response = await route.GET(new Request("http://localhost/api/combos/builder/options"));
   const body = (await response.json()) as any;
 
   assert.equal(response.status, 200);
@@ -243,7 +243,7 @@ test("combo builder options route exposes compatible provider nodes with node me
   });
   await modelsDb.addCustomModel("openai-compatible-demo", "gpt-custom", "GPT Custom");
 
-  const response = await route.GET();
+  const response = await route.GET(new Request("http://localhost/api/combos/builder/options"));
   const body = (await response.json()) as any;
   const provider = body.providers.find((entry) => entry.providerId === "openai-compatible-demo");
 

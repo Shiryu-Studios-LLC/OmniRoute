@@ -1305,16 +1305,6 @@
       "count": 2
     }
   },
-  "src/app/api/combos/reorder/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
-  "src/app/api/combos/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
   "src/app/api/combos/test/route.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -1508,11 +1498,6 @@
       "count": 1
     }
   },
-  "src/app/api/providers/[id]/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
   "src/app/api/providers/[id]/sync-models/route.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -1529,11 +1514,6 @@
     }
   },
   "src/app/api/providers/bulk/route.ts": {
-    "no-restricted-imports": {
-      "count": 1
-    }
-  },
-  "src/app/api/providers/client/route.ts": {
     "no-restricted-imports": {
       "count": 1
     }

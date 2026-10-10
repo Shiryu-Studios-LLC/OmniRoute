@@ -12,6 +12,7 @@ const ROLE_PERMISSIONS: Record<TenantRole, ReadonlySet<TenantManagementPermissio
 const TENANT_RESOURCE_PREFIXES = [
   "/api/keys",
   "/api/providers",
+  "/api/provider-nodes",
   "/api/combos",
   "/api/quota",
   "/api/usage",
@@ -19,6 +20,7 @@ const TENANT_RESOURCE_PREFIXES = [
   "/api/local-agents",
   "/api/tenant-members",
   "/api/cache/reasoning",
+  "/api/resilience/connections",
 ] as const;
 const MAINTENANCE_PATHS = [
   /^\/api\/usage\/combo-health-autopilot(?:\/|$)/,

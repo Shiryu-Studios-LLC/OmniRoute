@@ -12,6 +12,7 @@ const ALLOWED_REQUEST_HEADERS = new Set([
   "accept",
   "contentType",
   "mcpSessionId",
+  "mcpProtocolVersion",
   "upstreamAuthorization",
 ]);
 
@@ -23,6 +24,7 @@ export interface McpEgressProxyBody {
     accept?: string;
     contentType?: string;
     mcpSessionId?: string;
+    mcpProtocolVersion?: string;
     upstreamAuthorization?: string;
   };
   body: string;
@@ -105,6 +107,7 @@ function validateBody(value: unknown): McpEgressProxyBody | null {
     ["accept", "accept"],
     ["contentType", "contentType"],
     ["mcpSessionId", "mcpSessionId"],
+    ["mcpProtocolVersion", "mcpProtocolVersion"],
     ["upstreamAuthorization", "upstreamAuthorization"],
   ] as const;
   for (const [inputKey, outputKey] of mapping) {
@@ -332,6 +335,9 @@ export function createMcpEgressProxyHandler(options: McpEgressProxyOptions) {
       upstreamHeaders.set("content-type", payload.headers.contentType);
     if (payload.headers?.mcpSessionId) {
       upstreamHeaders.set("mcp-session-id", payload.headers.mcpSessionId);
+    }
+    if (payload.headers?.mcpProtocolVersion) {
+      upstreamHeaders.set("mcp-protocol-version", payload.headers.mcpProtocolVersion);
     }
     if (payload.headers?.upstreamAuthorization) {
       upstreamHeaders.set("authorization", payload.headers.upstreamAuthorization);

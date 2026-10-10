@@ -18,7 +18,11 @@ import type {
   GatewayDurableObjectNamespace,
 } from "./connectorGatewayDurableObject";
 import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
-import { getActiveCloudTenantOidcIdentity, getCloudTenantOidcCredentials } from "./tenantOidc";
+import {
+  getActiveCloudTenantOidcIdentity,
+  getCloudTenantOidcConfig,
+  getCloudTenantOidcCredentials,
+} from "./tenantOidc";
 import {
   acceptCloudTenantMembershipInvitation,
   cleanupExpiredCloudTenantMembershipInvitations,
@@ -52,7 +56,10 @@ import {
 import { getCloudTenantSettings, updateCloudTenantSettings } from "./tenantSettings";
 import {
   deleteCloudTenantOidcDraft,
+  countOtherCloudTenantOidcIdentities,
   getCloudTenantOidcDraft,
+  getCloudTenantOidcDraftCredentials,
+  promoteCloudTenantOidcDraft,
   recordCloudTenantOidcDraftValidation,
   saveCloudTenantOidcDraft,
   type CloudTenantOidcDraftAuthorization,
@@ -69,6 +76,7 @@ export const CLOUD_TENANT_OIDC_LOGIN_PATH = "/__cloud/auth/oidc/login";
 export const CLOUD_TENANT_OIDC_CALLBACK_PATH = "/__cloud/auth/oidc/callback";
 export const CLOUD_TENANT_OIDC_SESSION_PATH = "/__cloud/auth/session";
 export const CLOUD_TENANT_OIDC_LOGOUT_PATH = "/__cloud/auth/logout";
+export const CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH = `${CLOUD_TENANT_OIDC_DRAFT_PATH}/promotion`;
 export const CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH = "/__cloud/auth/members/invitations";
 export const CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH =
   "/__cloud/auth/oidc/invitations/redeem";
@@ -112,6 +120,13 @@ interface OidcLoginStateRow {
   consumed_at_ms: number | null;
   invitation_hash: string | null;
   owner_bootstrap_hash: string | null;
+  purpose: "login" | "draft_promotion";
+  promotion_session_hash: string | null;
+  promotion_membership_id: string | null;
+  promotion_draft_updated_at: string | null;
+  promotion_config_updated_at: string | null;
+  promotion_other_identity_count: number | null;
+  promotion_applied_at_ms: number | null;
 }
 
 interface OidcSessionRow {
@@ -537,16 +552,18 @@ async function startLoginForTenant(
 async function consumeState(
   db: CloudDb,
   state: string,
-  nowMs: number
+  nowMs: number,
+  promotionSessionHash: string | null = null
 ): Promise<OidcLoginStateRow | null> {
   if (!TOKEN_PATTERN.test(state)) return null;
   const stateHash = await sha256(state);
   const result = await db
     .prepare(
       `UPDATE cloud_tenant_oidc_login_states SET consumed_at_ms = ?
-        WHERE state_hash = ? AND consumed_at_ms IS NULL AND expires_at_ms > ?`
+        WHERE state_hash = ? AND consumed_at_ms IS NULL AND expires_at_ms > ?
+          AND (purpose <> 'draft_promotion' OR promotion_session_hash = ?)`
     )
-    .bind(nowMs, stateHash, nowMs)
+    .bind(nowMs, stateHash, nowMs, promotionSessionHash)
     .run();
   if (Number(result.meta?.changes ?? 0) !== 1) return null;
   return db
@@ -585,9 +602,14 @@ async function callback(
   ) {
     return withSetCookie(json({ error: "Invalid OIDC response" }, 400), clearedStateCookie);
   }
+  const promotionSessionCookie = getCookie(request, CLOUD_TENANT_OIDC_SESSION_COOKIE);
+  const promotionSessionHash =
+    promotionSessionCookie && TOKEN_PATTERN.test(promotionSessionCookie)
+      ? await sha256(promotionSessionCookie)
+      : null;
   let consumed: OidcLoginStateRow | null;
   try {
-    consumed = await consumeState(db, state, nowMs);
+    consumed = await consumeState(db, state, nowMs, promotionSessionHash);
   } catch {
     consumed = null;
   }
@@ -598,18 +620,56 @@ async function callback(
     if (consumed.redirect_uri !== new URL(CLOUD_TENANT_OIDC_CALLBACK_PATH, origin).toString()) {
       throw new Error("redirect URI mismatch");
     }
-    const credentials = await getCloudTenantOidcCredentials(
-      db,
-      options.credentialEncryptionKey,
-      consumed.tenant_id
-    );
-    if (
-      !credentials ||
-      credentials.issuer !== consumed.issuer ||
-      credentials.clientId !== consumed.client_id
-    ) {
-      throw new Error("OIDC config changed during login");
+    let credentials: Awaited<ReturnType<typeof getCloudTenantOidcCredentials>>;
+    if (consumed.purpose === "draft_promotion") {
+      if (
+        !promotionSessionHash ||
+        !consumed.promotion_session_hash ||
+        !consumed.promotion_membership_id ||
+        !consumed.promotion_draft_updated_at ||
+        !consumed.promotion_config_updated_at ||
+        consumed.promotion_other_identity_count === null ||
+        promotionSessionHash !== consumed.promotion_session_hash
+      ) {
+        throw new Error("OIDC promotion session changed");
+      }
+      const draftCredentials = await getCloudTenantOidcDraftCredentials(
+        db,
+        options.credentialEncryptionKey,
+        {
+          tenantId: consumed.tenant_id,
+          membershipId: consumed.promotion_membership_id,
+          sessionTokenHash: consumed.promotion_session_hash,
+          nowMs,
+        },
+        consumed.promotion_draft_updated_at
+      );
+      if (
+        !draftCredentials ||
+        draftCredentials.issuer !== consumed.issuer ||
+        draftCredentials.clientId !== consumed.client_id
+      ) {
+        throw new Error("OIDC draft changed during promotion");
+      }
+      credentials = {
+        ...draftCredentials,
+        isEnabled: true,
+      };
+    } else {
+      credentials = await getCloudTenantOidcCredentials(
+        db,
+        options.credentialEncryptionKey,
+        consumed.tenant_id
+      );
+      if (
+        !credentials ||
+        credentials.issuer !== consumed.issuer ||
+        credentials.clientId !== consumed.client_id
+      ) {
+        throw new Error("OIDC config changed during login");
+      }
     }
+    if (!credentials) throw new Error("OIDC credentials are unavailable");
     const verifier = await decryptCloudCredential(
       consumed.code_verifier_encrypted,
       options.credentialEncryptionKey,
@@ -707,7 +767,55 @@ async function callback(
       throw new Error("ID token claims invalid");
     }
     let identity: Awaited<ReturnType<typeof getActiveCloudTenantOidcIdentity>>;
-    if (consumed.invitation_hash) {
+    if (consumed.purpose === "draft_promotion") {
+      if (
+        !consumed.promotion_session_hash ||
+        !consumed.promotion_membership_id ||
+        !consumed.promotion_draft_updated_at ||
+        !consumed.promotion_config_updated_at ||
+        consumed.promotion_other_identity_count === null
+      ) {
+        throw new Error("OIDC promotion state is incomplete");
+      }
+      const promoted = await promoteCloudTenantOidcDraft(db, {
+        stateHash: consumed.state_hash,
+        tenantId: consumed.tenant_id,
+        membershipId: consumed.promotion_membership_id,
+        sessionTokenHash: consumed.promotion_session_hash,
+        draftUpdatedAt: consumed.promotion_draft_updated_at,
+        configUpdatedAt: consumed.promotion_config_updated_at,
+        otherIdentityCount: consumed.promotion_other_identity_count,
+        issuer: consumed.issuer,
+        clientId: consumed.client_id,
+        subject: payload.sub,
+        identityId: crypto.randomUUID(),
+        timestamp: new Date(nowMs).toISOString(),
+        nowMs,
+        audit: {
+          id: crypto.randomUUID(),
+          tenantId: consumed.tenant_id,
+          timestamp: new Date(nowMs).toISOString(),
+          action: "customer.oidc.draft.promote",
+          actor: `membership:${consumed.promotion_membership_id}`,
+          target: "pending-issuer-draft",
+          resourceType: "customer-oidc-draft",
+          status: "success",
+          requestId: request.headers.get("cf-ray") ?? request.headers.get("x-request-id"),
+          metadata: {
+            otherIdentityLinksInvalidated: consumed.promotion_other_identity_count,
+          },
+        },
+      });
+      if (!promoted) throw new Error("OIDC promotion preconditions changed");
+      identity = await getActiveCloudTenantOidcIdentity(db, {
+        tenantId: consumed.tenant_id,
+        issuer: consumed.issuer,
+        subject: payload.sub,
+      });
+      if (identity?.membershipId !== consumed.promotion_membership_id) {
+        throw new Error("OIDC promoted identity could not be resolved");
+      }
+    } else if (consumed.invitation_hash) {
       const invitation = await getPendingCloudTenantMembershipInvitation(
         db,
         consumed.invitation_hash,
@@ -941,6 +1049,16 @@ async function requireMembershipManager(
 ): Promise<ResolvedOidcSessionRow | null> {
   const session = await resolveSession(request, options, nowMs);
   if (!session || (session.role !== "owner" && session.role !== "admin")) return null;
+  return session;
+}
+
+async function requireTenantOwner(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  nowMs: number
+): Promise<ResolvedOidcSessionRow | null> {
+  const session = await resolveSession(request, options, nowMs);
+  if (!session || session.role !== "owner") return null;
   return session;
 }
 
@@ -1298,6 +1416,182 @@ async function customerOidcDraftPortal(
       },
       503
     );
+  }
+}
+
+async function customerOidcDraftPromotionPortal(
+  request: Request,
+  options: CloudTenantOidcAuthOptions,
+  origin: URL,
+  nowMs: number
+): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (request.headers.get("origin") !== origin.origin) {
+    return json({ error: "Origin not allowed" }, 403);
+  }
+  if (!options.db || !options.credentialEncryptionKey) {
+    return json({ error: "OIDC promotion is unavailable" }, 503);
+  }
+  const session = await requireTenantOwner(request, options, nowMs);
+  if (!session) return json({ error: "Owner session required" }, 403);
+  const rateLimit = await consumeCloudRateLimit(options.db, {
+    tenantId: CLOUD_PLATFORM_TENANT_ID,
+    bucketKey: `customer-oidc-draft-promotion:${session.tenant_id}:${session.membership_id}`,
+    limit: 5,
+    windowMs: 60_000,
+    nowMs,
+  });
+  if (!rateLimit.allowed) return json({ error: "OIDC promotion rate limit exceeded" }, 429);
+
+  const parsed = await readCloudCustomerSettingsBody(request, 2_000);
+  if (parsed instanceof Response) return parsed;
+  if (
+    !isRecord(parsed) ||
+    Object.keys(parsed).some(
+      (key) =>
+        !["action", "draftUpdatedAt", "configUpdatedAt", "otherIdentityLinkCount"].includes(key)
+    )
+  ) {
+    return json({ error: "Invalid OIDC promotion request" }, 400);
+  }
+  const authorization: CloudTenantOidcDraftAuthorization = {
+    tenantId: session.tenant_id,
+    membershipId: session.membership_id,
+    sessionTokenHash: session.session_token_hash,
+    nowMs,
+  };
+  try {
+    const draft = await getCloudTenantOidcDraft(options.db, authorization);
+    const config = await getCloudTenantOidcConfig(options.db, session.tenant_id);
+    if (!draft || !config)
+      return json({ error: "OIDC draft or active configuration not found" }, 404);
+    if (!config.isEnabled) {
+      return json({ error: "Use the first-owner claim flow to initialize OIDC sign-in" }, 409);
+    }
+    if (draft.issuer === config.issuer) {
+      return json({ error: "The pending issuer must differ from the active issuer" }, 409);
+    }
+    const otherIdentityLinkCount = await countOtherCloudTenantOidcIdentities(
+      options.db,
+      authorization
+    );
+    if (otherIdentityLinkCount === null) {
+      return json({ error: "OIDC promotion preview is unavailable" }, 503);
+    }
+    if (parsed.action === "preview") {
+      if (Object.keys(parsed).length !== 1) {
+        return json({ error: "Invalid OIDC promotion preview request" }, 400);
+      }
+      return json({
+        draftUpdatedAt: draft.updatedAt,
+        configUpdatedAt: config.updatedAt,
+        otherIdentityLinkCount,
+      });
+    }
+    if (
+      parsed.action !== "confirm" ||
+      Object.keys(parsed).length !== 4 ||
+      typeof parsed.draftUpdatedAt !== "string" ||
+      typeof parsed.configUpdatedAt !== "string" ||
+      !Number.isSafeInteger(parsed.otherIdentityLinkCount) ||
+      parsed.draftUpdatedAt !== draft.updatedAt ||
+      parsed.configUpdatedAt !== config.updatedAt ||
+      parsed.otherIdentityLinkCount !== otherIdentityLinkCount
+    ) {
+      return json({ error: "OIDC promotion preview is stale; review the impact again" }, 409);
+    }
+    const draftCredentials = await getCloudTenantOidcDraftCredentials(
+      options.db,
+      options.credentialEncryptionKey,
+      authorization,
+      draft.updatedAt
+    );
+    if (!draftCredentials) return json({ error: "OIDC draft or session changed" }, 409);
+
+    const fetcher = createOidcFetcher(options, draft.issuer);
+    const metadata = await discoverOidc(draft.issuer, origin, fetcher);
+    await cleanupOldStates(options.db, nowMs);
+    const state = randomToken();
+    const nonce = randomToken();
+    const verifier = randomToken();
+    const stateHash = await sha256(state);
+    const nonceHash = await sha256(nonce);
+    const redirectUri = new URL(CLOUD_TENANT_OIDC_CALLBACK_PATH, origin).toString();
+    const verifierEnvelope = await encryptCloudCredential(
+      verifier,
+      options.credentialEncryptionKey,
+      {
+        tenantId: session.tenant_id,
+        connectionId: `oidc-state-${stateHash}`,
+        field: "pkceVerifier",
+      }
+    );
+    const inserted = await options.db
+      .prepare(
+        `INSERT INTO cloud_tenant_oidc_login_states (
+           state_hash, tenant_id, issuer, client_id, redirect_uri, authorization_endpoint,
+           token_endpoint, jwks_uri, signing_algorithms_json, nonce_hash,
+           code_verifier_encrypted, created_at_ms, expires_at_ms, invitation_hash,
+           owner_bootstrap_hash, purpose, promotion_session_hash, promotion_membership_id,
+           promotion_draft_updated_at, promotion_config_updated_at,
+           promotion_other_identity_count, promotion_applied_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+                   'draft_promotion', ?, ?, ?, ?, ?, NULL)`
+      )
+      .bind(
+        stateHash,
+        session.tenant_id,
+        draft.issuer,
+        draft.clientId,
+        redirectUri,
+        metadata.authorizationEndpoint.toString(),
+        metadata.tokenEndpoint.toString(),
+        metadata.jwksUri.toString(),
+        JSON.stringify(metadata.algorithms),
+        nonceHash,
+        verifierEnvelope,
+        nowMs,
+        nowMs + CLOUD_TENANT_OIDC_STATE_TTL_MS,
+        session.session_token_hash,
+        session.membership_id,
+        draft.updatedAt,
+        config.updatedAt,
+        otherIdentityLinkCount
+      )
+      .run();
+    if (!inserted.success || Number(inserted.meta?.changes ?? 0) !== 1) {
+      return json({ error: "OIDC promotion could not be started" }, 503);
+    }
+    const authorizationUrl = new URL(metadata.authorizationEndpoint);
+    authorizationUrl.searchParams.set("response_type", "code");
+    authorizationUrl.searchParams.set("client_id", draft.clientId);
+    authorizationUrl.searchParams.set("redirect_uri", redirectUri);
+    authorizationUrl.searchParams.set(
+      "scope",
+      draft.scopes.includes("openid")
+        ? draft.scopes.join(" ")
+        : ["openid", ...draft.scopes].join(" ")
+    );
+    authorizationUrl.searchParams.set("state", state);
+    authorizationUrl.searchParams.set("nonce", nonce);
+    authorizationUrl.searchParams.set(
+      "code_challenge",
+      base64Url(
+        new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)))
+      )
+    );
+    authorizationUrl.searchParams.set("code_challenge_method", "S256");
+    return withSetCookie(
+      json({ authorizationUrl: authorizationUrl.toString() }),
+      cookie(STATE_COOKIE, state, {
+        path: SESSION_COOKIE_PATH,
+        maxAge: CLOUD_TENANT_OIDC_STATE_TTL_MS / 1000,
+        secure: secureCookie(origin),
+        sameSite: "Lax",
+      })
+    );
+  } catch {
+    return json({ error: "OIDC promotion could not be started" }, 503);
   }
 }
 
@@ -1974,6 +2268,7 @@ export async function handleCloudTenantOidcAuthRequest(
   const isMcpSettings = pathname === CLOUD_TENANT_MCP_SETTINGS_PATH;
   const isLocalAiSettings = pathname === CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH;
   const isOidcDraft = pathname === CLOUD_TENANT_OIDC_DRAFT_PATH;
+  const isOidcDraftPromotion = pathname === CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH;
   const isCreateInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATIONS_PATH;
   const isRedeemInvitation = pathname === CLOUD_TENANT_MEMBERSHIP_INVITATION_REDEEM_PATH;
   const isRedeemOwnerClaim = pathname === CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH;
@@ -1994,6 +2289,7 @@ export async function handleCloudTenantOidcAuthRequest(
     !isMcpSettings &&
     !isLocalAiSettings &&
     !isOidcDraft &&
+    !isOidcDraftPromotion &&
     !isCreateInvitation &&
     !isRedeemInvitation &&
     !isRedeemOwnerClaim
@@ -2003,7 +2299,11 @@ export async function handleCloudTenantOidcAuthRequest(
   const expectedMethod =
     isApiKeyCollection || isApiKeyItem || isBusinessProfile || isProviderConnections
       ? ""
-      : isCreateInvitation || isRedeemInvitation || isRedeemOwnerClaim || isLogout
+      : isCreateInvitation ||
+          isRedeemInvitation ||
+          isRedeemOwnerClaim ||
+          isLogout ||
+          isOidcDraftPromotion
         ? "POST"
         : isMemberItem
           ? "PATCH"
@@ -2026,9 +2326,11 @@ export async function handleCloudTenantOidcAuthRequest(
                   ? ["PUT"]
                   : isLocalAiSettings
                     ? ["PUT"]
-                    : isOidcDraft
-                      ? ["GET", "PUT", "POST", "DELETE"]
-                      : [expectedMethod];
+                    : isOidcDraftPromotion
+                      ? ["POST"]
+                      : isOidcDraft
+                        ? ["GET", "PUT", "POST", "DELETE"]
+                        : [expectedMethod];
   if (!allowedMethods.includes(request.method)) {
     return json({ error: "Method not allowed" }, 405, { Allow: allowedMethods.join(", ") });
   }
@@ -2044,6 +2346,9 @@ export async function handleCloudTenantOidcAuthRequest(
   if (isBusinessProfile) return customerBusinessProfilePortal(request, options, origin, nowMs);
   if (isProviderConnections)
     return customerProviderConnectionsPortal(request, options, origin, nowMs);
+  if (isOidcDraftPromotion) {
+    return customerOidcDraftPromotionPortal(request, options, origin, nowMs);
+  }
   if (isMcpServers) return customerMcpServersPortal(request, options, origin, nowMs);
   if (isFrontDesk) return customerFrontDeskConfigPortal(request, options, origin, nowMs);
   if (isOidcDraft) return customerOidcDraftPortal(request, options, origin, nowMs);

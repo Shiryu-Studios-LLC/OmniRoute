@@ -18,6 +18,7 @@ import {
 } from "@/app/api/v1/models/catalogSyncedCoverage";
 import { buildAliasMaps } from "@/app/api/v1/models/catalogProviderMaps";
 import { resolveCanonicalProviderId as resolveCanonicalProviderIdFromMaps } from "@/app/api/v1/models/catalogProviderMaps";
+import { requirePlatformAliasAccess } from "@/lib/api/platformAliasAccess";
 
 interface GetModelsDependencies {
   createCapabilitySnapshot?: typeof createModelCapabilityResolutionSnapshot;
@@ -26,6 +27,9 @@ interface GetModelsDependencies {
 // GET /api/models - Get models with aliases (only from active providers by default)
 export async function handleGetModels(request: Request, dependencies: GetModelsDependencies = {}) {
   try {
+    const tenantError = await requirePlatformAliasAccess(request);
+    if (tenantError) return tenantError;
+
     const { searchParams } = new URL(request.url);
     const showAll = searchParams.get("all") === "true";
 
@@ -149,8 +153,7 @@ export async function handleGetModels(request: Request, dependencies: GetModelsD
         staticModelId: m.model,
         syncedModelIds: syncedForProvider ? [...syncedForProvider] : [],
       });
-      const available =
-        (!activeProviders || activeProviders.has(m.provider)) && !suppressedBySync;
+      const available = (!activeProviders || activeProviders.has(m.provider)) && !suppressedBySync;
       return {
         ...m,
         fullModel,
@@ -175,6 +178,9 @@ export async function GET(request: Request) {
 
 // PUT /api/models - Update model alias
 export async function PUT(request) {
+  const tenantError = await requirePlatformAliasAccess(request);
+  if (tenantError) return tenantError;
+
   let rawBody;
   try {
     rawBody = await request.json();

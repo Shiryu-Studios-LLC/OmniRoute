@@ -29,10 +29,11 @@ test("Worker MCP transport calls only the fixed VPC proxy and maps bounded respo
       method: "POST",
       redirect: "manual",
       headers: {
-        Accept: "application/json",
+        Accept: "application/json, text/event-stream",
         Authorization: "Bearer tenant-mcp-secret",
         "Content-Type": "application/json",
         "Mcp-Session-Id": "session-request",
+        "MCP-Protocol-Version": "2025-11-25",
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
     },
@@ -48,7 +49,11 @@ test("Worker MCP transport calls only the fixed VPC proxy and maps bounded respo
     tenantId: string;
     serverId: string;
     url: string;
-    headers: { upstreamAuthorization?: string; mcpSessionId?: string };
+    headers: {
+      upstreamAuthorization?: string;
+      mcpSessionId?: string;
+      mcpProtocolVersion?: string;
+    };
   };
   const signedBody = JSON.stringify(payload);
   assert.equal(
@@ -64,6 +69,7 @@ test("Worker MCP transport calls only the fixed VPC proxy and maps bounded respo
   assert.equal(payload.url, "https://mcp.customer.example/mcp");
   assert.equal(payload.headers.upstreamAuthorization, "Bearer tenant-mcp-secret");
   assert.equal(payload.headers.mcpSessionId, "session-request");
+  assert.equal(payload.headers.mcpProtocolVersion, "2025-11-25");
   assert.equal(result.status, 200);
   assert.equal(result.headers.get("mcp-session-id"), "session-safe");
   assert.deepEqual(await result.json(), { jsonrpc: "2.0", id: 1, result: { tools: [] } });
@@ -138,6 +144,50 @@ test("Worker MCP transport rejects malformed and oversized proxy responses", asy
   assert.ok(transport);
   await assert.rejects(
     transport.fetch("https://mcp.example.com/mcp", { method: "POST", body: "{}" }, CONTEXT),
+    McpOutboundEgressError
+  );
+});
+
+test("Worker MCP transport preserves valid SSE content type and rejects unsafe response headers", async () => {
+  const sseBody = 'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{}}\n\n';
+  const transport = createCloudMcpEgressTransport({
+    proxyToken: TOKEN,
+    binding: {
+      fetch: async () =>
+        Response.json({
+          status: 200,
+          headers: { contentType: "text/event-stream; charset=utf-8" },
+          body: sseBody,
+        }),
+    },
+  });
+  assert.ok(transport);
+  const response = await transport.fetch(
+    "https://mcp.example.com/mcp",
+    { method: "POST", body: "{}" },
+    CONTEXT
+  );
+  assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
+  assert.equal(await response.text(), sseBody);
+
+  const unsafeHeaderTransport = createCloudMcpEgressTransport({
+    proxyToken: TOKEN,
+    binding: {
+      fetch: async () =>
+        Response.json({
+          status: 200,
+          headers: { contentType: "application/json\r\nset-cookie: leaked=yes" },
+          body: "{}",
+        }),
+    },
+  });
+  assert.ok(unsafeHeaderTransport);
+  await assert.rejects(
+    unsafeHeaderTransport.fetch(
+      "https://mcp.example.com/mcp",
+      { method: "POST", body: "{}" },
+      CONTEXT
+    ),
     McpOutboundEgressError
   );
 });

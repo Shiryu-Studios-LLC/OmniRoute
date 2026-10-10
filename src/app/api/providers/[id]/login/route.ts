@@ -8,7 +8,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { getCachedProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
 const ADOBE_FIREFLY_SLUGS = new Set(["adobe-firefly", "firefly"]);
@@ -161,118 +161,117 @@ export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ): Promise<NextResponse> {
-  const auth = await requireManagementAuth(req);
-  if (auth) return auth;
-
-  const { id } = await params;
-  const provider = await getCachedProviderConnectionById(id);
-  if (!provider) {
-    return NextResponse.json({ success: false, error: "Provider not found" }, { status: 404 });
-  }
-
-  const body = (await req.json().catch(() => ({}))) as {
-    timeout?: unknown;
-    freshSession?: unknown;
-  };
-  const providerSlug = resolveProviderSlug(provider as Record<string, unknown>);
-
-  // Adobe Firefly: dedicated JWT capture (never cookies/localStorage alone).
-  if (isAdobeFireflyProvider(provider as { provider?: unknown }, providerSlug)) {
-    try {
-      return await loginAdobeFirefly(id, body);
-    } catch (err) {
-      const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
-      return NextResponse.json(
-        { success: false, error: `Adobe Firefly sign-in error: ${msg}` },
-        { status: 500 }
-      );
+  return withManagementTenantContext(req, async () => {
+    const { id } = await params;
+    const provider = await getCachedProviderConnectionById(id);
+    if (!provider) {
+      return NextResponse.json({ success: false, error: "Provider not found" }, { status: 404 });
     }
-  }
 
-  // Conol: unofficial browser-session chat with cookie auth
-  // (__Secure-better-auth.session_token). Dedicated browser login + credential
-  // persistence (same shape as the other web-cookie providers).
-  if (providerSlug === "conol-web" || providerSlug === "cnl") {
-    try {
-      const { startConolBrowserLogin } = await import(
-        "@omniroute/open-sse/services/conolBrowserLogin.ts"
-      );
-      const result = await startConolBrowserLogin(
-        typeof body.timeout === "number" ? body.timeout : undefined
-      );
-      if (!result.success || !result.credentials) {
-        return NextResponse.json(result, { status: 400 });
-      }
+    const body = (await req.json().catch(() => ({}))) as {
+      timeout?: unknown;
+      freshSession?: unknown;
+    };
+    const providerSlug = resolveProviderSlug(provider as Record<string, unknown>);
+
+    // Adobe Firefly: dedicated JWT capture (never cookies/localStorage alone).
+    if (isAdobeFireflyProvider(provider as { provider?: unknown }, providerSlug)) {
       try {
-        await updateProviderConnection(id, {
-          apiKey: JSON.stringify(result.credentials),
-          providerSpecificData: result.credentials,
-        });
+        return await loginAdobeFirefly(id, body);
       } catch (err) {
         const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
         return NextResponse.json(
-          { success: false, error: `Extracted but failed to persist: ${msg}` },
+          { success: false, error: `Adobe Firefly sign-in error: ${msg}` },
           { status: 500 }
         );
       }
-      return NextResponse.json({
-        success: true,
-        credentials: result.credentials,
-        persisted: true,
-      });
-    } catch (err) {
-      const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
-      return NextResponse.json(
-        { success: false, error: `Login endpoint error: ${msg}` },
-        { status: 500 }
-      );
     }
-  }
 
-  try {
-    // Generic web-cookie path: pass the provider SLUG (not the DB id) so
-    // TOKEN_EXTRACTION_CONFIGS can find the extraction config.
-    // Bug: the previous code passed `id` (connection UUID), so the lookup always
-    // missed and returned "No extraction config" without launching a browser.
-    const { inAppLoginService } = await import("@omniroute/open-sse/services/inAppLoginService.ts");
-
-    const result = await inAppLoginService.startLogin(providerSlug || id, {
-      timeout: typeof body.timeout === "number" ? body.timeout : undefined,
-    });
-
-    // Persist credentials if extraction succeeded
-    if (result.success && result.credentials) {
+    // Conol: unofficial browser-session chat with cookie auth
+    // (__Secure-better-auth.session_token). Dedicated browser login + credential
+    // persistence (same shape as the other web-cookie providers).
+    if (providerSlug === "conol-web" || providerSlug === "cnl") {
       try {
-        const credentialsStr = JSON.stringify(result.credentials);
-        await updateProviderConnection(id, {
-          apiKey: credentialsStr,
-          providerSpecificData: result.credentials,
-        });
-
+        const { startConolBrowserLogin } =
+          await import("@omniroute/open-sse/services/conolBrowserLogin.ts");
+        const result = await startConolBrowserLogin(
+          typeof body.timeout === "number" ? body.timeout : undefined
+        );
+        if (!result.success || !result.credentials) {
+          return NextResponse.json(result, { status: 400 });
+        }
+        try {
+          await updateProviderConnection(id, {
+            apiKey: JSON.stringify(result.credentials),
+            providerSpecificData: result.credentials,
+          });
+        } catch (err) {
+          const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
+          return NextResponse.json(
+            { success: false, error: `Extracted but failed to persist: ${msg}` },
+            { status: 500 }
+          );
+        }
         return NextResponse.json({
           success: true,
           credentials: result.credentials,
           persisted: true,
         });
       } catch (err) {
-        // Hard Rule #12: never put raw err.message/stack in a response body.
         const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
         return NextResponse.json(
-          { success: false, error: `Extracted but failed to persist: ${msg}` },
+          { success: false, error: `Login endpoint error: ${msg}` },
           { status: 500 }
         );
       }
     }
 
-    return NextResponse.json(result, {
-      status: result.success ? 200 : 400,
-    });
-  } catch (err) {
-    // Hard Rule #12: never put raw err.message/stack in a response body.
-    const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
-    return NextResponse.json(
-      { success: false, error: `Login endpoint error: ${msg}` },
-      { status: 500 }
-    );
-  }
+    try {
+      // Generic web-cookie path: pass the provider SLUG (not the DB id) so
+      // TOKEN_EXTRACTION_CONFIGS can find the extraction config.
+      // Bug: the previous code passed `id` (connection UUID), so the lookup always
+      // missed and returned "No extraction config" without launching a browser.
+      const { inAppLoginService } =
+        await import("@omniroute/open-sse/services/inAppLoginService.ts");
+
+      const result = await inAppLoginService.startLogin(providerSlug || id, {
+        timeout: typeof body.timeout === "number" ? body.timeout : undefined,
+      });
+
+      // Persist credentials if extraction succeeded
+      if (result.success && result.credentials) {
+        try {
+          const credentialsStr = JSON.stringify(result.credentials);
+          await updateProviderConnection(id, {
+            apiKey: credentialsStr,
+            providerSpecificData: result.credentials,
+          });
+
+          return NextResponse.json({
+            success: true,
+            credentials: result.credentials,
+            persisted: true,
+          });
+        } catch (err) {
+          // Hard Rule #12: never put raw err.message/stack in a response body.
+          const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
+          return NextResponse.json(
+            { success: false, error: `Extracted but failed to persist: ${msg}` },
+            { status: 500 }
+          );
+        }
+      }
+
+      return NextResponse.json(result, {
+        status: result.success ? 200 : 400,
+      });
+    } catch (err) {
+      // Hard Rule #12: never put raw err.message/stack in a response body.
+      const msg = sanitizeErrorMessage(err instanceof Error ? err.message : err);
+      return NextResponse.json(
+        { success: false, error: `Login endpoint error: ${msg}` },
+        { status: 500 }
+      );
+    }
+  });
 }

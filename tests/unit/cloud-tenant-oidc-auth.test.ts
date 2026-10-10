@@ -39,12 +39,16 @@ import {
   CLOUD_TENANT_MCP_SETTINGS_PATH,
   CLOUD_TENANT_LOCAL_AI_SETTINGS_PATH,
   CLOUD_TENANT_OIDC_OWNER_CLAIM_REDEEM_PATH,
+  CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH,
   cleanupExpiredCloudTenantOidcAuthArtifacts,
   handleCloudTenantOidcAuthRequest,
 } from "../../src/cloud/tenantOidcAuth";
 import { createCloudRuntime } from "../../src/cloud/runtime";
 import { createOidcEgressProxyHandler } from "../../cloudflare/mcp-egress-proxy/oidcHandler.ts";
-import { CLOUD_CUSTOMER_PORTAL_PATH } from "../../src/cloud/customerPortal";
+import {
+  CLOUD_CUSTOMER_PORTAL_PATH,
+  handleCloudCustomerPortalRequest,
+} from "../../src/cloud/customerPortal";
 import {
   acceptCloudTenantOidcOwnerClaim,
   createCloudTenantOidcOwnerClaimCode,
@@ -352,6 +356,7 @@ async function setup() {
     "0026_revoke_customer_oidc_sessions_on_membership_change.sql",
     "0028_cloud_frontdesk_configs.sql",
     "0031_cloud_tenant_oidc_config_drafts.sql",
+    "0032_cloud_tenant_oidc_promotion_state.sql",
   ]) {
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", name), "utf8"));
   }
@@ -719,30 +724,32 @@ async function makeProvider(
     subject?: string;
     nonce?: string;
     corruptSignature?: boolean;
-  } = {}
+  } = {},
+  issuer = ISSUER,
+  clientId = "omni-client"
 ) {
   const { publicKey, privateKey } = await generateKeyPair("RS256", { modulusLength: 2048 });
   const jwk = await exportJWK(publicKey);
   Object.assign(jwk, { kid: "test-key", alg: "RS256", use: "sig" });
   const fetcher: typeof fetch = async (input, init) => {
     const url = input instanceof URL ? input : new URL(String(input));
-    if (url.href === `${ISSUER}/.well-known/openid-configuration`) {
+    if (url.href === `${issuer}/.well-known/openid-configuration`) {
       return Response.json({
-        issuer: ISSUER,
-        authorization_endpoint: `${ISSUER}/authorize`,
-        token_endpoint: `${ISSUER}/token`,
-        jwks_uri: `${ISSUER}/jwks`,
+        issuer,
+        authorization_endpoint: `${issuer}/authorize`,
+        token_endpoint: `${issuer}/token`,
+        jwks_uri: `${issuer}/jwks`,
         id_token_signing_alg_values_supported: ["RS256"],
       });
     }
-    if (url.href === `${ISSUER}/token`) {
+    if (url.href === `${issuer}/token`) {
       const params = new URLSearchParams(String(init?.body ?? ""));
       fetcherState.tokenRequests.push(params);
       const claims = new SignJWT({ nonce: overrides.nonce ?? fetcherState.nonce })
         .setProtectedHeader({ alg: "RS256", kid: "test-key" })
-        .setIssuer(overrides.issuer ?? ISSUER)
+        .setIssuer(overrides.issuer ?? issuer)
         .setSubject(overrides.subject ?? "external-user-17")
-        .setAudience(overrides.audience ?? "omni-client")
+        .setAudience(overrides.audience ?? clientId)
         .setIssuedAt(Math.floor(NOW / 1000))
         .setExpirationTime(Math.floor(NOW / 1000) + 300);
       let idToken = await claims.sign(privateKey);
@@ -754,7 +761,7 @@ async function makeProvider(
       }
       return Response.json({ id_token: idToken });
     }
-    if (url.href === `${ISSUER}/jwks`) return Response.json({ keys: [jwk] });
+    if (url.href === `${issuer}/jwks`) return Response.json({ keys: [jwk] });
     throw new Error(`Unexpected outbound URL: ${url.href}`);
   };
   return fetcher;
@@ -780,6 +787,119 @@ async function createPortalSession(
   );
   assert.equal(callback.status, 303, await callback.clone().text());
   return { app, cookie: getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE) };
+}
+
+const NEXT_ISSUER = "https://next-identity.example.com";
+const NEXT_CLIENT_ID = "next-omni-client";
+
+async function prepareDraftPromotion() {
+  const { db, tenant, membership } = await setup();
+  await db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'owner' WHERE tenant_id = ? AND id = ?")
+    .bind(tenant.id, membership.id)
+    .run();
+  const otherMembership = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "principal-oidc-other",
+    role: "member",
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "external-other-user",
+    membershipId: otherMembership.id,
+  });
+  const otherKey = await issueCloudCustomerApiKey(db, {
+    tenantId: tenant.id,
+    membershipId: otherMembership.id,
+    now: new Date(NOW).toISOString(),
+  });
+  const portal = await createPortalSession(db, tenant.slug, "external-user-17");
+  const otherPortal = await createPortalSession(db, tenant.slug, "external-other-user");
+  const state: { nonce?: string; tokenRequests: URLSearchParams[] } = { tokenRequests: [] };
+  const provider = await makeProvider(
+    state,
+    { subject: "new-owner-subject" },
+    NEXT_ISSUER,
+    NEXT_CLIENT_ID
+  );
+  const app = runtime(db, provider);
+  const headers = {
+    Origin: ORIGIN,
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${portal.cookie}`,
+    "Content-Type": "application/json",
+  };
+  const saved = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PATH}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        issuer: NEXT_ISSUER,
+        clientId: NEXT_CLIENT_ID,
+        clientSecret: "new-private-client-secret",
+        scopes: ["openid", "profile"],
+      }),
+    })
+  );
+  assert.equal(saved.status, 200, await saved.clone().text());
+  const previewResponse = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "preview" }),
+    })
+  );
+  assert.equal(previewResponse.status, 200, await previewResponse.clone().text());
+  const preview = (await previewResponse.json()) as {
+    draftUpdatedAt: string;
+    configUpdatedAt: string;
+    otherIdentityLinkCount: number;
+  };
+  const started = await app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "confirm", ...preview }),
+    })
+  );
+  assert.equal(started.status, 200, await started.clone().text());
+  return {
+    db,
+    tenant,
+    membership,
+    otherMembership,
+    otherKey,
+    portal,
+    otherPortal,
+    state,
+    app,
+    started,
+    preview,
+  };
+}
+
+async function finishDraftPromotion(
+  app: ReturnType<typeof runtime>,
+  started: Response,
+  state: { nonce?: string; tokenRequests: URLSearchParams[] },
+  sessionCookie: string
+): Promise<Response> {
+  const body = (await started.clone().json()) as { authorizationUrl: string };
+  const authorization = new URL(body.authorizationUrl);
+  state.nonce = authorization.searchParams.get("nonce") ?? undefined;
+  const stateToken = authorization.searchParams.get("state")!;
+  const stateCookie = getCookieValue(started, "omni_oidc_state");
+  return app.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=promotion-code&state=${encodeURIComponent(stateToken)}`,
+      {
+        headers: {
+          Origin: ORIGIN,
+          Cookie: `omni_oidc_state=${stateCookie}; ${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${sessionCookie}`,
+        },
+      }
+    )
+  );
 }
 
 test("business profile portal is owner/admin session scoped, origin checked, bounded, and audited without profile text", async () => {
@@ -3886,4 +4006,456 @@ test("OIDC issuer draft writes reject member, revoked-session, and audit-failure
     })
   );
   assert.equal(rateLimited.status, 429, "issuer discovery tests are rate limited per membership");
+});
+
+test("verified OIDC draft promotion confirms impact, retains the initiating membership, and invalidates old links and sessions", async () => {
+  const flow = await prepareDraftPromotion();
+  assert.equal(flow.preview.otherIdentityLinkCount, 1);
+  const authorizationUrl = new URL(
+    ((await flow.started.clone().json()) as { authorizationUrl: string }).authorizationUrl
+  );
+  assert.equal(authorizationUrl.origin, NEXT_ISSUER);
+  assert.equal(authorizationUrl.searchParams.get("client_id"), NEXT_CLIENT_ID);
+  assert.equal(authorizationUrl.searchParams.get("code_challenge_method"), "S256");
+  assert.equal(
+    JSON.stringify(await flow.started.clone().json()).includes("new-private-client-secret"),
+    false
+  );
+
+  const callback = await finishDraftPromotion(
+    flow.app,
+    flow.started,
+    flow.state,
+    flow.portal.cookie
+  );
+  assert.equal(callback.status, 303, await callback.clone().text());
+  const replayedCallback = await finishDraftPromotion(
+    flow.app,
+    flow.started,
+    flow.state,
+    flow.portal.cookie
+  );
+  assert.equal(replayedCallback.status, 400, "a successful promotion state cannot be replayed");
+  const config = flow.db.raw
+    .prepare(
+      "SELECT issuer, client_id, is_enabled FROM cloud_tenant_oidc_configs WHERE tenant_id = ?"
+    )
+    .get(flow.tenant.id) as { issuer: string; client_id: string; is_enabled: number };
+  assert.deepEqual(
+    { ...config },
+    {
+      issuer: NEXT_ISSUER,
+      client_id: NEXT_CLIENT_ID,
+      is_enabled: 1,
+    }
+  );
+  const identities = flow.db.raw
+    .prepare(
+      "SELECT issuer, subject, membership_id FROM cloud_tenant_oidc_identities WHERE tenant_id = ?"
+    )
+    .all(flow.tenant.id) as Array<{ issuer: string; subject: string; membership_id: string }>;
+  assert.deepEqual(
+    identities.map((identity) => ({ ...identity })),
+    [{ issuer: NEXT_ISSUER, subject: "new-owner-subject", membership_id: flow.membership.id }]
+  );
+  assert.equal(
+    flow.db.raw
+      .prepare("SELECT is_active FROM cloud_customer_memberships WHERE tenant_id = ? AND id = ?")
+      .get(flow.tenant.id, flow.otherMembership.id)?.is_active,
+    1,
+    "other membership remains intact"
+  );
+  assert.equal(
+    flow.db.raw
+      .prepare("SELECT revoked_at FROM cloud_customer_api_keys WHERE tenant_id = ? AND id = ?")
+      .get(flow.tenant.id, flow.otherKey.id)?.revoked_at,
+    null,
+    "other members' API keys remain intact"
+  );
+  const oldSession = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${flow.portal.cookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(oldSession.status, 401);
+  const otherOldSession = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${flow.otherPortal.cookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(
+    otherOldSession.status,
+    401,
+    "all other members' old issuer sessions are invalidated"
+  );
+  const newSessionCookie = getCookieValue(callback, CLOUD_TENANT_OIDC_SESSION_COOKIE);
+  const newSession = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: {
+        Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${newSessionCookie}`,
+        Origin: ORIGIN,
+      },
+    })
+  );
+  assert.equal(newSession.status, 200);
+  assert.equal(
+    ((await newSession.json()) as { membership: { id: string } }).membership.id,
+    flow.membership.id
+  );
+  const audit = flow.db.raw
+    .prepare(
+      "SELECT metadata_json FROM cloud_compliance_audit WHERE action = 'customer.oidc.draft.promote' AND tenant_id = ?"
+    )
+    .get(flow.tenant.id) as { metadata_json: string };
+  assert.deepEqual(JSON.parse(audit.metadata_json), { otherIdentityLinksInvalidated: 1 });
+  assert.equal(JSON.stringify(audit).includes(NEXT_ISSUER), false);
+  assert.equal(JSON.stringify(audit).includes("new-owner-subject"), false);
+  assert.equal(JSON.stringify(audit).includes("new-private-client-secret"), false);
+  assert.equal(
+    flow.db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_config_drafts WHERE tenant_id = ?")
+      .get(flow.tenant.id)?.count,
+    0
+  );
+});
+
+test("admins can save and test OIDC drafts but cannot preview or start issuer promotion", async () => {
+  const portalPage = handleCloudCustomerPortalRequest(
+    new Request(`${ORIGIN}${CLOUD_CUSTOMER_PORTAL_PATH}`)
+  );
+  assert.ok(portalPage);
+  const portalHtml = await portalPage.text();
+  assert.match(portalHtml, /other identity link/);
+  assert.doesNotMatch(portalHtml, /other linked users/);
+
+  const flow = await prepareDraftPromotion();
+  await flow.db
+    .prepare("DELETE FROM cloud_tenant_oidc_login_states WHERE purpose = 'draft_promotion'")
+    .run();
+  await flow.db
+    .prepare("UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?")
+    .bind(flow.tenant.id, flow.membership.id)
+    .run();
+  assert.equal(
+    flow.db.raw
+      .prepare("SELECT role FROM cloud_customer_memberships WHERE tenant_id = ? AND id = ?")
+      .get(flow.tenant.id, flow.membership.id)?.role,
+    "admin"
+  );
+  const adminPortal = await createPortalSession(flow.db, flow.tenant.slug, "external-user-17");
+  const headers = {
+    Origin: ORIGIN,
+    Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${adminPortal.cookie}`,
+    "Content-Type": "application/json",
+  };
+  const saved = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PATH}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        issuer: NEXT_ISSUER,
+        clientId: NEXT_CLIENT_ID,
+        clientSecret: "admin-updated-secret",
+        scopes: ["openid", "profile"],
+      }),
+    })
+  );
+  assert.equal(
+    saved.status,
+    200,
+    `admins retain draft authoring access: ${await saved.clone().text()}`
+  );
+  const discovery = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PATH}`, {
+      method: "POST",
+      headers,
+    })
+  );
+  assert.equal(discovery.status, 200, "admins retain issuer discovery access");
+
+  const preview = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "preview" }),
+    })
+  );
+  assert.equal(preview.status, 403);
+  const start = await flow.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_DRAFT_PROMOTION_PATH}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "confirm", ...flow.preview }),
+    })
+  );
+  assert.equal(start.status, 403);
+  assert.equal(
+    flow.db.raw
+      .prepare(
+        "SELECT COUNT(*) AS count FROM cloud_tenant_oidc_login_states WHERE purpose = 'draft_promotion'"
+      )
+      .get()?.count,
+    0,
+    "an admin cannot create an issuer-promotion authorization state"
+  );
+});
+
+test("OIDC draft promotion rejects cross-session replay, issuer mismatch, and changed revisions", async () => {
+  const crossSession = await prepareDraftPromotion();
+  const otherTenantPortal = await createOtherTenantPortalSession(crossSession.db);
+  const stateCookie = getCookieValue(crossSession.started, "omni_oidc_state");
+  const stateToken = new URL(
+    ((await crossSession.started.clone().json()) as { authorizationUrl: string }).authorizationUrl
+  ).searchParams.get("state")!;
+  const replay = await crossSession.app.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=replay&state=${encodeURIComponent(stateToken)}`,
+      {
+        headers: {
+          Cookie: `omni_oidc_state=${stateCookie}; ${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${otherTenantPortal.cookie}`,
+          Origin: "https://cloud.example.test",
+        },
+      }
+    )
+  );
+  assert.equal(
+    replay.status,
+    400,
+    "callback state cannot be redeemed by a different tenant's session"
+  );
+  assert.equal(
+    crossSession.db.raw
+      .prepare(
+        "SELECT consumed_at_ms FROM cloud_tenant_oidc_login_states WHERE promotion_membership_id = ? AND purpose = 'draft_promotion'"
+      )
+      .get(crossSession.membership.id)?.consumed_at_ms,
+    null,
+    "a cross-tenant session cannot consume the owner's promotion state"
+  );
+  assert.equal(
+    (
+      crossSession.db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(crossSession.tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER
+  );
+
+  const issuerMismatch = await prepareDraftPromotion();
+  const mismatchCallback = await finishDraftPromotion(
+    runtime(
+      issuerMismatch.db,
+      await makeProvider(
+        issuerMismatch.state,
+        { issuer: "https://attacker.example" },
+        NEXT_ISSUER,
+        NEXT_CLIENT_ID
+      )
+    ),
+    issuerMismatch.started,
+    issuerMismatch.state,
+    issuerMismatch.portal.cookie
+  );
+  assert.equal(mismatchCallback.status, 401);
+  assert.equal(
+    (
+      issuerMismatch.db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(issuerMismatch.tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER,
+    "an ID token with a different issuer must not promote the draft"
+  );
+
+  const changed = await prepareDraftPromotion();
+  await changed.db
+    .prepare("UPDATE cloud_tenant_oidc_config_drafts SET updated_at = ? WHERE tenant_id = ?")
+    .bind("2026-10-08T12:00:01.000Z", changed.tenant.id)
+    .run();
+  const changedDraftCallback = await finishDraftPromotion(
+    changed.app,
+    changed.started,
+    changed.state,
+    changed.portal.cookie
+  );
+  assert.equal(changedDraftCallback.status, 401);
+  assert.equal(
+    (
+      changed.db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(changed.tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER,
+    "a modified draft revision must not be promoted"
+  );
+
+  const changedConfig = await prepareDraftPromotion();
+  await setCloudTenantOidcConfig(changedConfig.db, ENCRYPTION_KEY, {
+    tenantId: changedConfig.tenant.id,
+    issuer: ISSUER,
+    clientId: "new-current-client",
+    now: new Date(NOW + 1).toISOString(),
+  });
+  const changedConfigCallback = await finishDraftPromotion(
+    changedConfig.app,
+    changedConfig.started,
+    changedConfig.state,
+    changedConfig.portal.cookie
+  );
+  assert.equal(changedConfigCallback.status, 401);
+  assert.equal(
+    (
+      changedConfig.db.raw
+        .prepare("SELECT client_id FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(changedConfig.tenant.id) as { client_id: string }
+    ).client_id,
+    "new-current-client",
+    "a changed active config revision must prevent the draft promotion"
+  );
+});
+
+async function createOtherTenantPortalSession(db: CloudDb) {
+  const tenant = await createCloudCustomerTenant(db, {
+    id: "customer-oidc-replay",
+    name: "Replay tenant",
+    slug: "oidc-replay",
+  });
+  const membership = await createCloudCustomerMembership(db, {
+    tenantId: tenant.id,
+    principalId: "principal-oidc-replay",
+    role: "owner",
+  });
+  await setCloudTenantOidcConfig(db, ENCRYPTION_KEY, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    clientId: "omni-client",
+    clientSecret: "client-secret-test",
+    isEnabled: true,
+  });
+  await addCloudTenantOidcIdentity(db, {
+    tenantId: tenant.id,
+    issuer: ISSUER,
+    subject: "external-user-17",
+    membershipId: membership.id,
+  });
+  return createPortalSession(db, tenant.slug, "external-user-17");
+}
+
+test("OIDC draft promotion aborts concurrent owner changes and rolls back when the audit write fails", async () => {
+  const changedOwner = await prepareDraftPromotion();
+  const stateCookie = getCookieValue(changedOwner.started, "omni_oidc_state");
+  const stateToken = new URL(
+    ((await changedOwner.started.clone().json()) as { authorizationUrl: string }).authorizationUrl
+  ).searchParams.get("state")!;
+  const originalDb = changedOwner.db;
+  const ownerSessionHash = createHash("sha256").update(changedOwner.portal.cookie).digest("hex");
+  await originalDb.exec("DROP TRIGGER cloud_revoke_oidc_sessions_after_membership_change");
+  const concurrentOwnerDb: CloudDb = {
+    prepare: <T = unknown>(sql: string) => originalDb.prepare<T>(sql),
+    async batch(statements: CloudDbStatement[]) {
+      await originalDb
+        .prepare(
+          "UPDATE cloud_customer_memberships SET role = 'admin' WHERE tenant_id = ? AND id = ?"
+        )
+        .bind(changedOwner.tenant.id, changedOwner.membership.id)
+        .run();
+      assert.equal(
+        originalDb.raw
+          .prepare("SELECT revoked_at_ms FROM cloud_tenant_oidc_sessions WHERE token_hash = ?")
+          .get(ownerSessionHash)?.revoked_at_ms,
+        null,
+        "the test preserves the initiating session after demotion"
+      );
+      return originalDb.batch(statements);
+    },
+    exec: (sql: string) => originalDb.exec(sql),
+  };
+  const racingCallbackApp = runtime(
+    concurrentOwnerDb,
+    await makeProvider(changedOwner.state, {}, NEXT_ISSUER, NEXT_CLIENT_ID)
+  );
+  const racingCallback = await racingCallbackApp.fetch(
+    new Request(
+      `${ORIGIN}${CLOUD_TENANT_OIDC_CALLBACK_PATH}?code=race&state=${encodeURIComponent(stateToken)}`,
+      {
+        headers: {
+          Cookie: `omni_oidc_state=${stateCookie}; ${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${changedOwner.portal.cookie}`,
+          Origin: ORIGIN,
+        },
+      }
+    )
+  );
+  assert.equal(racingCallback.status, 401);
+  assert.equal(
+    originalDb.raw
+      .prepare("SELECT revoked_at_ms FROM cloud_tenant_oidc_sessions WHERE token_hash = ?")
+      .get(ownerSessionHash)?.revoked_at_ms,
+    null,
+    "the callback failure is caused by the role predicate rather than session revocation"
+  );
+  assert.equal(
+    (
+      originalDb.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(changedOwner.tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER,
+    "a concurrent role downgrade blocks the config mutation"
+  );
+  assert.equal(
+    originalDb.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+      .get(changedOwner.tenant.id)?.count,
+    2
+  );
+
+  const auditFailure = await prepareDraftPromotion();
+  const failingCallbackApp = runtime(
+    new FailingAuditCloudDb(auditFailure.db),
+    await makeProvider(
+      auditFailure.state,
+      { subject: "new-owner-subject" },
+      NEXT_ISSUER,
+      NEXT_CLIENT_ID
+    )
+  );
+  const rejected = await finishDraftPromotion(
+    failingCallbackApp,
+    auditFailure.started,
+    auditFailure.state,
+    auditFailure.portal.cookie
+  );
+  assert.equal(rejected.status, 401);
+  assert.equal(
+    (
+      auditFailure.db.raw
+        .prepare("SELECT issuer FROM cloud_tenant_oidc_configs WHERE tenant_id = ?")
+        .get(auditFailure.tenant.id) as { issuer: string }
+    ).issuer,
+    ISSUER
+  );
+  assert.equal(
+    auditFailure.db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_identities WHERE tenant_id = ?")
+      .get(auditFailure.tenant.id)?.count,
+    2
+  );
+  assert.equal(
+    auditFailure.db.raw
+      .prepare("SELECT COUNT(*) AS count FROM cloud_tenant_oidc_config_drafts WHERE tenant_id = ?")
+      .get(auditFailure.tenant.id)?.count,
+    1
+  );
+  const stillActive = await auditFailure.app.fetch(
+    new Request(`${ORIGIN}${CLOUD_TENANT_OIDC_SESSION_PATH}`, {
+      headers: { Cookie: `${CLOUD_TENANT_OIDC_SESSION_COOKIE}=${auditFailure.portal.cookie}` },
+    })
+  );
+  assert.equal(stillActive.status, 200, "audit rollback preserves the existing portal session");
 });

@@ -93,6 +93,11 @@ test("tenant role permission matrix separates read, manage, and maintenance", ()
   assert.equal(isTenantManagementResource("/api/keys/key-1"), true);
   assert.equal(isTenantManagementResource("/api/keys-extra"), false);
   assert.equal(isTenantManagementResource("/api/local-agents"), true);
+  assert.equal(isTenantManagementResource("/api/provider-nodes"), true);
+  assert.equal(getTenantManagementPermission("/api/provider-nodes", "GET"), "read");
+  assert.equal(getTenantManagementPermission("/api/provider-nodes/node-1", "PUT"), "manage");
+  assert.equal(isTenantManagementResource("/api/resilience/connections"), true);
+  assert.equal(getTenantManagementPermission("/api/resilience/connections", "GET"), "read");
   assert.equal(getTenantManagementPermission("/api/local-agents", "GET"), "read");
   assert.equal(getTenantManagementPermission("/api/local-agents", "POST"), "manage");
   assert.equal(getTenantManagementPermission("/api/local-agents/device-1", "DELETE"), "manage");
@@ -149,6 +154,16 @@ test("management policy applies explicit tenant roles to tenant resource routes"
   );
   assert.equal(localAgentRevocation.allow, false);
   assert.equal(localAgentRevocation.status, 403);
+
+  const providerNodeRead = await policy.evaluate(
+    policyContext(headers, "GET", "/api/provider-nodes")
+  );
+  assert.equal(providerNodeRead.allow, true);
+  const providerNodeWrite = await policy.evaluate(
+    policyContext(headers, "POST", "/api/provider-nodes")
+  );
+  assert.equal(providerNodeWrite.allow, false);
+  assert.equal(providerNodeWrite.status, 403);
 
   const quotaRead = await policy.evaluate(policyContext(headers, "GET", "/api/quota/groups"));
   assert.equal(quotaRead.allow, true);

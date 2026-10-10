@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { buildCodexAuthFile, CodexAuthFileError } from "@/lib/oauth/utils/codexAuthFile";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 function toErrorResponse(error: unknown) {
@@ -19,24 +19,23 @@ function toErrorResponse(error: unknown) {
 }
 
 export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const authError = await requireManagementAuth(_request);
-  if (authError) return authError;
+  return withManagementTenantContext(_request, async () => {
+    try {
+      const { id } = await params;
+      const built = await buildCodexAuthFile(id);
 
-  try {
-    const { id } = await params;
-    const built = await buildCodexAuthFile(id);
-
-    return new Response(built.content, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Content-Disposition": `attachment; filename="${built.fileName}"`,
-        "Cache-Control": "no-store, max-age=0",
-        "X-Content-Type-Options": "nosniff",
-      },
-    });
-  } catch (error) {
-    console.error("[Codex Auth Export] Failed:", error);
-    return toErrorResponse(error);
-  }
+      return new Response(built.content, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${built.fileName}"`,
+          "Cache-Control": "no-store, max-age=0",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    } catch (error) {
+      console.error("[Codex Auth Export] Failed:", error);
+      return toErrorResponse(error);
+    }
+  });
 }

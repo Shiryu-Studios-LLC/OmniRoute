@@ -10,6 +10,7 @@ import {
   resolveModelAliasLookup,
 } from "@/lib/modelMetadataRegistry";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { requirePlatformAliasAccess } from "@/lib/api/platformAliasAccess";
 
 // GET /api/models/alias - Get all aliases
 export async function GET(request) {
@@ -22,6 +23,13 @@ export async function GET(request) {
         authError.headers.set(key, value);
       }
       return authError;
+    }
+
+    const tenantError = await requirePlatformAliasAccess(request);
+    if (tenantError) {
+      const headers = getCatalogDiagnosticsHeaders({ request, resolvedAlias: alias });
+      for (const [key, value] of Object.entries(headers)) tenantError.headers.set(key, value);
+      return tenantError;
     }
 
     if (alias) {
@@ -119,6 +127,14 @@ export async function PUT(request) {
       return authError;
     }
 
+    const tenantError = await requirePlatformAliasAccess(request);
+    if (tenantError) {
+      for (const [key, value] of Object.entries(diagnosticHeaders)) {
+        tenantError.headers.set(key, value);
+      }
+      return tenantError;
+    }
+
     const validation = validateBody(cloudModelAliasUpdateSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json(
@@ -161,6 +177,14 @@ export async function DELETE(request) {
         authError.headers.set(key, value);
       }
       return authError;
+    }
+
+    const tenantError = await requirePlatformAliasAccess(request);
+    if (tenantError) {
+      for (const [key, value] of Object.entries(diagnosticHeaders)) {
+        tenantError.headers.set(key, value);
+      }
+      return tenantError;
     }
 
     const { searchParams } = new URL(request.url);

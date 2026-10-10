@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCachedCursorAgentAvailability } from "@/lib/cursor/renewal";
+import { withPlatformAdminManagementContext } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
@@ -28,21 +29,23 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
  * 🔒 LOCAL_ONLY — spawns `cursor-agent status --format json` via
  * `checkCursorAgentAvailability()` (Hard Rules #15 + #17).
  */
-export async function GET() {
-  try {
-    const { available } = await getCachedCursorAgentAvailability();
-    return NextResponse.json({ cursorAgentAvailable: available });
-  } catch (error) {
-    // checkCursorAgentAvailability() currently swallows all realistic errors
-    // internally (spawn failures, unparseable output) — this catch is
-    // defense-in-depth consistency with the rest of this plan's routes, not
-    // a currently-reachable path.
-    return NextResponse.json(
-      {
-        cursorAgentAvailable: false,
-        error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-      },
-      { status: 500 }
-    );
-  }
+export async function GET(request: Request) {
+  return withPlatformAdminManagementContext(request, async () => {
+    try {
+      const { available } = await getCachedCursorAgentAvailability();
+      return NextResponse.json({ cursorAgentAvailable: available });
+    } catch (error) {
+      // checkCursorAgentAvailability() currently swallows all realistic errors
+      // internally (spawn failures, unparseable output) — this catch is
+      // defense-in-depth consistency with the rest of this plan's routes, not
+      // a currently-reachable path.
+      return NextResponse.json(
+        {
+          cursorAgentAvailable: false,
+          error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+        },
+        { status: 500 }
+      );
+    }
+  });
 }

@@ -27,6 +27,8 @@ const tenantContext = await import("../../src/lib/tenantContext.ts");
 const credentialsRoute = await import("../../src/app/api/cloud/credentials/update/route.ts");
 const aliasRoute = await import("../../src/app/api/cloud/models/alias/route.ts");
 const resolveAliasRoute = await import("../../src/app/api/cloud/model/resolve/route.ts");
+const legacyAliasRoute = await import("../../src/app/api/models/alias/route.ts");
+const dashboardModelsRoute = await import("../../src/app/api/models/route.ts");
 const cloudAuthRoute = await import("../../src/app/api/cloud/auth/route.ts");
 
 async function resetStorage() {
@@ -384,6 +386,142 @@ test("cloud alias reads preserve platform aliases and hide them from customer AP
     model: "platform-model",
   });
   assert.equal(customerResolve.status, 404);
+});
+
+test("legacy model alias routes restrict global reads and writes to the platform tenant", async () => {
+  await localDb.setModelAlias("legacy-platform", "openai/legacy-model");
+  const platformKey = await createKey(["manage"]);
+  const customer = await tenantProvisioning.provisionCustomerTenant({
+    name: "Customer Legacy Aliases",
+    slug: "customer-legacy-aliases",
+    owner: { principalId: "customer-legacy-aliases-owner", identityVerified: true },
+    provisionedBy: "platform-legacy-aliases-test",
+  });
+  const customerManageKey = await tenantContext.runWithTenantContext(
+    { tenantId: customer.tenant.id, principalId: "customer-legacy-aliases-admin", role: "owner" },
+    () => createKey(["manage"])
+  );
+  const customerHeaders = {
+    "x-goog-api-key": customerManageKey.key,
+    "content-type": "application/json",
+  };
+  const platformHeaders = {
+    "x-goog-api-key": platformKey.key,
+    "content-type": "application/json",
+  };
+
+  const customerList = await legacyAliasRoute.GET(
+    new Request("http://localhost/api/models/alias", { headers: customerHeaders })
+  );
+  const customerResolve = await legacyAliasRoute.GET(
+    new Request("http://localhost/api/models/alias?alias=legacy-platform", {
+      headers: customerHeaders,
+    })
+  );
+  const customerPut = await legacyAliasRoute.PUT(
+    new Request("http://localhost/api/models/alias", {
+      method: "PUT",
+      headers: customerHeaders,
+      body: JSON.stringify({ model: "openai/customer-model", alias: "customer-global" }),
+    })
+  );
+  const customerDelete = await legacyAliasRoute.DELETE(
+    new Request("http://localhost/api/models/alias?alias=legacy-platform", {
+      method: "DELETE",
+      headers: customerHeaders,
+    })
+  );
+
+  assert.equal(customerList.status, 403);
+  assert.equal(customerResolve.status, 403);
+  assert.equal(customerPut.status, 403);
+  assert.equal(customerDelete.status, 403);
+  assert.deepEqual(await localDb.getModelAliases(), {
+    "legacy-platform": "openai/legacy-model",
+  });
+
+  const platformList = await legacyAliasRoute.GET(
+    new Request("http://localhost/api/models/alias", { headers: platformHeaders })
+  );
+  const platformResolve = await legacyAliasRoute.GET(
+    new Request("http://localhost/api/models/alias?alias=legacy-platform", {
+      headers: platformHeaders,
+    })
+  );
+  assert.equal(platformList.status, 200);
+  assert.equal((await platformList.json()).aliases["legacy-platform"], "openai/legacy-model");
+  assert.equal(platformResolve.status, 200);
+
+  const platformPut = await legacyAliasRoute.PUT(
+    new Request("http://localhost/api/models/alias", {
+      method: "PUT",
+      headers: platformHeaders,
+      body: JSON.stringify({ model: "openai/platform-model", alias: "platform-created" }),
+    })
+  );
+  assert.equal(platformPut.status, 200);
+  assert.equal((await localDb.getModelAliases())["platform-created"], "openai/platform-model");
+
+  const platformDelete = await legacyAliasRoute.DELETE(
+    new Request("http://localhost/api/models/alias?alias=platform-created", {
+      method: "DELETE",
+      headers: platformHeaders,
+    })
+  );
+  assert.equal(platformDelete.status, 200);
+  assert.equal((await localDb.getModelAliases())["platform-created"], undefined);
+});
+
+test("dashboard models route denies customer keys but preserves anonymous local access", async () => {
+  await localDb.setModelAlias("dashboard-platform", "openai/dashboard-model");
+  const localGet = await dashboardModelsRoute.GET(
+    new Request("http://localhost/api/models?all=true")
+  );
+  const localGetBody = await localGet.json();
+  assert.equal(localGet.status, 200);
+  assert.ok(Array.isArray(localGetBody.models));
+
+  const localPut = await dashboardModelsRoute.PUT(
+    new Request("http://localhost/api/models", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "openai/local-model", alias: "local-alias" }),
+    })
+  );
+  assert.equal(localPut.status, 200);
+
+  const customer = await tenantProvisioning.provisionCustomerTenant({
+    name: "Customer Dashboard Models",
+    slug: "customer-dashboard-models",
+    owner: { principalId: "customer-dashboard-models-owner", identityVerified: true },
+    provisionedBy: "platform-dashboard-models-test",
+  });
+  const customerManageKey = await tenantContext.runWithTenantContext(
+    { tenantId: customer.tenant.id, principalId: "customer-dashboard-models-admin", role: "owner" },
+    () => createKey(["manage"])
+  );
+  const customerHeaders = {
+    "x-goog-api-key": customerManageKey.key,
+    "content-type": "application/json",
+  };
+
+  const customerGet = await dashboardModelsRoute.GET(
+    new Request("http://localhost/api/models?all=true", { headers: customerHeaders })
+  );
+  const customerPut = await dashboardModelsRoute.PUT(
+    new Request("http://localhost/api/models", {
+      method: "PUT",
+      headers: customerHeaders,
+      body: JSON.stringify({ model: "openai/customer-model", alias: "customer-dashboard" }),
+    })
+  );
+
+  assert.equal(customerGet.status, 403);
+  assert.equal(customerPut.status, 403);
+  assert.deepEqual(await localDb.getModelAliases(), {
+    "dashboard-platform": "openai/dashboard-model",
+    "openai/local-model": "local-alias",
+  });
 });
 
 test("cloud write routes keep 401 for missing or invalid Bearer credentials", async () => {

@@ -72,11 +72,23 @@ test("connection verification skips an ACTIVE exclusive lease before any probe o
 });
 
 test("model discovery, quota refresh, and reset-credit paths reject ACTIVE leased connections", async () => {
-  const response = await providerModels.GET(
-    new Request("http://omniroute.local/api/providers/leased-test-connection/models"),
-    { params: { id: "leased-test-connection" } }
-  );
-  assert.equal(response.status, 409);
+  const previousInternalToken = process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN;
+  process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN = "exclusive-lease-test-service-token";
+  try {
+    const response = await providerModels.GET(
+      new Request("http://127.0.0.1/api/providers/leased-test-connection/models", {
+        headers: {
+          "x-omniroute-internal-service-token": "exclusive-lease-test-service-token",
+          "x-omniroute-peer-locality": "loopback",
+        },
+      }),
+      { params: { id: "leased-test-connection" } }
+    );
+    assert.equal(response.status, 409);
+  } finally {
+    if (previousInternalToken === undefined) delete process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN;
+    else process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN = previousInternalToken;
+  }
 
   await assert.rejects(
     providerLimits.fetchLiveProviderLimits("leased-test-connection"),

@@ -78,10 +78,23 @@ first-owner claim.
 Platform-admin OIDC configuration can rotate a client ID or secret while keeping the same
 issuer. Changing the issuer is rejected while the tenant has any active owner membership or
 any linked OIDC identity. An issuer change would otherwise remove those identity links without
-safely transferring the owner to the new issuer. Deleting the active configuration is also
-rejected while an active owner or linked identity exists. Issuer cutover and configuration
-deletion remain unavailable until a verified recovery flow can establish the replacement
-identity. Unused configurations with no active owners or identity links can still be deleted.
+safely transferring the owner to the new issuer. The verified promotion flow below provides
+that transfer. Deleting the active configuration is also rejected while an active owner or
+linked identity exists. Unused configurations with no active owners or identity links can still
+be deleted.
+
+An active tenant owner can promote a saved issuer draft with
+`POST /__cloud/auth/oidc-draft/promotion`. The portal first shows the count of other linked
+identities that will be invalidated and requires an explicit same-origin confirmation. The
+Worker rejects admins from previewing or starting promotion, then starts OIDC authorization
+with one-use state, nonce, and PKCE bound to the current owner session, active-config revision,
+and exact draft revision. The callback rechecks that the initiating membership is still an
+active owner and verifies the new issuer's signature, issuer, audience, time claims, and nonce
+before atomically activating the draft, linking only the initiating membership, removing old
+issuer links, revoking old sessions, deleting the draft, and writing a count-only audit event.
+Other membership records and API keys remain; those members must be re-invited and re-enrolled.
+Draft promotion requires controlled OIDC egress and does not replace the separate first-owner
+claim flow for `oidc_pending` tenants.
 
 The session cookie is `HttpOnly`, `SameSite=Lax`, scoped to `/__cloud/auth`, and expires
 within eight hours. The database stores a hash of the opaque cookie token. Session
@@ -110,10 +123,11 @@ identity link.
 Tenant issuer/client configuration and issuer/subject membership links are stored in
 Cloudflare D1 by migration `0015_cloud_tenant_oidc.sql`; authorization state and portal
 sessions are stored by `0016_cloud_tenant_oidc_sessions.sql`; digest-only membership invites
-and their OIDC callback binding are stored by `0018_cloud_tenant_membership_invitations.sql`.
+and their OIDC callback binding are stored by `0018_cloud_tenant_membership_invitations.sql`;
+session-bound draft-promotion state is stored by `0032_cloud_tenant_oidc_promotion_state.sql`.
 OIDC client secrets and PKCE verifiers are encrypted using the Worker credential encryption
-key. Customer OIDC issuer configuration remains platform-admin managed; tenant owners/admins
-can invite members but cannot change the issuer or auto-link identities by email/domain. BYO
-OIDC per tenant is the selected long-term direction. Customer-managed issuer changes should wait
-for controlled outbound resolution and a verified first-owner recovery flow; keep the current
-platform-admin configuration path available for break-glass recovery.
+key. Tenant owners/admins can promote a verified pending issuer through the session-bound flow
+above and can invite members; they cannot auto-link identities by email/domain. The
+platform-admin configuration path remains available for initial configuration and break-glass
+operations. First-owner enrollment for `oidc_pending` tenants continues to use its separate
+one-use claim flow.

@@ -3,7 +3,11 @@ import {
   type CloudComplianceAuditInput,
 } from "./complianceAudit";
 import type { CloudDb } from "./db";
-import { encryptCloudCredential } from "./credentialEncryption";
+import {
+  decryptCloudCredential,
+  encryptCloudCredential,
+  isCloudCredentialEnvelope,
+} from "./credentialEncryption";
 
 const DEFAULT_SCOPES = ["openid", "profile", "email"];
 export const CLOUD_TENANT_OIDC_DRAFT_PATH = "/__cloud/auth/oidc-draft";
@@ -23,6 +27,10 @@ export interface CloudTenantOidcDraftAuthorization {
   membershipId: string;
   sessionTokenHash: string;
   nowMs: number;
+}
+
+export interface CloudTenantOidcDraftCredentials extends CloudTenantOidcDraft {
+  clientSecret: string;
 }
 
 interface DraftRow {
@@ -151,6 +159,291 @@ export async function getCloudTenantOidcDraft(
     .bind(authorization.tenantId, ...sessionBindings(authorization))
     .first<DraftRow>();
   return row ? mapDraft(row) : null;
+}
+
+/** Decrypts a draft only for the current owner/admin session inside the Worker auth flow. */
+export async function getCloudTenantOidcDraftCredentials(
+  db: CloudDb,
+  encryptionKey: string | undefined,
+  authorization: CloudTenantOidcDraftAuthorization,
+  expectedUpdatedAt: string
+): Promise<CloudTenantOidcDraftCredentials | null> {
+  const row = await db
+    .prepare<DraftRow & { client_secret_encrypted: string }>(
+      `SELECT draft.tenant_id, draft.issuer, draft.client_id, draft.client_secret_encrypted,
+              draft.scopes_json, draft.created_at, draft.updated_at
+         FROM cloud_tenant_oidc_config_drafts draft
+        WHERE draft.tenant_id = ? AND draft.updated_at = ? AND ${sessionPredicate()}
+        LIMIT 1`
+    )
+    .bind(authorization.tenantId, expectedUpdatedAt, ...sessionBindings(authorization))
+    .first();
+  if (!row) return null;
+  if (!isCloudCredentialEnvelope(row.client_secret_encrypted)) {
+    throw new Error("OIDC draft client secret is not encrypted");
+  }
+  const clientSecret = await decryptCloudCredential(row.client_secret_encrypted, encryptionKey, {
+    tenantId: authorization.tenantId,
+    connectionId: "tenant-oidc-pending-draft",
+    field: "clientSecret",
+  });
+  return { ...mapDraft(row), clientSecret };
+}
+
+export async function countOtherCloudTenantOidcIdentities(
+  db: CloudDb,
+  authorization: CloudTenantOidcDraftAuthorization
+): Promise<number | null> {
+  const row = await db
+    .prepare<{ count: number }>(
+      `SELECT COUNT(*) AS count
+         FROM cloud_tenant_oidc_identities identity
+        WHERE identity.tenant_id = ? AND identity.membership_id <> ?
+          AND ${sessionPredicate()}`
+    )
+    .bind(authorization.tenantId, authorization.membershipId, ...sessionBindings(authorization))
+    .first();
+  return row ? Number(row.count) : null;
+}
+
+/** Atomically promotes one verified draft identity, invalidates old sessions/links, and audits. */
+export async function promoteCloudTenantOidcDraft(
+  db: CloudDb,
+  input: {
+    stateHash: string;
+    tenantId: string;
+    membershipId: string;
+    sessionTokenHash: string;
+    draftUpdatedAt: string;
+    configUpdatedAt: string;
+    otherIdentityCount: number;
+    issuer: string;
+    clientId: string;
+    subject: string;
+    identityId: string;
+    timestamp: string;
+    nowMs: number;
+    audit: CloudComplianceAuditInput;
+  }
+): Promise<{ identityLinksInvalidated: number; sessionsInvalidated: number } | null> {
+  const markState = db
+    .prepare(
+      `UPDATE cloud_tenant_oidc_login_states
+          SET promotion_applied_at_ms = ?
+        WHERE state_hash = ? AND purpose = 'draft_promotion'
+          AND consumed_at_ms = ? AND expires_at_ms > ?
+          AND promotion_applied_at_ms IS NULL
+          AND tenant_id = ? AND issuer = ? AND client_id = ?
+          AND promotion_session_hash = ? AND promotion_membership_id = ?
+          AND promotion_draft_updated_at = ? AND promotion_config_updated_at = ?
+          AND promotion_other_identity_count = ?
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_config_drafts draft
+             WHERE draft.tenant_id = ? AND draft.updated_at = ?
+               AND draft.issuer = ? AND draft.client_id = ?
+          )
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_configs config
+             WHERE config.tenant_id = ? AND config.updated_at = ?
+               AND config.issuer <> ? AND config.is_enabled = 1
+          )
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_sessions session
+            JOIN cloud_customer_memberships membership
+              ON membership.tenant_id = session.tenant_id AND membership.id = session.membership_id
+             AND membership.is_active = 1 AND membership.role = 'owner'
+            JOIN cloud_tenant_oidc_identities identity
+              ON identity.tenant_id = session.tenant_id AND identity.id = session.identity_id
+             AND identity.membership_id = session.membership_id
+            JOIN cloud_tenant_oidc_configs config
+              ON config.tenant_id = identity.tenant_id AND config.issuer = identity.issuer
+             AND config.is_enabled = 1 AND config.updated_at = ?
+            JOIN tenants tenant ON tenant.id = session.tenant_id
+             AND tenant.kind = 'customer' AND tenant.is_active = 1
+             WHERE session.token_hash = ? AND session.tenant_id = ?
+               AND session.membership_id = ? AND session.revoked_at_ms IS NULL
+               AND session.expires_at_ms > ?
+          )
+          AND (
+            SELECT COUNT(*) FROM cloud_tenant_oidc_identities identity
+             WHERE identity.tenant_id = ? AND identity.membership_id <> ?
+          ) = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_identities identity
+             WHERE identity.tenant_id = ? AND identity.issuer = ?
+               AND identity.subject = ? AND identity.membership_id <> ?
+          )`
+    )
+    .bind(
+      input.nowMs,
+      input.stateHash,
+      input.nowMs,
+      input.nowMs,
+      input.tenantId,
+      input.issuer,
+      input.clientId,
+      input.sessionTokenHash,
+      input.membershipId,
+      input.draftUpdatedAt,
+      input.configUpdatedAt,
+      input.otherIdentityCount,
+      input.tenantId,
+      input.draftUpdatedAt,
+      input.issuer,
+      input.clientId,
+      input.tenantId,
+      input.configUpdatedAt,
+      input.issuer,
+      input.configUpdatedAt,
+      input.sessionTokenHash,
+      input.tenantId,
+      input.membershipId,
+      input.nowMs,
+      input.tenantId,
+      input.membershipId,
+      input.otherIdentityCount,
+      input.tenantId,
+      input.issuer,
+      input.subject,
+      input.membershipId
+    );
+  const updateConfig = db
+    .prepare(
+      `UPDATE cloud_tenant_oidc_configs
+          SET issuer = ?, client_id = ?,
+              client_secret_encrypted = (
+                SELECT draft.client_secret_encrypted FROM cloud_tenant_oidc_config_drafts draft
+                 WHERE draft.tenant_id = ? AND draft.updated_at = ?
+              ),
+              scopes_json = (
+                SELECT draft.scopes_json FROM cloud_tenant_oidc_config_drafts draft
+                 WHERE draft.tenant_id = ? AND draft.updated_at = ?
+              ),
+              is_enabled = 1, updated_at = ?
+        WHERE tenant_id = ? AND updated_at = ?
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_login_states state
+             WHERE state.state_hash = ? AND state.promotion_applied_at_ms = ?
+          )`
+    )
+    .bind(
+      input.issuer,
+      input.clientId,
+      input.tenantId,
+      input.draftUpdatedAt,
+      input.tenantId,
+      input.draftUpdatedAt,
+      input.timestamp,
+      input.tenantId,
+      input.configUpdatedAt,
+      input.stateHash,
+      input.nowMs
+    );
+  const revokeSessions = db
+    .prepare(
+      `UPDATE cloud_tenant_oidc_sessions SET revoked_at_ms = ?
+        WHERE tenant_id = ? AND revoked_at_ms IS NULL
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_login_states state
+             WHERE state.state_hash = ? AND state.promotion_applied_at_ms = ?
+          )`
+    )
+    .bind(input.nowMs, input.tenantId, input.stateHash, input.nowMs);
+  const deleteIdentities = db
+    .prepare(
+      `DELETE FROM cloud_tenant_oidc_identities
+        WHERE tenant_id = ?
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_login_states state
+            JOIN cloud_tenant_oidc_configs config ON config.tenant_id = state.tenant_id
+             WHERE state.state_hash = ? AND state.promotion_applied_at_ms = ?
+               AND config.issuer = ? AND config.updated_at = ?
+          )`
+    )
+    .bind(input.tenantId, input.stateHash, input.nowMs, input.issuer, input.timestamp);
+  const insertIdentity = db
+    .prepare(
+      `INSERT INTO cloud_tenant_oidc_identities
+         (id, tenant_id, issuer, subject, membership_id, created_at)
+       SELECT ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM cloud_tenant_oidc_login_states state
+          JOIN cloud_tenant_oidc_configs config ON config.tenant_id = state.tenant_id
+           WHERE state.state_hash = ? AND state.promotion_applied_at_ms = ?
+             AND config.issuer = ? AND config.updated_at = ?
+        )
+          AND EXISTS (
+            SELECT 1 FROM cloud_customer_memberships membership
+             WHERE membership.tenant_id = ? AND membership.id = ?
+               AND membership.is_active = 1 AND membership.role = 'owner'
+          )`
+    )
+    .bind(
+      input.identityId,
+      input.tenantId,
+      input.issuer,
+      input.subject,
+      input.membershipId,
+      input.timestamp,
+      input.stateHash,
+      input.nowMs,
+      input.issuer,
+      input.timestamp,
+      input.tenantId,
+      input.membershipId
+    );
+  const deleteDraft = db
+    .prepare(
+      `DELETE FROM cloud_tenant_oidc_config_drafts
+        WHERE tenant_id = ? AND updated_at = ?
+          AND EXISTS (
+            SELECT 1 FROM cloud_tenant_oidc_login_states state
+            JOIN cloud_tenant_oidc_configs config ON config.tenant_id = state.tenant_id
+             WHERE state.state_hash = ? AND state.promotion_applied_at_ms = ?
+               AND config.issuer = ? AND config.updated_at = ?
+          )`
+    )
+    .bind(
+      input.tenantId,
+      input.draftUpdatedAt,
+      input.stateHash,
+      input.nowMs,
+      input.issuer,
+      input.timestamp
+    );
+  const audit = prepareCloudComplianceAuditInsert(db, input.audit, {
+    requirePreviousStatementChange: true,
+  }).statement;
+
+  const results = await db.batch([
+    markState,
+    updateConfig,
+    revokeSessions,
+    deleteIdentities,
+    insertIdentity,
+    deleteDraft,
+    audit,
+  ]);
+  const changes = results.map((result) =>
+    result && typeof result === "object" && "meta" in result
+      ? Number((result as { meta?: { changes?: unknown } }).meta?.changes ?? 0)
+      : 0
+  );
+  if (
+    changes[0] !== 1 ||
+    changes[1] !== 1 ||
+    changes[2]! < 1 ||
+    changes[3]! < 1 ||
+    changes[4] !== 1 ||
+    changes[5] !== 1 ||
+    changes[6] !== 1
+  ) {
+    return null;
+  }
+  return {
+    identityLinksInvalidated: changes[3] ?? 0,
+    sessionsInvalidated: changes[2] ?? 0,
+  };
 }
 
 /** Records only a sanitized validation outcome if the owner/admin session is still active. */

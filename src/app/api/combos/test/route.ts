@@ -6,7 +6,7 @@ import { getRuntimePorts } from "@/lib/runtime/ports";
 import { resolveNestedComboTargets } from "@omniroute/open-sse/services/combo.ts";
 import { testComboSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 async function getInternalApiKey(): Promise<string | null> {
@@ -128,73 +128,72 @@ async function testComboTarget(target, baseInternalUrl, internalApiKey: string |
  * and only reports success when the model returns usable text content.
  */
 export async function POST(request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
-
-  let rawBody;
-  try {
-    rawBody = await request.json();
-  } catch {
-    return NextResponse.json(
-      {
-        error: {
-          message: "Invalid request",
-          details: [{ field: "body", message: "Invalid JSON body" }],
+  return withManagementTenantContext(request, async () => {
+    let rawBody;
+    try {
+      rawBody = await request.json();
+    } catch {
+      return NextResponse.json(
+        {
+          error: {
+            message: "Invalid request",
+            details: [{ field: "body", message: "Invalid JSON body" }],
+          },
         },
-      },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const validation = validateBody(testComboSchema, rawBody);
-    if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
-    }
-    const { comboName } = validation.data;
-
-    const combo = await getComboByName(comboName);
-    if (!combo) {
-      return NextResponse.json({ error: "Combo not found" }, { status: 404 });
+        { status: 400 }
+      );
     }
 
-    const allCombos = await getCombos();
-    const targets = resolveNestedComboTargets(combo, allCombos);
+    try {
+      const validation = validateBody(testComboSchema, rawBody);
+      if (isValidationFailure(validation)) {
+        return NextResponse.json({ error: validation.error }, { status: 400 });
+      }
+      const { comboName } = validation.data;
 
-    if (targets.length === 0) {
-      return NextResponse.json({ error: "Combo has no models" }, { status: 400 });
+      const combo = await getComboByName(comboName);
+      if (!combo) {
+        return NextResponse.json({ error: "Combo not found" }, { status: 404 });
+      }
+
+      const allCombos = await getCombos();
+      const targets = resolveNestedComboTargets(combo, allCombos);
+
+      if (targets.length === 0) {
+        return NextResponse.json({ error: "Combo has no models" }, { status: 400 });
+      }
+
+      const baseInternalUrl = getInternalBaseUrl();
+      const internalApiKey = await getInternalApiKey();
+      const results = await Promise.all(
+        targets.map((target) => testComboTarget(target, baseInternalUrl, internalApiKey))
+      );
+      const resolvedResult = results.find((result) => result.status === "ok") || null;
+      const resolvedBy = resolvedResult?.model || null;
+
+      return NextResponse.json({
+        comboName,
+        strategy: combo.strategy || "priority",
+        resolvedBy,
+        resolvedByExecutionKey: resolvedResult?.executionKey || null,
+        resolvedByTarget: resolvedResult
+          ? {
+              model: resolvedResult.model,
+              provider: resolvedResult.provider,
+              stepId: resolvedResult.stepId,
+              executionKey: resolvedResult.executionKey,
+              connectionId: resolvedResult.connectionId,
+              label: resolvedResult.label,
+            }
+          : null,
+        results,
+        testedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.log("Error testing combo:", error);
+      return NextResponse.json({ error: "Failed to test combo" }, { status: 500 });
     }
-
-    const baseInternalUrl = getInternalBaseUrl();
-    const internalApiKey = await getInternalApiKey();
-    const results = await Promise.all(
-      targets.map((target) => testComboTarget(target, baseInternalUrl, internalApiKey))
-    );
-    const resolvedResult = results.find((result) => result.status === "ok") || null;
-    const resolvedBy = resolvedResult?.model || null;
-
-    return NextResponse.json({
-      comboName,
-      strategy: combo.strategy || "priority",
-      resolvedBy,
-      resolvedByExecutionKey: resolvedResult?.executionKey || null,
-      resolvedByTarget: resolvedResult
-        ? {
-            model: resolvedResult.model,
-            provider: resolvedResult.provider,
-            stepId: resolvedResult.stepId,
-            executionKey: resolvedResult.executionKey,
-            connectionId: resolvedResult.connectionId,
-            label: resolvedResult.label,
-          }
-        : null,
-      results,
-      testedAt: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.log("Error testing combo:", error);
-    return NextResponse.json({ error: "Failed to test combo" }, { status: 500 });
-  }
+  });
 }
 
 function getInternalBaseUrl(): string {

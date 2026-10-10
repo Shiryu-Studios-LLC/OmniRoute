@@ -10,7 +10,10 @@ import {
   getProviderNodeById,
   isCloudEnabled,
 } from "@/models";
-import { isAnthropicCompatibleProvider, isOpenAICompatibleProvider } from "@/shared/constants/providers";
+import {
+  isAnthropicCompatibleProvider,
+  isOpenAICompatibleProvider,
+} from "@/shared/constants/providers";
 import { isManagedProviderConnectionId } from "@/lib/providers/catalog";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { resolveBulkNameCollisions } from "@/shared/utils/bulkApiKeyParser";
@@ -21,7 +24,7 @@ import {
   normalizeProviderSpecificData,
   sanitizeProviderSpecificDataForResponse,
 } from "@/lib/providers/requestDefaults";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { withManagementTenantContext } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { validateProviderApiKey } from "@/lib/providers/validation";
 import { getProxyForLevel, resolveProxyForProvider } from "@/lib/localDb";
@@ -164,7 +167,10 @@ async function resolveImportNameCollisions(entries: ImportEntry[]): Promise<Impo
     const resolvedProviderEntries = resolveBulkNameCollisions(providerEntries, existingNames);
 
     indices.forEach((originalIndex, i) => {
-      resolved[originalIndex] = { ...entries[originalIndex], name: resolvedProviderEntries[i].name };
+      resolved[originalIndex] = {
+        ...entries[originalIndex],
+        name: resolvedProviderEntries[i].name,
+      };
     });
   }
 
@@ -187,89 +193,93 @@ async function syncToCloudIfEnabled() {
 // Partial-failure semantics identical to /api/providers/bulk: every entry succeeds or
 // fails independently and the response always returns 200 with per-entry results.
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  return withManagementTenantContext(request, async () => {
+    const auditContext = getAuditRequestContext(request);
 
-  const auditContext = getAuditRequestContext(request);
-
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const validation = validateBody(bulkImportProviderSchema, body);
-  if (isValidationFailure(validation)) {
-    return NextResponse.json({ error: validation.error }, { status: 400 });
-  }
-
-  const { entries, validateKeys } = validation.data;
-  const resolvedEntries = await resolveImportNameCollisions(entries);
-
-  const created: Array<Record<string, unknown>> = [];
-  const errors: Array<{ index: number; name: string; provider: string; message: string }> = [];
-
-  for (let i = 0; i < resolvedEntries.length; i++) {
-    const entry = resolvedEntries[i];
+    let body: unknown;
     try {
-      const result = await importOneEntry(entry, !!validateKeys);
-      if ("error" in result) {
-        errors.push({ index: i, name: entry.name, provider: entry.provider, message: result.error });
-        continue;
-      }
-      created.push(result.created);
-      logAuditEvent({
-        action: "provider.credentials.created",
-        actor: "admin",
-        target: getProviderAuditTarget(result.created),
-        resourceType: "provider_credentials",
-        status: "success",
-        ipAddress: auditContext.ipAddress || undefined,
-        requestId: auditContext.requestId,
-        metadata: {
-          provider: entry.provider,
-          via: "import",
-          connection: summarizeProviderConnectionForAudit(result.created),
-        },
-      });
-    } catch (err) {
-      errors.push({
-        index: i,
-        name: entry.name,
-        provider: entry.provider,
-        message: sanitizeErrorMessage(err) || "Failed to create connection",
-      });
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
-  }
 
-  if (created.length > 0) {
-    await syncToCloudIfEnabled();
-  }
+    const validation = validateBody(bulkImportProviderSchema, body);
+    if (isValidationFailure(validation)) {
+      return NextResponse.json({ error: validation.error }, { status: 400 });
+    }
 
-  logAuditEvent({
-    action: "provider.credentials.bulk_created",
-    actor: "admin",
-    resourceType: "provider_credentials",
-    status: errors.length === entries.length ? "failure" : "success",
-    ipAddress: auditContext.ipAddress || undefined,
-    requestId: auditContext.requestId,
-    metadata: {
-      via: "import",
-      total: entries.length,
-      success: created.length,
-      failed: errors.length,
-    },
+    const { entries, validateKeys } = validation.data;
+    const resolvedEntries = await resolveImportNameCollisions(entries);
+
+    const created: Array<Record<string, unknown>> = [];
+    const errors: Array<{ index: number; name: string; provider: string; message: string }> = [];
+
+    for (let i = 0; i < resolvedEntries.length; i++) {
+      const entry = resolvedEntries[i];
+      try {
+        const result = await importOneEntry(entry, !!validateKeys);
+        if ("error" in result) {
+          errors.push({
+            index: i,
+            name: entry.name,
+            provider: entry.provider,
+            message: result.error,
+          });
+          continue;
+        }
+        created.push(result.created);
+        logAuditEvent({
+          action: "provider.credentials.created",
+          actor: "admin",
+          target: getProviderAuditTarget(result.created),
+          resourceType: "provider_credentials",
+          status: "success",
+          ipAddress: auditContext.ipAddress || undefined,
+          requestId: auditContext.requestId,
+          metadata: {
+            provider: entry.provider,
+            via: "import",
+            connection: summarizeProviderConnectionForAudit(result.created),
+          },
+        });
+      } catch (err) {
+        errors.push({
+          index: i,
+          name: entry.name,
+          provider: entry.provider,
+          message: sanitizeErrorMessage(err) || "Failed to create connection",
+        });
+      }
+    }
+
+    if (created.length > 0) {
+      await syncToCloudIfEnabled();
+    }
+
+    logAuditEvent({
+      action: "provider.credentials.bulk_created",
+      actor: "admin",
+      resourceType: "provider_credentials",
+      status: errors.length === entries.length ? "failure" : "success",
+      ipAddress: auditContext.ipAddress || undefined,
+      requestId: auditContext.requestId,
+      metadata: {
+        via: "import",
+        total: entries.length,
+        success: created.length,
+        failed: errors.length,
+      },
+    });
+
+    return NextResponse.json(
+      {
+        success: created.length,
+        failed: errors.length,
+        total: entries.length,
+        created,
+        errors,
+      },
+      { status: 200 }
+    );
   });
-
-  return NextResponse.json(
-    {
-      success: created.length,
-      failed: errors.length,
-      total: entries.length,
-      created,
-      errors,
-    },
-    { status: 200 }
-  );
 }

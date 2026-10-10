@@ -278,11 +278,23 @@ test("when database throws, response has empty connections + meta.degraded inclu
   // Force DB errors by closing the instance so getRawProviderConnections throws.
   const db = getDbInstance();
   db.close();
-  const body = await json(await GET(makeReq()));
-  assert.equal(body.connections.length, 0, "connections should be empty on db failure");
-  assert.ok(body.meta.degraded.includes("database"), "degraded should include database");
-  // restore
-  resetDbInstance();
+  const previousToken = process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN;
+  process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN = "resilience-test-internal-token";
+  try {
+    const req = new Request("http://localhost/api/resilience/connections", {
+      headers: {
+        "x-omniroute-internal-service-token": "resilience-test-internal-token",
+        "x-omniroute-peer-locality": "loopback",
+      },
+    });
+    const body = await json(await GET(req));
+    assert.equal(body.connections.length, 0, "connections should be empty on db failure");
+    assert.ok(body.meta.degraded.includes("database"), "degraded should include database");
+  } finally {
+    if (previousToken === undefined) delete process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN;
+    else process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN = previousToken;
+    resetDbInstance();
+  }
 });
 
 // --- Window metadata ----------------------------------------------------------------

@@ -9,6 +9,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { withPlatformAdminManagementContext } from "@/lib/api/requireManagementAuth";
 import {
   getOpenRouterProviderStats,
   refreshOpenRouterProviderStats,
@@ -25,15 +26,17 @@ export async function GET(req: NextRequest) {
   const forceRefresh = req.nextUrl.searchParams.get("refresh") === "true";
 
   if (forceRefresh) {
-    const result = await refreshOpenRouterProviderStats();
-    return NextResponse.json({
-      object: "list",
-      data: result.data,
-      meta: {
-        source: result.ok ? "fresh" : "error",
-        count: result.data.length,
-        error: result.error ?? undefined,
-      },
+    return withPlatformAdminManagementContext(req, async () => {
+      const result = await refreshOpenRouterProviderStats();
+      return NextResponse.json({
+        object: "list",
+        data: result.data,
+        meta: {
+          source: result.ok ? "fresh" : "error",
+          count: result.data.length,
+          error: result.error ?? undefined,
+        },
+      });
     });
   }
 

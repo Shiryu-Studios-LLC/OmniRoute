@@ -196,35 +196,160 @@ function parseSafeEndpoint(endpoint: string): URL {
   return url;
 }
 
-async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+async function readBoundedRpcResponse(
+  response: Response,
+  maxBytes: number,
+  expectedId: number | undefined,
+  signal: AbortSignal
+): Promise<string> {
   if (!response.body) return "";
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (expectedId === undefined) {
+    // Notifications do not have a JSON-RPC response to consume.
+    const reader = response.body.getReader();
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+    return "";
+  }
+  if (contentType !== "application/json" && contentType !== "text/event-stream") {
+    await response.body.cancel().catch(() => undefined);
+    throw new TenantRemoteMcpError(
+      "MCP_UPSTREAM_PROTOCOL_ERROR",
+      "MCP server returned an unsupported response content type"
+    );
+  }
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
   let total = 0;
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let eventData: string[] = [];
+  let line = "";
+  let swallowLineFeed = false;
+
+  const inspectEvent = (): string | null => {
+    if (eventData.length === 0) return null;
+    const data = eventData.join("\n");
+    eventData = [];
+    let value: unknown;
+    try {
+      value = JSON.parse(data) as unknown;
+    } catch {
+      throw new TenantRemoteMcpError(
+        "MCP_UPSTREAM_PROTOCOL_ERROR",
+        "MCP server returned invalid server-sent event data"
+      );
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (record.id !== expectedId) return null;
+    return data;
+  };
+
+  const processLine = (): string | null => {
+    const current = line;
+    line = "";
+    if (current === "") return inspectEvent();
+    if (current.startsWith(":")) return null;
+    const separator = current.indexOf(":");
+    const field = separator < 0 ? current : current.slice(0, separator);
+    let value = separator < 0 ? "" : current.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "data") eventData.push(value);
+    return null;
+  };
+
+  const processSseText = (text: string): string | null => {
+    for (const character of text) {
+      if (swallowLineFeed) {
+        swallowLineFeed = false;
+        if (character === "\n") continue;
+      }
+      if (character === "\r") {
+        const match = processLine();
+        swallowLineFeed = true;
+        if (match !== null) return match;
+      } else if (character === "\n") {
+        const match = processLine();
+        if (match !== null) return match;
+      } else {
+        line += character;
+      }
+    }
+    return null;
+  };
+
+  const readNext = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+    if (signal.aborted) {
+      void reader.cancel(signal.reason).catch(() => undefined);
+      throw signal.reason ?? new Error("MCP response read aborted");
+    }
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        signal.removeEventListener("abort", onAbort);
+        void reader.cancel(signal.reason).catch(() => undefined);
+        reject(signal.reason ?? new Error("MCP response read aborted"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      reader.read().then(
+        (result) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(result);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        }
+      );
+    });
+  };
+
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const { done, value } = await readNext();
+      if (done) {
+        if (contentType === "text/event-stream") {
+          const tail = decoder.decode();
+          const match = processSseText(tail);
+          if (match !== null) return match;
+          if (line.length > 0) {
+            const finalMatch = processLine();
+            if (finalMatch !== null) return finalMatch;
+          }
+          const finalEvent = inspectEvent();
+          if (finalEvent !== null) return finalEvent;
+          throw new TenantRemoteMcpError(
+            "MCP_UPSTREAM_PROTOCOL_ERROR",
+            "MCP server closed its event stream without the requested response"
+          );
+        }
+        break;
+      }
       total += value.byteLength;
       if (total > maxBytes) {
-        await reader.cancel();
         throw new TenantRemoteMcpError(
           "MCP_UPSTREAM_RESPONSE_TOO_LARGE",
           "MCP server response exceeded the configured limit"
         );
       }
-      chunks.push(value);
+      if (contentType === "text/event-stream") {
+        const match = processSseText(decoder.decode(value, { stream: true }));
+        if (match !== null) {
+          await reader.cancel().catch(() => undefined);
+          return match;
+        }
+      } else {
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
     }
+    if (contentType === "application/json") chunks.push(decoder.decode());
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // An abort can settle the pending read asynchronously after cancellation.
+    }
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
+  return chunks.join("");
 }
 
 function parseRpcResponse(text: string, expectedId: number): Record<string, unknown> {
@@ -345,7 +470,8 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
     message: Record<string, unknown>,
     sessionId?: string,
     authorization?: string,
-    context?: { tenantId: string; serverId: string }
+    context?: { tenantId: string; serverId: string },
+    protocolVersion?: string
   ): Promise<{ response: Response; body: string }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -358,8 +484,9 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
           signal: controller.signal,
           headers: {
             "Content-Type": "application/json",
-            Accept: "application/json",
+            Accept: "application/json, text/event-stream",
             ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+            ...(protocolVersion ? { "MCP-Protocol-Version": protocolVersion } : {}),
             ...(authorization ? { Authorization: authorization } : {}),
           },
           body: JSON.stringify(message),
@@ -375,7 +502,15 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       if (!response.ok) {
         throw new TenantRemoteMcpError("MCP_UPSTREAM_UNAVAILABLE", "MCP server discovery failed");
       }
-      return { response, body: await readBoundedText(response, maxResponseBytes) };
+      return {
+        response,
+        body: await readBoundedRpcResponse(
+          response,
+          maxResponseBytes,
+          message.id as number | undefined,
+          controller.signal
+        ),
+      };
     } catch (error) {
       if (error instanceof TenantRemoteMcpError) throw error;
       if (error instanceof McpOutboundEgressError) {
@@ -400,7 +535,7 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
     endpoint: URL;
     authorization?: string;
     sessionId?: string;
-    protocolVersion: string | null;
+    protocolVersion: string;
     serverInfo: RemoteMcpDiscovery["serverInfo"];
     tools: DiscoveredRemoteMcpTool[];
   }> {
@@ -439,21 +574,35 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       );
     }
     const init = initResult as Record<string, unknown>;
+    if (
+      typeof init.protocolVersion !== "string" ||
+      init.protocolVersion.length === 0 ||
+      init.protocolVersion.length > 128 ||
+      /[\r\n\0]/.test(init.protocolVersion)
+    ) {
+      throw new TenantRemoteMcpError(
+        "MCP_UPSTREAM_PROTOCOL_ERROR",
+        "MCP server returned an invalid negotiated protocol version"
+      );
+    }
     const sessionId = initialized.response.headers.get("Mcp-Session-Id") ?? undefined;
+    const protocolVersion = init.protocolVersion;
 
     await postJsonRpc(
       endpoint,
       { jsonrpc: "2.0", method: "notifications/initialized" },
       sessionId,
       authorization,
-      { tenantId, serverId: server.id }
+      { tenantId, serverId: server.id },
+      protocolVersion
     );
     const listed = await postJsonRpc(
       endpoint,
       { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
       sessionId,
       authorization,
-      { tenantId, serverId: server.id }
+      { tenantId, serverId: server.id },
+      protocolVersion
     );
     const listResponse = parseRpcResponse(listed.body, 2);
     const listResult = listResponse.result;
@@ -463,7 +612,7 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       endpoint,
       ...(authorization ? { authorization } : {}),
       ...(sessionId ? { sessionId } : {}),
-      protocolVersion: typeof init.protocolVersion === "string" ? init.protocolVersion : null,
+      protocolVersion,
       serverInfo: parseServerInfo(init.serverInfo),
       tools: parseTools(listResult, maxTools),
     };
@@ -529,7 +678,8 @@ export function createTenantRemoteMcpRuntime(options: TenantRemoteMcpRuntimeOpti
       },
       connection.sessionId,
       connection.authorization,
-      { tenantId: connection.tenantId, serverId }
+      { tenantId: connection.tenantId, serverId },
+      connection.protocolVersion
     );
     const parsed = parseRpcResponse(called.body, 3);
     if (!parsed.result || typeof parsed.result !== "object" || Array.isArray(parsed.result)) {

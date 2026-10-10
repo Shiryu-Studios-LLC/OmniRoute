@@ -11,6 +11,7 @@ const ALLOWED_REQUEST_HEADERS = new Set([
   "authorization",
   "content-type",
   "mcp-session-id",
+  "mcp-protocol-version",
 ]);
 
 interface ProxyResponseEnvelope {
@@ -83,6 +84,7 @@ function readAllowedHeaders(input: HeadersInit | undefined): {
   upstreamAuthorization?: string;
   contentType?: string;
   mcpSessionId?: string;
+  mcpProtocolVersion?: string;
 } {
   const headers = new Headers(input);
   for (const name of headers.keys()) {
@@ -97,11 +99,13 @@ function readAllowedHeaders(input: HeadersInit | undefined): {
   const authorization = headers.get("authorization") ?? undefined;
   const contentType = headers.get("content-type") ?? undefined;
   const mcpSessionId = headers.get("mcp-session-id") ?? undefined;
+  const mcpProtocolVersion = headers.get("mcp-protocol-version") ?? undefined;
   if (
     (accept !== undefined && accept.length > 256) ||
     (authorization !== undefined && authorization.length > 8_192) ||
     (contentType !== undefined && contentType.length > 128) ||
-    (mcpSessionId !== undefined && mcpSessionId.length > 512)
+    (mcpSessionId !== undefined && mcpSessionId.length > 512) ||
+    (mcpProtocolVersion !== undefined && mcpProtocolVersion.length > 128)
   ) {
     throw new McpOutboundEgressError(
       "MCP_OUTBOUND_DNS_REJECTED",
@@ -113,6 +117,7 @@ function readAllowedHeaders(input: HeadersInit | undefined): {
     ...(authorization ? { upstreamAuthorization: authorization } : {}),
     ...(contentType ? { contentType } : {}),
     ...(mcpSessionId ? { mcpSessionId } : {}),
+    ...(mcpProtocolVersion ? { mcpProtocolVersion } : {}),
   };
 }
 
@@ -167,7 +172,9 @@ function parseEnvelope(value: unknown): ProxyResponseEnvelope {
   if (
     Object.keys(headers).some((key) => !["contentType", "mcpSessionId"].includes(key)) ||
     (headers.contentType !== undefined &&
-      (typeof headers.contentType !== "string" || headers.contentType.length > 256)) ||
+      (typeof headers.contentType !== "string" ||
+        headers.contentType.length > 256 ||
+        /[\r\n\0]/.test(headers.contentType))) ||
     (headers.mcpSessionId !== undefined &&
       (typeof headers.mcpSessionId !== "string" || headers.mcpSessionId.length > 512))
   ) {

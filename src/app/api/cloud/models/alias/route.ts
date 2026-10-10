@@ -1,10 +1,8 @@
 import { NextResponse } from "next/server";
 import { validateApiKey, getModelAliases, setModelAlias, isCloudEnabled } from "@/models";
-import { extractApiKey } from "@/sse/services/auth";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
 import { getCloudModelAliasesForTenant } from "@/lib/db/models/aliases";
-import { PLATFORM_TENANT_ID } from "@/lib/db/tenantScope";
-import { getTenantContext } from "@/lib/tenantContext";
+import { requirePlatformAliasAccess } from "@/lib/api/platformAliasAccess";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
@@ -19,29 +17,8 @@ export async function PUT(request: Request) {
   });
   if (authError) return authError;
 
-  let tenantId = getTenantContext()?.tenantId;
-  const apiKey = extractApiKey(request, { allowUrl: false });
-  if (apiKey) {
-    try {
-      // Management auth establishes request context in the normal pipeline.
-      // Resolve the key metadata too so direct route invocation and callers
-      // without an inherited AsyncLocalStorage context still honor tenant scope.
-      const metadata = await getApiKeyMetadata(apiKey);
-      if (metadata?.tenantId) tenantId = metadata.tenantId;
-    } catch {
-      return NextResponse.json(
-        { error: "Unable to authorize model alias update" },
-        { status: 503 }
-      );
-    }
-  }
-
-  if (tenantId && tenantId !== PLATFORM_TENANT_ID) {
-    return NextResponse.json(
-      { error: "Global model aliases can only be changed by the platform tenant" },
-      { status: 403 }
-    );
-  }
+  const tenantError = await requirePlatformAliasAccess(request);
+  if (tenantError) return tenantError;
 
   let rawBody;
   try {

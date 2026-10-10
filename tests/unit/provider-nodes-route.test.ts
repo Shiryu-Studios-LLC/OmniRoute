@@ -62,7 +62,7 @@ test("provider nodes route lists stored nodes and exposes the CC feature flag", 
   });
 
   process.env.ENABLE_CC_COMPATIBLE_PROVIDER = "true";
-  const response = await providerNodesRoute.GET();
+  const response = await providerNodesRoute.GET(new Request("http://localhost/api/provider-nodes"));
   const body = (await response.json()) as any;
 
   assert.equal(response.status, 200);
