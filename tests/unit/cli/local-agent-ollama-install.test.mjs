@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -167,6 +167,37 @@ test("Ollama install rejects unsupported platforms, architectures, and unverifie
         },
       }),
       /failed its official size or SHA-256 verification/
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("failed executable-link activation rolls back the extracted version and preserves the file", async () => {
+  const home = mkdtempSync(join(tmpdir(), "omniroute-ollama-rollback-"));
+  const binaryLink = join(home, ".local", "bin", "ollama");
+  const versionPath = join(home, ".local", "share", "omniroute", "ollama", "v0.40.1");
+  try {
+    mkdirSync(join(home, ".local", "bin"), { recursive: true });
+    writeFileSync(binaryLink, "user-owned executable\n");
+
+    await assert.rejects(
+      installLocalAgentOllama({
+        platform: "linux",
+        architecture: "x64",
+        home,
+        uid: process.getuid(),
+        fetch: mockFetch(),
+        run: fakeExtract,
+      }),
+      /Refusing to replace a non-symlink/
+    );
+
+    assert.equal(readFileSync(binaryLink, "utf8"), "user-owned executable\n");
+    assert.equal(
+      existsSync(versionPath),
+      false,
+      "failed activation must remove the orphaned version"
     );
   } finally {
     rmSync(home, { recursive: true, force: true });

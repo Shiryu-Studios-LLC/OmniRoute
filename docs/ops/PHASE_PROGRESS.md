@@ -4,7 +4,7 @@ title: "OmniRoute Phases Progress"
 
 # OmniRoute Phases Progress
 
-Last updated: 2026-10-10 @ 4:24 CST
+Last updated: 2026-10-10 @ 4:35 CST
 
 ## Current state
 
@@ -16,9 +16,11 @@ Last updated: 2026-10-10 @ 4:24 CST
 
 - Phase 13 operator audit attribution (2026-10-10): first-owner OIDC claim issuance now records the already-verified operator scope in its atomic audit row (`cloud-identity-admin` for the scoped identity credential); the inference credential remains denied. Focused cloud runtime API tests pass 24/24 and assert the token is not recorded. The threat model now documents this control; cross-tenant identity authority and staging secret isolation remain open.
 
+- Phase 7/8/9/11 follow-up (2026-10-10): customer provisioning rejects invalid or mixed bootstrap modes before any database writes; identity suite passes 16/16. The local Ollama installer removes its verified version directory when activation fails before committing the executable link, while preserving a user-owned executable; installer tests pass 4/4. Stale connector connect cleanup now revokes a session only when its original session ID is still current, preserving a concurrently replaced session and its queued work. `/__cloud/readiness` and `/__cloud/db` require the D1 probe to return the expected row instead of treating an empty result as healthy. Combined gateway, Durable Object, and cloud boundary tests pass 32/32; core typecheck passes. Phases 7–9 remain partial and Phase 11 remains in progress pending deployment/staging evidence. No deployment occurred.
+
 - Active worktree: `/home/okashi/.devspace/worktrees/OmniRoute-e1d58cf1`
 - Branch: `feat/cloudflare-runtime-readiness`
-- Latest verified updates are pushed to `origin/feat/cloudflare-runtime-readiness`: `7301d1f52` (persistence failure handling, localhost pinning, repeatable Worker dry runs, and provider-node isolation) and `50d38ee0f` (operator audit attribution and D1-backed real Ollama Front Desk E2E). Worktree is clean after those commits.
+- Latest pushed baseline on `origin/feat/cloudflare-runtime-readiness`: `7301d1f52` (persistence failure handling, localhost pinning, repeatable Worker dry runs, and provider-node isolation) and `50d38ee0f` (operator audit attribution and D1-backed real Ollama Front Desk E2E). Additional Phase 7–11 follow-ups are currently uncommitted in this worktree.
 - Phase 13 tenant-isolation fix (2026-10-09, commit `db391c95d`, pushed): `/api/cloud/auth` now resolves the verified API-key tenant and scopes provider-connection reads through the tenant context. Before this, unscoped connection reads used the platform tenant default, so a customer key could receive platform provider metadata. The regression seeds separate platform/customer connections and verifies the customer sees only its own connection. Focused `cloud-write-auth` tests pass 6/6, with core typecheck, targeted ESLint, formatting, and diff checks passing. Model aliases still come from the existing global `key_value` namespace; provider credential values are not returned by this endpoint.
 - Phase 4 OIDC recovery hardening (2026-10-09, uncommitted): issuer changes now fail closed while any active owner or linked identity exists; same-issuer client rotation remains supported. Active OIDC configuration deletion uses a conditional D1 delete and returns 409 while an owner or identity link remains, preventing deletion from stranding existing owners. Worker/D1 tests cover linked identities, orphaned active owners, same-issuer updates, and deletion after identity recovery. Focused OIDC suites pass 38/38; the integrated OIDC, alias, and inference-policy suites pass 55/55. Owner-controlled draft-to-active promotion and verified issuer recovery are implemented by the 2026-10-10 OIDC promotion flow below; live external-IdP and staging egress validation remain outstanding.
 - Phase 11 budget persistence reliability (2026-10-09, uncommitted): `setCloudInferenceMonthlyBudget()` now fails when D1 resolves with `success: false`, preventing an unpersisted budget from receiving a success audit/response. The failure-injection regression proves the budget remains unset; focused inference-policy tests pass 9/9.

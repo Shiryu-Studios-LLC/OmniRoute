@@ -67,6 +67,52 @@ test("cloud runtime reports a healthy D1 binding", async () => {
   });
 });
 
+test("cloud runtime does not report a D1 probe as healthy without its expected row", async () => {
+  const runtime = createCloudRuntime({
+    env: {
+      DB: {
+        prepare: () => ({
+          bind() {
+            return this;
+          },
+          async first() {
+            return null;
+          },
+          async all() {
+            return { results: [], success: true };
+          },
+          async run() {
+            return { success: true };
+          },
+        }),
+        async batch() {
+          return [];
+        },
+        async exec() {
+          return undefined;
+        },
+      },
+    },
+  });
+
+  const readinessResponse = await runtime.fetch(
+    new Request("https://omniroute.test/__cloud/readiness")
+  );
+  assert.equal(readinessResponse.status, 503);
+  const readiness = (await readinessResponse.json()) as {
+    checks: { database: string };
+  };
+  assert.equal(readiness.checks.database, "error");
+
+  const databaseResponse = await runtime.fetch(new Request("https://omniroute.test/__cloud/db"));
+  assert.equal(databaseResponse.status, 503);
+  assert.deepEqual(await databaseResponse.json(), {
+    status: "error",
+    runtime: "cloudflare",
+    database: "d1",
+  });
+});
+
 test("cloud runtime readiness requires D1, Durable Object, and R2 storage", async () => {
   let doProbeCount = 0;
   let artifactProbeCount = 0;

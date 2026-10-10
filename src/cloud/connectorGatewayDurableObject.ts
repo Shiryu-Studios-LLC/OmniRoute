@@ -39,7 +39,7 @@ export interface GatewayCoordinatorStub {
     lastSeenAt: string,
     leaseExpiresAt: string
   ): Promise<boolean>;
-  revokeSession(deviceId: string, revokedAt: string): Promise<void>;
+  revokeSession(deviceId: string, revokedAt: string, expectedSessionId?: string): Promise<void>;
   enqueueRequest(deviceId: string, request: GatewayDeviceRequest): Promise<boolean>;
   takeRequests(
     deviceId: string,
@@ -270,14 +270,29 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     });
   }
 
-  async revokeSession(deviceId: string, revokedAt: string): Promise<void> {
+  async revokeSession(
+    deviceId: string,
+    revokedAt: string,
+    expectedSessionId?: string
+  ): Promise<void> {
     assertDeviceId(deviceId);
     if (!isTimestamp(revokedAt)) throw new Error("Invalid gateway revocation timestamp");
     await this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
       const value = await transaction.get<unknown>(SESSION_KEY);
-      if (isSessionRecord(value) && value.deviceId === deviceId && value.revokedAt === null) {
+      if (
+        isSessionRecord(value) &&
+        value.deviceId === deviceId &&
+        value.revokedAt === null &&
+        (expectedSessionId === undefined || value.sessionId === expectedSessionId)
+      ) {
         await transaction.put(SESSION_KEY, { ...value, revokedAt });
+      }
+      if (
+        expectedSessionId !== undefined &&
+        (!isSessionRecord(value) || value.sessionId !== expectedSessionId)
+      ) {
+        return;
       }
       // Revoked session requests and their retained idempotency results must
       // not occupy queue capacity or be observable after revocation.
@@ -723,8 +738,8 @@ export class DurableObjectGatewayCoordinator implements GatewayCoordinator {
     return this.forDevice(deviceId).touchSession(deviceId, sessionId, lastSeenAt, leaseExpiresAt);
   }
 
-  revokeSession(deviceId: string, revokedAt: string): Promise<void> {
-    return this.forDevice(deviceId).revokeSession(deviceId, revokedAt);
+  revokeSession(deviceId: string, revokedAt: string, expectedSessionId?: string): Promise<void> {
+    return this.forDevice(deviceId).revokeSession(deviceId, revokedAt, expectedSessionId);
   }
 
   enqueueRequest(deviceId: string, request: GatewayDeviceRequest): Promise<boolean> {

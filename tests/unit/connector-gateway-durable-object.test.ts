@@ -762,6 +762,36 @@ test("revocation and session replacement clear undeliverable work", async () => 
   );
 });
 
+test("stale connect cleanup leaves a replacement Durable Object session and queue intact", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession(session());
+  await coordinator.putSession(session("device_A", "session_B"));
+  const replacementRequest: GatewayDeviceRequest = {
+    requestId: "replacement_work",
+    tenantId: "tenant_A",
+    sessionId: "session_B",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:02.000Z",
+    expiresAt: "2026-10-08T12:10:00.000Z",
+    status: "pending",
+  };
+  assert.equal(await coordinator.enqueueRequest("device_A", replacementRequest), true);
+
+  await coordinator.revokeSession("device_A", "2026-10-08T12:00:03.000Z", "session_A");
+
+  assert.equal((await coordinator.getSession("device_A"))?.sessionId, "session_B");
+  assert.equal(
+    await coordinator.getRequest(
+      "device_A",
+      replacementRequest.requestId,
+      "2026-10-08T12:00:04.000Z"
+    ),
+    replacementRequest
+  );
+});
+
 test("completed request retention is bounded by row count and serialized bytes", async () => {
   const storage = new MemoryStorage();
   const durableObject = new GatewaySessionDurableObject({

@@ -237,6 +237,9 @@ export async function installLocalAgentOllama({
   const archivePath = join(stagingDir, "ollama.tar.zst");
   const unpackedDir = join(stagingDir, "unpacked");
   mkdirSync(unpackedDir, { mode: 0o700 });
+  let installedVersion = false;
+  let temporaryLink = null;
+  let linkCommitted = false;
   try {
     await fetchArchive(release.url, archivePath, release.size, release.digest, { fetch });
     extractVerifiedArchive(archivePath, unpackedDir, run);
@@ -249,8 +252,9 @@ export async function installLocalAgentOllama({
     const installedStage = join(stagingDir, "version");
     renameSync(unpackedDir, installedStage);
     renameSync(installedStage, versionDir);
+    installedVersion = true;
     const link = join(binDir, "ollama");
-    const linkTemp = join(binDir, `.ollama-${randomBytes(8).toString("hex")}`);
+    temporaryLink = join(binDir, `.ollama-${randomBytes(8).toString("hex")}`);
     let existing;
     try {
       existing = lstatSync(link);
@@ -266,11 +270,23 @@ export async function installLocalAgentOllama({
           "Refusing to replace an Ollama link outside OmniRoute's install directory."
         );
     }
-    symlinkSync(join(versionDir, "bin", "ollama"), linkTemp);
-    renameSync(linkTemp, link);
-    rmSync(stagingDir, { recursive: true, force: true });
+    symlinkSync(join(versionDir, "bin", "ollama"), temporaryLink);
+    renameSync(temporaryLink, link);
+    temporaryLink = null;
+    linkCommitted = true;
+    // The install is committed once the user-local link points at the verified
+    // release. Cleanup failure must not remove the linked version.
+    try {
+      rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      // A later install can remove an orphaned private staging directory.
+    }
     return { version: release.tag, binary: link, path: versionDir, digest: release.digest };
   } catch (error) {
+    if (temporaryLink) rmSync(temporaryLink, { force: true });
+    if (installedVersion && !linkCommitted) {
+      rmSync(versionDir, { recursive: true, force: true });
+    }
     rmSync(stagingDir, { recursive: true, force: true });
     throw error;
   }

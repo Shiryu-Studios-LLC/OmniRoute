@@ -40,6 +40,17 @@ export async function provisionCloudCustomer(
   db: CloudDb,
   input: CloudCustomerProvisioningInput
 ): Promise<ProvisionedCloudCustomer | ProvisionedOidcPendingCloudCustomer> {
+  const oidcPending = "bootstrapMode" in input;
+  if (oidcPending && input.bootstrapMode !== "oidc_pending") {
+    throw new TypeError("Unsupported customer bootstrap mode");
+  }
+  if (oidcPending && "ownerPrincipalId" in input) {
+    throw new TypeError("OIDC-pending provisioning cannot include an owner principal");
+  }
+  if (!oidcPending && (!input.ownerPrincipalId || typeof input.ownerPrincipalId !== "string")) {
+    throw new TypeError("Trusted owner principal is required for customer provisioning");
+  }
+
   let tenantInserted = false;
   try {
     const insertResult = await db
@@ -63,7 +74,7 @@ export async function provisionCloudCustomer(
     if (!tenant) throw new Error("Provisioned customer tenant could not be read back");
     if (!settings) throw new Error("Provisioned customer tenant settings could not be read back");
 
-    if ("bootstrapMode" in input) {
+    if (oidcPending) {
       return {
         tenant,
         settings,

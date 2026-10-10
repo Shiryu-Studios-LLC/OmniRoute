@@ -435,8 +435,8 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
 
         if (options.env?.DB) {
           try {
-            await options.env.DB.prepare("SELECT 1 AS ok").first();
-            checks.database = "ok";
+            const probe = await options.env.DB.prepare<{ ok: number }>("SELECT 1 AS ok").first();
+            checks.database = probe?.ok === 1 ? "ok" : "error";
           } catch {
             checks.database = "error";
           }
@@ -492,7 +492,8 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         }
 
         try {
-          await options.env.DB.prepare("SELECT 1 AS ok").first();
+          const probe = await options.env.DB.prepare<{ ok: number }>("SELECT 1 AS ok").first();
+          if (probe?.ok !== 1) throw new Error("D1 health probe returned no result");
           return Response.json(
             { status: "ok", runtime: "cloudflare", database: "d1" },
             { headers: { "Cache-Control": "no-store" } }

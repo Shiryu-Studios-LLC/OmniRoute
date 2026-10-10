@@ -85,7 +85,7 @@ export interface GatewayCoordinator {
     lastSeenAt: string,
     leaseExpiresAt: string
   ): Promise<boolean>;
-  revokeSession(deviceId: string, revokedAt: string): Promise<void>;
+  revokeSession(deviceId: string, revokedAt: string, expectedSessionId?: string): Promise<void>;
   enqueueRequest(deviceId: string, request: GatewayDeviceRequest): Promise<boolean>;
   takeRequests(
     deviceId: string,
@@ -422,7 +422,11 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         currentDevice.tenantId !== device.tenantId ||
         !digestEqual(currentDevice.credentialHash, suppliedHash)
       ) {
-        await options.coordinator.revokeSession(device.id, new Date(now()).toISOString());
+        await options.coordinator.revokeSession(
+          device.id,
+          new Date(now()).toISOString(),
+          session.sessionId
+        );
         return null;
       }
       return {

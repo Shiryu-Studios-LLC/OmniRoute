@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { CloudDb, CloudDbStatement } from "../../src/cloud/db";
 import { handleCloudApiRequest } from "../../src/cloud/httpApi";
+import { provisionCloudCustomer } from "../../src/cloud/provisioning";
 import {
   authenticateCloudCustomerApiKey,
   createCloudCustomerMembership,
@@ -433,6 +434,43 @@ test("platform admin can provision an explicit OIDC-pending tenant without creat
       slug: "oidc-pending-customer",
       bootstrapMode: "oidc_pending",
     });
+  } finally {
+    d1.db.close();
+  }
+});
+
+test("provisioning rejects unknown or mixed bootstrap modes before creating a tenant", async () => {
+  const { d1, now } = await fixture();
+  try {
+    await assert.rejects(
+      provisionCloudCustomer(d1, {
+        id: "tenant-invalid-bootstrap",
+        name: "Invalid Bootstrap",
+        slug: "invalid-bootstrap",
+        bootstrapMode: "unexpected",
+        now,
+      } as never),
+      { name: "TypeError", message: "Unsupported customer bootstrap mode" }
+    );
+
+    await assert.rejects(
+      provisionCloudCustomer(d1, {
+        id: "tenant-mixed-bootstrap",
+        name: "Mixed Bootstrap",
+        slug: "mixed-bootstrap",
+        bootstrapMode: "oidc_pending",
+        ownerPrincipalId: "trusted-owner",
+        now,
+      } as never),
+      { name: "TypeError", message: "OIDC-pending provisioning cannot include an owner principal" }
+    );
+
+    const tenants = await d1
+      .prepare<{ id: string }>(
+        "SELECT id FROM tenants WHERE id IN ('tenant-invalid-bootstrap', 'tenant-mixed-bootstrap')"
+      )
+      .all();
+    assert.deepEqual(tenants.results, []);
   } finally {
     d1.db.close();
   }

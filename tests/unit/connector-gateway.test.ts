@@ -45,9 +45,11 @@ function createMemoryAdapters(initialDevices: GatewayDeviceRecord[]) {
       session.leaseExpiresAt = leaseExpiresAt;
       return true;
     },
-    async revokeSession(deviceId, revokedAt) {
+    async revokeSession(deviceId, revokedAt, expectedSessionId) {
       const session = sessions.get(deviceId);
-      if (session) session.revokedAt = revokedAt;
+      if (session && (expectedSessionId === undefined || session.sessionId === expectedSessionId)) {
+        session.revokedAt = revokedAt;
+      }
     },
     async enqueueRequest(deviceId, request) {
       const rows = requests.get(deviceId) ?? [];
@@ -282,6 +284,48 @@ test("connect racing with credential rotation revokes the session it just create
 
   assert.equal(await gateway.connect("device_race", credential), null);
   assert.equal(adapters.sessions.get("device_race")?.revokedAt !== null, true);
+});
+
+test("stale connect cleanup does not revoke a newer concurrent device session", async () => {
+  const credential = "agent-credential-race";
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_race",
+      tenantId: "tenant_race",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama.chat"],
+      revokedAt: null,
+    },
+  ]);
+  const originalGetDevice = adapters.directory.getDevice.bind(adapters.directory);
+  let reads = 0;
+  adapters.directory.getDevice = async (deviceId) => {
+    reads += 1;
+    const device = await originalGetDevice(deviceId);
+    if (reads === 2 && device) {
+      await adapters.coordinator.putSession({
+        sessionId: "session_newer",
+        deviceId,
+        tenantId: device.tenantId,
+        tokenHash: await sha256Hex("newer-token"),
+        connectedAt: "2026-10-08T12:00:01.000Z",
+        lastSeenAt: "2026-10-08T12:00:01.000Z",
+        leaseExpiresAt: "2026-10-08T12:01:01.000Z",
+        revokedAt: null,
+      });
+      return { ...device, credentialHash: await sha256Hex("rotated-credential") };
+    }
+    return device;
+  };
+  const gateway = createConnectorGateway({
+    ...adapters,
+    createId: () => "session_stale",
+    createToken: () => "session-token-stale",
+  });
+
+  assert.equal(await gateway.connect("device_race", credential), null);
+  assert.equal(adapters.sessions.get("device_race")?.sessionId, "session_newer");
+  assert.equal(adapters.sessions.get("device_race")?.revokedAt, null);
 });
 
 test("invalid lease bounds are rejected before creating gateway sessions", () => {
