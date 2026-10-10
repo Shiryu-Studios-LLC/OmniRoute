@@ -20,6 +20,7 @@ import { cloudflareClientIpBucket, consumeCloudRateLimit } from "./rateLimit";
 import {
   isCloudOpenAiResponsesModel,
   isCloudOpenAiResponsesModelResult,
+  type CloudOpenAiResponsesModel,
 } from "./providerExecution";
 import { getCloudProviderConnections } from "./providers";
 import { appendCloudUsageRecord } from "./usage";
@@ -44,6 +45,11 @@ const DEFAULT_CUSTOMER_RATE_LIMIT = { limit: 20, windowMs: 60_000 };
 const DEFAULT_FAILED_KEY_RATE_LIMIT = { limit: 600, windowMs: 60_000 };
 const DEFAULT_FAILED_KEY_FALLBACK_RATE_LIMIT = { limit: 10, windowMs: 60_000 };
 const ALLOWED_BODY_FIELDS = new Set(["model", "messages", "max_completion_tokens", "stream"]);
+const CLOUD_COMBO_MODEL_PREFIX = "combo:";
+const CLOUD_COMBO_MAX_TARGETS = 10;
+// These statuses reject the requested model before response generation. Throttles,
+// timeouts, redirects, server errors, and malformed successes can have unknown outcomes.
+const CLOUD_COMBO_RETRYABLE_REJECTIONS = new Set([400, 401, 403, 404, 422]);
 const encoder = new TextEncoder();
 
 export interface CloudInferenceCustomerHttpApiOptions {
@@ -62,9 +68,15 @@ export interface CloudInferenceCustomerHttpApiOptions {
 
 interface CustomerRequest {
   model: string;
+  comboName?: string;
   message: string;
   stream: boolean;
   maxOutputTokens?: number;
+}
+
+interface CloudInferenceTarget {
+  model: CloudOpenAiResponsesModel;
+  entitlement: NonNullable<Awaited<ReturnType<typeof getCloudInferenceEntitlement>>>;
 }
 
 interface CountResponse {
@@ -184,7 +196,15 @@ async function readBoundedJson(
 
 function parseCustomerRequest(body: Record<string, unknown>): CustomerRequest | null {
   if (Object.keys(body).some((key) => !ALLOWED_BODY_FIELDS.has(key))) return null;
-  if (!isCloudOpenAiResponsesModel(body.model)) return null;
+  const comboName =
+    typeof body.model === "string" && body.model.startsWith(CLOUD_COMBO_MODEL_PREFIX)
+      ? body.model.slice(CLOUD_COMBO_MODEL_PREFIX.length)
+      : null;
+  if (
+    !isCloudOpenAiResponsesModel(body.model) &&
+    (comboName === null || !/^[\w./\-[\] ]{1,100}$/.test(comboName.trim()))
+  )
+    return null;
   if (!Array.isArray(body.messages) || body.messages.length !== 1) return null;
   const message = body.messages[0];
   if (
@@ -211,12 +231,134 @@ function parseCustomerRequest(body: Record<string, unknown>): CustomerRequest | 
   if (body.stream !== undefined && typeof body.stream !== "boolean") return null;
   return {
     model: body.model,
+    ...(comboName === null ? {} : { comboName: comboName.trim() }),
     message: content,
     stream: body.stream === true,
     ...(body.max_completion_tokens === undefined
       ? {}
       : { maxOutputTokens: body.max_completion_tokens as number }),
   };
+}
+
+type CloudTargetResolution =
+  | { kind: "ok"; targets: CloudInferenceTarget[]; strategy: "priority" | null }
+  | { kind: "not_found" }
+  | { kind: "unsupported" }
+  | { kind: "unavailable" }
+  | { kind: "not_entitled" };
+
+function comboTargetModel(value: unknown): CloudOpenAiResponsesModel | null {
+  if (typeof value === "string") {
+    const model = value.startsWith("openai/") ? value.slice("openai/".length) : value;
+    return isCloudOpenAiResponsesModel(model) ? model : null;
+  }
+  const target = record(value);
+  if (
+    !target ||
+    Object.keys(target).length !== 3 ||
+    target.kind !== "model" ||
+    target.provider !== "openai" ||
+    !isCloudOpenAiResponsesModel(target.model)
+  ) {
+    return null;
+  }
+  return target.model;
+}
+
+/**
+ * Cloud inference deliberately supports only priority combos of direct, allowlisted
+ * OpenAI Responses targets. Nested combos, other strategies/providers, and config
+ * semantics are rejected until their routing and accounting contracts are implemented.
+ */
+async function resolveCloudInferenceTargets(
+  db: CloudDb,
+  tenantId: string,
+  request: CustomerRequest
+): Promise<CloudTargetResolution> {
+  let models: CloudOpenAiResponsesModel[];
+  let strategy: "priority" | null = null;
+  if (!request.comboName) {
+    models = [request.model as CloudOpenAiResponsesModel];
+  } else {
+    let row: Record<string, unknown> | null;
+    try {
+      row = await db
+        .prepare<Record<string, unknown>>(
+          "SELECT data_json, is_active FROM cloud_tenant_combos WHERE tenant_id = ? AND name = ? AND is_active = 1"
+        )
+        .bind(tenantId, request.comboName)
+        .first();
+    } catch {
+      return { kind: "unavailable" };
+    }
+    if (!row) return { kind: "not_found" };
+    let data: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(String(row.data_json));
+      const candidate = record(parsed);
+      if (!candidate) return { kind: "unsupported" };
+      data = candidate;
+    } catch {
+      return { kind: "unsupported" };
+    }
+    const allowedDataFields = new Set([
+      "name",
+      "description",
+      "config",
+      "models",
+      "strategy",
+      "isActive",
+    ]);
+    if (
+      Object.keys(data).some((key) => !allowedDataFields.has(key)) ||
+      data.name !== request.comboName ||
+      (data.description !== undefined &&
+        (typeof data.description !== "string" || data.description.length > 2000)) ||
+      data.strategy !== "priority" ||
+      (data.isActive !== undefined &&
+        (typeof data.isActive !== "boolean" || data.isActive !== (Number(row.is_active) === 1)))
+    ) {
+      return { kind: "unsupported" };
+    }
+    if (
+      data.config !== undefined &&
+      (!record(data.config) || Object.keys(data.config as Record<string, unknown>).length > 0)
+    ) {
+      return { kind: "unsupported" };
+    }
+    if (
+      !Array.isArray(data.models) ||
+      data.models.length < 1 ||
+      data.models.length > CLOUD_COMBO_MAX_TARGETS
+    ) {
+      return { kind: "unsupported" };
+    }
+    models = [];
+    const seen = new Set<string>();
+    for (const item of data.models) {
+      const model = comboTargetModel(item);
+      if (!model || seen.has(model)) return { kind: "unsupported" };
+      seen.add(model);
+      models.push(model);
+    }
+    strategy = "priority";
+  }
+
+  const targets: CloudInferenceTarget[] = [];
+  try {
+    for (const model of models) {
+      const entitlement = await getCloudInferenceEntitlement(db, tenantId, "openai", model);
+      if (!entitlement?.enabled) return { kind: "not_entitled" };
+      targets.push({ model, entitlement });
+    }
+  } catch {
+    return { kind: "unavailable" };
+  }
+  return { kind: "ok", targets, strategy };
+}
+
+function attemptReservationId(requestId: string, index: number, combo: boolean): string {
+  return combo ? `${requestId}_attempt_${index + 1}` : requestId;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -301,6 +443,10 @@ async function fetchTimedBody(
           await response.body?.cancel().catch(() => undefined);
           return { response, body: null };
         }
+        if (response.status >= 400 && response.status < 500) {
+          await response.body?.cancel().catch(() => undefined);
+          return { response, body: null };
+        }
         const body = await readBoundedResponse(response, maxBytes);
         return { response, body };
       })(),
@@ -308,6 +454,38 @@ async function fetchTimedBody(
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function fetchTimedStreamHeaders(
+  fetcher: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<{
+  response: Response;
+  controller: AbortController;
+  timer: ReturnType<typeof setTimeout>;
+}> {
+  const controller = new AbortController();
+  let rejectTimeout: ((error: Error) => void) | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timer = setTimeout(() => {
+    controller.abort("upstream timeout");
+    rejectTimeout?.(new Error("upstream timeout"));
+  }, timeoutMs);
+  try {
+    const response = await Promise.race([
+      fetcher(url, { ...init, signal: controller.signal, redirect: "manual" }),
+      timeout,
+    ]);
+    return { response, controller, timer };
+  } catch (error) {
+    clearTimeout(timer);
+    controller.abort("upstream unavailable");
+    throw error;
   }
 }
 
@@ -401,9 +579,9 @@ function chatCompletion(
   };
 }
 
-function requestPayload(request: CustomerRequest) {
+function requestPayload(request: CustomerRequest, targetModel = request.model) {
   return {
-    model: request.model,
+    model: targetModel,
     input: request.message,
   };
 }
@@ -456,21 +634,25 @@ interface CloudStreamInput {
   claim: { tenantId: string; requestId: string } & Parameters<
     typeof markCloudInferenceOutcomeUnavailable
   >[1];
+  reservationId: string;
   tenantId: string;
   apiKeyId: string;
-  apiKey: string;
   connectionId: string;
   inputTokens: number;
   maxOutputTokens: number;
-  fetcher: typeof fetch;
+  response: Response;
+  controller: AbortController;
+  timer: ReturnType<typeof setTimeout>;
   countPayload: ReturnType<typeof requestPayload>;
+  outputModel: string;
+  comboStrategy: "priority" | null;
   audit: (status: string, metadata?: Record<string, unknown>) => Promise<void>;
   startedAt: number;
 }
 
 /** Stream only the pinned Responses endpoint; persist the bounded SSE transcript for exact replay. */
 async function streamCloudInference(input: CloudStreamInput): Promise<Response> {
-  const { options, claim } = input;
+  const { options, claim, response, controller, timer } = input;
   const db = options.db!;
   const nowMs = () => options.now?.() ?? Date.now();
   const failedResponse = (message: string, status: number) =>
@@ -478,61 +660,12 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
   const settleConservatively = async () => {
     await settleCloudInferenceReservation(db, {
       tenantId: input.tenantId,
-      reservationId: claim.requestId,
+      reservationId: input.reservationId,
       actualInputTokens: input.inputTokens,
       actualOutputTokens: input.maxOutputTokens,
       now: new Date(nowMs()),
     });
   };
-  const controller = new AbortController();
-  let response: Response;
-  let rejectTimeout: ((error: Error) => void) | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    rejectTimeout = reject;
-  });
-  const timer = setTimeout(() => {
-    controller.abort("upstream timeout");
-    rejectTimeout?.(new Error("upstream timeout"));
-  }, options.generationTimeoutMs ?? CLOUD_INFERENCE_GENERATION_TIMEOUT_MS);
-  try {
-    response = await Promise.race([
-      input.fetcher(CLOUD_INFERENCE_RESPONSE_URL, {
-        method: "POST",
-        headers: {
-          ...requestHeaders(input.apiKey),
-          Accept: "text/event-stream",
-        },
-        body: JSON.stringify({
-          ...input.countPayload,
-          max_output_tokens: input.maxOutputTokens,
-          store: false,
-          stream: true,
-        }),
-        signal: controller.signal,
-        redirect: "manual",
-      }),
-      timeout,
-    ]);
-  } catch {
-    clearTimeout(timer);
-    controller.abort("upstream unavailable");
-    try {
-      await settleConservatively();
-    } catch {
-      // The idempotency tombstone below prevents uncertain redispatch.
-    }
-    await markCloudInferenceOutcomeUnavailable(db, claim, nowMs());
-    try {
-      await input.audit("generation_outcome_unavailable", {
-        inputTokens: input.inputTokens,
-        outputTokensReserved: input.maxOutputTokens,
-        connectionId: input.connectionId,
-      });
-    } catch {
-      // Keep the public failure generic.
-    }
-    return failedResponse("Inference outcome is unavailable and will not be retried", 504);
-  }
   if ((response.status >= 300 && response.status <= 399) || !response.ok || !response.body) {
     clearTimeout(timer);
     await response.body?.cancel().catch(() => undefined);
@@ -544,6 +677,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
     await markCloudInferenceOutcomeUnavailable(db, claim, nowMs());
     try {
       await input.audit("generation_outcome_unavailable", {
+        model: input.countPayload.model,
         inputTokens: input.inputTokens,
         outputTokensReserved: input.maxOutputTokens,
         connectionId: input.connectionId,
@@ -650,9 +784,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
       void (async () => {
         try {
           if (
-            !emit(
-              chatChunk(claim.requestId, created, { role: "assistant" }, input.countPayload.model)
-            )
+            !emit(chatChunk(claim.requestId, created, { role: "assistant" }, input.outputModel))
           ) {
             await fail("Inference result exceeds the response limit", true);
             return;
@@ -683,12 +815,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
             if (pendingDelta && emittedDelta) {
               if (
                 !emit(
-                  chatChunk(
-                    claim.requestId,
-                    created,
-                    { content: pendingDelta },
-                    input.countPayload.model
-                  )
+                  chatChunk(claim.requestId, created, { content: pendingDelta }, input.outputModel)
                 )
               ) {
                 await fail("Inference result exceeds the response limit", true);
@@ -717,21 +844,14 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
           }
           if (
             pendingDelta &&
-            !emit(
-              chatChunk(
-                claim.requestId,
-                created,
-                { content: pendingDelta },
-                input.countPayload.model
-              )
-            )
+            !emit(chatChunk(claim.requestId, created, { content: pendingDelta }, input.outputModel))
           ) {
             await fail("Inference result exceeds the response limit", true);
             return;
           }
           const settled = await settleCloudInferenceReservation(db, {
             tenantId: input.tenantId,
-            reservationId: claim.requestId,
+            reservationId: input.reservationId,
             actualInputTokens: providerResult.usage.input_tokens,
             actualOutputTokens: providerResult.usage.output_tokens,
             now: new Date(nowMs()),
@@ -742,7 +862,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
           }
           try {
             await appendCloudUsageRecord(db, {
-              id: claim.requestId,
+              id: input.reservationId,
               tenantId: input.tenantId,
               provider: CLOUD_INFERENCE_PROVIDER,
               model: input.countPayload.model,
@@ -753,11 +873,13 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
               serviceTier: "customer-managed",
               status: "success",
               success: true,
+              comboStrategy: input.comboStrategy,
               latencyMs: Math.max(0, Math.round(performance.now() - input.startedAt)),
               endpoint: CLOUD_INFERENCE_CHAT_PATH,
               timestamp: new Date(nowMs()).toISOString(),
             });
             await input.audit("success", {
+              model: input.countPayload.model,
               inputTokens: providerResult.usage.input_tokens,
               outputTokens: providerResult.usage.output_tokens,
               connectionId: input.connectionId,
@@ -772,7 +894,7 @@ async function streamCloudInference(input: CloudStreamInput): Promise<Response> 
               ? "length"
               : "stop";
           const terminal =
-            chatChunk(claim.requestId, created, {}, input.countPayload.model, finishReason) +
+            chatChunk(claim.requestId, created, {}, input.outputModel, finishReason) +
             "data: [DONE]\n\n";
           const terminalBytes = outputEncoder.encode(terminal);
           if (transcriptBytes + terminalBytes.byteLength > CLOUD_INFERENCE_MAX_RESPONSE_BYTES) {
@@ -932,6 +1054,7 @@ export async function handleCloudInferenceCustomerRequest(
     );
   }
   if (
+    !customerRequest.comboName &&
     customerRequest.model !== CLOUD_INFERENCE_MODEL &&
     identity.role !== "owner" &&
     identity.role !== "admin"
@@ -1034,23 +1157,32 @@ export async function handleCloudInferenceCustomerRequest(
     });
   };
 
-  let entitlement;
-  try {
-    entitlement = await getCloudInferenceEntitlement(
-      options.db,
-      identity.tenantId,
-      CLOUD_INFERENCE_PROVIDER,
-      customerRequest.model
-    );
-  } catch {
+  const targetResolution = await resolveCloudInferenceTargets(
+    options.db,
+    identity.tenantId,
+    customerRequest
+  );
+  if (targetResolution.kind === "unavailable") {
     return cache(
       { error: { message: "Inference policy is unavailable", type: "cloud_inference_error" } },
       503
     );
   }
-  if (!entitlement?.enabled) {
+  if (targetResolution.kind === "not_found") {
     try {
-      await audit("denied", { reason: "entitlement_disabled" });
+      await audit("denied", { reason: "combo_not_found" });
+    } catch {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Inference audit is unavailable", 503, claim.requestId);
+    }
+    return cache(
+      { error: { message: "Customer combo is unavailable", type: "cloud_inference_error" } },
+      404
+    );
+  }
+  if (targetResolution.kind === "unsupported") {
+    try {
+      await audit("denied", { reason: "combo_contract_unsupported" });
     } catch {
       await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
       return errorResponse("Inference audit is unavailable", 503, claim.requestId);
@@ -1058,7 +1190,26 @@ export async function handleCloudInferenceCustomerRequest(
     return cache(
       {
         error: {
-          message: "Inference is not enabled for this model",
+          message: "Customer combo uses unsupported routing settings",
+          type: "cloud_inference_error",
+        },
+      },
+      400
+    );
+  }
+  if (targetResolution.kind === "not_entitled") {
+    try {
+      await audit("denied", { reason: "combo_target_not_entitled" });
+    } catch {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Inference audit is unavailable", 503, claim.requestId);
+    }
+    return cache(
+      {
+        error: {
+          message: customerRequest.comboName
+            ? "Inference is not enabled for every combo target"
+            : "Inference is not enabled for this model",
           type: "cloud_inference_error",
         },
       },
@@ -1066,10 +1217,14 @@ export async function handleCloudInferenceCustomerRequest(
     );
   }
 
+  const targets = targetResolution.targets;
+  const maxEntitledOutputTokens = Math.min(
+    ...targets.map((target) => target.entitlement.maxOutputTokens)
+  );
   const maxOutputTokens =
     customerRequest.maxOutputTokens ??
-    Math.min(CLOUD_INFERENCE_DEFAULT_OUTPUT_TOKENS, entitlement.maxOutputTokens);
-  if (maxOutputTokens < 1 || maxOutputTokens > entitlement.maxOutputTokens) {
+    Math.min(CLOUD_INFERENCE_DEFAULT_OUTPUT_TOKENS, maxEntitledOutputTokens);
+  if (maxOutputTokens < 1 || maxOutputTokens > maxEntitledOutputTokens) {
     try {
       await audit("denied", { reason: "output_cap_exceeded" });
     } catch {
@@ -1131,45 +1286,385 @@ export async function handleCloudInferenceCustomerRequest(
   }
 
   const fetcher = options.fetcher ?? fetch;
-  const countPayload = requestPayload(customerRequest);
-  let countResult: CountResponse | null = null;
-  try {
-    const result = await fetchTimedBody(
-      fetcher,
-      CLOUD_INFERENCE_COUNT_URL,
-      {
-        method: "POST",
-        headers: requestHeaders(apiKey),
-        body: JSON.stringify(countPayload),
-      },
-      options.countTimeoutMs ?? CLOUD_INFERENCE_COUNT_TIMEOUT_MS,
-      CLOUD_INFERENCE_MAX_COUNT_RESPONSE_BYTES
+  let inputCapFailures = 0;
+  let rejectedTargets = 0;
+
+  for (let index = 0; index < targets.length; index += 1) {
+    const target = targets[index];
+    const attemptStartedAt = performance.now();
+    const countPayload = requestPayload(customerRequest, target.model);
+    let countResponse: TimedResponseBody;
+    try {
+      countResponse = await fetchTimedBody(
+        fetcher,
+        CLOUD_INFERENCE_COUNT_URL,
+        {
+          method: "POST",
+          headers: requestHeaders(apiKey),
+          body: JSON.stringify(countPayload),
+        },
+        options.countTimeoutMs ?? CLOUD_INFERENCE_COUNT_TIMEOUT_MS,
+        CLOUD_INFERENCE_MAX_COUNT_RESPONSE_BYTES
+      );
+    } catch {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      try {
+        await audit("count_outcome_unavailable", {
+          model: target.model,
+          endpoint: "/v1/responses/input_tokens",
+        });
+      } catch {
+        // The idempotency tombstone is authoritative if accounting is unavailable.
+      }
+      return errorResponse("Input token count could not be confirmed", 504, claim.requestId);
+    }
+    const countJson = countResponse.body === null ? null : safeParseJson(countResponse.body);
+    const countResult = countResponse.response.ok ? parseCountResponse(countJson) : null;
+    if (!countResult) {
+      if (CLOUD_COMBO_RETRYABLE_REJECTIONS.has(countResponse.response.status)) {
+        rejectedTargets += 1;
+        try {
+          await audit("target_fallback", {
+            model: target.model,
+            reason: "token_count_rejected",
+            upstreamStatus: countResponse.response.status,
+          });
+        } catch {
+          await markCloudInferenceOutcomeUnavailable(
+            options.db,
+            claim,
+            options.now?.() ?? Date.now()
+          );
+          return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
+        }
+        continue;
+      }
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      try {
+        await audit("count_outcome_unavailable", {
+          model: target.model,
+          endpoint: "/v1/responses/input_tokens",
+          upstreamStatus: countResponse.response.status,
+        });
+      } catch {
+        // The idempotency tombstone is authoritative if accounting is unavailable.
+      }
+      return errorResponse("Input token count could not be confirmed", 502, claim.requestId);
+    }
+
+    const inputTokens = countResult.input_tokens;
+    if (inputTokens > target.entitlement.maxInputTokens) {
+      inputCapFailures += 1;
+      try {
+        await audit("target_skipped", {
+          model: target.model,
+          reason: "input_cap_exceeded",
+          inputTokens,
+        });
+      } catch {
+        await markCloudInferenceOutcomeUnavailable(
+          options.db,
+          claim,
+          options.now?.() ?? Date.now()
+        );
+        return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
+      }
+      continue;
+    }
+
+    const reservationId = attemptReservationId(
+      claim.requestId,
+      index,
+      Boolean(targetResolution.strategy)
     );
-    const countJson = result.body === null ? null : safeParseJson(result.body);
-    countResult = result.response.ok ? parseCountResponse(countJson) : null;
-  } catch {
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+    let reservation;
     try {
-      await audit("count_outcome_unavailable", { endpoint: "/v1/responses/input_tokens" });
+      reservation = await reserveCloudInferenceTokens(options.db, {
+        tenantId: identity.tenantId,
+        reservationId,
+        provider: CLOUD_INFERENCE_PROVIDER,
+        model: target.model,
+        inputTokens,
+        maxOutputTokens,
+        now: new Date(options.now?.() ?? Date.now()),
+      });
     } catch {
-      // The idempotency tombstone remains the authoritative outcome marker.
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Token budget reservation is unavailable", 503, claim.requestId);
     }
-    return errorResponse("Input token count could not be confirmed", 504, claim.requestId);
-  }
-  if (!countResult) {
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+    if (reservation.kind === "denied" || reservation.kind === "conflict") {
+      try {
+        await audit("denied", {
+          model: target.model,
+          reason: "token_budget_or_policy_denied",
+          inputTokens,
+          maxOutputTokens,
+        });
+      } catch {
+        await markCloudInferenceOutcomeUnavailable(
+          options.db,
+          claim,
+          options.now?.() ?? Date.now()
+        );
+        return errorResponse("Inference audit is unavailable", 503, claim.requestId);
+      }
+      return cache(
+        {
+          error: {
+            message: "Tenant token budget or model policy denied this request",
+            type: "cloud_inference_error",
+          },
+        },
+        429
+      );
+    }
+
+    const settle = async (actualInputTokens: number, actualOutputTokens: number) =>
+      settleCloudInferenceReservation(options.db!, {
+        tenantId: identity.tenantId,
+        reservationId,
+        actualInputTokens,
+        actualOutputTokens,
+        now: new Date(options.now?.() ?? Date.now()),
+      });
+    const recordRejectedAttempt = async (upstreamStatus: number) => {
+      const settled = await settle(inputTokens, 0);
+      if (settled.kind !== "updated" && settled.kind !== "replay")
+        throw new Error("Rejected inference attempt could not be settled");
+      await appendCloudUsageRecord(options.db!, {
+        id: reservationId,
+        tenantId: identity.tenantId,
+        provider: CLOUD_INFERENCE_PROVIDER,
+        model: target.model,
+        connectionId,
+        apiKeyId: identity.apiKeyId,
+        tokensInput: inputTokens,
+        tokensOutput: 0,
+        serviceTier: "customer-managed",
+        status: targetResolution.strategy ? "fallback" : "rejected",
+        success: false,
+        errorCode: `upstream_rejected_${upstreamStatus}`,
+        comboStrategy: targetResolution.strategy,
+        latencyMs: Math.max(0, Math.round(performance.now() - attemptStartedAt)),
+        endpoint: CLOUD_INFERENCE_CHAT_PATH,
+        timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+      });
+      await audit(targetResolution.strategy ? "target_fallback" : "target_rejected", {
+        model: target.model,
+        reason: "upstream_rejected_before_generation",
+        upstreamStatus,
+        countedInputTokens: inputTokens,
+      });
+    };
+    const settleAmbiguous = async (status: string, metadata: Record<string, unknown> = {}) => {
+      try {
+        await settle(inputTokens, maxOutputTokens);
+      } catch {
+        // The idempotency tombstone prevents a second generation after uncertain dispatch.
+      }
+      await markCloudInferenceOutcomeUnavailable(options.db!, claim, options.now?.() ?? Date.now());
+      try {
+        await audit(status, {
+          model: target.model,
+          inputTokens,
+          outputTokensReserved: maxOutputTokens,
+          connectionId,
+          ...metadata,
+        });
+      } catch {
+        // Keep provider details and accounting failures out of the client response.
+      }
+    };
+
+    if (customerRequest.stream) {
+      let streamStart: Awaited<ReturnType<typeof fetchTimedStreamHeaders>>;
+      try {
+        streamStart = await fetchTimedStreamHeaders(
+          fetcher,
+          CLOUD_INFERENCE_RESPONSE_URL,
+          {
+            method: "POST",
+            headers: { ...requestHeaders(apiKey), Accept: "text/event-stream" },
+            body: JSON.stringify({
+              ...countPayload,
+              max_output_tokens: maxOutputTokens,
+              store: false,
+              stream: true,
+            }),
+          },
+          options.generationTimeoutMs ?? CLOUD_INFERENCE_GENERATION_TIMEOUT_MS
+        );
+      } catch {
+        await settleAmbiguous("generation_outcome_unavailable");
+        return errorResponse(
+          "Inference outcome is unavailable and will not be retried",
+          504,
+          claim.requestId
+        );
+      }
+      if (CLOUD_COMBO_RETRYABLE_REJECTIONS.has(streamStart.response.status)) {
+        clearTimeout(streamStart.timer);
+        await streamStart.response.body?.cancel().catch(() => undefined);
+        try {
+          await recordRejectedAttempt(streamStart.response.status);
+        } catch {
+          await markCloudInferenceOutcomeUnavailable(
+            options.db,
+            claim,
+            options.now?.() ?? Date.now()
+          );
+          return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
+        }
+        continue;
+      }
+      if (
+        streamStart.response.status >= 300 ||
+        !streamStart.response.ok ||
+        !streamStart.response.body
+      ) {
+        clearTimeout(streamStart.timer);
+        await streamStart.response.body?.cancel().catch(() => undefined);
+        await settleAmbiguous("generation_outcome_unavailable", {
+          upstreamStatus: streamStart.response.status,
+        });
+        return errorResponse(
+          "Inference result could not be safely confirmed",
+          502,
+          claim.requestId
+        );
+      }
+      return streamCloudInference({
+        options,
+        claim,
+        reservationId,
+        tenantId: identity.tenantId,
+        apiKeyId: identity.apiKeyId,
+        connectionId,
+        inputTokens,
+        maxOutputTokens,
+        response: streamStart.response,
+        controller: streamStart.controller,
+        timer: streamStart.timer,
+        countPayload,
+        outputModel: customerRequest.model,
+        comboStrategy: targetResolution.strategy,
+        audit,
+        startedAt: attemptStartedAt,
+      });
+    }
+
+    let result: TimedResponseBody;
     try {
-      await audit("count_outcome_unavailable", { endpoint: "/v1/responses/input_tokens" });
+      result = await fetchTimedBody(
+        fetcher,
+        CLOUD_INFERENCE_RESPONSE_URL,
+        {
+          method: "POST",
+          headers: requestHeaders(apiKey),
+          body: JSON.stringify({
+            ...countPayload,
+            max_output_tokens: maxOutputTokens,
+            store: false,
+          }),
+        },
+        options.generationTimeoutMs ?? CLOUD_INFERENCE_GENERATION_TIMEOUT_MS,
+        CLOUD_INFERENCE_MAX_RESPONSE_BYTES
+      );
     } catch {
-      // The idempotency tombstone remains the authoritative outcome marker.
+      await settleAmbiguous("generation_outcome_unavailable");
+      return errorResponse(
+        "Inference outcome is unavailable and will not be retried",
+        504,
+        claim.requestId
+      );
     }
-    return errorResponse("Input token count could not be confirmed", 502, claim.requestId);
+    if (CLOUD_COMBO_RETRYABLE_REJECTIONS.has(result.response.status)) {
+      try {
+        await recordRejectedAttempt(result.response.status);
+      } catch {
+        await markCloudInferenceOutcomeUnavailable(
+          options.db,
+          claim,
+          options.now?.() ?? Date.now()
+        );
+        return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
+      }
+      continue;
+    }
+
+    const providerJson = result.body === null ? null : safeParseJson(result.body);
+    const providerResult = result.response.ok
+      ? parseProviderResponse(providerJson, target.model)
+      : null;
+    const content = providerResult ? assistantText(providerResult.output) : null;
+    if (
+      !providerResult ||
+      content === null ||
+      providerResult.usage.input_tokens > inputTokens ||
+      providerResult.usage.output_tokens > maxOutputTokens
+    ) {
+      await settleAmbiguous("generation_outcome_unavailable", {
+        upstreamStatus: result.response.status,
+      });
+      return errorResponse("Inference result could not be safely confirmed", 502, claim.requestId);
+    }
+
+    const settled = await settle(
+      providerResult.usage.input_tokens,
+      providerResult.usage.output_tokens
+    );
+    if (settled.kind !== "updated" && settled.kind !== "replay") {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Token accounting could not be safely confirmed", 503, claim.requestId);
+    }
+    const completion = chatCompletion(
+      providerResult,
+      content,
+      claim.requestId,
+      customerRequest.model
+    );
+    if (safeJsonString(completion) === null) {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Inference result exceeds the response limit", 502, claim.requestId);
+    }
+    try {
+      await appendCloudUsageRecord(options.db, {
+        id: reservationId,
+        tenantId: identity.tenantId,
+        provider: CLOUD_INFERENCE_PROVIDER,
+        model: target.model,
+        connectionId,
+        apiKeyId: identity.apiKeyId,
+        tokensInput: providerResult.usage.input_tokens,
+        tokensOutput: providerResult.usage.output_tokens,
+        serviceTier: "customer-managed",
+        status: "success",
+        success: true,
+        comboStrategy: targetResolution.strategy,
+        latencyMs: Math.max(0, Math.round(performance.now() - attemptStartedAt)),
+        endpoint: CLOUD_INFERENCE_CHAT_PATH,
+        timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
+      });
+      await audit("success", {
+        model: target.model,
+        inputTokens: providerResult.usage.input_tokens,
+        outputTokens: providerResult.usage.output_tokens,
+        connectionId,
+        ...(targetResolution.strategy ? { comboStrategy: targetResolution.strategy } : {}),
+      });
+    } catch {
+      await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
+      return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
+    }
+    return cache(completion, 200);
   }
 
-  const inputTokens = countResult.input_tokens;
-  if (inputTokens > entitlement.maxInputTokens) {
+  if (inputCapFailures === targets.length) {
     try {
-      await audit("denied", { reason: "input_cap_exceeded", inputTokens });
+      await audit("denied", {
+        reason: "input_cap_exceeded",
+        targets: inputCapFailures,
+      });
     } catch {
       await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
       return errorResponse("Inference audit is unavailable", 503, claim.requestId);
@@ -1179,187 +1674,32 @@ export async function handleCloudInferenceCustomerRequest(
       413
     );
   }
-
-  let reservation;
-  try {
-    reservation = await reserveCloudInferenceTokens(options.db, {
-      tenantId: identity.tenantId,
-      reservationId: claim.requestId,
-      provider: CLOUD_INFERENCE_PROVIDER,
-      model: customerRequest.model,
-      inputTokens,
-      maxOutputTokens,
-      now: new Date(options.now?.() ?? Date.now()),
-    });
-  } catch {
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-    return errorResponse("Token budget reservation is unavailable", 503, claim.requestId);
-  }
-  if (reservation.kind === "denied" || reservation.kind === "conflict") {
+  if (rejectedTargets > 0) {
     try {
-      await audit("denied", {
-        reason: "token_budget_or_policy_denied",
-        inputTokens,
-        maxOutputTokens,
+      await audit("unavailable", {
+        reason: "all_targets_rejected_before_generation",
+        rejectedTargets,
       });
     } catch {
       await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-      return errorResponse("Inference audit is unavailable", 503, claim.requestId);
+      return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
     }
     return cache(
       {
         error: {
-          message: "Tenant token budget or model policy denied this request",
+          message: customerRequest.comboName
+            ? "No combo target accepted the inference request"
+            : "The inference model rejected the request",
           type: "cloud_inference_error",
         },
       },
-      429
+      502
     );
   }
-
-  let providerResult: ProviderResponse | null = null;
-  let content: string | null = null;
-  const startedAt = performance.now();
-  if (customerRequest.stream) {
-    return streamCloudInference({
-      options,
-      claim,
-      tenantId: identity.tenantId,
-      apiKeyId: identity.apiKeyId,
-      apiKey,
-      connectionId,
-      inputTokens,
-      maxOutputTokens,
-      fetcher,
-      countPayload,
-      audit,
-      startedAt,
-    });
-  }
-  try {
-    const result = await fetchTimedBody(
-      fetcher,
-      CLOUD_INFERENCE_RESPONSE_URL,
-      {
-        method: "POST",
-        headers: requestHeaders(apiKey),
-        body: JSON.stringify({
-          ...countPayload,
-          max_output_tokens: maxOutputTokens,
-          store: false,
-        }),
-      },
-      options.generationTimeoutMs ?? CLOUD_INFERENCE_GENERATION_TIMEOUT_MS,
-      CLOUD_INFERENCE_MAX_RESPONSE_BYTES
-    );
-    const providerJson = result.body === null ? null : safeParseJson(result.body);
-    providerResult = result.response.ok
-      ? parseProviderResponse(providerJson, customerRequest.model)
-      : null;
-    content = providerResult ? assistantText(providerResult.output) : null;
-  } catch {
-    await settleCloudInferenceReservation(options.db, {
-      tenantId: identity.tenantId,
-      reservationId: claim.requestId,
-      actualInputTokens: inputTokens,
-      actualOutputTokens: maxOutputTokens,
-      now: new Date(options.now?.() ?? Date.now()),
-    });
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-    try {
-      await audit("generation_outcome_unavailable", {
-        inputTokens,
-        outputTokensReserved: maxOutputTokens,
-        connectionId,
-      });
-    } catch {
-      // The reservation and idempotency tombstone retain the conservative outcome.
-    }
-    return errorResponse(
-      "Inference outcome is unavailable and will not be retried",
-      504,
-      claim.requestId
-    );
-  }
-
-  if (
-    !providerResult ||
-    content === null ||
-    providerResult.usage.input_tokens > inputTokens ||
-    providerResult.usage.output_tokens > maxOutputTokens
-  ) {
-    await settleCloudInferenceReservation(options.db, {
-      tenantId: identity.tenantId,
-      reservationId: claim.requestId,
-      actualInputTokens: inputTokens,
-      actualOutputTokens: maxOutputTokens,
-      now: new Date(options.now?.() ?? Date.now()),
-    });
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-    try {
-      await audit("generation_outcome_unavailable", {
-        inputTokens,
-        outputTokensReserved: maxOutputTokens,
-        connectionId,
-      });
-    } catch {
-      // The reservation and idempotency tombstone retain the conservative outcome.
-    }
-    return errorResponse("Inference result could not be safely confirmed", 502, claim.requestId);
-  }
-
-  const settled = await settleCloudInferenceReservation(options.db, {
-    tenantId: identity.tenantId,
-    reservationId: claim.requestId,
-    actualInputTokens: providerResult.usage.input_tokens,
-    actualOutputTokens: providerResult.usage.output_tokens,
-    now: new Date(options.now?.() ?? Date.now()),
-  });
-  if (settled.kind !== "updated" && settled.kind !== "replay") {
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-    return errorResponse("Token accounting could not be safely confirmed", 503, claim.requestId);
-  }
-
-  const completion = chatCompletion(
-    providerResult,
-    content,
-    claim.requestId,
-    customerRequest.model
+  return cache(
+    { error: { message: "No combo target can serve this request", type: "cloud_inference_error" } },
+    413
   );
-  const completionJson = safeJsonString(completion);
-  if (completionJson === null) {
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-    return errorResponse("Inference result exceeds the response limit", 502, claim.requestId);
-  }
-
-  try {
-    await appendCloudUsageRecord(options.db, {
-      id: claim.requestId,
-      tenantId: identity.tenantId,
-      provider: CLOUD_INFERENCE_PROVIDER,
-      model: customerRequest.model,
-      connectionId,
-      apiKeyId: identity.apiKeyId,
-      tokensInput: providerResult.usage.input_tokens,
-      tokensOutput: providerResult.usage.output_tokens,
-      serviceTier: "customer-managed",
-      status: "success",
-      success: true,
-      latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
-      endpoint: CLOUD_INFERENCE_CHAT_PATH,
-      timestamp: new Date(options.now?.() ?? Date.now()).toISOString(),
-    });
-    await audit("success", {
-      inputTokens: providerResult.usage.input_tokens,
-      outputTokens: providerResult.usage.output_tokens,
-      connectionId,
-    });
-  } catch {
-    await markCloudInferenceOutcomeUnavailable(options.db, claim, options.now?.() ?? Date.now());
-    return errorResponse("Inference accounting is unavailable", 503, claim.requestId);
-  }
-
-  return cache(completion, 200);
 }
 
 function safeParseJson(value: string): unknown {

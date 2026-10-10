@@ -98,6 +98,7 @@ async function fixture(
     "0013_cloud_inference_idempotency_tombstone_retention.sql",
     "0014_cloud_inference_reservation_retention.sql",
     "0022_provider_execution_contract.sql",
+    "0035_cloud_tenant_combos.sql",
   ])
     await db.exec(readFileSync(join(process.cwd(), "cloudflare/migrations", migration), "utf8"));
   for (const [id, name, slug] of [
@@ -193,6 +194,29 @@ async function fixture(
       clock += ms;
     },
   };
+}
+
+async function storeCombo(
+  db: SqliteCloudDb,
+  tenantId: string,
+  name: string,
+  data: Record<string, unknown>,
+  isActive = true
+) {
+  await db
+    .prepare(
+      "INSERT INTO cloud_tenant_combos (id, tenant_id, name, data_json, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(
+      `combo-${tenantId}-${name}`,
+      tenantId,
+      name,
+      JSON.stringify({ name, ...data }),
+      isActive ? 1 : 0,
+      NOW,
+      NOW
+    )
+    .run();
 }
 
 function request(
@@ -423,6 +447,334 @@ test("owner-selected OpenAI Responses model uses its entitlement and is reflecte
     );
     assert.equal(await replay.text(), firstText);
     assert.equal(calls, 2, "replay retains the selected model and never redispatches");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("priority customer combo falls back across entitled targets with per-attempt accounting and exact replay", async () => {
+  const f = await fixture();
+  const fallbackModel = "gpt-4.1-mini";
+  const comboAlias = "combo:customer-default";
+  try {
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model: fallbackModel,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await storeCombo(f.db, TENANT_A, "customer-default", {
+      name: "customer-default",
+      models: [
+        "openai/gpt-4o-mini-2024-07-18",
+        { kind: "model", provider: "openai", model: fallbackModel },
+      ],
+      strategy: "priority",
+      isActive: true,
+    });
+    await storeCombo(f.db, TENANT_B, "tenant-b-only", {
+      name: "tenant-b-only",
+      models: ["gpt-4o-mini-2024-07-18"],
+      strategy: "priority",
+      isActive: true,
+    });
+    let calls = 0;
+    const app = f.runtime(async (input, init) => {
+      calls += 1;
+      const url = String(input);
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (url.endsWith("input_tokens")) {
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      }
+      if (body.model === "gpt-4o-mini-2024-07-18") {
+        return Response.json({ error: { message: "Model rejected" } }, { status: 400 });
+      }
+      return upstream(fallbackModel, "gpt-4.1-mini-2025-04-14")(input, init);
+    });
+    const first = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-priority-combo-001",
+        "hello",
+        false,
+        undefined,
+        comboAlias
+      )
+    );
+    assert.equal(first.status, 200);
+    const firstText = await first.text();
+    const completion = JSON.parse(firstText) as {
+      model: string;
+      choices: { message: { content: string } }[];
+    };
+    assert.equal(completion.model, comboAlias);
+    assert.equal(completion.choices[0]?.message.content, "world");
+    assert.equal(calls, 4, "each target is counted and only the successful target generates");
+
+    const usage = await f.db
+      .prepare<{
+        model: string;
+        status: string;
+        success: number;
+        tokens_input: number;
+        tokens_output: number;
+      }>(
+        "SELECT model,status,success,tokens_input,tokens_output FROM cloud_usage_history WHERE tenant_id=? ORDER BY id"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.deepEqual(
+      usage.results.map((row) => [
+        row.model,
+        row.status,
+        row.success,
+        row.tokens_input,
+        row.tokens_output,
+      ]),
+      [
+        ["gpt-4o-mini-2024-07-18", "fallback", 0, 5, 0],
+        [fallbackModel, "success", 1, 5, 2],
+      ]
+    );
+    const reservations = await f.db
+      .prepare<{
+        model: string;
+        status: string;
+        actual_input_tokens: number;
+        actual_output_tokens: number;
+      }>(
+        "SELECT model,status,actual_input_tokens,actual_output_tokens FROM cloud_inference_reservations WHERE tenant_id=? ORDER BY model"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.deepEqual(
+      reservations.results.map((row) => [
+        row.model,
+        row.status,
+        row.actual_input_tokens,
+        row.actual_output_tokens,
+      ]),
+      [
+        [fallbackModel, "settled", 5, 2],
+        ["gpt-4o-mini-2024-07-18", "settled", 5, 0],
+      ]
+    );
+    const audits = await f.db
+      .prepare<{ status: string; metadata_json: string }>(
+        "SELECT status,metadata_json FROM cloud_compliance_audit WHERE tenant_id=? ORDER BY timestamp,rowid"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.ok(audits.results.some((row) => row.status === "target_fallback"));
+    assert.ok(audits.results.some((row) => row.status === "success"));
+    assert.ok(audits.results.every((row) => !row.metadata_json.includes("hello")));
+
+    const replay = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-priority-combo-001",
+        "hello",
+        false,
+        undefined,
+        comboAlias
+      )
+    );
+    assert.equal(await replay.text(), firstText);
+    assert.equal(calls, 4, "replay does not resolve or execute the combo again");
+    const crossTenant = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-cross-tenant-combo-001",
+        "hello",
+        false,
+        undefined,
+        "combo:tenant-b-only"
+      )
+    );
+    assert.equal(crossTenant.status, 404);
+    assert.equal(calls, 4, "a tenant cannot resolve another tenant's combo");
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("customer inference rejects unsupported combo strategies and target forms before provider dispatch", async () => {
+  const f = await fixture();
+  try {
+    const invalid = [
+      {
+        name: "unsupported-strategy",
+        data: { strategy: "round-robin", models: ["gpt-4o-mini-2024-07-18"], isActive: true },
+      },
+      {
+        name: "unsupported-provider",
+        data: {
+          strategy: "priority",
+          models: [{ kind: "model", provider: "anthropic", model: "gpt-4o-mini-2024-07-18" }],
+          isActive: true,
+        },
+      },
+      {
+        name: "unsupported-combo-ref",
+        data: {
+          strategy: "priority",
+          models: [{ kind: "combo-ref", comboName: "nested" }],
+          isActive: true,
+        },
+      },
+      {
+        name: "unsupported-config",
+        data: {
+          strategy: "priority",
+          models: ["gpt-4o-mini-2024-07-18"],
+          config: { maxRetries: 2 },
+          isActive: true,
+        },
+      },
+      {
+        name: "unexpected-data-key",
+        data: {
+          strategy: "priority",
+          models: ["gpt-4o-mini-2024-07-18"],
+          runtimeTargets: ["unreviewed"],
+          isActive: true,
+        },
+      },
+    ];
+    for (const item of invalid) await storeCombo(f.db, TENANT_A, item.name, item.data);
+    let calls = 0;
+    const app = f.runtime(async () => {
+      calls += 1;
+      return Response.json({});
+    });
+    for (let index = 0; index < invalid.length; index += 1) {
+      const response = await app.fetch(
+        request(
+          f.issued.token,
+          `idempotency-unsupported-combo-${index}`,
+          "hello",
+          false,
+          undefined,
+          `combo:${invalid[index].name}`
+        )
+      );
+      assert.equal(response.status, 400);
+    }
+    await storeCombo(
+      f.db,
+      TENANT_A,
+      "inactive-combo",
+      {
+        strategy: "priority",
+        models: ["gpt-4o-mini-2024-07-18"],
+        isActive: false,
+      },
+      false
+    );
+    const inactiveResponse = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-inactive-combo-001",
+        "hello",
+        false,
+        undefined,
+        "combo:inactive-combo"
+      )
+    );
+    assert.equal(inactiveResponse.status, 404);
+    await storeCombo(f.db, TENANT_A, "unentitled-target", {
+      strategy: "priority",
+      models: ["gpt-4o-mini-2024-07-18", "gpt-4.1-mini"],
+      isActive: true,
+    });
+    const unentitled = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-unentitled-combo-01",
+        "hello",
+        false,
+        undefined,
+        "combo:unentitled-target"
+      )
+    );
+    assert.equal(unentitled.status, 403);
+    assert.equal(calls, 0);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("priority combo does not retry throttled or ambiguous generation outcomes", async () => {
+  const f = await fixture();
+  try {
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model: "gpt-4.1-mini",
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await storeCombo(f.db, TENANT_A, "no-retry", {
+      models: ["gpt-4o-mini-2024-07-18", "gpt-4.1-mini"],
+      strategy: "priority",
+      isActive: true,
+    });
+    let calls = 0;
+    const app = f.runtime(async (input) => {
+      calls += 1;
+      if (String(input).endsWith("input_tokens"))
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      return Response.json({ error: { message: "Rate limited" } }, { status: 429 });
+    });
+    const response = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-combo-no-retry-01",
+        "hello",
+        false,
+        undefined,
+        "combo:no-retry"
+      )
+    );
+    assert.equal(response.status, 502);
+    assert.equal(calls, 2, "the next priority target is not dispatched after a 429");
+    const reservations = await f.db
+      .prepare<{
+        model: string;
+        status: string;
+        actual_input_tokens: number;
+        actual_output_tokens: number;
+      }>(
+        "SELECT model,status,actual_input_tokens,actual_output_tokens FROM cloud_inference_reservations WHERE tenant_id=?"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.deepEqual(
+      reservations.results.map((row) => [
+        row.model,
+        row.status,
+        row.actual_input_tokens,
+        row.actual_output_tokens,
+      ]),
+      [["gpt-4o-mini-2024-07-18", "settled", 5, 40]]
+    );
+    const retry = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-combo-no-retry-01",
+        "hello",
+        false,
+        undefined,
+        "combo:no-retry"
+      )
+    );
+    assert.equal(retry.status, 503);
+    assert.equal(calls, 2, "ambiguous generation is tombstoned and never redispatched");
   } finally {
     f.db.db.close();
   }
@@ -766,6 +1118,106 @@ test("streaming inference settles terminal usage before done and replays the exa
       "stream and non-stream operations have different fingerprints"
     );
     assert.equal(calls, 2);
+  } finally {
+    f.db.db.close();
+  }
+});
+
+test("streaming priority combo retries an explicit pre-generation rejection before emitting SSE", async () => {
+  const f = await fixture();
+  const fallbackModel = "gpt-4.1-mini";
+  try {
+    await setCloudInferenceEntitlement(f.db, {
+      tenantId: TENANT_A,
+      provider: "openai",
+      model: fallbackModel,
+      enabled: true,
+      maxInputTokens: 100,
+      maxOutputTokens: 40,
+      now: NOW,
+    });
+    await storeCombo(f.db, TENANT_A, "streaming-fallback", {
+      models: ["gpt-4o-mini-2024-07-18", "openai/gpt-4.1-mini"],
+      strategy: "priority",
+      isActive: true,
+    });
+    const completedEvent = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_combo_stream",
+        model: "gpt-4.1-mini-2025-04-14",
+        status: "completed",
+        created_at: 10,
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "streamed" }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+      },
+    })}\n\n`;
+    const deltaEvent =
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"streamed"}\n\n';
+    let calls = 0;
+    const app = f.runtime(async (input, init) => {
+      calls += 1;
+      const url = String(input);
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (url.endsWith("input_tokens"))
+        return Response.json({ object: "response.input_tokens", input_tokens: 5 });
+      if (body.model === "gpt-4o-mini-2024-07-18")
+        return Response.json({ error: { message: "Model rejected" } }, { status: 403 });
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(deltaEvent + completedEvent));
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      );
+    });
+    const response = await app.fetch(
+      request(
+        f.issued.token,
+        "idempotency-streaming-combo-001",
+        "hello",
+        true,
+        undefined,
+        "combo:streaming-fallback"
+      )
+    );
+    assert.equal(response.status, 200);
+    const transcript = await response.text();
+    assert.match(transcript, /"model":"combo:streaming-fallback"/);
+    assert.match(transcript, /"content":"streamed"/);
+    assert.match(transcript, /data: \[DONE\]/);
+    assert.equal(calls, 4);
+    const reservations = await f.db
+      .prepare<{
+        model: string;
+        status: string;
+        actual_input_tokens: number;
+        actual_output_tokens: number;
+      }>(
+        "SELECT model,status,actual_input_tokens,actual_output_tokens FROM cloud_inference_reservations WHERE tenant_id=? ORDER BY model"
+      )
+      .bind(TENANT_A)
+      .all();
+    assert.deepEqual(
+      reservations.results.map((row) => [
+        row.model,
+        row.status,
+        row.actual_input_tokens,
+        row.actual_output_tokens,
+      ]),
+      [
+        [fallbackModel, "settled", 5, 2],
+        ["gpt-4o-mini-2024-07-18", "settled", 5, 0],
+      ]
+    );
   } finally {
     f.db.db.close();
   }

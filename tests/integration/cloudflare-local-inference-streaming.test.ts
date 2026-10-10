@@ -674,5 +674,89 @@ test(
       "recovery should dispatch one count and generation"
     );
     assert.equal(recoveredStats.body.lastError, null);
+
+    const revokeCustomerAKey = spawnSync(
+      process.execPath,
+      [
+        wranglerBin,
+        "d1",
+        "execute",
+        workerName,
+        "--local",
+        "--persist-to",
+        persistDir,
+        "--config",
+        wranglerConfigPath,
+        "--env-file",
+        safeEnvPath,
+        "--yes",
+        "--command",
+        `UPDATE cloud_customer_api_keys SET revoked_at = datetime('now') WHERE tenant_id = '${tenantId}' AND revoked_at IS NULL;`,
+      ],
+      {
+        cwd: tempDir,
+        env: commandEnv,
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 2 * 1024 * 1024,
+      }
+    );
+    assert.equal(
+      revokeCustomerAKey.status,
+      0,
+      `failed to revoke tenant A's customer key in local D1:\n${revokeCustomerAKey.stdout}\n${revokeCustomerAKey.stderr}`
+    );
+
+    const revokedTenantAResponse = await inferenceRequest(
+      `cloud-local-inference-revoked-a-${crypto.randomUUID()}`,
+      customerKey,
+      "tenant A's revoked key must not reach the provider"
+    );
+    assert.equal(
+      revokedTenantAResponse.status,
+      401,
+      `the real inference route must reject tenant A's revoked key: ${await revokedTenantAResponse
+        .clone()
+        .text()}`
+    );
+    const afterRevokedKeyStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(
+      afterRevokedKeyStats.body.callCount,
+      8,
+      "a revoked tenant A key must be rejected before any provider dispatch"
+    );
+
+    const tenantBAfterRevocation = await inferenceRequest(
+      `cloud-local-inference-tenant-b-after-a-revoke-${crypto.randomUUID()}`,
+      customerBKey,
+      "tenant B remains active after tenant A key revocation"
+    );
+    assert.equal(
+      tenantBAfterRevocation.status,
+      200,
+      `tenant B's active key should continue routing after tenant A revocation:\n${await tenantBAfterRevocation
+        .clone()
+        .text()}\n${output}`
+    );
+    assert.equal(
+      (await tenantBAfterRevocation.text()).includes("local mock provider."),
+      true,
+      "tenant B should receive its own provider response after tenant A revocation"
+    );
+    const afterTenantBRevocationStats = await requestJson(`${baseUrl}/__test/mock-provider/stats`, {
+      token: adminToken,
+    });
+    assert.equal(
+      afterTenantBRevocationStats.body.callCount,
+      10,
+      "tenant B should make exactly one count and generation dispatch after tenant A revocation"
+    );
+    assert.deepEqual(
+      (afterTenantBRevocationStats.body.credentialIds as string[]).slice(-2),
+      ["tenant-b", "tenant-b"],
+      "tenant B must continue using its own provider connection after tenant A revocation"
+    );
   }
 );
