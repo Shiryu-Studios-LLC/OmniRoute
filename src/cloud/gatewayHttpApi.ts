@@ -311,7 +311,7 @@ export async function handleGatewayDeviceRequest(
     path === `${PREFIX}/heartbeat`
       ? ["capabilities", "serviceHealth"]
       : path === `${PREFIX}/result`
-        ? ["requestId", "result"]
+        ? ["requestId", "deliveryAttempt", "result"]
         : path === `${PREFIX}/stream-event`
           ? ["requestId", "sequence", "event"]
           : path === `${PREFIX}/stream-cancel`
@@ -392,9 +392,18 @@ export async function handleGatewayDeviceRequest(
 
   if (path === `${PREFIX}/result`) {
     if (
-      !exactKeys(body, ["version", "deviceId", "sessionToken", "requestId", "result"]) ||
+      !["version", "deviceId", "sessionToken", "requestId", "result"].every((key) => key in body) ||
+      !Object.keys(body).every((key) =>
+        ["version", "deviceId", "sessionToken", "requestId", "deliveryAttempt", "result"].includes(
+          key
+        )
+      ) ||
       typeof body.requestId !== "string" ||
-      !REQUEST_ID.test(body.requestId)
+      !REQUEST_ID.test(body.requestId) ||
+      (body.deliveryAttempt !== undefined &&
+        (!Number.isSafeInteger(body.deliveryAttempt) ||
+          Number(body.deliveryAttempt) < 1 ||
+          Number(body.deliveryAttempt) > 3))
     ) {
       return json({ error: "Invalid result request" }, 400);
     }
@@ -415,6 +424,9 @@ export async function handleGatewayDeviceRequest(
     const accepted = await gateway.submitDeviceResult({
       ...session,
       requestId: body.requestId,
+      ...(body.deliveryAttempt === undefined
+        ? {}
+        : { deliveryAttempt: Number(body.deliveryAttempt) }),
       result: body.result,
     });
     return accepted

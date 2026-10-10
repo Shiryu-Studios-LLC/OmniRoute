@@ -36,7 +36,10 @@ export interface GatewayDeviceRequest {
   payload: string;
   createdAt: string;
   expiresAt: string;
-  status: "pending" | "delivered" | "complete";
+  status: "pending" | "delivered" | "complete" | "failed";
+  deliveryFailure?: "delivery_attempts_exhausted";
+  deliveryAttempts?: number;
+  deliveryLeaseExpiresAt?: string;
   result?: string;
   stream?: true;
   streamNextSequence?: number;
@@ -98,7 +101,8 @@ export interface GatewayCoordinator {
     sessionId: string,
     requestId: string,
     result: string,
-    now: string
+    now: string,
+    deliveryAttempt?: number
   ): Promise<boolean>;
   getRequest(
     deviceId: string,
@@ -167,6 +171,7 @@ export interface GatewayDeviceRequestEnvelope {
   capability: string;
   payload: unknown;
   expiresAt: string;
+  deliveryAttempt?: number;
   stream?: true;
 }
 
@@ -630,6 +635,9 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         ) {
           return { ok: false, reason: "queue_full" };
         }
+        if (storedRequest?.status === "failed") {
+          return { ok: false, reason: "offline" };
+        }
         if (storedRequest?.status === "complete" && storedRequest.result !== undefined) {
           if (now() >= deadline) return { ok: false, reason: "timeout" };
           const active = await this.authorizeCapability(input);
@@ -672,6 +680,7 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
           }
           return { ok: false, reason: "timeout" };
         }
+        if (stored?.status === "failed") return { ok: false, reason: "offline" };
         if (stored?.status === "complete" && stored.result !== undefined) {
           const completedFor = await this.authorizeCapability(input);
           if (!completedFor.ok || completedFor.target.sessionId !== target.sessionId) {
@@ -727,6 +736,9 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         capability: request.capability,
         payload: JSON.parse(request.payload) as unknown,
         expiresAt: request.expiresAt,
+        ...(request.deliveryAttempts === undefined
+          ? {}
+          : { deliveryAttempt: request.deliveryAttempts }),
         ...(request.stream ? { stream: true as const } : {}),
       }));
     },
@@ -1000,6 +1012,7 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
       deviceId: string;
       sessionToken: string;
       requestId: string;
+      deliveryAttempt?: number;
       result: unknown;
     }): Promise<boolean> {
       const authenticated = await authenticateDeviceSession(input.deviceId, input.sessionToken);
@@ -1010,7 +1023,8 @@ export function createConnectorGateway(options: ConnectorGatewayOptions) {
         authenticated.session.sessionId,
         input.requestId,
         result,
-        new Date(now()).toISOString()
+        new Date(now()).toISOString(),
+        input.deliveryAttempt
       );
     },
 

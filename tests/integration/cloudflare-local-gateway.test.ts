@@ -1049,6 +1049,7 @@ test(
           await deviceTransport.submitResult(customerA.session!, {
             version: 1,
             requestId: gatewayRequest.requestId,
+            deliveryAttempt: gatewayRequest.deliveryAttempt,
             outcome: {
               ok: true,
               value: {
@@ -1112,6 +1113,7 @@ test(
           await deviceTransport.submitResult(customerB.session!, {
             version: 1,
             requestId: gatewayRequestB.requestId,
+            deliveryAttempt: gatewayRequestB.deliveryAttempt,
             outcome: {
               ok: true,
               value: { message: { role: "assistant", content: "Completed for tenant B." } },
@@ -1184,6 +1186,7 @@ test(
               await deviceTransport.submitResult(customerB.session!, {
                 version: 1,
                 requestId: requestB.requestId,
+                deliveryAttempt: requestB.deliveryAttempt,
                 outcome: {
                   ok: true,
                   value: { message: { role: "assistant", content: "Concurrent result for B." } },
@@ -1205,6 +1208,7 @@ test(
               await deviceTransport.submitResult(customerA.session!, {
                 version: 1,
                 requestId: requestA.requestId,
+                deliveryAttempt: requestA.deliveryAttempt,
                 outcome: {
                   ok: true,
                   value: { message: { role: "assistant", content: "Concurrent result for A." } },
@@ -1550,6 +1554,7 @@ test(
         await deviceTransport.submitResult(customer.session!, {
           version: 1,
           requestId,
+          deliveryAttempt: deviceRequests![0]!.deliveryAttempt,
           outcome: { ok: true, value: { answer: expectedAnswer } },
         }),
         true

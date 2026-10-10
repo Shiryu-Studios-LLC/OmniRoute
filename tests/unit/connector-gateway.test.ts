@@ -403,6 +403,51 @@ test("tenant-authorized device requests complete through the authenticated devic
   assert.equal(adapters.requests.get("device_req")?.length, 0);
 });
 
+test("gateway reports a terminal delivery-attempt failure instead of waiting again", async () => {
+  const credential = "agent-delivery-attempt-limit-credential";
+  const adapters = createMemoryAdapters([
+    {
+      id: "device_failed",
+      tenantId: "tenant_failed",
+      credentialHash: await sha256Hex(credential),
+      capabilities: ["ollama.chat"],
+      revokedAt: null,
+    },
+  ]);
+  const gateway = createConnectorGateway({
+    ...adapters,
+    now: () => 1_800_000_000_000,
+    createId: () => "session_failed",
+    createToken: () => "session-token-failed",
+  });
+  const session = await gateway.connect("device_failed", credential);
+  assert.ok(session);
+  adapters.requests.set("device_failed", [
+    {
+      requestId: "exhausted_request",
+      tenantId: "tenant_failed",
+      sessionId: session.sessionId,
+      capability: "ollama.chat",
+      payload: "{}",
+      createdAt: new Date(1_800_000_000_000).toISOString(),
+      expiresAt: new Date(1_800_000_900_000).toISOString(),
+      status: "failed",
+      deliveryFailure: "delivery_attempts_exhausted",
+    },
+  ]);
+
+  assert.deepEqual(
+    await gateway.requestCapability({
+      tenantId: "tenant_failed",
+      deviceId: "device_failed",
+      capability: "ollama.chat",
+      payload: {},
+      requestId: "exhausted_request",
+    }),
+    { ok: false, reason: "offline" }
+  );
+});
+
 test("cross-tenant calls, revoked sessions, and expired calls cannot receive results", async () => {
   const credential = "agent-request-credential-b";
   let now = 1_800_000_000_000;

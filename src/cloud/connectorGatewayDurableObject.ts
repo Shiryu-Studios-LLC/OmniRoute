@@ -52,7 +52,8 @@ export interface GatewayCoordinatorStub {
     sessionId: string,
     requestId: string,
     result: string,
-    now: string
+    now: string,
+    deliveryAttempt?: number
   ): Promise<boolean>;
   getRequest(
     deviceId: string,
@@ -95,6 +96,12 @@ const SESSION_KEY = "gateway:session";
 const REQUESTS_KEY = "gateway:requests";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_PENDING_REQUESTS = 16;
+// This is bounded at-least-once recovery. One Local Agent runner polls serially,
+// but another process sharing its session may receive a retry while an earlier
+// upstream execution is still active. Attempt fencing rejects stale results; it
+// cannot prevent duplicate upstream side effects once both attempts have started.
+const REQUEST_DELIVERY_LEASE_MS = 30_000;
+const MAX_REQUEST_DELIVERY_ATTEMPTS = 3;
 // Keep the single serialized queue value below the SQLite-backed Durable
 // Object value limit, including JSON keys and per-row metadata.
 const MAX_STORED_REQUESTS = 64;
@@ -152,9 +159,18 @@ function isRequestRecord(value: unknown): value is GatewayDeviceRequest {
     Number.isFinite(Date.parse(request.createdAt ?? "")) &&
     Number.isFinite(Date.parse(request.expiresAt ?? "")) &&
     Date.parse(request.expiresAt ?? "") > Date.parse(request.createdAt ?? "") &&
+    (request.deliveryAttempts === undefined ||
+      (Number.isSafeInteger(request.deliveryAttempts) &&
+        request.deliveryAttempts >= 0 &&
+        request.deliveryAttempts <= MAX_REQUEST_DELIVERY_ATTEMPTS)) &&
+    (request.deliveryLeaseExpiresAt === undefined || isTimestamp(request.deliveryLeaseExpiresAt)) &&
     (request.status === "pending" ||
       request.status === "delivered" ||
-      request.status === "complete") &&
+      request.status === "complete" ||
+      request.status === "failed") &&
+    (request.deliveryFailure === undefined ||
+      request.deliveryFailure === "delivery_attempts_exhausted") &&
+    (request.status !== "failed" || request.deliveryFailure === "delivery_attempts_exhausted") &&
     (request.result === undefined || resultBytes <= MAX_REQUEST_BYTES) &&
     (request.stream === undefined || request.stream === true) &&
     (request.streamNextSequence === undefined ||
@@ -193,6 +209,27 @@ function isTerminalStreamEvent(event: unknown): boolean {
 function requestQueueFits(requests: GatewayDeviceRequest[]): boolean {
   if (requests.length > MAX_STORED_REQUESTS) return false;
   return new TextEncoder().encode(JSON.stringify(requests)).byteLength <= MAX_REQUEST_QUEUE_BYTES;
+}
+
+function failExhaustedDelivery(request: GatewayDeviceRequest, now: string): GatewayDeviceRequest {
+  const leaseExpired =
+    request.status === "delivered" &&
+    request.stream !== true &&
+    (request.deliveryLeaseExpiresAt === undefined ||
+      Date.parse(request.deliveryLeaseExpiresAt) <= Date.parse(now));
+  if (!leaseExpired || (request.deliveryAttempts ?? 0) < MAX_REQUEST_DELIVERY_ATTEMPTS) {
+    return request;
+  }
+  const {
+    deliveryAttempts: _deliveryAttempts,
+    deliveryLeaseExpiresAt: _deliveryLeaseExpiresAt,
+    ...terminal
+  } = request;
+  return {
+    ...terminal,
+    status: "failed",
+    deliveryFailure: "delivery_attempts_exhausted",
+  };
 }
 
 function assertDeviceId(deviceId: string): void {
@@ -319,7 +356,9 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
       const rows = await this.readRequests(transaction);
       const now = Date.parse(request.createdAt);
       const active = rows.filter((row) => Date.parse(row.expiresAt) > now);
-      const pending = active.filter((row) => row.status !== "complete");
+      const pending = active.filter(
+        (row) => row.status === "pending" || row.status === "delivered"
+      );
       if (
         pending.length >= MAX_PENDING_REQUESTS ||
         active.some((row) => row.requestId === request.requestId) ||
@@ -358,17 +397,36 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
       )
         return [];
       const rows = await this.readRequests(transaction);
-      const valid = rows.filter(
-        (row) =>
-          isRequestRecord(row) &&
-          row.sessionId === sessionId &&
-          Date.parse(row.expiresAt) > Date.parse(now)
-      );
+      const valid = rows
+        .filter(
+          (row) =>
+            isRequestRecord(row) &&
+            row.sessionId === sessionId &&
+            Date.parse(row.expiresAt) > Date.parse(now)
+        )
+        .map((row) => failExhaustedDelivery(row, now));
       const delivered: GatewayDeviceRequest[] = [];
       const updated = valid.map((row) => {
-        if (row.status !== "pending") return row;
+        const deliveryAttempts = row.deliveryAttempts ?? 0;
+        const deliveryLeaseExpired =
+          row.status === "delivered" &&
+          row.stream !== true &&
+          (row.deliveryLeaseExpiresAt === undefined ||
+            Date.parse(row.deliveryLeaseExpiresAt) <= Date.parse(now));
+        if (row.status !== "pending" && !deliveryLeaseExpired) return row;
         if (delivered.length >= limit) return row;
-        const request = { ...row, status: "delivered" as const };
+        const request = {
+          ...row,
+          status: "delivered" as const,
+          ...(row.stream === true
+            ? {}
+            : {
+                deliveryAttempts: Math.min(deliveryAttempts + 1, MAX_REQUEST_DELIVERY_ATTEMPTS),
+                deliveryLeaseExpiresAt: new Date(
+                  Date.parse(now) + REQUEST_DELIVERY_LEASE_MS
+                ).toISOString(),
+              }),
+        };
         delivered.push(request);
         return request;
       });
@@ -382,7 +440,8 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     sessionId: string,
     requestId: string,
     result: string,
-    now: string
+    now: string,
+    deliveryAttempt?: number
   ): Promise<boolean> {
     assertDeviceId(deviceId);
     if (
@@ -410,12 +469,21 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
       if (
         index < 0 ||
         rows[index].status !== "delivered" ||
+        (rows[index].deliveryAttempts !== undefined &&
+          (deliveryAttempt !== undefined
+            ? deliveryAttempt !== rows[index].deliveryAttempts
+            : rows[index].deliveryAttempts > 1)) ||
         Date.parse(rows[index].expiresAt) <= Date.parse(now)
       ) {
         return false;
       }
       const updated = [...rows];
-      updated[index] = { ...updated[index], status: "complete", result };
+      const {
+        deliveryAttempts: _deliveryAttempts,
+        deliveryLeaseExpiresAt: _deliveryLeaseExpiresAt,
+        ...completed
+      } = updated[index];
+      updated[index] = { ...completed, status: "complete", result };
       if (!requestQueueFits(updated)) return false;
       await transaction.put(REQUESTS_KEY, updated);
       return true;
@@ -675,7 +743,9 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     return this.state.storage.transaction(async (transaction) => {
       await this.assertBound(transaction, deviceId);
       const rows = await this.readRequests(transaction);
-      const valid = rows.filter((row) => Date.parse(row.expiresAt) > Date.parse(now));
+      const valid = rows
+        .filter((row) => Date.parse(row.expiresAt) > Date.parse(now))
+        .map((row) => failExhaustedDelivery(row, now));
       await transaction.put(REQUESTS_KEY, valid);
       return valid.find((row) => row.requestId === requestId) ?? null;
     });
@@ -705,10 +775,10 @@ export class GatewaySessionDurableObject implements GatewayCoordinatorStub {
     // idempotency records. Keep in-flight work first, then the newest completed
     // results that fit the current storage budget.
     const inFlight = valid
-      .filter((request) => request.status !== "complete")
+      .filter((request) => request.status === "pending" || request.status === "delivered")
       .slice(0, MAX_PENDING_REQUESTS);
     const completed = valid
-      .filter((request) => request.status === "complete")
+      .filter((request) => request.status === "complete" || request.status === "failed")
       .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
     const retained = [...inFlight];
     for (const request of completed) {
@@ -771,14 +841,16 @@ export class DurableObjectGatewayCoordinator implements GatewayCoordinator {
     sessionId: string,
     requestId: string,
     result: string,
-    now: string
+    now: string,
+    deliveryAttempt?: number
   ): Promise<boolean> {
     return this.forDevice(deviceId).submitRequestResult(
       deviceId,
       sessionId,
       requestId,
       result,
-      now
+      now,
+      deliveryAttempt
     );
   }
 

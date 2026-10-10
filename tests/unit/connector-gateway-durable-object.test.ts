@@ -9,10 +9,14 @@ import {
   DurableObjectGatewayCoordinator,
   GatewaySessionDurableObject,
 } from "../../src/cloud/connectorGatewayDurableObject.js";
+import { createConnectorGateway } from "../../src/cloud/connectorGateway.js";
+import { runLocalAgentGatewayCycle } from "../../src/lib/localAgent/runner.js";
+import type { LocalDiscoveryResult } from "../../src/lib/localAgent/localDiscovery.js";
 import type {
   GatewayDeviceRequest,
   GatewaySessionRecord,
 } from "../../src/cloud/connectorGateway.js";
+import type { LocalAgentGatewayResult } from "../../src/lib/localAgent/gatewayProtocol.js";
 
 class MemoryStorage implements GatewayDurableStorage {
   private values = new Map<string, unknown>();
@@ -200,7 +204,8 @@ test("Durable Object request queue binds delivery and results to the active tena
       "session_A",
       "request_A",
       JSON.stringify({ text: "hello" }),
-      request.createdAt
+      request.createdAt,
+      1
     ),
     true
   );
@@ -226,6 +231,281 @@ test("Durable Object request queue binds delivery and results to the active tena
     payload: JSON.stringify({ prompt: "x".repeat(65_537) }),
   };
   assert.equal(await coordinator.enqueueRequest("device_A", largeRequest), false);
+});
+
+test("Durable Object redelivers non-stream work after a lost poll response lease", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession({
+    ...session(),
+    leaseExpiresAt: "2026-10-08T12:10:00.000Z",
+  });
+  const createdAt = "2026-10-08T12:00:00.000Z";
+  const request: GatewayDeviceRequest = {
+    requestId: "poll_response_lost",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt,
+    expiresAt: "2026-10-08T12:10:00.000Z",
+    status: "pending",
+  };
+
+  assert.equal(await coordinator.enqueueRequest("device_A", request), true);
+  const firstDelivery = await coordinator.takeRequests("device_A", "session_A", createdAt);
+  assert.equal(firstDelivery.length, 1);
+  assert.equal(firstDelivery[0]?.deliveryAttempts, 1);
+  assert.equal(firstDelivery[0]?.deliveryLeaseExpiresAt, "2026-10-08T12:00:30.000Z");
+  assert.deepEqual(
+    await coordinator.takeRequests("device_A", "session_A", "2026-10-08T12:00:29.999Z"),
+    [],
+    "the queue must not immediately duplicate work while its delivery lease is active"
+  );
+
+  const redelivered = await coordinator.takeRequests(
+    "device_A",
+    "session_A",
+    "2026-10-08T12:00:30.000Z"
+  );
+  assert.equal(redelivered.length, 1);
+  assert.equal(redelivered[0]?.requestId, request.requestId);
+  assert.equal(redelivered[0]?.deliveryAttempts, 2);
+  assert.equal(
+    await coordinator.submitRequestResult(
+      "device_A",
+      "session_A",
+      request.requestId,
+      JSON.stringify({ text: "stale" }),
+      "2026-10-08T12:00:30.001Z",
+      1
+    ),
+    false,
+    "an earlier Local Agent execution cannot submit after its lease was superseded"
+  );
+  assert.equal(
+    await coordinator.submitRequestResult(
+      "device_A",
+      "session_A",
+      request.requestId,
+      JSON.stringify({ text: "recovered" }),
+      "2026-10-08T12:00:31.000Z",
+      2
+    ),
+    true
+  );
+  assert.deepEqual(await coordinator.getRequest("device_A", request.requestId, createdAt), {
+    ...request,
+    status: "complete",
+    result: JSON.stringify({ text: "recovered" }),
+  });
+  assert.deepEqual(
+    await coordinator.takeRequests("device_A", "session_A", "2026-10-08T12:01:00.000Z"),
+    [],
+    "a completed result stops further deliveries"
+  );
+});
+
+test("exhausted non-stream delivery becomes terminal instead of remaining delivered", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  await coordinator.putSession({
+    ...session(),
+    leaseExpiresAt: "2026-10-08T12:10:00.000Z",
+  });
+  const request: GatewayDeviceRequest = {
+    requestId: "delivery_attempt_limit",
+    tenantId: "tenant_A",
+    sessionId: "session_A",
+    capability: "ollama.chat",
+    payload: "{}",
+    createdAt: "2026-10-08T12:00:00.000Z",
+    expiresAt: "2026-10-08T12:10:00.000Z",
+    status: "pending",
+  };
+  assert.equal(await coordinator.enqueueRequest("device_A", request), true);
+  for (const at of [0, 30_000, 60_000]) {
+    const deliveries = await coordinator.takeRequests(
+      "device_A",
+      "session_A",
+      new Date(Date.parse(request.createdAt) + at).toISOString()
+    );
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0]?.deliveryAttempts, Math.floor(at / 30_000) + 1);
+  }
+
+  const terminal = await coordinator.getRequest(
+    "device_A",
+    request.requestId,
+    "2026-10-08T12:01:30.000Z"
+  );
+  assert.deepEqual(
+    terminal,
+    { ...request, status: "failed", deliveryFailure: "delivery_attempts_exhausted" },
+    "a result poll exposes and persists the terminal recovery reason without another device poll"
+  );
+  assert.deepEqual(
+    await coordinator.takeRequests("device_A", "session_A", "2026-10-08T12:01:30.000Z"),
+    [],
+    "attempt exhaustion must stop re-delivery"
+  );
+  assert.equal(
+    await coordinator.submitRequestResult(
+      "device_A",
+      "session_A",
+      request.requestId,
+      "{}",
+      "2026-10-08T12:01:31.000Z",
+      3
+    ),
+    false,
+    "late work cannot overwrite the terminal attempt limit"
+  );
+});
+
+test("retry recovers one lost poll delivery without enqueueing a duplicate request", async () => {
+  const { namespace } = makeNamespace();
+  const coordinator = new DurableObjectGatewayCoordinator(namespace);
+  const credential = "integration_device_credential_1234567890";
+  const credentialDigest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(credential)
+  );
+  const device = {
+    id: "device_A",
+    tenantId: "tenant_A",
+    credentialHash: Array.from(new Uint8Array(credentialDigest), (byte) =>
+      byte.toString(16).padStart(2, "0")
+    ).join(""),
+    capabilities: ["ollama.chat"],
+    revokedAt: null,
+  };
+  const directory = {
+    async getDevice(deviceId: string) {
+      return deviceId === device.id ? device : null;
+    },
+    async revokeDevice() {
+      return false;
+    },
+  };
+  let now = Date.parse("2026-10-08T12:00:00.000Z");
+  const gateway = createConnectorGateway({
+    coordinator,
+    directory,
+    now: () => now,
+    createId: () => "session_A",
+    createToken: () => "device-session-token",
+    createRequestId: () => "stable_request_A",
+    wait: async () => new Promise((resolve) => setTimeout(resolve, 0)),
+  });
+  const session = await gateway.connect(device.id, credential);
+  assert.ok(session);
+
+  let enqueueCalls = 0;
+  const enqueue = coordinator.enqueueRequest.bind(coordinator);
+  coordinator.enqueueRequest = async (...args) => {
+    enqueueCalls += 1;
+    return enqueue(...args);
+  };
+  const createdAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + 15 * 60_000).toISOString();
+  const request: GatewayDeviceRequest = {
+    requestId: "stable_request_A",
+    tenantId: device.tenantId,
+    sessionId: session.sessionId,
+    capability: "ollama.chat",
+    payload: JSON.stringify({ prompt: "hello" }),
+    createdAt,
+    expiresAt,
+    status: "pending",
+  };
+  assert.equal(await coordinator.enqueueRequest(device.id, request), true);
+  const lostPollResponse = await gateway.pollDeviceRequests({
+    deviceId: device.id,
+    sessionToken: session.sessionToken,
+  });
+  assert.equal(lostPollResponse?.[0]?.requestId, request.requestId);
+  assert.equal(enqueueCalls, 1);
+
+  // The client retries with the same idempotency identity after the bounded
+  // delivery lease expires. The gateway resumes the retained row.
+  now += 30_000;
+  const localAgentTransport = {
+    connect: gateway.connect,
+    heartbeat: (currentSession: typeof session, capabilities?: string[]) =>
+      gateway.heartbeat(currentSession.deviceId, currentSession.sessionToken, capabilities),
+    poll: async (currentSession: typeof session) => {
+      const requests = await gateway.pollDeviceRequests({
+        deviceId: currentSession.deviceId,
+        sessionToken: currentSession.sessionToken,
+      });
+      assert.equal(requests?.length, 1, "runner should recover the expired non-stream delivery");
+      return requests;
+    },
+    submitResult: (currentSession: typeof session, result: LocalAgentGatewayResult) =>
+      gateway.submitDeviceResult({
+        deviceId: currentSession.deviceId,
+        sessionToken: currentSession.sessionToken,
+        requestId: result.requestId,
+        deliveryAttempt: result.deliveryAttempt,
+        result: { version: result.version, outcome: result.outcome },
+      }),
+  };
+  const discovery: LocalDiscoveryResult = {
+    heartbeat: {
+      status: "online",
+      capabilities: ["ollama.chat"],
+      serviceHealth: { ollama: true, comfyui: false },
+    },
+    services: [
+      { service: "ollama", reachable: true, models: [] },
+      { service: "comfyui", reachable: false, models: [] },
+    ],
+  };
+  let localExecutions = 0;
+  const cycle = await runLocalAgentGatewayCycle(
+    { gatewayUrl: "http://127.0.0.1:8787", deviceId: device.id, credential },
+    {
+      fetch,
+      now: () => now,
+      gateway: localAgentTransport,
+      execute: async (receivedRequest) => {
+        assert.equal(receivedRequest.requestId, request.requestId);
+        localExecutions += 1;
+        return { text: "hello" };
+      },
+    },
+    session,
+    discovery
+  );
+  assert.equal(cycle.processed, 1);
+  assert.equal(enqueueCalls, 1, "retry must reuse the durable request instead of enqueuing again");
+  assert.equal(localExecutions, 1);
+  assert.deepEqual(
+    await gateway.requestCapability({
+      tenantId: device.tenantId,
+      deviceId: device.id,
+      capability: request.capability,
+      payload: { prompt: "hello" },
+      timeoutMs: 30_000,
+      requestId: request.requestId,
+      requestCreatedAt: createdAt,
+      requestExpiresAt: expiresAt,
+    }),
+    {
+      ok: true,
+      requestId: request.requestId,
+      result: {
+        version: 1,
+        outcome: { ok: true, value: { text: "hello" } },
+      },
+    }
+  );
+  assert.deepEqual(
+    await gateway.pollDeviceRequests({ deviceId: device.id, sessionToken: session.sessionToken }),
+    [],
+    "a completed request is no longer eligible for delivery"
+  );
 });
 
 test("Durable Object rejects requests whose deadline is not after creation", async () => {
@@ -297,7 +577,8 @@ test("invalid protocol timestamps cannot purge queued work or complete a request
       "session_A",
       request.requestId,
       "{}",
-      "invalid-clock"
+      "invalid-clock",
+      1
     ),
     false,
     "an invalid clock must not bypass session or request expiry checks"
@@ -332,6 +613,11 @@ test("Durable Object stream queue allows one ordered event and acknowledges only
   assert.equal(
     (await coordinator.takeRequests("device_A", "session_A", request.createdAt))[0]?.stream,
     true
+  );
+  assert.deepEqual(
+    await coordinator.takeRequests("device_A", "session_A", "2026-10-08T12:00:15.000Z"),
+    [],
+    "stream work is never redelivered after a possible partial execution"
   );
 
   const delta = JSON.stringify({ type: "delta", data: { content: "hello" } });
@@ -758,7 +1044,8 @@ test("completed idempotent results do not consume the pending queue capacity", a
         "session_A",
         request.requestId,
         "{}",
-        createdAt
+        createdAt,
+        1
       ),
       true
     );
@@ -870,7 +1157,8 @@ test("completed request retention is bounded by row count and serialized bytes",
         "session_A",
         row.requestId,
         "{}",
-        createdAt
+        createdAt,
+        1
       ),
       true
     );
@@ -917,7 +1205,8 @@ test("completed request retention is bounded by row count and serialized bytes",
         "session_A",
         row.requestId,
         "x".repeat(64 * 1024),
-        createdAt
+        createdAt,
+        1
       ))
     ) {
       break;

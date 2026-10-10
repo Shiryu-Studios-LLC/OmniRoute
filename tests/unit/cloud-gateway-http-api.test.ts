@@ -714,11 +714,13 @@ test("D1 device registration and Worker v1 connect/heartbeat/poll/result stay de
       capability: "ollama:chat:qwen-local",
       payload: { messages: [{ role: "user", content: "hello" }] },
       expiresAt: "2026-10-08T12:00:20.000Z",
+      deliveryAttempt: 1,
     });
     assert.equal(
       await transport.submitResult(session, {
         version: 1,
         requestId,
+        deliveryAttempt: 1,
         outcome: { ok: true, value: { message: { role: "assistant", content: "hi" } } },
       }),
       true
@@ -1611,6 +1613,7 @@ test("customer invocation derives tenant from its API key, completes through the
       await deviceA.transport.submitResult(deviceA.session, {
         version: 1,
         requestId: requests![0].requestId,
+        deliveryAttempt: requests![0].deliveryAttempt,
         outcome: {
           ok: true,
           value: {
@@ -1682,6 +1685,7 @@ test("customer invocation derives tenant from its API key, completes through the
       await deviceB.transport.submitResult(deviceB.session, {
         version: 1,
         requestId: requestsB![0].requestId,
+        deliveryAttempt: requestsB![0].deliveryAttempt,
         outcome: { ok: false, error: { code: "capability_execution_failed" } },
       }),
       true
@@ -1770,6 +1774,7 @@ test("customer invocation replays completed results only while its device remain
       await device.transport.submitResult(device.session, {
         version: 1,
         requestId: requests![0].requestId,
+        deliveryAttempt: requests![0].deliveryAttempt,
         outcome: { ok: true, value: { message: { role: "assistant", content: "once" } } },
       }),
       true
@@ -1852,6 +1857,7 @@ test("an invocation retry after timeout resumes the same retained device request
       await device.transport.submitResult(device.session, {
         version: 1,
         requestId: delivered![0].requestId,
+        deliveryAttempt: delivered![0].deliveryAttempt,
         outcome: { ok: true, value: { recovered: true } },
       }),
       true
@@ -1935,6 +1941,7 @@ test("a result-audit failure retries from the completed device request without i
       await device.transport.submitResult(device.session, {
         version: 1,
         requestId,
+        deliveryAttempt: delivered![0].deliveryAttempt,
         outcome: { ok: true, value: { recovered: "same durable request" } },
       }),
       true
@@ -2259,6 +2266,7 @@ test("device connect, heartbeat, and result routes apply independent limits", as
           deviceId,
           sessionToken: session.sessionToken,
           requestId: "no-pending-request",
+          deliveryAttempt: 1,
           result: { ok: true },
         })
       ).status,
@@ -2272,6 +2280,7 @@ test("device connect, heartbeat, and result routes apply independent limits", as
           deviceId,
           sessionToken: session.sessionToken,
           requestId: "no-pending-request",
+          deliveryAttempt: 1,
           result: { ok: true },
         })
       ).status,

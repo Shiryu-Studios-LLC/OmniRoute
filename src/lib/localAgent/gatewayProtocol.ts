@@ -14,6 +14,7 @@ export interface LocalAgentGatewayRequest {
   capability: string;
   payload: unknown;
   expiresAt: string;
+  deliveryAttempt?: number;
   stream?: true;
 }
 
@@ -29,6 +30,7 @@ export type LocalAgentGatewayOutcome =
 export interface LocalAgentGatewayResult {
   version: typeof LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION;
   requestId: string;
+  deliveryAttempt?: number;
   outcome: LocalAgentGatewayOutcome;
 }
 
@@ -106,6 +108,7 @@ export interface ConnectorGatewayPort {
     deviceId: string;
     sessionToken: string;
     requestId: string;
+    deliveryAttempt?: number;
     result: unknown;
   }): Promise<boolean>;
   submitDeviceStreamEvent?(input: {
@@ -141,6 +144,9 @@ export function createConnectorGatewayTransport(
         deviceId: session.deviceId,
         sessionToken: session.sessionToken,
         requestId: result.requestId,
+        ...(result.deliveryAttempt === undefined
+          ? {}
+          : { deliveryAttempt: result.deliveryAttempt }),
         result: {
           version: result.version,
           outcome: result.outcome,

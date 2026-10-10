@@ -521,6 +521,9 @@ export async function runLocalAgentGatewayCycle(
     const result: LocalAgentGatewayResult = {
       version: LOCAL_AGENT_GATEWAY_PROTOCOL_VERSION,
       requestId: request.requestId,
+      ...(request.deliveryAttempt === undefined
+        ? {}
+        : { deliveryAttempt: request.deliveryAttempt }),
       outcome,
     };
     let resultFits = false;
@@ -638,6 +641,9 @@ export async function runLocalAgentWithGateway(
         if (!discovery && !(await refreshed)) throw new Error("Local service discovery failed");
       }
       if (!discovery) throw new Error("Local service discovery is unavailable");
+      // Do not start another poll until every request from this batch finishes.
+      // This keeps the same Local Agent process from acquiring a second delivery
+      // while it is still executing the first one.
       const cycle = await runLocalAgentGatewayCycle(
         config,
         { ...dependencies, abortSignal: signal },

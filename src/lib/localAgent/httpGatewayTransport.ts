@@ -274,6 +274,9 @@ export function createHttpLocalAgentGatewayTransport(
           capability: value.capability,
           payload: value.payload,
           expiresAt: value.expiresAt,
+          ...(Number.isSafeInteger(value.deliveryAttempt)
+            ? { deliveryAttempt: Number(value.deliveryAttempt) }
+            : {}),
           ...(value.stream === true ? { stream: true as const } : {}),
         });
       }
@@ -285,6 +288,7 @@ export function createHttpLocalAgentGatewayTransport(
         deviceId: session.deviceId,
         sessionToken: session.sessionToken,
         requestId: result.requestId,
+        deliveryAttempt: result.deliveryAttempt,
         result: { version: result.version, outcome: result.outcome },
       });
       return (
