@@ -57,15 +57,18 @@ class RewrapDb implements CloudDb {
         const match = /FROM ([a-z_]+)[\s\S]*?(?:WHERE|AND) ([a-z_]+) IS NOT NULL/.exec(sql);
         const table = match?.[1];
         const column = match?.[2];
+        const isCursorQuery = sql.includes("rowid > ?");
+        const cursor = isCursorQuery ? Number(values[0]) : 0;
         const activePrefix = String(values.at(-1));
         const found =
           table && column
             ? thisDb.rowsFor(table).some((row) => {
                 const value = row[column];
                 return (
+                  (!isCursorQuery || Number(row.rowid) > cursor) &&
                   typeof value === "string" &&
                   (value.startsWith("enc:v2:") || value.startsWith("enc:v3:")) &&
-                  !value.startsWith(activePrefix)
+                  (isCursorQuery || !value.startsWith(activePrefix))
                 );
               })
             : false;
@@ -77,7 +80,6 @@ class RewrapDb implements CloudDb {
         const column = match?.[2];
         if (!table || !column) return { results: [] as U[], success: true };
         const cursor = Number(values[0]);
-        const activePrefix = String(values[2]);
         const limit = Number(values.at(-1));
         const results = thisDb
           .rowsFor(table)
@@ -86,8 +88,7 @@ class RewrapDb implements CloudDb {
             return (
               Number(row.rowid) > cursor &&
               typeof value === "string" &&
-              (value.startsWith("enc:v2:") || value.startsWith("enc:v3:")) &&
-              !value.startsWith(activePrefix)
+              (value.startsWith("enc:v2:") || value.startsWith("enc:v3:"))
             );
           })
           .sort((left, right) => Number(left.rowid) - Number(right.rowid))
@@ -409,6 +410,30 @@ test("credential maintenance counts bad envelopes without changing their ciphert
   assert.equal(continued.rewrapped, 1);
   assert.equal(continued.hasMore, true, "the unrecoverable envelope remains pending");
   assert.match(laterRow.api_key ?? "", /^enc:v3:new-key:/);
+});
+
+test("credential maintenance blocks key retirement for unreadable envelopes labeled with the active key ID", async () => {
+  const db = new RewrapDb();
+  const row = connection(1, "connection-reused-key-id", "tenant-a");
+  const priorMaterialWithReusedId = await encryptCloudCredential(
+    "still-wrapped-by-the-prior-key",
+    { legacyKey, keys: { "new-key": oldV3Key }, activeKeyId: "new-key" },
+    { tenantId: row.tenant_id, connectionId: row.id, field: "apiKey" }
+  );
+  row.api_key = priorMaterialWithReusedId;
+  db.connections.push(row);
+
+  const result = await rewrapCloudCredentialRows(db, ring);
+
+  assert.deepEqual(result, {
+    scanned: 1,
+    rewrapped: 0,
+    failed: 1,
+    conflicts: 0,
+    hasMore: true,
+  });
+  assert.equal(row.api_key, priorMaterialWithReusedId);
+  assert.equal(JSON.stringify(result).includes("still-wrapped-by-the-prior-key"), false);
 });
 
 test("credential maintenance performs no D1 work when key rotation is inactive", async () => {

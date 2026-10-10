@@ -224,7 +224,17 @@ export async function markCloudImageJobRunning(
     )
     .bind(jobId, sessionId, now)
     .run();
-  return Number(result.meta?.changes ?? 0) === 1;
+  const changes = result.meta?.changes;
+  if (
+    !result.success ||
+    typeof changes !== "number" ||
+    !Number.isSafeInteger(changes) ||
+    changes < 0 ||
+    changes > 1
+  ) {
+    throw new Error("D1 gateway image-job state update failed");
+  }
+  return changes === 1;
 }
 
 export async function cancelCloudImageJob(

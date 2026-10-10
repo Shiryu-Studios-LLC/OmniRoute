@@ -167,13 +167,14 @@ export async function rewrapCloudCredentialRows(
       .bind(keyring.activeKeyId, cursorKey)
       .first();
     let cursor = Number(cursorRow?.last_rowid ?? 0);
-    let query = await selectCredentialPage(db, spec, cursor, activePrefix, limit);
+    let query = await selectCredentialPage(db, spec, cursor, limit);
     if (query.results.length === 0 && cursor > 0) {
       await updateCredentialCursor(db, keyring.activeKeyId, cursorKey, 0);
       cursor = 0;
-      query = await selectCredentialPage(db, spec, cursor, activePrefix, limit);
+      query = await selectCredentialPage(db, spec, cursor, limit);
     }
 
+    let blockedOnActiveKeyFailure = false;
     for (const row of query.results) {
       result.scanned += 1;
       let replacement: string;
@@ -182,10 +183,22 @@ export async function rewrapCloudCredentialRows(
       } catch (error) {
         if (error instanceof CloudCredentialEncryptionError) {
           result.failed += 1;
+          if (row.envelope.startsWith(activePrefix)) {
+            // Do not pass an unreadable envelope already labeled with the active key. It may
+            // indicate key-ID reuse with different material, which must block retirement.
+            blockedOnActiveKeyFailure = true;
+            break;
+          }
           await updateCredentialCursor(db, keyring.activeKeyId, cursorKey, row.rowid);
           continue;
         }
         throw new Error("Cloud credential rewrap encryption failed");
+      }
+
+      if (replacement === row.envelope) {
+        // Active-key envelopes are authenticated by rewrapCloudCredential before this no-op.
+        await updateCredentialCursor(db, keyring.activeKeyId, cursorKey, row.rowid);
+        continue;
       }
 
       const update = await db
@@ -203,9 +216,31 @@ export async function rewrapCloudCredentialRows(
       else throw new Error("Cloud credential rewrap update returned invalid state");
       await updateCredentialCursor(db, keyring.activeKeyId, cursorKey, row.rowid);
     }
+    if (blockedOnActiveKeyFailure) result.hasMore = true;
   }
 
   for (const spec of CREDENTIAL_COLUMNS) {
+    const cursorRow = await db
+      .prepare<{ last_rowid: number }>(
+        `SELECT last_rowid FROM cloud_credential_rewrap_cursors
+          WHERE active_key_id = ? AND credential_column = ?`
+      )
+      .bind(keyring.activeKeyId, `${spec.table}.${spec.column}`)
+      .first();
+    const cursor = Number(cursorRow?.last_rowid ?? 0);
+    const unscanned = await db
+      .prepare<{ present: number }>(
+        `SELECT 1 AS present
+           FROM ${spec.table}
+          WHERE rowid > ?
+            AND ${spec.column} IS NOT NULL
+            AND (substr(${spec.column}, 1, 7) = 'enc:v2:' OR substr(${spec.column}, 1, 7) = 'enc:v3:')
+          LIMIT 1`
+      )
+      .bind(cursor)
+      .first();
+    if (unscanned) result.hasMore = true;
+
     const pending = await db
       .prepare<{ present: number }>(
         `SELECT 1 AS present
@@ -229,7 +264,6 @@ async function selectCredentialPage(
   db: CloudDb,
   spec: CredentialColumn,
   afterRowid: number,
-  activePrefix: string,
   limit: number
 ) {
   const query = await db
@@ -239,11 +273,10 @@ async function selectCredentialPage(
         WHERE rowid > ?
           AND ${spec.column} IS NOT NULL
           AND (substr(${spec.column}, 1, 7) = 'enc:v2:' OR substr(${spec.column}, 1, 7) = 'enc:v3:')
-          AND substr(${spec.column}, 1, ?) <> ?
         ORDER BY rowid
         LIMIT ?`
     )
-    .bind(afterRowid, activePrefix.length, activePrefix, limit)
+    .bind(afterRowid, limit)
     .all();
   if (!query.success) throw new Error("Cloud credential rewrap query failed");
   return query;

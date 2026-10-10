@@ -459,6 +459,34 @@ test("image-job insert failure is reported as unavailable rather than exhausted 
   assert.equal(stored.count, 0);
 });
 
+test("image-job control reports D1 state-update failures instead of a false cancellation", async () => {
+  const fixture = await createFixture();
+  const created = await createJob(fixture, "image-job-control-storage-failure");
+  const job = (await created.json()) as { jobId: string };
+
+  const response = await handleGatewayImageJobRequest(
+    new Request(`https://cloud.test/__gateway/v1/device/image-jobs/${job.jobId}/control`, {
+      headers: deviceHeaders(fixture.deviceId, fixture.session!.sessionToken),
+    }),
+    {
+      db: failRunForSqlPrefix(
+        fixture.db,
+        "UPDATE cloud_gateway_image_jobs\n          SET state = 'running'"
+      ),
+      sessions: fixture.sessions,
+      artifacts: fixture.bucket,
+      now: () => fixture.currentTime(),
+    }
+  );
+
+  assert.equal(response?.status, 503);
+  assert.deepEqual(await response?.json(), { error: "Image-job storage is unavailable" });
+  const stored = fixture.db.db
+    .prepare("SELECT state FROM cloud_gateway_image_jobs WHERE job_id = ?")
+    .get(job.jobId) as { state: string };
+  assert.equal(stored.state, "queued");
+});
+
 test("image job rejects mismatched idempotency input and cancellation rejects late artifacts", async () => {
   const fixture = await createFixture();
   const first = await createJob(fixture);

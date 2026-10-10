@@ -577,9 +577,16 @@ async function handleDevice(
     }
     if (current.state === "cancelled") return json({ status: "cancelled" });
     if (current.state === "queued") {
-      await markCloudImageJobRunning(options.db, job.jobId, authenticated.sessionId, now);
+      try {
+        await markCloudImageJobRunning(options.db, job.jobId, authenticated.sessionId, now);
+      } catch {
+        return json({ error: "Image-job storage is unavailable" }, 503);
+      }
     }
     const latest = await getCloudImageJob(options.db, job.jobId);
+    if (latest?.state === "queued") {
+      return json({ error: "Image-job storage is unavailable" }, 503);
+    }
     return json({
       status:
         latest?.state === "expired"

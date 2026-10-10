@@ -33,6 +33,10 @@ import {
   handleCloudCustomerOnboardingRequest,
 } from "./tenantOnboardingHttpApi";
 import { CLOUD_CUSTOMER_MCP_SERVERS_PATH, handleCloudTenantMcpRequest } from "./tenantMcpHttpApi";
+import {
+  CLOUD_CUSTOMER_COMBOS_PATH,
+  handleCloudCustomerCombosRequest,
+} from "./tenantCombosHttpApi";
 import type { CloudMcpEgressBinding } from "./mcpEgressTransport";
 import { createCloudOidcEgressTransport, type CloudOidcEgressBinding } from "./oidcEgressTransport";
 import { CLOUD_CUSTOMER_PORTAL_PATH, handleCloudCustomerPortalRequest } from "./customerPortal";
@@ -371,6 +375,24 @@ export function createCloudRuntime(options: CloudRuntimeOptions = {}) {
         } catch {
           return Response.json(
             { error: "Customer business profile request could not be completed" },
+            { status: 503, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+
+      if (
+        url.pathname === CLOUD_CUSTOMER_COMBOS_PATH ||
+        url.pathname.startsWith(`${CLOUD_CUSTOMER_COMBOS_PATH}/`)
+      ) {
+        try {
+          const response = await handleCloudCustomerCombosRequest(request, {
+            db: options.env?.DB,
+            now,
+          });
+          if (response) return response;
+        } catch {
+          return Response.json(
+            { error: "Customer combo request could not be completed" },
             { status: 503, headers: { "Cache-Control": "no-store" } }
           );
         }
