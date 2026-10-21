@@ -375,6 +375,16 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
           console.warn("[STARTUP] Embed WS proxy failed to start (non-fatal):", msg);
         }),
   },
+  {
+    name: "provider-gateway",
+    start: () =>
+      import("@/lib/services/providerGateway")
+        .then((m) => m.initProviderGateway())
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn("[STARTUP] Provider gateway failed to start (non-fatal):", msg);
+        }),
+  },
   // Conductor bridge (PRD Conductor RF1): mirrors OmniConductor hub tasks into the
   // A2A TaskManager via the hub SSE. Opt-in — self-gated on CONDUCTOR_HUB_URL.
   {
