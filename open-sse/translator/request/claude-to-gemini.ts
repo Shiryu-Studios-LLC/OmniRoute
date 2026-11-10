@@ -21,7 +21,11 @@ import {
 } from "../../services/geminiThoughtSignatureStore.ts";
 import { capMaxOutputTokens, capThinkingBudget } from "../../../src/lib/modelCapabilities.ts";
 import { getModelSpec } from "../../../src/shared/constants/modelSpecs.ts";
-import { gemini38ThinkingConfig, isGemini38Model } from "../../services/thinkingBudget.ts";
+import {
+  gemini38ThinkingConfig,
+  isGeminiThinkingLevelModel,
+  resolveClaudeNativeGeminiThinking,
+} from "../../services/thinkingBudget.ts";
 
 import {
   buildChangedToolNameMap,
@@ -437,7 +441,13 @@ export function claudeToGeminiRequest(model, body, stream, credentials = null) {
   // Priority: thinking.budget_tokens (Claude native) > output_config.effort (Claude Code).
   // Models without thinking support (TTS, transcription, gemini-2.5-flash-image)
   // 400 on ANY thinkingConfig, so they skip both paths below (#16928).
-  if (model.startsWith("gemma-4") || geminiModelRejectsThinkingConfig(model)) {
+  const rejectsThinkingConfig = geminiModelRejectsThinkingConfig(model);
+  const nativeThinking = rejectsThinkingConfig
+    ? null
+    : resolveClaudeNativeGeminiThinking(model, body);
+  if (nativeThinking !== null) {
+    result.generationConfig.thinkingConfig = nativeThinking;
+  } else if (model.startsWith("gemma-4") || rejectsThinkingConfig) {
     // gemma-4 models returns - 400: Thinking budget is not supported for this model
   } else if (body.thinking?.type === "enabled" && typeof body.thinking.budget_tokens === "number") {
     // typeof check ensures only numeric budget_tokens triggers the thinking path;
@@ -459,7 +469,7 @@ export function claudeToGeminiRequest(model, body, stream, credentials = null) {
       // (possibly cap-clamped) budget value. Only the reasoning_effort/output_config.effort
       // paths below treat a resulting budget of 0 as "thinking disabled".
       // Flash-Lite models 400 on thinkingBudget 0, so it is omitted for them.
-      result.generationConfig.thinkingConfig = isGemini38Model(model)
+      result.generationConfig.thinkingConfig = isGeminiThinkingLevelModel(model)
         ? gemini38ThinkingConfig(model, cappedBudget, body)
         : buildGeminiThinkingConfig(model, cappedBudget, true);
     }
@@ -485,7 +495,7 @@ export function claudeToGeminiRequest(model, body, stream, credentials = null) {
       // Models with thinkingBudgetCap:0 (e.g. gemini-3-flash) reject
       // thinkingConfig even for effort-based paths.
       if (getModelSpec(model)?.thinkingBudgetCap !== 0) {
-        result.generationConfig.thinkingConfig = isGemini38Model(model)
+        result.generationConfig.thinkingConfig = isGeminiThinkingLevelModel(model)
           ? gemini38ThinkingConfig(model, budget, body)
           : {
               thinkingBudget: budget,
@@ -507,7 +517,7 @@ export function claudeToGeminiRequest(model, body, stream, credentials = null) {
   // Gemini strictly rejects requests containing consecutive messages with the same role
   // (400 INVALID_ARGUMENT: "Request contains consecutive messages with the same role").
   // Normalize adjacent same-role messages by concatenating their parts.
-  result.contents = mergeConsecutiveSameRoleContents(result.contents);
+  result.contents = mergeConsecutiveSameRoleContents(result.contents, model);
   mergeTrailingTextIntoFunctionResponses(result.contents);
   // Guard the one alternation violation the merge above cannot reach: history
   // that opens with a functionCall-bearing turn instead of a user turn.
