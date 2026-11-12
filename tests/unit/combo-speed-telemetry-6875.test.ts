@@ -252,3 +252,51 @@ test("buildAutoCandidates: a provider/model with no historical signal omits the 
   assert.strictEqual(candidate!.avgE2ELatencyMs, undefined);
   assert.strictEqual(candidate!.avgTokensPerSecond, undefined);
 });
+
+test("buildAutoCandidates: AGY alias uses Antigravity executor history for reliability and latency", async () => {
+  const model = "gemini-3.1-flash-lite";
+  const now = Date.now();
+  for (let i = 0; i < 12; i++) {
+    await saveRequestUsage({
+      provider: "antigravity",
+      model,
+      success: i < 10,
+      latencyMs: 1650,
+      timeToFirstTokenMs: 300,
+      tokens: { output: 90 },
+      timestamp: new Date(now - i * 1000).toISOString(),
+    });
+  }
+
+  const modelStr = `agy/${model}`;
+  const candidates = await buildAutoCandidates(
+    [
+      {
+        kind: "model" as const,
+        stepId: "agy-alias",
+        executionKey: `agy>${modelStr}`,
+        modelStr,
+        provider: "agy",
+        providerId: "agy",
+        connectionId: null,
+        weight: 1,
+        label: null,
+      },
+    ],
+    "speed-telemetry-test-combo-agy",
+    null,
+    undefined,
+    { quotaPreflight: { enabled: false } } as never
+  );
+
+  const candidate = candidates.find((c) => c.modelStr === modelStr);
+  assert.ok(candidate, "AGY candidate should resolve");
+
+  const { getModelLatencyStats } = await import("../../src/lib/usageDb.ts");
+  const historical = await getModelLatencyStats({ windowHours: 24, minSamples: 3 });
+  const observed = historical[`antigravity/${model}`];
+  assert.ok(observed && observed.totalRequests >= 10);
+  assert.ok(Math.abs(candidate!.errorRate - (1 - observed.successRate)) < 0.00001);
+  assert.equal(candidate!.avgTtftMs, observed.avgTtftMs);
+  assert.equal(candidate!.p95LatencyMs, observed.p95LatencyMs);
+});

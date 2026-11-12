@@ -464,7 +464,15 @@ export async function buildAutoCandidates(
       const provider = target.provider || parsed.provider || parsed.providerAlias || "unknown";
       const model = parsed.model || modelStr;
       const historicalKey = `${provider}/${model}`;
-      const historicalModelMetric = historicalLatencyStats[historicalKey] || null;
+      // The Antigravity CLI uses `agy` in combo targets while its executor
+      // records usage under `antigravity`. Prefer the exact provider history,
+      // but reuse the equivalent backend's samples when the exact key is absent.
+      // Without this fallback, successful AGY models are treated as cold starts.
+      const historicalModelMetric =
+        historicalLatencyStats[historicalKey] ||
+        (provider === "agy" ? historicalLatencyStats[`antigravity/${model}`] : null) ||
+        (provider === "antigravity" ? historicalLatencyStats[`agy/${model}`] : null) ||
+        null;
       const historicalTotal = Number(historicalModelMetric?.totalRequests);
       const hasHistoricalSignal =
         Number.isFinite(historicalTotal) && historicalTotal >= MIN_HISTORY_SAMPLES;
