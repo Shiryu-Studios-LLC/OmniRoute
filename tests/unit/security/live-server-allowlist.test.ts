@@ -48,6 +48,28 @@ describe("parseCsvEnv", () => {
 });
 
 describe("buildAllowedOrigins", () => {
+  it("allows configured Cloudflare Access HTTPS origins only when same-origin relay is enabled", () => {
+    const env = {
+      ...EMPTY_ENV,
+      OMNIROUTE_LIVE_WS_SAME_ORIGIN: "1",
+      OMNIROUTE_CF_ACCESS_PUBLIC_HOSTNAMES:
+        "omniroute.shiryu.org,app.example.test,evil/path,localhost,example.com:8443",
+    };
+    const allowed = buildAllowedOrigins(env);
+    assert.equal(allowed.has("https://omniroute.shiryu.org"), true);
+    assert.equal(allowed.has("https://app.example.test"), true);
+    assert.equal(allowed.has("http://omniroute.shiryu.org"), false);
+    assert.equal(allowed.has("https://evil/path"), false);
+    assert.equal(allowed.has("https://example.com:8443"), false);
+    assert.equal(allowed.has("https://localhost"), false);
+    assert.equal(
+      buildAllowedOrigins({ ...env, OMNIROUTE_LIVE_WS_SAME_ORIGIN: "0" }).has(
+        "https://omniroute.shiryu.org"
+      ),
+      false
+    );
+  });
+
   it("includes the loopback defaults", () => {
     const out = buildAllowedOrigins(EMPTY_ENV);
     for (const origin of DEFAULT_ALLOWED_ORIGINS) {

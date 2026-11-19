@@ -9,6 +9,7 @@ import { resolveRuntimePorts, withRuntimePortEnv } from "../build/runtime-env.mj
 import { createOmnirouteWsBridge } from "./v1-ws-bridge.mjs";
 import { createResponsesWsProxy } from "./responses-ws-proxy.mjs";
 import { createNextUpgradeRelay } from "./next-upgrade-relay.mjs";
+import { proxyLiveWsUpgrade } from "./live-ws-proxy.mjs";
 import { ensurePeerStampToken, stampPeerIp } from "./peer-stamp.mjs";
 import methodGuard from "./http-method-guard.cjs";
 import headResponseGuard from "./head-response-guard.cjs";
@@ -102,6 +103,9 @@ const systemdNotifier = createSystemdNotifier();
 // mode, exactly like the `next` CLI does.
 process.env.NODE_ENV = dev ? "development" : "production";
 process.env.OMNIROUTE_INTERNAL_SCHEME = "http";
+// This runner forwards /live-ws upgrades through the main port, including
+// Cloudflare Tunnel. The handshake can advertise a same-origin URL to browsers.
+process.env.OMNIROUTE_LIVE_WS_SAME_ORIGIN = "1";
 
 const { dashboardPort } = runtimePorts;
 const hostname = process.env.HOST || "0.0.0.0";
@@ -233,6 +237,7 @@ async function start() {
     try {
       // Cleartext `Upgrade: h2c` (JDK HttpClient) is not a WebSocket upgrade: serve it as HTTP/1.1.
       if (handleH2cUpgrade(server, req, socket, head)) return;
+      if (proxyLiveWsUpgrade(req, socket, head)) return;
       const responsesWsHandled = await responsesWsProxy.handleUpgrade(req, socket, head);
       if (responsesWsHandled) return;
       const handled = await wsBridge.handleUpgrade(req, socket, head);

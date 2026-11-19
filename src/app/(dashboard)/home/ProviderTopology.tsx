@@ -349,7 +349,8 @@ function layoutProvider(
     { nodeId, providerId: p.provider, angle, color: config.color || "#6b7280" },
     selectTopologyModels(p.provider, ctx.modelMode, ctx.activeRequests, ctx.recentRequests),
     ctx.orbit,
-    (2 * Math.PI) / slot.count
+    (2 * Math.PI) / slot.count,
+    ctx.modelMode === "on"
   );
   return { node, edges: [edge, ...sub.edges], modelNodes: sub.nodes };
 }

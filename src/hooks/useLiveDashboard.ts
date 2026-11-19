@@ -120,7 +120,20 @@ export function useLiveDashboard({
       .then((body) => {
         if (cancelled) return;
         const publicUrl = sanitizeWsPublicUrl(body?.live?.publicUrl);
-        if (publicUrl) setHandshakeUrl(publicUrl);
+        if (publicUrl) {
+          setHandshakeUrl(publicUrl);
+        } else if (body?.live?.sameOrigin === true) {
+          // The runner has a same-origin /live-ws Upgrade proxy. A Cloudflare
+          // dashboard cannot access its loopback :20132 from the browser.
+          const livePath =
+            typeof body.live.path === "string" &&
+            body.live.path.startsWith("/") &&
+            !body.live.path.startsWith("//")
+              ? body.live.path
+              : "/live-ws";
+          const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+          setHandshakeUrl(`${scheme}//${window.location.host}${livePath}`);
+        }
         if (typeof body?.live?.path === "string" && body.live.path.startsWith("/")) {
           setHandshakePath(body.live.path);
         }
@@ -406,8 +419,16 @@ export function useLiveRequests(options?: UseLiveDashboardOptions) {
     completed: [],
   });
   const maxCompleted = 100;
+  // One socket also carries the actual Combo target attempts. A requested alias such as
+  // Claude-Free does not name the provider/model that was selected downstream.
+  const [comboEvents, setComboEvents] = useState<LiveComboEvent[]>([]);
 
   const handleEvent = useCallback((event: WsEventPayload) => {
+    if (event.channel === "combo") {
+      const combo = toLiveComboEvent(event);
+      if (combo) setComboEvents((prev) => [combo, ...prev].slice(0, 100));
+      return;
+    }
     if (event.channel !== "requests") return;
 
     if (event.event === "request.started") {
@@ -476,7 +497,7 @@ export function useLiveRequests(options?: UseLiveDashboardOptions) {
   }, []);
 
   const { connection, reconnect } = useLiveDashboard({
-    channels: ["requests"],
+    channels: ["requests", "combo"],
     onEvent: handleEvent,
     ...options,
   });
@@ -484,6 +505,7 @@ export function useLiveRequests(options?: UseLiveDashboardOptions) {
   return {
     activeRequests: Array.from(requestState.active.values()),
     completedRequests: requestState.completed,
+    comboEvents,
     activeCount: requestState.active.size,
     isConnected: connection.isConnected,
     reconnect,

@@ -45,6 +45,21 @@ export function parseCsvEnv(value: string | undefined | null): Set<string> {
  */
 export function buildAllowedOrigins(env: NodeJS.ProcessEnv = process.env): Set<string> {
   const extra = parseCsvEnv(env.LIVE_WS_ALLOWED_ORIGINS);
+  // The same-origin dashboard bridge shares its public hostname with the
+  // management UI. Restrict this extension to validated HTTPS hostnames
+  // explicitly configured for Cloudflare Access, never user-supplied Host.
+  if (env.OMNIROUTE_LIVE_WS_SAME_ORIGIN === "1") {
+    for (const configured of parseCsvEnv(env.OMNIROUTE_CF_ACCESS_PUBLIC_HOSTNAMES)) {
+      const hostname = configured.trim().toLowerCase();
+      if (
+        hostname.length <= 253 &&
+        hostname.includes(".") &&
+        hostname.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+      ) {
+        extra.add(`https://${hostname}`);
+      }
+    }
+  }
   const runtimePort = env.PORT || env.DASHBOARD_PORT;
   const dynamicDefaults: string[] = [];
   if (runtimePort && runtimePort !== "20128") {

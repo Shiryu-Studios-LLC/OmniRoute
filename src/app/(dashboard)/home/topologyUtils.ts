@@ -12,6 +12,103 @@ export interface TopologyActiveRequest {
   model: string;
 }
 
+/** One real attempt from the authenticated call-logs endpoint (not a model catalog entry). */
+export interface TopologyCallLog {
+  id?: string;
+  timestamp?: string;
+  provider?: string;
+  providerDisplay?: string | null;
+  model?: string;
+  requestedModel?: string | null;
+  comboName?: string | null;
+  status?: number;
+  error?: string | null;
+  active?: boolean;
+  stale?: boolean;
+  path?: string;
+  sourceFormat?: string | null;
+  targetFormat?: string | null;
+}
+
+export interface TopologyRoute {
+  provider: string;
+  providerDisplay: string;
+  model: string;
+  requestedModel: string | null;
+  comboName: string | null;
+  timestamp: string | null;
+  active: boolean;
+  error: boolean;
+}
+
+/** Preserve the distinct models observed in this dashboard visit when ON is selected. */
+export function appendTopologyModels<T extends { provider: string; model: string }>(
+  previous: TopologyActiveRequest[],
+  observations: T[]
+): TopologyActiveRequest[] {
+  const keys = new Set(
+    previous.map(({ provider, model }) => `${provider.toLowerCase()}\u0000${model.toLowerCase()}`)
+  );
+  const next = [...previous];
+  for (const { provider, model } of observations) {
+    if (
+      typeof provider !== "string" ||
+      !provider.trim() ||
+      typeof model !== "string" ||
+      !model.trim()
+    )
+      continue;
+    const key = `${provider.toLowerCase()}\u0000${model.toLowerCase()}`;
+    if (keys.has(key)) continue;
+    keys.add(key);
+    next.push({ provider, model });
+  }
+  return next.length === previous.length ? previous : next;
+}
+
+/**
+ * Keep actual downstream attempts (provider+model) in the topology after they complete.
+ * Combo aliases such as Claude-Free are labels on the request, NOT the serving model.
+ * Probes, invalid rows and stale abandoned in-flight entries must never light up a path.
+ */
+export function selectTopologyRoutes(logs: TopologyCallLog[], limit = 24): TopologyRoute[] {
+  if (!Array.isArray(logs)) return [];
+  const routes: TopologyRoute[] = [];
+  const seen = new Set<string>();
+  for (const log of logs) {
+    if (
+      !log ||
+      log.stale ||
+      log.model === "connection-test" ||
+      log.path === "/api/providers/test" ||
+      log.sourceFormat === "test" ||
+      log.targetFormat === "test"
+    )
+      continue;
+    const provider = typeof log.provider === "string" ? log.provider.trim() : "";
+    const model = typeof log.model === "string" ? log.model.trim() : "";
+    if (!provider || !model || provider.toLowerCase() === "unknown") continue;
+    const active = log.active === true || log.status === 0;
+    const status = typeof log.status === "number" ? log.status : null;
+    const error = !active && (Boolean(log.error) || (status !== null && status >= 400));
+    const key = `${provider.toLowerCase()}\u0000${model.toLowerCase()}\u0000${active}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    routes.push({
+      provider,
+      providerDisplay: log.providerDisplay?.trim() || provider,
+      model,
+      requestedModel: log.requestedModel?.trim() || null,
+      comboName: log.comboName?.trim() || null,
+      timestamp: log.timestamp || null,
+      active,
+      error,
+    });
+    if (routes.length >= limit) break;
+  }
+  return routes;
+}
+
 /** Minimal in-flight request shape (subset of LiveRequest from useLiveRequests) */
 interface InFlightRequest {
   provider: string;
@@ -121,19 +218,25 @@ export function buildModelSubNodes(
   provider: { nodeId: string; providerId: string; angle: number; color: string },
   models: TopologyModelEntry[],
   orbit: { rx: number; ry: number },
-  sectorAngle: number
+  sectorAngle: number,
+  showAll = false
 ): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   if (models.length === 0) return { nodes, edges };
 
-  const visible: ModelNodeData[] = models.slice(0, MAX_TOPOLOGY_MODEL_SUBNODES).map((m) => ({
+  // ON mode is explicitly an inventory of every observed model. Keep the
+  // compact +N cap for other callers, but never silently hide observed models
+  // while the operator has requested ON.
+  const visible: ModelNodeData[] = (
+    showAll ? models : models.slice(0, MAX_TOPOLOGY_MODEL_SUBNODES)
+  ).map((m) => ({
     label: m.model,
     active: m.active,
     color: provider.color,
     providerId: provider.providerId,
   }));
-  const hidden = models.length - visible.length;
+  const hidden = showAll ? 0 : models.length - visible.length;
   if (hidden > 0) {
     visible.push({
       label: `+${hidden}`,
@@ -148,10 +251,17 @@ export function buildModelSubNodes(
   const fanStep = count > 1 ? Math.min(MAX_MODEL_FAN_STEP, (sectorAngle * 0.7) / (count - 1)) : 0;
 
   visible.forEach((data, j) => {
-    const angle = provider.angle + (j - (count - 1) / 2) * fanStep;
+    // For ON, fan models outward along the provider's ray with enough spacing
+    // for the pill labels to stay separate as new models are discovered. AUTO
+    // keeps its old, compact positioning because active requests are transient.
+    const angle = showAll ? provider.angle : provider.angle + (j - (count - 1) / 2) * fanStep;
     const row = j % 2;
-    const cx = (orbit.rx + MODEL_ORBIT_GAP_X + row * MODEL_ROW_STEP_X) * Math.cos(angle);
-    const cy = (orbit.ry + MODEL_ORBIT_GAP_Y + row * MODEL_ROW_STEP_Y) * Math.sin(angle);
+    const cx =
+      (orbit.rx + MODEL_ORBIT_GAP_X + (showAll ? j * 156 : row * MODEL_ROW_STEP_X)) *
+      Math.cos(angle);
+    const cy =
+      (orbit.ry + MODEL_ORBIT_GAP_Y + (showAll ? j * 48 : row * MODEL_ROW_STEP_Y)) *
+      Math.sin(angle);
     const { sourceHandle, targetHandle } = getHandles(angle, cx);
     const id = data.overflow
       ? `model-${provider.providerId}-__more`
@@ -171,7 +281,14 @@ export function buildModelSubNodes(
       target: id,
       targetHandle,
       animated: data.active,
-      style: edgeStyle(data.active, false, false),
+      // The provider -> model branch is intentionally thinner than the main
+      // OmniRoute -> provider beam. While active React Flow animates its dashes;
+      // in AUTO mode the model and this edge disappear on request completion.
+      style: {
+        ...edgeStyle(data.active, false, false),
+        strokeWidth: data.active ? 1.3 : 1,
+        ...(data.active ? { strokeDasharray: "3 5" } : {}),
+      },
     });
   });
 
